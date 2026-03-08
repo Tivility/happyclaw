@@ -236,6 +236,14 @@ function resolveEffectiveGroup(group: RegisteredGroup): { effectiveGroup: Regist
   return { effectiveGroup: group, isHome: false };
 }
 
+/** Resolve the owner's home folder for memory mounting. Non-home groups read owner's home memory. */
+function resolveOwnerHomeFolder(group: RegisteredGroup): string {
+  if (group.created_by) {
+    return getUserHomeGroup(group.created_by)?.folder || group.folder;
+  }
+  return group.folder;
+}
+
 /** Send a message to an IM channel with automatic fail-count tracking and auto-unbind. */
 function extractLocalImImagePaths(text: string, groupFolder?: string): string[] {
   if (!groupFolder || !text) return [];
@@ -1711,6 +1719,8 @@ async function runAgent(
       queue.registerProcess(chatJid, proc, containerName, group.folder, identifier);
     };
 
+    const ownerHomeFolder = resolveOwnerHomeFolder(group);
+
     let output: ContainerOutput;
 
     if (executionMode === 'host') {
@@ -1728,6 +1738,7 @@ async function runAgent(
         },
         onProcessCb,
         wrappedOnOutput,
+        ownerHomeFolder,
       );
     } else {
       output = await runContainerAgent(
@@ -1744,6 +1755,7 @@ async function runAgent(
         },
         onProcessCb,
         wrappedOnOutput,
+        ownerHomeFolder,
       );
     }
 
@@ -2684,11 +2696,13 @@ async function processAgentConversation(chatJid: string, agentId: string): Promi
     const availableGroups = getAvailableGroups();
     writeGroupsSnapshot(effectiveGroup.folder, isAdminHome, availableGroups, new Set(Object.keys(registeredGroups)));
 
+    const ownerHomeFolder = resolveOwnerHomeFolder(effectiveGroup);
+
     let output: ContainerOutput;
     if (executionMode === 'host') {
-      output = await runHostAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput);
+      output = await runHostAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput, ownerHomeFolder);
     } else {
-      output = await runContainerAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput);
+      output = await runContainerAgent(effectiveGroup, containerInput, onProcessCb, wrappedOnOutput, ownerHomeFolder);
     }
 
     // Finalize session

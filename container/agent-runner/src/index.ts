@@ -350,7 +350,7 @@ function getSessionSummary(sessionId: string, transcriptPath: string): string | 
 /**
  * Archive the full transcript to conversations/ before compaction.
  */
-function createPreCompactHook(_isHome: boolean, isAdminHome: boolean): HookCallback {
+function createPreCompactHook(isHome: boolean, _isAdminHome: boolean): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
     const transcriptPath = preCompact.transcript_path;
@@ -388,10 +388,10 @@ function createPreCompactHook(_isHome: boolean, isAdminHome: boolean): HookCallb
       log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    // Flag memory flush for admin home container (full memory write access)
-    if (isAdminHome) {
+    // Flag memory flush for home containers (full memory write access)
+    if (isHome) {
       needsMemoryFlush = true;
-      log('PreCompact: flagged memory flush for admin home container');
+      log('PreCompact: flagged memory flush for home container');
     }
 
     return {};
@@ -623,15 +623,20 @@ function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean): string 
       '系统也会在上下文压缩前提示你保存记忆。',
     ].join('\n');
   }
-  // Non-home group container
+  // Non-home group container: read-only access to home memory, use Claude auto memory
   return [
     '',
     '## 记忆',
     '',
-    '可使用 `memory_search` 和 `memory_get` 工具搜索记忆文件。',
-    '获知重要信息（项目决策、待办、讨论要点等）时，**必须立即**调用 `memory_append` 保存。',
-    '不要等待——获知后立刻存储。',
-    '全局记忆（`/workspace/global/CLAUDE.md`）为只读，无法直接修改。',
+    '### 查询主工作区记忆',
+    '可使用 `memory_search` 和 `memory_get` 工具搜索主工作区的记忆（全局记忆和日期记忆）。',
+    '需要回忆过去的决策、偏好或项目上下文时使用这些工具。',
+    '',
+    '### 本地记忆',
+    '重要信息直接记录在当前工作区的 CLAUDE.md 或其他文件中。',
+    'Claude 会自动维护你的会话记忆，无需额外操作。',
+    '',
+    '全局记忆（`/workspace/global/CLAUDE.md`）为只读参考。',
   ].join('\n');
 }
 
@@ -735,11 +740,12 @@ async function runQuery(
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
   const globalClaudeMdPath = path.join(WORKSPACE_GLOBAL, 'CLAUDE.md');
 
-  // Always inject global CLAUDE.md content into system prompt so the agent
-  // has memory context from the start. Home containers also get filesystem
-  // read/write access via additionalDirectories for editing.
+  // Home containers: inject full global CLAUDE.md for immediate context.
+  // Non-home containers: global CLAUDE.md is accessible via filesystem (mounted readonly)
+  // but NOT injected into system prompt to avoid context pollution that causes
+  // the agent to "continue" unrelated previous work.
   let globalClaudeMd = '';
-  if (fs.existsSync(globalClaudeMdPath)) {
+  if (isHome && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
   const outputGuidelines = [
@@ -766,14 +772,29 @@ async function runQuery(
     '且 agent-browser 可用，立即改用 agent-browser 通过真实浏览器访问。不要反复重试 WebFetch。',
   ].join('\n');
 
-  // Read HEARTBEAT.md (recent work summary) for context injection
+  // Read HEARTBEAT.md (recent work summary) — only for home containers.
+  // Non-home containers are task-isolated and should not see unrelated work history,
+  // which can mislead the agent into "continuing" previous tasks instead of
+  // focusing on the user's current message.
   let heartbeatContent = '';
-  const heartbeatPath = path.join(WORKSPACE_GLOBAL, 'HEARTBEAT.md');
-  if (fs.existsSync(heartbeatPath)) {
-    try {
-      const raw = fs.readFileSync(heartbeatPath, 'utf-8');
-      heartbeatContent = raw.length > 4096 ? raw.slice(0, 4096) + '\n\n[...截断]' : raw;
-    } catch { /* skip */ }
+  if (isHome) {
+    const heartbeatPath = path.join(WORKSPACE_GLOBAL, 'HEARTBEAT.md');
+    if (fs.existsSync(heartbeatPath)) {
+      try {
+        const raw = fs.readFileSync(heartbeatPath, 'utf-8');
+        const truncated = raw.length > 4096 ? raw.slice(0, 4096) + '\n\n[...截断]' : raw;
+        heartbeatContent = [
+          '',
+          '## 近期工作参考（仅供背景了解）',
+          '',
+          '> 以下是系统自动生成的近期工作摘要，仅供参考。',
+          '> **不要主动继续这些工作**，除非用户明确要求「继续」或主动提到相关话题。',
+          '> 请专注于用户当前的消息。',
+          '',
+          truncated,
+        ].join('\n');
+      } catch { /* skip */ }
+    }
   }
 
   const backgroundTaskGuidelines = [
@@ -787,17 +808,33 @@ async function runQuery(
     '告知用户：「已为您在后台启动该任务，完成后我会第一时间反馈。现在有其他问题也可以随时问我。」',
   ].join('\n');
 
+  // Interaction guidelines to prevent the agent from confusing MCP tool
+  // descriptions with user input, or proactively describing available tools.
+  const interactionGuidelines = [
+    '',
+    '## 交互原则',
+    '',
+    '**始终专注于用户当前的实际消息。**',
+    '',
+    '- 你可能拥有多种 MCP 工具（如外卖点餐、优惠券查询等），这些是你的辅助能力，**不是用户发送的内容**。',
+    '- **不要主动介绍、列举或描述你的可用工具**，除非用户明确询问「你能做什么」或「你有什么功能」。',
+    '- 当用户需要某个功能时，直接使用对应工具完成任务即可，无需事先解释工具的存在。',
+    '- 如果用户的消息很简短（如打招呼），简洁回应即可，不要用工具列表填充回复。',
+  ].join('\n');
+
   const systemPromptAppend = [
     globalClaudeMd,
     heartbeatContent,
+    interactionGuidelines,
     memoryRecall,
     outputGuidelines,
     webFetchGuidelines,
     backgroundTaskGuidelines,
   ].filter(Boolean).join('\n');
 
-  // Home containers (admin & member) can access global and memory directories
-  // Non-home containers only access memory (global CLAUDE.md injected via systemPromptAppend)
+  // Home containers (admin & member) can access global and memory directories.
+  // Non-home containers only access memory directory; global CLAUDE.md is NOT
+  // injected into systemPrompt but remains accessible via filesystem (readonly mount).
   const extraDirs = isHome
     ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
     : [WORKSPACE_MEMORY];
@@ -1182,8 +1219,8 @@ async function main(): Promise<void> {
         continue;
       }
 
-      // Memory Flush: run an extra query to let agent save durable memories (admin home only)
-      if (needsMemoryFlush && isAdminHome) {
+      // Memory Flush: run an extra query to let agent save durable memories (home containers only)
+      if (needsMemoryFlush && isHome) {
         needsMemoryFlush = false;
         log('Running memory flush query after compaction...');
 

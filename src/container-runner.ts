@@ -174,6 +174,7 @@ function buildVolumeMounts(
   mountUserSkills = true,
   selectedSkills: string[] | null = null,
   agentId?: string,
+  ownerHomeFolder?: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -223,13 +224,14 @@ function buildVolumeMounts(
     });
   }
 
-  // Per-group memory directory (isolated from workspace to avoid polluting user files)
-  const memoryDir = path.join(DATA_DIR, 'memory', group.folder);
+  // Memory directory: home containers write their own; non-home containers read owner's home memory
+  const memoryFolder = group.is_home ? group.folder : (ownerHomeFolder || group.folder);
+  const memoryDir = path.join(DATA_DIR, 'memory', memoryFolder);
   mkdirForContainer(memoryDir);
   mounts.push({
     hostPath: memoryDir,
     containerPath: '/workspace/memory',
-    readonly: false,
+    readonly: !group.is_home,
   });
 
   // Per-group Claude sessions directory (isolated from other groups)
@@ -239,7 +241,11 @@ function buildVolumeMounts(
     : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   mkdirForContainer(groupSessionsDir);
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
+  // Only load user-configured MCP servers for home containers.
+  // Non-home (flow) containers get a clean context with just the built-in happyclaw MCP,
+  // preventing MCP tool descriptions (e.g., 12 McDonald's tools) from overwhelming
+  // the Agent's context and causing hallucinations on short user messages.
+  const mcpServers = (group.is_home && ownerId) ? loadUserMcpServers(ownerId) : {};
   ensureSettingsJson(settingsFile, mcpServers);
 
   mounts.push({
@@ -418,6 +424,7 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -428,7 +435,7 @@ export async function runContainerAgent(
   const isAdminHome = !!group.is_home && group.folder === 'main';
   // Per-user skills: always mount if the group has an owner
   const shouldMountUserSkills = !!group.created_by;
-  const mounts = buildVolumeMounts(group, isAdminHome, shouldMountUserSkills, group.selected_skills ?? null, input.agentId);
+  const mounts = buildVolumeMounts(group, isAdminHome, shouldMountUserSkills, group.selected_skills ?? null, input.agentId, ownerHomeFolder);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const agentSuffix = input.agentId ? `-${input.agentId.replace(/[^a-zA-Z0-9-]/g, '-')}` : '';
   const containerName = `happyclaw-${safeName}${agentSuffix}-${Date.now()}`;
@@ -649,6 +656,7 @@ export async function runHostAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, identifier: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  ownerHomeFolder?: string,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
   const setupInstallHint = 'npm --prefix container/agent-runner install';
@@ -751,8 +759,9 @@ export async function runHostAgent(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
 
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
+  // Only load user-configured MCP servers for home containers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const hostMcpServers = group.created_by ? loadUserMcpServers(group.created_by) : {};
+  const hostMcpServers = (group.is_home && group.created_by) ? loadUserMcpServers(group.created_by) : {};
   ensureSettingsJson(settingsFile, hostMcpServers);
 
   // 4. Skills 自动链接到 session 目录
@@ -841,7 +850,8 @@ export async function runHostAgent(
     fs.mkdirSync(legacyGlobalDir, { recursive: true });
     hostEnv['HAPPYCLAW_WORKSPACE_GLOBAL'] = legacyGlobalDir;
   }
-  hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(DATA_DIR, 'memory', group.folder);
+  const memoryFolder = group.is_home ? group.folder : (ownerHomeFolder || group.folder);
+  hostEnv['HAPPYCLAW_WORKSPACE_MEMORY'] = path.join(DATA_DIR, 'memory', memoryFolder);
   hostEnv['HAPPYCLAW_WORKSPACE_IPC'] = groupIpcDir;
   hostEnv['CLAUDE_CONFIG_DIR'] = groupSessionsDir;
   // 让 SDK 捕获 CLI 的 stderr 输出，便于排查启动失败
