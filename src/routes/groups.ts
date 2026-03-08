@@ -48,6 +48,9 @@ import {
   getGroupsByTargetMainJid,
   getMessage,
   deleteMessage,
+  getUserPinnedGroups,
+  pinGroup,
+  unpinGroup,
 } from '../db.js';
 import { logger } from '../logger.js';
 import {
@@ -149,6 +152,7 @@ interface GroupPayloadItem {
   member_role?: 'owner' | 'member';
   member_count?: number;
   selected_skills?: string[] | null;
+  pinned_at?: string;
 }
 
 function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
@@ -200,6 +204,9 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
     }
   }
 
+  // Fetch user's pinned groups
+  const pins = getUserPinnedGroups(user.id);
+
   // Cache member info per folder (avoid repeated queries)
   const memberCache = new Map<string, { count: number; role: 'owner' | 'member' | null }>();
   function getMemberInfo(folder: string) {
@@ -241,6 +248,7 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       member_role: memberInfo?.role ?? undefined,
       member_count: isShared ? memberInfo?.count : undefined,
       selected_skills: group.selected_skills ?? null,
+      pinned_at: pins[jid] || undefined,
     };
   }
 
@@ -607,21 +615,6 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   if (!existing) return c.json({ error: 'Group not found' }, 404);
 
   const authUser = c.get('user') as AuthUser;
-  if (!canModifyGroup({ id: authUser.id, role: authUser.role }, existing)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-
-  // Non-web JIDs (feishu/telegram) cannot be renamed by non-admin
-  if (!jid.startsWith('web:') && authUser.role !== 'admin') {
-    return c.json({ error: 'This group cannot be edited' }, 403);
-  }
-
-  if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
-    return c.json(
-      { error: 'Insufficient permissions for host execution mode' },
-      403,
-    );
-  }
 
   const body = await c.req.json().catch(() => ({}));
   const validation = GroupPatchSchema.safeParse(body);
@@ -632,31 +625,61 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     );
   }
 
-  const { name: rawName, selected_skills } = validation.data;
+  const { name: rawName, selected_skills, is_pinned } = validation.data;
   const name = rawName ? normalizeGroupName(rawName) : undefined;
 
   // 至少需要提供一个字段
-  if (!name && selected_skills === undefined) {
+  if (!name && selected_skills === undefined && is_pinned === undefined) {
     return c.json({ error: 'No fields to update' }, 400);
   }
 
-  const updated: RegisteredGroup = {
-    name: name || existing.name,
-    folder: existing.folder,
-    added_at: existing.added_at,
-    containerConfig: existing.containerConfig,
-    executionMode: existing.executionMode,
-    customCwd: existing.customCwd,
-    created_by: existing.created_by,
-    is_home: existing.is_home,
-    selected_skills: selected_skills !== undefined ? (selected_skills ?? null) : existing.selected_skills,
-  };
+  // Pin/unpin only requires canAccessGroup (it's a per-user preference)
+  const isPinOnly = is_pinned !== undefined && !name && selected_skills === undefined;
+  if (isPinOnly) {
+    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...existing, jid })) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+  } else {
+    // Name/skills changes require canModifyGroup (owner only)
+    if (!canModifyGroup({ id: authUser.id, role: authUser.role }, { ...existing, jid })) {
+      return c.json({ error: 'Group not found' }, 404);
+    }
+    if (!jid.startsWith('web:') && authUser.role !== 'admin') {
+      return c.json({ error: 'This group cannot be edited' }, 403);
+    }
+    if (isHostExecutionGroup(existing) && !hasHostExecutionPermission(authUser)) {
+      return c.json({ error: 'Insufficient permissions for host execution mode' }, 403);
+    }
+  }
 
-  setRegisteredGroup(jid, updated);
-  if (name) updateChatName(jid, name);
-  deps.getRegisteredGroups()[jid] = updated;
+  // Handle pin/unpin (per-user, separate table)
+  let pinned_at: string | undefined;
+  if (is_pinned === true) {
+    pinned_at = pinGroup(authUser.id, jid);
+  } else if (is_pinned === false) {
+    unpinGroup(authUser.id, jid);
+  }
 
-  return c.json({ success: true });
+  // Update registered group if name or skills changed
+  if (name || selected_skills !== undefined) {
+    const updated: RegisteredGroup = {
+      name: name || existing.name,
+      folder: existing.folder,
+      added_at: existing.added_at,
+      containerConfig: existing.containerConfig,
+      executionMode: existing.executionMode,
+      customCwd: existing.customCwd,
+      created_by: existing.created_by,
+      is_home: existing.is_home,
+      selected_skills: selected_skills !== undefined ? (selected_skills ?? null) : existing.selected_skills,
+    };
+
+    setRegisteredGroup(jid, updated);
+    if (name) updateChatName(jid, name);
+    deps.getRegisteredGroups()[jid] = updated;
+  }
+
+  return c.json({ success: true, pinned_at });
 });
 
 // DELETE /api/groups/:jid - 删除群组
