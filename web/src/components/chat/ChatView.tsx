@@ -260,8 +260,14 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         handleWsNewMessage(groupJid, data.message, data.agentId, data.source);
       }
     });
+    // WebSocket 消息校验失败时通知用户
+    const unsub4 = wsManager.on('ws_error', (data: any) => {
+      if (!data.chatJid || data.chatJid === groupJid) {
+        showToast('发送失败', data.error || '消息格式无效', 4000);
+      }
+    });
     // agent_status 已提升到 AppLayout 全局监听
-    return () => { unsub1(); unsub2(); unsub3(); };
+    return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
   }, [groupJid, handleStreamEvent, handleWsNewMessage, clearStreaming]);
 
   const [scrollTrigger, setScrollTrigger] = useState(0);

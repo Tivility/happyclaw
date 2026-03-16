@@ -338,7 +338,8 @@ export type WsMessageOut =
       type: 'billing_update';
       userId: string;
       usage: BillingAccessResult;
-    };
+    }
+  | { type: 'ws_error'; error: string; chatJid?: string };
 
 export type WsMessageIn =
   | {

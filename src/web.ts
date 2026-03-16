@@ -641,6 +641,16 @@ function setupWebSocket(server: any): WebSocketServer {
             attachments: msg.attachments,
           });
           if (!wsValidation.success) {
+            const errMsg: WsMessageOut = {
+              type: 'ws_error',
+              error: '消息格式无效',
+              chatJid: msg.chatJid,
+            };
+            ws.send(JSON.stringify(errMsg));
+            logger.warn(
+              { chatJid: msg.chatJid, issues: wsValidation.error.issues.map(i => i.message) },
+              'WebSocket send_message validation failed',
+            );
             return;
           }
           const { chatJid, content, attachments } = wsValidation.data;
