@@ -178,7 +178,7 @@ export function loadDailyReportConfig(): DailyReportConfig {
   return {
     enabled: true,
     runHour: 5,
-    pass1Model: 'claude-haiku-4-5-20251001',
+    pass1Model: 'claude-sonnet-4-5-20250929',
     pass2Model: 'claude-sonnet-4-5-20250929',
     users: {},
   };
