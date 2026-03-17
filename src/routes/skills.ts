@@ -352,6 +352,7 @@ function findModifiedEntries(dir: string, afterMs: number): string[] {
 /**
  * Copy a skill entry (directory or symlink target) to dest.
  * Resolves symlinks and copies the real content so the copy is self-contained.
+ * Used for registry-installed skills that need a local copy.
  */
 function copySkillToUser(src: string, dest: string): void {
   // Resolve symlink to get the real directory
@@ -366,6 +367,25 @@ function copySkillToUser(src: string, dest: string): void {
   }
 
   fs.cpSync(realSrc, dest, { recursive: true });
+}
+
+/**
+ * Link a skill entry to dest via symlink (resolving to the real directory).
+ * Used for host-synced skills so updates propagate automatically.
+ */
+function linkSkillToUser(src: string, dest: string): void {
+  // Resolve to the real directory if src itself is a symlink
+  let realSrc = src;
+  try {
+    const lstat = fs.lstatSync(src);
+    if (lstat.isSymbolicLink()) {
+      realSrc = fs.realpathSync(src);
+    }
+  } catch {
+    // use src as-is
+  }
+
+  fs.symlinkSync(realSrc, dest);
 }
 
 // --- Search cache (LRU, 5min TTL, max 100 entries) ---
@@ -873,7 +893,7 @@ async function syncHostSkillsForUser(
     const existingUserSkills = new Set<string>();
     if (fs.existsSync(userDir)) {
       for (const entry of fs.readdirSync(userDir, { withFileTypes: true })) {
-        if (entry.isDirectory()) existingUserSkills.add(entry.name);
+        if (entry.isDirectory() || entry.isSymbolicLink()) existingUserSkills.add(entry.name);
       }
     }
 
@@ -893,11 +913,13 @@ async function syncHostSkillsForUser(
       const dest = path.join(userDir, name);
 
       if (existingUserSkills.has(name)) {
+        // 已存在且之前是同步来的 → 更新（删除旧副本/链接，创建新 symlink）
         fs.rmSync(dest, { recursive: true, force: true });
-        copySkillToUser(src, dest);
+        linkSkillToUser(src, dest);
         stats.updated++;
       } else {
-        copySkillToUser(src, dest);
+        // 全新的 → 新增（symlink 到源目录，源文件更新自动生效）
+        linkSkillToUser(src, dest);
         stats.added++;
       }
       newSyncedList.push(name);
