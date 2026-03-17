@@ -52,6 +52,7 @@ const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事
 
 let needsMemoryFlush = false;
 let hadCompaction = false;
+let needsClaudeMdUpdate = false;
 let currentPermissionMode: PermissionMode = 'bypassPermissions';
 // Module-level session ID so SIGTERM handler can emit it before exit.
 // Updated in main() whenever a query returns a new session.
@@ -91,6 +92,29 @@ const MEMORY_FLUSH_DISALLOWED_TOOLS = [
   'mcp__happyclaw__resume_task',
   'mcp__happyclaw__cancel_task',
   'mcp__happyclaw__register_group',
+];
+
+// CLAUDE.md 更新：非 home 容器压缩后的轻量更新（仅 Read + Edit）
+const CLAUDEMD_UPDATE_ALLOWED_TOOLS = ['Read', 'Edit'];
+const CLAUDEMD_UPDATE_DISALLOWED_TOOLS = [
+  'Bash', 'Write', 'WebSearch', 'WebFetch', 'Glob', 'Grep',
+  'Task', 'TaskOutput', 'TaskStop',
+  'TeamCreate', 'TeamDelete', 'SendMessage',
+  'TodoWrite', 'ToolSearch', 'Skill', 'NotebookEdit',
+  'mcp__happyclaw__send_message',
+  'mcp__happyclaw__send_image',
+  'mcp__happyclaw__send_file',
+  'mcp__happyclaw__schedule_task',
+  'mcp__happyclaw__list_tasks',
+  'mcp__happyclaw__pause_task',
+  'mcp__happyclaw__resume_task',
+  'mcp__happyclaw__cancel_task',
+  'mcp__happyclaw__register_group',
+  'mcp__happyclaw__install_skill',
+  'mcp__happyclaw__uninstall_skill',
+  'mcp__happyclaw__memory_append',
+  'mcp__happyclaw__memory_search',
+  'mcp__happyclaw__memory_get',
 ];
 
 const IMAGE_MAX_DIMENSION = 8000; // Anthropic API 限制
@@ -498,6 +522,10 @@ function createPreCompactHook(
       needsMemoryFlush = true;
       log('PreCompact: flagged memory flush for home container');
     }
+
+    // Flag CLAUDE.md update for all containers
+    needsClaudeMdUpdate = true;
+    log('PreCompact: flagged CLAUDE.md update');
 
     return {};
   };
@@ -1698,19 +1726,28 @@ async function main(): Promise<void> {
         continue;
       }
 
-      // Memory Flush: run an extra query to let agent save durable memories (home containers only)
+      // Memory Flush + CLAUDE.md Update: run an extra query to let agent save durable memories and update workspace CLAUDE.md
       if (needsMemoryFlush && isHome) {
         needsMemoryFlush = false;
+        needsClaudeMdUpdate = false; // home 容器在 memory flush 中一并处理
         log('Running memory flush query after compaction...');
 
         const today = new Date().toISOString().split('T')[0];
+        const claudeMdPath = path.join(WORKSPACE_GROUP, 'CLAUDE.md');
+        const hasClaudeMd = fs.existsSync(claudeMdPath);
         const flushPrompt = [
           '上下文压缩前记忆刷新。',
           '**优先检查全局记忆**：先 Read /workspace/global/CLAUDE.md，如果有「待记录」字段且你已获知对应信息（用户身份、偏好、常用项目等），用 Edit 工具立即填写。',
           '用户明确要求记住的内容，以及下次对话仍可能用到的信息，也写入全局记忆。',
           `然后使用 memory_append 将时效性记忆保存到 memory/${today}.md（今日进展、临时决策、待办等）。`,
           '如需确认上下文，可先用 memory_search/memory_get 查阅。',
-          '如果没有值得保存的内容，回复一个字：OK。',
+          ...(hasClaudeMd ? [
+            `**工作区 CLAUDE.md 维护**：Read ${claudeMdPath}，检查「当前状态」节是否需要更新。`,
+            '如果本次对话有实质性进展（新系统上线、关键决策、工作重心变化），用 Edit 整体替换「当前状态」节，保持 3-5 行。',
+            '如果目录结构有变化（新增了重要文件或目录），顺带更新「目录结构」节。其他节不动。',
+            '没有实质变化则不改。',
+          ] : []),
+          '如果没有值得保存的内容（记忆和 CLAUDE.md 都无需更新），回复一个字：OK。',
         ].join(' ');
 
         const flushResult = await runQuery(
@@ -1732,6 +1769,46 @@ async function main(): Promise<void> {
           log('Close sentinel during memory flush, exiting');
           writeOutput({ status: 'closed', result: null });
           break;
+        }
+      }
+
+      // CLAUDE.md Update: non-home 容器单独更新（home 容器已在 memory flush 中处理）
+      if (needsClaudeMdUpdate) {
+        needsClaudeMdUpdate = false;
+        const claudeMdPath = path.join(WORKSPACE_GROUP, 'CLAUDE.md');
+        if (fs.existsSync(claudeMdPath)) {
+          log('Running CLAUDE.md update query after compaction...');
+
+          const updatePrompt = [
+            '上下文压缩前工作区状态同步。',
+            `Read ${claudeMdPath}，检查「当前状态」节是否需要更新。`,
+            '如果本次对话有实质性进展（新系统上线、关键决策、工作重心变化），用 Edit 整体替换「当前状态」节，保持 3-5 行。',
+            '如果目录结构有变化（新增了重要文件或目录），顺带更新「目录结构」节。其他节不动。',
+            '没有实质变化则回复：OK。',
+          ].join(' ');
+
+          const updateResult = await runQuery(
+            updatePrompt,
+            sessionId,
+            mcpServerConfig,
+            containerInput,
+            '',
+            resumeAt,
+            false,
+            CLAUDEMD_UPDATE_ALLOWED_TOOLS,
+            CLAUDEMD_UPDATE_DISALLOWED_TOOLS,
+          );
+          if (updateResult.newSessionId) sessionId = updateResult.newSessionId;
+          if (updateResult.lastAssistantUuid) resumeAt = updateResult.lastAssistantUuid;
+          log('CLAUDE.md update completed');
+
+          if (updateResult.closedDuringQuery) {
+            log('Close sentinel during CLAUDE.md update, exiting');
+            writeOutput({ status: 'closed', result: null });
+            break;
+          }
+        } else {
+          log('No CLAUDE.md found, skipping update');
         }
       }
 
