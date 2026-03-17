@@ -1,7 +1,8 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web start \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
        format format-check install install-host-tools clean reset-init update-sdk ensure-latest-sdk sync-types \
-       backup restore help _ensure-docker-image logs status stop \
+       backup restore launchd-install launchd-uninstall launchd-restart \
+       launchd-status launchd-log help _ensure-docker-image logs status stop \
        _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale \
        _start-pm2 _start-direct
 
@@ -328,6 +329,44 @@ restore: ## 从 happyclaw-backup-*.tar.gz 恢复数据（用法：make restore �
 	echo "后续步骤："; \
 	echo "  1. 如需 Docker 容器支持：./container/build.sh"; \
 	echo "  2. 启动服务：make start"
+
+# ─── Launchd (macOS 进程守护) ────────────────────────────────
+
+PLIST_TEMPLATE = config/com.happyclaw.plist
+PLIST_DST = $(HOME)/Library/LaunchAgents/com.happyclaw.plist
+NODE_BIN = $(shell which node)
+PROJECT_DIR = $(shell pwd)
+
+launchd-install: build ## 安装 launchd 守护（开机自启 + 立即启动）
+	@if [ -z "$(NODE_BIN)" ]; then echo "❌ 找不到 node，请确保 PATH 正确"; exit 1; fi
+	@mkdir -p $(HOME)/Library/LaunchAgents
+	@sed \
+		-e 's|__NODE_BIN__|$(NODE_BIN)|g' \
+		-e 's|__PROJECT_DIR__|$(PROJECT_DIR)|g' \
+		-e 's|__HOME__|$(HOME)|g' \
+		$(PLIST_TEMPLATE) > $(PLIST_DST)
+	launchctl load $(PLIST_DST)
+	@echo "✅ HappyClaw 已注册为 launchd 服务（开机自启）"
+	@echo "   node:    $(NODE_BIN)"
+	@echo "   project: $(PROJECT_DIR)"
+	@echo "   状态：make launchd-status"
+	@echo "   日志：make launchd-log"
+
+launchd-uninstall: ## 卸载 launchd 守护（停止 + 取消开机自启）
+	-launchctl unload $(PLIST_DST) 2>/dev/null
+	-rm -f $(PLIST_DST)
+	@echo "✅ HappyClaw launchd 服务已卸载"
+
+launchd-restart: ## 重启 launchd 守护的 HappyClaw
+	launchctl kickstart -k gui/$$(id -u)/com.happyclaw
+	@echo "✅ HappyClaw 已重启"
+
+launchd-status: ## 查看 launchd 守护状态
+	@launchctl print gui/$$(id -u)/com.happyclaw 2>/dev/null || echo "❌ 服务未注册，请先 make launchd-install"
+
+launchd-log: ## 查看 launchd 守护日志（最近 50 行）
+	@echo "=== stdout ===" && tail -50 data/launchd-stdout.log 2>/dev/null || echo "(empty)"
+	@echo "\n=== stderr ===" && tail -50 data/launchd-stderr.log 2>/dev/null || echo "(empty)"
 
 # ─── Help ────────────────────────────────────────────────────
 
