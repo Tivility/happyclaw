@@ -551,6 +551,7 @@ WebSocket：`/ws`（协议详见 §3.6）。
   - 通过 `make update-sdk` 手动触发一次更新
 - 容器内以 `node` 非 root 用户运行，需注意文件权限
 - **关闭服务时禁止 `lsof -ti:PORT | xargs kill`**，该命令会杀掉所有连接到该端口的进程（包括 OrbStack/Docker 网络代理），导致 Docker daemon 崩溃。正确做法：`lsof -ti:PORT -sTCP:LISTEN | xargs kill`（仅杀监听进程）
+- **禁止手动创建 launchd plist 文件**。launchd 服务统一通过 `make launchd-install` 管理（模板在 `config/com.happyclaw.plist`）。手动创建第二个 plist 会导致双服务竞争端口，产生无限 crash loop 并截断有效日志
 
 ### 10.1 Issue / PR 规范
 
