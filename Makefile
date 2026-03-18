@@ -190,6 +190,15 @@ PROJECT_DIR = $(shell pwd)
 
 launchd-install: build ## 安装 launchd 守护（开机自启 + 立即启动）
 	@if [ -z "$(NODE_BIN)" ]; then echo "❌ 找不到 node，请确保 PATH 正确"; exit 1; fi
+	@# 检测冲突的 launchd 服务（同名 happyclaw 但不同 Label）
+	@for f in $(HOME)/Library/LaunchAgents/com.happyclaw*.plist; do \
+		[ -f "$$f" ] || continue; \
+		[ "$$f" = "$(PLIST_DST)" ] && continue; \
+		label=$$(defaults read "$$f" Label 2>/dev/null); \
+		echo "⚠️  发现冲突的 launchd 服务: $$f (Label: $$label)"; \
+		echo "   请先卸载: launchctl bootout gui/$$(id -u)/$$label && rm $$f"; \
+		exit 1; \
+	done
 	@mkdir -p $(HOME)/Library/LaunchAgents
 	@sed \
 		-e 's|__NODE_BIN__|$(NODE_BIN)|g' \
