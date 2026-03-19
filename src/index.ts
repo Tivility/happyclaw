@@ -2708,7 +2708,7 @@ function saveInterruptedStreamingMessages(): void {
       storeMessageDirect(
         msgId,
         jid,
-        'happyclaw-agent',
+        ASSISTANT_NAME,
         ASSISTANT_NAME,
         interruptedText,
         timestamp,
@@ -2744,7 +2744,8 @@ function encodeJidForFilename(jid: string): string {
 }
 
 function decodeJidFromFilename(filename: string): string {
-  return Buffer.from(filename.replace('.txt', ''), 'base64url').toString();
+  const name = filename.endsWith('.txt') ? filename.slice(0, -4) : filename;
+  return Buffer.from(name, 'base64url').toString();
 }
 
 /** Write all active streaming texts to disk (atomic write per file). */
@@ -2807,7 +2808,7 @@ function recoverStreamingBuffer(): void {
           storeMessageDirect(
             msgId,
             jid,
-            'happyclaw-agent',
+            ASSISTANT_NAME,
             ASSISTANT_NAME,
             interruptedText,
             timestamp,
@@ -3105,7 +3106,7 @@ function startIpcWatcher(): void {
                     const persistedImgMsgId = storeMessageDirect(
                       imgMsgId,
                       data.chatJid,
-                      'happyclaw-agent',
+                      ASSISTANT_NAME,
                       ASSISTANT_NAME,
                       displayText,
                       imgTimestamp,
@@ -3932,7 +3933,7 @@ async function processAgentConversation(
             const persistedMsgId = storeMessageDirect(
               msgId,
               virtualChatJid,
-              'happyclaw-agent',
+              ASSISTANT_NAME,
               ASSISTANT_NAME,
               interruptedText,
               timestamp,
@@ -4014,7 +4015,7 @@ async function processAgentConversation(
         const persistedMsgId = storeMessageDirect(
           msgId,
           virtualChatJid,
-          'happyclaw-agent',
+          ASSISTANT_NAME,
           ASSISTANT_NAME,
           text,
           timestamp,
@@ -4235,7 +4236,7 @@ async function processAgentConversation(
         const persistedMsgId = storeMessageDirect(
           msgId,
           virtualChatJid,
-          'happyclaw-agent',
+          ASSISTANT_NAME,
           ASSISTANT_NAME,
           interruptedText,
           timestamp,
@@ -4275,7 +4276,7 @@ async function processAgentConversation(
         const persistedMsgId = storeMessageDirect(
           msgId,
           virtualChatJid,
-          'happyclaw-agent',
+          ASSISTANT_NAME,
           ASSISTANT_NAME,
           partialReply,
           timestamp,

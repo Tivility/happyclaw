@@ -51,7 +51,7 @@ export interface StreamSnapshotData {
     id: string;
     timestamp: number;
     text: string;
-    kind: string;
+    kind: 'tool' | 'skill' | 'hook' | 'status';
   }>;
   todos?: Array<{ id: string; content: string; status: string }>;
   systemStatus: string | null;
@@ -254,9 +254,11 @@ const dbTaskAgentCleanupTimers = new Map<string, ReturnType<typeof setTimeout>>(
 const STREAMING_STORAGE_KEY = 'hc_streaming';
 const streamingSaveTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-/** Debounced save of streaming state to sessionStorage (max once per 500ms per jid). */
+/** Debounced save of streaming state to sessionStorage (trailing-edge, 500ms per jid). */
 function saveStreamingToSession(chatJid: string, state: StreamingState | undefined): void {
-  if (streamingSaveTimers.has(chatJid)) return; // already scheduled
+  // Cancel previous timer to always save the latest state (trailing-edge debounce)
+  const existing = streamingSaveTimers.get(chatJid);
+  if (existing) clearTimeout(existing);
   streamingSaveTimers.set(chatJid, setTimeout(() => {
     streamingSaveTimers.delete(chatJid);
     try {
@@ -718,7 +720,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   agents: {},
   agentStreaming: {},
   activeAgentTab: (() => {
-    try { return JSON.parse(sessionStorage.getItem('activeAgentTabs') || '{}'); } catch { return {}; }
+    try { return JSON.parse(sessionStorage.getItem('hc_activeAgentTabs') || '{}'); } catch { return {}; }
   })(),
   sdkTasks: {},
   sdkTaskAliases: {},
@@ -1831,13 +1833,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       activeAgentTab: { ...s.activeAgentTab, [jid]: agentId },
     }));
     try {
-      const stored = JSON.parse(sessionStorage.getItem('activeAgentTabs') || '{}');
+      const stored = JSON.parse(sessionStorage.getItem('hc_activeAgentTabs') || '{}');
       if (agentId) {
         stored[jid] = agentId;
       } else {
         delete stored[jid];
       }
-      sessionStorage.setItem('activeAgentTabs', JSON.stringify(stored));
+      sessionStorage.setItem('hc_activeAgentTabs', JSON.stringify(stored));
     } catch { /* ignore */ }
   },
 

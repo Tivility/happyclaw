@@ -366,6 +366,7 @@ data/
   config/registration.json                 # 注册设置（开关、邀请码要求）
   config/session-secret.key                # 会话签名密钥（0600 权限）
   config/system-settings.json              # 系统运行参数（容器超时、并发限制等）
+  streaming-buffer/                         # 流式文本磁盘缓冲（崩溃恢复用，自动清理）
   skills/{userId}/                         # 用户级 Skills 数据
   mcp-servers/{userId}/servers.json        # 用户 MCP Servers 配置
 

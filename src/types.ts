@@ -375,7 +375,7 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: string;
+          kind: 'tool' | 'skill' | 'hook' | 'status';
         }>;
         todos?: Array<{ id: string; content: string; status: string }>;
         systemStatus: string | null;
