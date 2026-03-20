@@ -56,6 +56,18 @@ function findClaudeCliPath(): { command: string; args: string[] } | null {
   return { command: 'claude', args: [] };
 }
 
+/**
+ * Find a CLAUDE_CONFIG_DIR with valid .credentials.json for CLI auth.
+ * Priority: env var → data/sessions/main/.claude/
+ */
+function findClaudeConfigDir(): string | undefined {
+  if (process.env.CLAUDE_CONFIG_DIR) return process.env.CLAUDE_CONFIG_DIR;
+  const sessionDir = path.join(DATA_DIR, 'sessions', 'main', '.claude');
+  const credFile = path.join(sessionDir, '.credentials.json');
+  if (fs.existsSync(credFile)) return sessionDir;
+  return undefined;
+}
+
 function callClaudeCli(prompt: string, model?: string): Promise<string | null> {
   return new Promise((resolve) => {
     const cliPath = findClaudeCliPath();
@@ -68,12 +80,20 @@ function callClaudeCli(prompt: string, model?: string): Promise<string | null> {
     const args = [...cliPath.args, '--print'];
     if (model) args.push('--model', model);
 
+    // Inherit parent env and inject CLAUDE_CONFIG_DIR so CLI can find OAuth credentials.
+    // Without this, launchd's minimal env causes "Not logged in".
+    const configDir = findClaudeConfigDir();
+    const env = { ...process.env };
+    if (configDir) env.CLAUDE_CONFIG_DIR = configDir;
+
     const child = execFile(cliPath.command, args, {
       maxBuffer: 10 * 1024 * 1024, // 10MB
       timeout: 120_000, // 2 minutes
+      env,
     }, (error, stdout, stderr) => {
       if (error) {
         console.error('[ai-client] claude CLI failed:', error.message);
+        if (stderr) console.error('[ai-client] stderr:', stderr.slice(0, 500));
         resolve(null);
         return;
       }
@@ -88,16 +108,18 @@ function callClaudeCli(prompt: string, model?: string): Promise<string | null> {
 }
 
 /**
- * Try SDK first (if API key available), fall back to CLI.
+ * Try SDK first (API key or OAuth token), fall back to CLI.
  */
 async function callClaude(prompt: string, model?: string): Promise<string | null> {
-  // If we have a real API key (not OAuth), use SDK directly
   const config = getClaudeApiConfig();
-  if (config?.apiKey) {
+
+  // Use SDK if we have an API key or OAuth bearer token
+  if (config?.apiKey || config?.authToken) {
     try {
       const { default: Anthropic } = await import('@anthropic-ai/sdk');
       const client = new Anthropic({
-        apiKey: config.apiKey,
+        apiKey: config.apiKey || undefined,
+        authToken: config.authToken || undefined,
         baseURL: config.baseUrl || undefined,
       });
       const response = await client.messages.create({
@@ -112,7 +134,7 @@ async function callClaude(prompt: string, model?: string): Promise<string | null
     }
   }
 
-  // Fall back to Claude CLI (supports OAuth)
+  // Fall back to Claude CLI (with CLAUDE_CONFIG_DIR for OAuth)
   return callClaudeCli(prompt, model);
 }
 

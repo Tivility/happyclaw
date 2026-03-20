@@ -45,13 +45,14 @@ export async function runScript(
           timeout: scriptTimeout,
           maxBuffer: MAX_BUFFER,
           env: {
-            PATH: process.env.PATH,
+            // Inherit full parent env so child processes (e.g. Claude CLI)
+            // can access OAuth credentials, Keychain, and system services.
+            ...process.env,
             LANG: process.env.LANG || 'en_US.UTF-8',
             TZ:
               process.env.TZ ||
               Intl.DateTimeFormat().resolvedOptions().timeZone,
             GROUP_FOLDER: groupFolder,
-            HOME: process.env.HOME || cwd,
           },
           shell: '/bin/sh',
         },
