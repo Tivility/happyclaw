@@ -19,6 +19,7 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import { createHash } from 'crypto';
 import { logger } from './logger.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
+import { preprocessMarkdownForFeishu } from './feishu-card-utils.js';
 
 // ─── Types ────────────────────────────────────────────────────
 
@@ -219,9 +220,10 @@ function buildCardContent(
 ): CardContentResult {
   const { title: extractedTitle, body } = extractTitleAndBody(text);
   const title = overrideTitle || extractedTitle;
-  // Apply Markdown optimization for Feishu card rendering
+  // Preprocess markdown for Feishu card compatibility (headings → bold, blockquotes → grey),
+  // then apply Markdown style optimization (heading demotion, table spacing, etc.)
   const rawContent = body || text.trim();
-  const contentToRender = optimizeMarkdownStyle(rawContent, 2);
+  const contentToRender = optimizeMarkdownStyle(preprocessMarkdownForFeishu(rawContent), 2);
   const elements: Array<Record<string, unknown>> = [];
 
   if (contentToRender.length > CARD_MD_LIMIT) {
