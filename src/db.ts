@@ -2145,16 +2145,11 @@ function parseGroupRow(
     initGitUrl: row.init_git_url ?? undefined,
     created_by: row.created_by ?? undefined,
     is_home: row.is_home === 1,
-    selected_skills: row.selected_skills
-      ? JSON.parse(row.selected_skills)
-      : null,
     target_agent_id: row.target_agent_id ?? undefined,
     target_main_jid: row.target_main_jid ?? undefined,
     reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
     require_mention: row.require_mention === 1,
     activation_mode: parseActivationMode(row.activation_mode),
-    mcp_mode: row.mcp_mode === 'custom' ? 'custom' : 'inherit',
-    selected_mcps: row.selected_mcps ? JSON.parse(row.selected_mcps) : null,
   };
 }
 
@@ -2199,14 +2194,14 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.initGitUrl ?? null,
     group.created_by ?? null,
     group.is_home ? 1 : 0,
-    group.selected_skills ? JSON.stringify(group.selected_skills) : null,
+    null, // selected_skills: deprecated, always null (user-level skills apply globally)
     group.target_agent_id ?? null,
     group.target_main_jid ?? null,
     group.reply_policy ?? 'source_only',
     group.require_mention === true ? 1 : 0,
     group.activation_mode ?? 'auto',
-    group.mcp_mode ?? 'inherit',
-    group.selected_mcps ? JSON.stringify(group.selected_mcps) : null,
+    'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
+    null, // selected_mcps: deprecated, always null
   );
 }
 
@@ -2668,9 +2663,6 @@ export function getGroupsByOwner(
     initGitUrl: row.init_git_url ?? undefined,
     created_by: row.created_by ?? undefined,
     is_home: row.is_home === 1,
-    selected_skills: row.selected_skills
-      ? JSON.parse(row.selected_skills)
-      : null,
   }));
 }
 

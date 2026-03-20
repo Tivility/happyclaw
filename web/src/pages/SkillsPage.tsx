@@ -74,7 +74,7 @@ export function SkillsPage() {
         {/* Header */}
         <div className="bg-background border-b border-border px-6 py-4">
           <PageHeader
-            title="技能管理"
+            title="技能(Skill)管理"
             subtitle={`用户级 ${manualUserSkills.length + syncedUserSkills.length}${syncedUserSkills.length > 0 ? `（含同步 ${syncedUserSkills.length}）` : ''} · 项目级 ${projectSkills.length} · 启用 ${enabledCount}`}
             actions={
               <div className="flex items-center gap-3">

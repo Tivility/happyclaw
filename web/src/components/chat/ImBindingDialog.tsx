@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import { Loader2, Link2, Unlink, MessageSquare, Users, ArrowRightLeft } from 'lucide-react';
 import {
   Dialog,
@@ -27,12 +27,18 @@ const CHANNEL_LABEL: Record<string, string> = {
   telegram: 'Telegram',
 };
 
+const ACTIVATION_MODE_OPTIONS = [
+  { value: 'always', label: '始终响应' },
+  { value: 'when_mentioned', label: '仅 @mention' },
+] as const;
+
 export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImBindingDialogProps) {
   const [imGroups, setImGroups] = useState<AvailableImGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [filter, setFilter] = useState('');
   const [rebindTarget, setRebindTarget] = useState<{ imJid: string; group: AvailableImGroup } | null>(null);
+  const [activationModes, setActivationModes] = useState<Record<string, string>>({});
 
   const loadAvailableImGroups = useChatStore((s) => s.loadAvailableImGroups);
   const bindImGroup = useChatStore((s) => s.bindImGroup);
@@ -48,15 +54,25 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
       setActionLoading(null);
       setFilter('');
       setRebindTarget(null);
+      setActivationModes({});
       return;
     }
 
     setActionLoading(null);
     setRebindTarget(null);
+    setActivationModes({});
     setLoading(true);
     setFilter('');
     loadAvailableImGroups(groupJid).then((groups) => {
       setImGroups(groups);
+      // Initialize activation modes from existing data for feishu groups
+      const initial: Record<string, string> = {};
+      for (const g of groups) {
+        if (g.channel_type === 'feishu' && g.activation_mode && g.activation_mode !== 'auto') {
+          initial[g.jid] = g.activation_mode;
+        }
+      }
+      setActivationModes(initial);
       setLoading(false);
     });
   }, [open, groupJid, agentId, loadAvailableImGroups]);
@@ -95,7 +111,9 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
     try {
       let ok: boolean;
       if (isMainMode) {
-        ok = await bindMainImGroup(groupJid, imJid);
+        const target = imGroups.find((g) => g.jid === imJid);
+        const mode = target?.channel_type === 'feishu' ? (activationModes[imJid] || 'always') : undefined;
+        ok = await bindMainImGroup(groupJid, imJid, false, mode);
       } else {
         ok = await bindImGroup(groupJid, agentId, imJid);
       }
@@ -130,6 +148,17 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
     setActionLoading(null);
   };
 
+  const handleActivationModeChange = useCallback(async (imJid: string, mode: string) => {
+    setActivationModes((prev) => ({ ...prev, [imJid]: mode }));
+    // Re-bind with force to update activation_mode on already-bound group
+    try {
+      await bindMainImGroup(groupJid, imJid, true, mode);
+      await reloadGroups();
+    } catch {
+      showToast('更新触发模式失败');
+    }
+  }, [groupJid, bindMainImGroup]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const describeBindTarget = (group: AvailableImGroup): string => {
     if (group.bound_agent_id && group.bound_target_name) {
       return group.bound_workspace_name && group.bound_workspace_name !== group.bound_target_name
@@ -144,13 +173,14 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
 
   const confirmRebind = async () => {
     if (!rebindTarget) return;
-    const { imJid } = rebindTarget;
+    const { imJid, group: rebindGroup } = rebindTarget;
     setRebindTarget(null);
     setActionLoading(imJid);
     try {
       let ok: boolean;
       if (isMainMode) {
-        ok = await bindMainImGroup(groupJid, imJid, true);
+        const mode = rebindGroup.channel_type === 'feishu' ? (activationModes[imJid] || 'always') : undefined;
+        ok = await bindMainImGroup(groupJid, imJid, true, mode);
       } else {
         ok = await bindImGroup(groupJid, agentId!, imJid, true);
       }
@@ -265,22 +295,47 @@ export function ImBindingDialog({ open, groupJid, agentId, agent, onClose }: ImB
                     </div>
                   </div>
 
+                  {/* Activation mode selector — only for main mode + unbound feishu group chats */}
+                  {isMainMode && group.channel_type === 'feishu' && !boundToThis && !boundToOther && (
+                    <select
+                      value={activationModes[group.jid] || 'always'}
+                      onChange={(e) => setActivationModes((prev) => ({ ...prev, [group.jid]: e.target.value }))}
+                      className="flex-shrink-0 text-xs px-1.5 py-1 rounded border border-border bg-background text-foreground"
+                    >
+                      {ACTIVATION_MODE_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>{o.label}</option>
+                      ))}
+                    </select>
+                  )}
+
                   {/* Action button — three states: unbind / rebind / bind */}
                   {boundToThis ? (
-                    <Button
-                      size="sm"
-                      variant="outline"
-                      onClick={() => handleUnbind(group.jid)}
-                      disabled={isActioning}
-                      className="flex-shrink-0"
-                    >
-                      {isActioning ? (
-                        <Loader2 className="w-3 h-3 animate-spin" />
-                      ) : (
-                        <Unlink className="w-3 h-3 mr-1" />
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      {isMainMode && group.channel_type === 'feishu' && (
+                        <select
+                          value={activationModes[group.jid] || group.activation_mode || 'always'}
+                          onChange={(e) => handleActivationModeChange(group.jid, e.target.value)}
+                          className="text-xs px-1.5 py-1 rounded border border-border bg-background text-foreground"
+                        >
+                          {ACTIVATION_MODE_OPTIONS.map((o) => (
+                            <option key={o.value} value={o.value}>{o.label}</option>
+                          ))}
+                        </select>
                       )}
-                      解绑
-                    </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => handleUnbind(group.jid)}
+                        disabled={isActioning}
+                      >
+                        {isActioning ? (
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                        ) : (
+                          <Unlink className="w-3 h-3 mr-1" />
+                        )}
+                        解绑
+                      </Button>
+                    </div>
                   ) : boundToOther ? (
                     <Button
                       size="sm"

@@ -153,7 +153,6 @@ interface GroupPayloadItem {
   is_shared?: boolean;
   member_role?: 'owner' | 'member';
   member_count?: number;
-  selected_skills?: string[] | null;
   pinned_at?: string;
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled';
 }
@@ -262,7 +261,6 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
       is_shared: isShared || undefined,
       member_role: memberInfo?.role ?? undefined,
       member_count: isShared ? memberInfo?.count : undefined,
-      selected_skills: group.selected_skills ?? null,
       pinned_at: pins[jid] || undefined,
       activation_mode: group.activation_mode ?? 'auto',
     };
@@ -696,7 +694,6 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
 
   const {
     name: rawName,
-    selected_skills,
     is_pinned,
     activation_mode,
   } = validation.data;
@@ -705,7 +702,6 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   // 至少需要提供一个字段
   if (
     !name &&
-    selected_skills === undefined &&
     is_pinned === undefined &&
     activation_mode === undefined
   ) {
@@ -716,7 +712,6 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   const isPinOnly =
     is_pinned !== undefined &&
     !name &&
-    selected_skills === undefined &&
     activation_mode === undefined;
   if (isPinOnly) {
     if (
@@ -759,12 +754,8 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     unpinGroup(authUser.id, jid);
   }
 
-  // Update registered group if name, skills, or activation_mode changed
-  if (
-    name ||
-    selected_skills !== undefined ||
-    activation_mode !== undefined
-  ) {
+  // Update registered group if name or activation_mode changed
+  if (name || activation_mode !== undefined) {
     const updated: RegisteredGroup = {
       name: name || existing.name,
       folder: existing.folder,
@@ -776,10 +767,6 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
       initGitUrl: existing.initGitUrl,
       created_by: existing.created_by,
       is_home: existing.is_home,
-      selected_skills:
-        selected_skills !== undefined
-          ? (selected_skills ?? null)
-          : existing.selected_skills,
       target_agent_id: existing.target_agent_id,
       target_main_jid: existing.target_main_jid,
       reply_policy: existing.reply_policy,
@@ -1626,73 +1613,6 @@ groupRoutes.put('/:jid/mode', authMiddleware, async (c) => {
 
   const sent = deps.queue.setPermissionMode(jid, mode);
   return c.json({ success: true, mode, applied: sent });
-});
-
-// --- MCP Configuration Routes ---
-
-// GET /api/groups/:jid/mcp - 获取工作区 MCP 配置
-groupRoutes.get('/:jid/mcp', authMiddleware, (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-
-  return c.json({
-    mcp_mode: group.mcp_mode ?? 'inherit',
-    selected_mcps: group.selected_mcps ?? null,
-  });
-});
-
-// PUT /api/groups/:jid/mcp - 更新工作区 MCP 配置
-groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
-  const jid = c.req.param('jid');
-  const group = getRegisteredGroup(jid);
-  if (!group) return c.json({ error: 'Group not found' }, 404);
-
-  const authUser = c.get('user') as AuthUser;
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
-    return c.json({ error: 'Group not found' }, 404);
-  }
-
-  const body = await c.req.json().catch(() => ({}));
-  const mcp_mode = body.mcp_mode;
-  const selected_mcps = body.selected_mcps;
-
-  // Validate mcp_mode
-  if (mcp_mode !== undefined && mcp_mode !== 'inherit' && mcp_mode !== 'custom') {
-    return c.json({ error: 'Invalid mcp_mode' }, 400);
-  }
-
-  // Validate selected_mcps
-  if (selected_mcps !== undefined && selected_mcps !== null) {
-    if (!Array.isArray(selected_mcps)) {
-      return c.json({ error: 'selected_mcps must be an array' }, 400);
-    }
-    for (const mcp of selected_mcps) {
-      if (typeof mcp !== 'string') {
-        return c.json({ error: 'selected_mcps must contain strings' }, 400);
-      }
-    }
-  }
-
-  // Update the group
-  const updatedGroup: RegisteredGroup = {
-    ...group,
-    mcp_mode: mcp_mode ?? group.mcp_mode ?? 'inherit',
-    selected_mcps: selected_mcps !== undefined ? selected_mcps : group.selected_mcps,
-  };
-
-  setRegisteredGroup(jid, updatedGroup);
-
-  return c.json({
-    success: true,
-    mcp_mode: updatedGroup.mcp_mode,
-    selected_mcps: updatedGroup.selected_mcps,
-  });
 });
 
 // POST /api/groups/:jid/stop - 停止工作区容器/进程（下次发送消息时自动重启）

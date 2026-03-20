@@ -33,7 +33,7 @@ import {
 import { providerPool } from './provider-pool.js';
 import { isApiError } from './agent-output-parser.js';
 import type { ClaudeProviderConfig } from './runtime-config.js';
-import { resolveGroupMcpServers } from './mcp-utils.js';
+import { loadUserMcpServers } from './mcp-utils.js';
 import { RegisteredGroup, StreamEvent } from './types.js';
 import {
   attachStderrHandler,
@@ -198,7 +198,6 @@ function buildVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
   mountUserSkills = true,
-  selectedSkills: string[] | null = null,
   agentId?: string,
   ownerHomeFolder?: string,
   taskRunId?: string,
@@ -278,7 +277,7 @@ function buildVolumeMounts(
     : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   mkdirForContainer(groupSessionsDir);
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const mcpServers = resolveGroupMcpServers(group, ownerId);
+  const mcpServers = ownerId ? loadUserMcpServers(ownerId) : {};
   ensureSettingsJson(settingsFile, mcpServers);
 
   mounts.push({
@@ -288,8 +287,7 @@ function buildVolumeMounts(
   });
 
   // Skills：以只读卷挂载宿主机目录（由 entrypoint 创建符号链接）
-  // selectedSkills 为 null 时挂载整个目录（全部 skills）
-  // selectedSkills 为数组时仅挂载选中的 skill 子目录
+  // 用户的所有 skills 在其所有工作区中全量生效
   const projectSkillsDir = path.join(projectRoot, 'container', 'skills');
   const userSkillsDir =
     mountUserSkills && ownerId ? path.join(DATA_DIR, 'skills', ownerId) : null;
@@ -301,53 +299,20 @@ function buildVolumeMounts(
     fs.mkdirSync(userSkillsDir, { recursive: true });
   }
 
-  if (selectedSkills === null) {
-    // 全量挂载（默认行为）
-    if (fs.existsSync(projectSkillsDir)) {
-      mounts.push({
-        hostPath: projectSkillsDir,
-        containerPath: '/workspace/project-skills',
-        readonly: true,
-      });
-    }
-    if (userSkillsDir) {
-      mounts.push({
-        hostPath: userSkillsDir,
-        containerPath: '/workspace/user-skills',
-        readonly: true,
-      });
-    }
-  } else {
-    // 按需挂载：仅挂载选中的 skill 子目录
-    const selectedSet = new Set(selectedSkills);
-    // 项目级 skills
-    if (fs.existsSync(projectSkillsDir)) {
-      for (const name of selectedSet) {
-        if (!/^[\w\-]+$/.test(name)) continue; // 防御性跳过非法名称
-        const skillPath = path.join(projectSkillsDir, name);
-        if (fs.existsSync(skillPath) && fs.statSync(skillPath).isDirectory()) {
-          mounts.push({
-            hostPath: skillPath,
-            containerPath: `/workspace/project-skills/${name}`,
-            readonly: true,
-          });
-        }
-      }
-    }
-    // 用户级 skills
-    if (userSkillsDir) {
-      for (const name of selectedSet) {
-        if (!/^[\w\-]+$/.test(name)) continue; // 防御性跳过非法名称
-        const skillPath = path.join(userSkillsDir, name);
-        if (fs.existsSync(skillPath) && fs.statSync(skillPath).isDirectory()) {
-          mounts.push({
-            hostPath: skillPath,
-            containerPath: `/workspace/user-skills/${name}`,
-            readonly: true,
-          });
-        }
-      }
-    }
+  // 全量挂载：用户的所有 skills 在所有工作区中生效
+  if (fs.existsSync(projectSkillsDir)) {
+    mounts.push({
+      hostPath: projectSkillsDir,
+      containerPath: '/workspace/project-skills',
+      readonly: true,
+    });
+  }
+  if (userSkillsDir) {
+    mounts.push({
+      hostPath: userSkillsDir,
+      containerPath: '/workspace/user-skills',
+      readonly: true,
+    });
   }
 
   // Per-group IPC namespace: each group gets its own IPC directory
@@ -495,7 +460,6 @@ export async function runContainerAgent(
       group,
       isAdminHome,
       shouldMountUserSkills,
-      group.selected_skills ?? null,
       input.agentId,
       ownerHomeFolder,
       input.taskRunId,
@@ -918,14 +882,14 @@ export async function runHostAgent(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
 
   // 3. 写入 settings.json（合并模式，不覆盖已有用户配置）
-  // Resolve MCP servers based on group's mcp_mode (same logic as Docker mode).
+  // Load user's global MCP servers (same logic as Docker mode).
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  const hostMcpServers = resolveGroupMcpServers(group, group.created_by);
+  const hostMcpServers = group.created_by ? loadUserMcpServers(group.created_by) : {};
   ensureSettingsJson(settingsFile, hostMcpServers);
 
   // 4. Skills 自动链接到 session 目录
-  // 链接顺序：项目级 → 宿主机级(admin only, 覆盖同名项目级) → 用户级(覆盖同名)
-  // selected_skills 过滤：仅链接选中的 skills
+  // 链接顺序：项目级 → 用户级(覆盖同名项目级)
+  // 用户的所有 skills 在所有工作区中生效
   try {
     const skillsDir = path.join(groupSessionsDir, 'skills');
     fs.mkdirSync(skillsDir, { recursive: true });
@@ -941,14 +905,10 @@ export async function runHostAgent(
       }
     }
 
-    const selectedSkills = group.selected_skills ?? null;
-    const selectedSet = selectedSkills ? new Set(selectedSkills) : null;
-
     const linkSkillEntries = (sourceDir: string) => {
       if (!fs.existsSync(sourceDir)) return;
       for (const entry of fs.readdirSync(sourceDir, { withFileTypes: true })) {
         if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
-        if (selectedSet && !selectedSet.has(entry.name)) continue;
         const linkPath = path.join(skillsDir, entry.name);
         try {
           // 移除已有符号链接（高优先级覆盖低优先级）

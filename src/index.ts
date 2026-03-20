@@ -5198,8 +5198,10 @@ function shouldProcessGroupMessage(chatJid: string): boolean {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return false;
 
-  // activation_mode 优先于 require_mention
+  // activation_mode 直接存在 IM 群组自身的 registered_groups 记录上（绑定时设置），
+  // 无需追溯 target_main_jid
   const mode = group.activation_mode ?? 'auto';
+
   switch (mode) {
     case 'always':
       return true; // 群聊不需要 @bot

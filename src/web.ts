@@ -49,6 +49,7 @@ import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
 import agentRoutes from './routes/agents.js';
 import mcpServersRoutes from './routes/mcp-servers.js';
+import workspaceConfigRoutes from './routes/workspace-config.js';
 import agentDefinitionsRoutes from './routes/agent-definitions.js';
 import { usage as usageRoutes } from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
@@ -169,6 +170,7 @@ app.route('/api/browse', browseRoutes);
 app.route('/api/mcp-servers', mcpServersRoutes);
 app.route('/api/agent-definitions', agentDefinitionsRoutes);
 app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
+app.route('/api/groups', workspaceConfigRoutes); // Workspace config under /api/groups/:jid/workspace-config
 app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
