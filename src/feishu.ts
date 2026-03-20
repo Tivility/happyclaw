@@ -22,6 +22,7 @@ import {
   getStreamingSession,
 } from './feishu-streaming-card.js';
 import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
+import { buildContentElements, wrapCardJson } from './feishu-card-utils.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -474,12 +475,11 @@ function buildPostMdFallback(text: string): string {
 }
 
 function buildInteractiveCard(text: string): object {
-  const optimized = optimizeMarkdownStyle(text, 2);
   const lines = text.split('\n');
   let title = '';
   let bodyStartIdx = 0;
 
-  // Extract title from first heading if present (use original text for title)
+  // Extract title from first heading if present
   for (let i = 0; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
     if (/^#{1,3}\s+/.test(lines[i])) {
@@ -489,22 +489,7 @@ function buildInteractiveCard(text: string): object {
     break;
   }
 
-  // Apply optimizeMarkdownStyle to body (title was already extracted from original)
-  const optimizedLines = optimized.split('\n');
-  // Skip lines corresponding to the title in optimized text
-  let optimizedBody: string;
-  if (bodyStartIdx > 0) {
-    // Find the first non-empty line in optimized text and skip it (it's the demoted title)
-    let skipIdx = 0;
-    for (let i = 0; i < optimizedLines.length; i++) {
-      if (!optimizedLines[i].trim()) continue;
-      skipIdx = i + 1;
-      break;
-    }
-    optimizedBody = optimizedLines.slice(skipIdx).join('\n').trim();
-  } else {
-    optimizedBody = optimized.trim();
-  }
+  const body = lines.slice(bodyStartIdx).join('\n').trim();
 
   // Generate title if no heading found — use first line preview
   if (!title) {
@@ -517,43 +502,19 @@ function buildInteractiveCard(text: string): object {
         : firstLine || 'Reply';
   }
 
-  // Build card elements
-  const elements: Array<Record<string, unknown>> = [];
-  const contentToRender = optimizedBody || optimized.trim();
-
-  if (contentToRender.length > CARD_MD_LIMIT) {
-    // Long content: split into multiple markdown elements
-    const chunks = splitAtParagraphs(contentToRender, CARD_MD_LIMIT);
-    for (const chunk of chunks) {
-      elements.push({ tag: 'markdown', content: chunk });
-    }
-  } else if (contentToRender) {
-    // Split by horizontal rules for visual sections
-    const sections = contentToRender.split(/\n-{3,}\n/);
-    for (let i = 0; i < sections.length; i++) {
-      if (i > 0) elements.push({ tag: 'hr' });
-      const s = sections[i].trim();
-      if (s) elements.push({ tag: 'markdown', content: s });
-    }
-  }
+  const contentToRender = body || text.trim();
+  // buildContentElements handles: table → native component, markdown preprocessing
+  const { elements, hasTable } = buildContentElements(contentToRender);
 
   // Ensure at least one element
   if (elements.length === 0) {
-    elements.push({ tag: 'markdown', content: optimized.trim() });
+    elements.push({ tag: 'markdown', content: text.trim() });
   }
 
-  return {
-    schema: '2.0',
-    config: {
-      wide_screen_mode: true,
-      summary: { content: title },
-    },
-    header: {
-      title: { tag: 'plain_text', content: title },
-      template: 'indigo',
-    },
-    body: { elements },
-  };
+  return wrapCardJson(elements, hasTable, {
+    title: { tag: 'plain_text', content: title },
+    template: 'indigo',
+  });
 }
 
 // ─── Factory Function ──────────────────────────────────────────
