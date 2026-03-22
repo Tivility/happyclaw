@@ -1983,6 +1983,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingSession =
     imManager.createStreamingSession(streamingSessionJid, makeOnCardCreated(streamingSessionJid));
   let streamingAccumulatedText = '';
+  let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
   if (streamingSession) {
     registerStreamingSession(streamingSessionJid, streamingSession);
@@ -2014,6 +2015,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       streamingSessionJid = newStreamingJid;
       streamingSession = imManager.createStreamingSession(streamingSessionJid, makeOnCardCreated(streamingSessionJid));
       streamingAccumulatedText = '';
+      streamingAccumulatedThinking = '';
       if (streamingSession) {
         registerStreamingSession(streamingSessionJid, streamingSession);
       }
@@ -2089,9 +2091,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         if (result.status === 'stream' && result.streamEvent) {
           broadcastStreamEvent(chatJid, result.streamEvent);
 
-          // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
+          // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
           if (result.streamEvent.eventType === 'text_delta' && result.streamEvent.text) {
             streamingAccumulatedText += result.streamEvent.text;
+          }
+          if (result.streamEvent.eventType === 'thinking_delta' && result.streamEvent.text) {
+            streamingAccumulatedThinking += result.streamEvent.text;
           }
 
           // ── Feed stream events into Feishu streaming card ──
@@ -2100,6 +2105,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           if (streamingSession && !streamingSession.isActive()) {
             unregisterStreamingSession(streamingSessionJid);
             streamingAccumulatedText = '';
+            streamingAccumulatedThinking = '';
             sentReply = false;
             streamInterrupted = false;
             streamingSession = imManager.createStreamingSession(
@@ -2127,7 +2133,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             const inlineWebJid = chatJid.startsWith('web:') ? chatJid : `web:${effectiveGroup.folder}`;
             const inlineAlreadySaved = shutdownSavedJids.has(chatJid) || shutdownSavedJids.has(inlineWebJid);
             if (!sentReply && !inlineAlreadySaved) {
-              const interruptedText = buildInterruptedReply(streamingAccumulatedText);
+              const interruptedText = buildInterruptedReply(streamingAccumulatedText, streamingAccumulatedThinking);
               try {
                 if (streamingSession?.isActive()) {
                   await streamingSession.abort('已中断').catch(() => {});
@@ -2144,6 +2150,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 sentReply = true;
                 clearStreamingSnapshot(chatJid);
                 streamingAccumulatedText = '';
+                streamingAccumulatedThinking = '';
                 commitCursor();
               } catch (err) {
                 logger.warn({ err, chatJid }, 'Failed to save interrupted text on status event');
@@ -2429,6 +2436,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             ) {
               unregisterStreamingSession(streamingSessionJid);
               streamingAccumulatedText = '';
+              streamingAccumulatedThinking = '';
               streamingSession = imManager.createStreamingSession(
                 streamingSessionJid,
                 makeOnCardCreated(streamingSessionJid),
@@ -2502,6 +2510,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // text from multiple turns into one message on shutdown.
             clearStreamingSnapshot(chatJid);
             streamingAccumulatedText = '';
+            streamingAccumulatedThinking = '';
             // Persist cursor as soon as a visible reply is emitted.
             // Long-lived runners may stay alive for idleTimeout, and waiting
             // until process exit would cause duplicate replay after restart.
@@ -2551,7 +2560,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     const alreadySavedByShutdown = shutdownSavedJids.has(chatJid) || shutdownSavedJids.has(webJidForShutdownCheck);
 
     if (wasInterrupted && !alreadySavedByShutdown) {
-      const interruptedText = buildInterruptedReply(streamingAccumulatedText);
+      const interruptedText = buildInterruptedReply(streamingAccumulatedText, streamingAccumulatedThinking);
       try {
         // sendToIM: false — 飞书卡片已通过 abort() 展示内容，不重复发送
         lastReplyMsgId = await sendMessage(chatJid, interruptedText, {
@@ -2575,7 +2584,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // 进程被杀（SIGTERM/错误）后不会自动继续，"上下文压缩中"提示会误导用户。
     if (!sentReply && !alreadySavedByShutdown && streamingAccumulatedText.trim()) {
       try {
-        const partialReply = buildInterruptedReply(streamingAccumulatedText);
+        const partialReply = buildInterruptedReply(streamingAccumulatedText, streamingAccumulatedThinking);
         lastReplyMsgId = await sendMessage(chatJid, partialReply, {
           sendToIM: false,
           messageMeta: {
@@ -3131,9 +3140,18 @@ async function sendMessage(
   }
 }
 
-function buildInterruptedReply(partialText: string): string {
+function buildInterruptedReply(partialText: string, thinkingText?: string): string {
   const trimmed = partialText.trimEnd();
-  return trimmed ? `${trimmed}\n\n---\n*⚠️ 已中断*` : '*⚠️ 已中断*';
+  const trimmedThinking = thinkingText?.trimEnd();
+  const parts: string[] = [];
+  if (trimmedThinking) {
+    parts.push(`<details>\n<summary>💭 Reasoning (已中断)</summary>\n\n${trimmedThinking}\n\n</details>`);
+  }
+  if (trimmed) {
+    parts.push(trimmed);
+  }
+  parts.push('---\n*⚠️ 已中断*');
+  return parts.join('\n\n');
 }
 
 function buildOverflowPartialReply(partialText: string): string {

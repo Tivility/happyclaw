@@ -1660,10 +1660,14 @@ async function main(): Promise<void> {
       // 中断后：跳过 memory flush 和 session update，等待下一条消息
       if (queryResult.interruptedDuringQuery) {
         log('Query interrupted by user, waiting for next message');
+        // 中断后清除 resumeAt：被中断的 assistant 消息可能未完整提交到 session 历史。
+        // 使用 undefined 让 SDK 自行选择恢复点，避免因指向不完整消息的 UUID 导致 resume 失败。
+        resumeAt = undefined;
         writeOutput({
           status: 'stream',
           result: null,
           streamEvent: { eventType: 'status', statusText: 'interrupted' },
+          newSessionId: sessionId,  // 确保主进程持久化 session ID
         });
         // 清理可能残留的 _interrupt 文件
         try { fs.unlinkSync(IPC_INPUT_INTERRUPT_SENTINEL); } catch { /* ignore */ }
@@ -1671,6 +1675,8 @@ async function main(): Promise<void> {
         const nextMessage = await waitForIpcMessage();
         if (nextMessage === null) {
           log('Close sentinel received after interrupt, exiting');
+          // 退出前发送 session 更新，确保主进程持久化最新 session ID
+          writeOutput({ status: 'success', result: null, newSessionId: sessionId });
           break;
         }
         clearInterruptRequested();

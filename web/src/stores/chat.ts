@@ -1399,6 +1399,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // 中断事件：冻结流式 UI（保留已输出文本），等待 new_message 完成最终转换。
     if (event.eventType === 'status' && event.statusText === 'interrupted') {
+      // 强制 flush rAF 缓冲：thinking_delta/text_delta 通过 requestAnimationFrame 批处理，
+      // 中断信号可能在 rAF 回调执行前到达，导致 thinkingText 仍为空 → hasData=false → 卡片消失。
+      const mainKey = `main:${chatJid}`;
+      const pendingEntry = pendingDeltas.get(mainKey);
+      if (pendingEntry) {
+        cancelAnimationFrame(pendingEntry.raf);
+        flushPendingDelta(mainKey, chatJid, undefined, set);
+      }
       set((s) => {
         const streamState = s.streaming[chatJid];
         const nextStreaming = { ...s.streaming };
