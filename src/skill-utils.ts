@@ -127,9 +127,18 @@ export function scanSkillDirectory(
   try {
     const entries = fs.readdirSync(rootDir, { withFileTypes: true });
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
 
       const skillDir = path.join(rootDir, entry.name);
+      // For symlinks, verify the target is a directory
+      if (entry.isSymbolicLink()) {
+        try {
+          const realPath = fs.realpathSync(skillDir);
+          if (!fs.statSync(realPath).isDirectory()) continue;
+        } catch {
+          continue; // broken symlink
+        }
+      }
       const skillMdPath = path.join(skillDir, 'SKILL.md');
       const skillMdDisabledPath = path.join(skillDir, 'SKILL.md.disabled');
 
