@@ -6,8 +6,9 @@
 
 你会收到：
 1. `pipeline/knowledge-buffer.md` 本周新增条目
-2. 当前 `AI-Chat-Knowledge.md` 的完整内容（用于去重对比）
-3. 当前 `KNOWLEDGE-INDEX.md` 的完整内容（用于索引更新）
+2. `pipeline/knowledge-buffer-archive/` 最近 4 周的归档（用于跨周关联和模式识别）
+3. 当前 `AI-Chat-Knowledge.md` 的完整内容（用于去重对比）
+4. 当前 `KNOWLEDGE-INDEX.md` 的完整内容（用于索引更新）
 
 ## 执行步骤
 
@@ -47,11 +48,12 @@
 - 新条目添加到索引
 - 检查跨工作区关联（如明镜台的商业思考 ↔ 问道坊的项目规划），标注交叉引用
 
-### Step 4: 归档 buffer
+### Step 4: 归档 buffer + 滚动清理
 
-将本周已处理的 knowledge-buffer.md 内容归档：
+将本周已处理的 knowledge-buffer.md 内容归档，并清理过期归档：
 - 归档文件：`pipeline/knowledge-buffer-archive/YYYY-WNN.md`
 - 清空 `pipeline/knowledge-buffer.md`（保留文件头注释）
+- **滚动清理**：删除 `knowledge-buffer-archive/` 中超过 4 周的归档文件（保留最近 4 周 + 当周）
 
 ## 输出
 

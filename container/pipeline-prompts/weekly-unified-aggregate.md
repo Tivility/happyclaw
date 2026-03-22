@@ -48,11 +48,15 @@ find /Users/tivility/happyclaw/data/groups/ -maxdepth 2 -name "observations.md" 
 
 ### 2.2 知识维度输入
 
-读取当前 home 工作区的 `pipeline/knowledge-buffer.md`。
+读取当前 home 工作区的：
+- `pipeline/knowledge-buffer.md`（本周新增）
+- `pipeline/knowledge-buffer-archive/` 最近 4 周的归档文件（用于跨周关联）
 
 ### 2.3 交互维度输入
 
-读取当前 home 工作区的 `pipeline/interaction-buffer.md`。
+读取当前 home 工作区的：
+- `pipeline/interaction-buffer.md`（本周新增）
+- `pipeline/interaction-buffer-archive/` 最近 4 周的归档文件（用于跨周频率分析）
 
 ### 2.4 现有聚合产出
 
@@ -84,7 +88,7 @@ find /Users/tivility/happyclaw/data/groups/ -maxdepth 2 -name "observations.md" 
 读取 `container/pipeline-prompts/sub-agents/knowledge-aggregator.md` 的完整内容作为 prompt。
 
 传入：
-- Step 2.2 的 knowledge-buffer.md 内容
+- Step 2.2 的 knowledge-buffer.md 内容 + 最近 4 周 archive 内容
 - 当前 AI-Chat-Knowledge.md 完整内容
 - 当前 KNOWLEDGE-INDEX.md 完整内容
 
@@ -97,7 +101,7 @@ find /Users/tivility/happyclaw/data/groups/ -maxdepth 2 -name "observations.md" 
 读取 `container/pipeline-prompts/sub-agents/interaction-aggregator.md` 的完整内容作为 prompt。
 
 传入：
-- Step 2.3 的 interaction-buffer.md 内容
+- Step 2.3 的 interaction-buffer.md 内容 + 最近 4 周 archive 内容
 - 当前 interaction-rules.md 完整内容
 
 子任务负责直接执行 interaction-rules.md 更新和 buffer 归档。

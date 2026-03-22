@@ -6,8 +6,9 @@
 
 你会收到：
 1. `pipeline/interaction-buffer.md` 本周新增条目
-2. 当前 `interaction-rules.md` 的完整内容（用于去重和状态管理）
-3. 相关工作区的 CLAUDE.md 内容（用于判断已有规则覆盖情况）
+2. `pipeline/interaction-buffer-archive/` 最近 4 周的归档（用于跨周频率分析和模式识别）
+3. 当前 `interaction-rules.md` 的完整内容（用于去重和状态管理）
+4. 相关工作区的 CLAUDE.md 内容（用于判断已有规则覆盖情况）
 
 ## 执行步骤
 
@@ -64,11 +65,12 @@
 
 补丁仅为建议，**不自动写入**。在周报中展示给用户，用户确认后才执行写入。
 
-### Step 5: 归档 buffer
+### Step 5: 归档 buffer + 滚动清理
 
-将本周已处理的 interaction-buffer.md 内容归档：
+将本周已处理的 interaction-buffer.md 内容归档，并清理过期归档：
 - 归档文件：`pipeline/interaction-buffer-archive/YYYY-WNN.md`
 - 清空 `pipeline/interaction-buffer.md`（保留文件头注释）
+- **滚动清理**：删除 `interaction-buffer-archive/` 中超过 4 周的归档文件（保留最近 4 周 + 当周）
 
 ## 输出
 
