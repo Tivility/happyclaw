@@ -1132,6 +1132,25 @@ async function runQuery(
     '- **不要主动介绍、列举或描述你的可用工具**，除非用户明确询问「你能做什么」或「你有什么功能」。',
     '- 当用户需要某个功能时，直接使用对应工具完成任务即可，无需事先解释工具的存在。',
     '- 如果用户的消息很简短（如打招呼），简洁回应即可，不要用工具列表填充回复。',
+    '',
+    '## 方案设计原则',
+    '',
+    '当任务满足以下**任一条件**时，**必须先输出方案设计，等待用户明确确认后再执行**：',
+    '- 涉及多个文件或模块的修改',
+    '- 需要做架构选型或技术决策',
+    '- 预计执行步骤超过 5 步',
+    '- 用户的需求描述模糊，有多种实现路径',
+    '- 涉及数据迁移、配置变更、或不可逆操作',
+    '',
+    '方案设计格式：',
+    '1. 问题分析',
+    '2. 可选方案（如有多个）',
+    '3. 推荐方案及理由',
+    '4. 影响范围（哪些文件、哪些模块）',
+    '5. 风险评估',
+    '',
+    '**未经用户确认的方案不得执行。** 只有当用户明确说「直接做」「不用方案」「按你说的来」等确认语时，才可跳过此流程。',
+    '简单任务（单文件修改、明确的 bug 修复、用户给出了具体指令）不需要走此流程。',
   ].join('\n');
 
   // Conversation agents (sub-conversations with agentId) get special behavioral guidelines
@@ -1191,7 +1210,7 @@ async function runQuery(
       systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
       allowedTools,
       ...(disallowedTools && { disallowedTools }),
-      thinking: { type: 'adaptive' as const },
+      thinking: { type: 'enabled' as const, budgetTokens: 10000 },
       permissionMode: currentPermissionMode,
       allowDangerouslySkipPermissions: true,
       agentProgressSummaries: true,
@@ -1818,10 +1837,16 @@ async function main(): Promise<void> {
       // ── Non-blocking compaction: auto-continue after context compaction ──
       // Instead of waiting for user to send "继续", automatically start a
       // new query so the agent resumes seamlessly where it left off.
+      // The prompt reminds the agent to preserve planning state across compaction.
       if (hadCompaction) {
         hadCompaction = false;
         log('Auto-continuing after compaction (non-blocking)');
-        prompt = '继续';
+        prompt = [
+          '继续。',
+          '注意：刚刚发生了上下文压缩。如果压缩前你正在进行方案设计、讨论或等待用户确认，',
+          '请先简要回顾当前方案状态和待确认事项，不要直接跳到执行阶段。',
+          '如果压缩前已经在执行中，则继续执行即可。',
+        ].join('');
         promptImages = undefined;
         containerInput.turnId = generateTurnId();
         continue;
