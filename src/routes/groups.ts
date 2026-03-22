@@ -1705,4 +1705,55 @@ groupRoutes.put('/:jid/mcp', authMiddleware, async (c) => {
   });
 });
 
+// POST /api/groups/:jid/bind-im — 将 IM 群绑定到已有工作区（同 folder 映射）
+groupRoutes.post('/:jid/bind-im', authMiddleware, async (c) => {
+  const deps = getWebDeps();
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+
+  const jid = decodeURIComponent(c.req.param('jid'));
+  const authUser = c.get('user') as AuthUser;
+
+  const group = getRegisteredGroup(jid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
+    return c.json({ error: 'Forbidden' }, 403);
+  }
+
+  const body = await c.req.json().catch(() => ({}));
+  const imJid = typeof body.im_jid === 'string' ? body.im_jid.trim() : '';
+  const name = typeof body.name === 'string' ? body.name.trim() : group.name;
+  const force = body.force === true;
+
+  if (!imJid) return c.json({ error: 'im_jid is required' }, 400);
+  if (!/^(feishu|telegram|qq):/.test(imJid)) {
+    return c.json({ error: 'im_jid must start with feishu:, telegram:, or qq:' }, 400);
+  }
+
+  // 检查是否已注册且指向不同 folder
+  const existing = getRegisteredGroup(imJid);
+  if (existing && existing.folder !== group.folder && !force) {
+    return c.json({ error: 'IM group is already bound to another workspace' }, 409);
+  }
+
+  const now = new Date().toISOString();
+  const imGroup: RegisteredGroup = {
+    name,
+    folder: group.folder,
+    added_at: now,
+    executionMode: group.executionMode,
+    created_by: authUser.id,
+  };
+
+  setRegisteredGroup(imJid, imGroup);
+  updateChatName(imJid, name);
+  deps.getRegisteredGroups()[imJid] = imGroup;
+
+  logger.info(
+    { imJid, folder: group.folder, userId: authUser.id },
+    'IM group bound to workspace',
+  );
+
+  return c.json({ success: true, im_jid: imJid, folder: group.folder });
+});
+
 export default groupRoutes;
