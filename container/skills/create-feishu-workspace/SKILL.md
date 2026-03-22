@@ -64,7 +64,7 @@ node "<happyclaw-root>/container/skills/create-feishu-workspace/create-workspace
 - `name`：群名
 - `avatarSet`：是否成功设置头像
 
-向用户汇报创建结果。如果需要重启服务来激活绑定，使用 `mcp__happyclaw__restart_server` 工具。
+向用户汇报创建结果。绑定通过 API 完成，无需重启服务即可生效。
 
 ## 头像提示词模板
 
@@ -85,5 +85,4 @@ node "<happyclaw-root>/container/skills/create-feishu-workspace/create-workspace
 
 - 飞书群创建需要 bot 具有 `im:chat` 权限
 - 头像生成使用火山引擎 Seedream 5.0（doubao-seedream-5-0-260128），最小分辨率 2048x2048
-- 创建完成后需重启 HappyClaw 服务以激活飞书群绑定
 - 用户 open_id 从飞书配置中的最近消息上下文获取，或使用脚本的 `--user-open-id` 参数指定

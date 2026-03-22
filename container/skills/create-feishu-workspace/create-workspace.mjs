@@ -19,7 +19,7 @@
  *   ARK_API_KEY      火山引擎 API Key（头像生成必需）
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
+import { readFileSync, existsSync, readdirSync } from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 
@@ -54,7 +54,7 @@ if (!NAME) {
 const DATA_DIR = path.join(HAPPYCLAW_ROOT, 'data');
 const DB_PATH = path.join(DATA_DIR, 'db', 'messages.db');
 
-// Lazy-load better-sqlite3 (single import)
+// Lazy-load better-sqlite3 (only used for getAdminSession)
 let _Database = null;
 async function getDatabase() {
   if (!_Database) _Database = (await import('better-sqlite3')).default;
@@ -207,41 +207,22 @@ async function createHappyclawWorkspace(sessionToken, name, executionMode) {
   });
   const data = await res.json();
   if (!data.jid) throw new Error(`Create workspace: ${JSON.stringify(data)}`);
-
-  const Database = await getDatabase();
-  const db = new Database(DB_PATH);
-  const group = db.prepare('SELECT folder FROM registered_groups WHERE jid = ?').get(data.jid);
-  db.close();
-  return { jid: data.jid, folder: group?.folder || '' };
+  return { jid: data.jid, folder: data.group.folder };
 }
 
-async function bindFeishuGroup(chatId, name, folder, executionMode, userId) {
-  const Database = await getDatabase();
-  const db = new Database(DB_PATH);
-  const feishuJid = `feishu:${chatId}`;
-
-  const groupDir = path.join(DATA_DIR, 'groups', folder);
-  mkdirSync(groupDir, { recursive: true });
-
-  db.prepare(`
-    INSERT OR REPLACE INTO registered_groups (jid, name, folder, execution_mode, created_by, added_at)
-    VALUES (?, ?, ?, ?, ?, datetime('now'))
-  `).run(feishuJid, name, folder, executionMode, userId || 'system');
-
-  db.prepare(`
-    INSERT OR IGNORE INTO chats (jid, name) VALUES (?, ?)
-  `).run(feishuJid, name);
-
-  db.close();
-  return feishuJid;
-}
-
-async function getAdminUserId() {
-  const Database = await getDatabase();
-  const db = new Database(DB_PATH);
-  const row = db.prepare("SELECT id FROM users WHERE role = 'admin' LIMIT 1").get();
-  db.close();
-  return row?.id || null;
+async function bindFeishuToWorkspace(sessionToken, workspaceJid, chatId, name) {
+  const port = process.env.WEB_PORT || '3000';
+  const res = await fetch(`http://localhost:${port}/api/groups/${encodeURIComponent(workspaceJid)}/bind-im`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Cookie': `happyclaw_session=${sessionToken}`
+    },
+    body: JSON.stringify({ im_jid: `feishu:${chatId}`, name })
+  });
+  const data = await res.json();
+  if (!data.success) throw new Error(`Bind IM: ${JSON.stringify(data)}`);
+  return data;
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
@@ -301,15 +282,13 @@ async function main() {
   result.folder = workspace.folder;
   console.log(`  [OK] folder: ${workspace.folder}`);
 
-  // 6. Bind Feishu group to workspace
+  // 6. Bind Feishu group to workspace (via API, updates in-memory cache immediately)
   console.log('[6/6] 绑定飞书群到工作区...');
-  const adminUserId = await getAdminUserId();
-  await bindFeishuGroup(chatId, NAME, workspace.folder, MODE, adminUserId);
+  await bindFeishuToWorkspace(sessionToken, workspace.jid, chatId, NAME);
   console.log('  [OK]');
 
   console.log('\n=== 完成 ===');
   console.log(JSON.stringify(result, null, 2));
-  console.log('\n提示: 需要重启服务以激活飞书群绑定');
 }
 
 main().catch(err => {
