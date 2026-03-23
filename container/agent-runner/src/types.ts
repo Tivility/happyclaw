@@ -21,6 +21,8 @@ export interface ContainerInput {
   /** Whether this is the admin's home container (full privileges). */
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
+  /** Privacy mode: messages not persisted to DB, conversations not archived. */
+  privacyMode?: boolean;
   images?: Array<{ data: string; mimeType?: string }>;
   agentId?: string;
   agentName?: string;

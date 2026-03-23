@@ -10,6 +10,7 @@ import { ConfirmDialog } from '@/components/common';
 import { ChatGroupItem } from './ChatGroupItem';
 import { CreateContainerDialog } from './CreateContainerDialog';
 import { RenameDialog } from './RenameDialog';
+import { api } from '../../api/client';
 import { SkeletonCardList } from '@/components/common/Skeletons';
 import { cn } from '@/lib/utils';
 import type { GroupInfo } from '../../types';
@@ -54,6 +55,10 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
   // Clear history confirm state
   const [clearState, setClearState] = useState({ open: false, jid: '', name: '' });
   const [clearLoading, setClearLoading] = useState(false);
+
+  // Privacy mode confirm state
+  const [privacyState, setPrivacyState] = useState({ open: false, jid: '', name: '' });
+  const [privacyLoading, setPrivacyLoading] = useState(false);
 
   const {
     groups,
@@ -170,6 +175,21 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
     }
   };
 
+  const handlePrivacyConfirm = async () => {
+    setPrivacyLoading(true);
+    try {
+      await api.patch(`/api/groups/${encodeURIComponent(privacyState.jid)}`, {
+        privacy_mode: true,
+      });
+      await loadGroups();
+      setPrivacyState({ open: false, jid: '', name: '' });
+    } catch {
+      // Error handled by API client
+    } finally {
+      setPrivacyLoading(false);
+    }
+  };
+
   const allGroups = mainGroup ? [mainGroup, ...otherGroups] : otherGroups;
 
   const renderSections = (sections: DateSection[], showCollabBadge: boolean) =>
@@ -196,11 +216,13 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
             isRunning={runnerStates[g.jid] === 'running'}
             editable={g.editable}
             deletable={g.deletable}
+            privacyMode={g.privacy_mode}
             onSelect={handleGroupSelect}
             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
             onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
             onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
             onTogglePin={(jid) => togglePin(jid)}
+            onEnablePrivacy={(jid, name) => setPrivacyState({ open: true, jid, name })}
           />
         ))}
       </div>
@@ -270,9 +292,11 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
                   isHome
                   isRunning={runnerStates[mainGroup.jid] === 'running'}
                   editable
+                  privacyMode={mainGroup.privacy_mode}
                   onSelect={handleGroupSelect}
                   onRename={(jid, name) => setRenameState({ open: true, jid, name })}
                   onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
+                  onEnablePrivacy={(jid, name) => setPrivacyState({ open: true, jid, name })}
                 />
               </div>
             )}
@@ -302,11 +326,13 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
                     isRunning={runnerStates[g.jid] === 'running'}
                     editable={g.editable}
                     deletable={g.deletable}
+                    privacyMode={g.privacy_mode}
                     onSelect={handleGroupSelect}
                     onRename={(jid, name) => setRenameState({ open: true, jid, name })}
                     onClearHistory={(jid, name) => setClearState({ open: true, jid, name })}
                     onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
                     onTogglePin={(jid) => togglePin(jid)}
+                    onEnablePrivacy={(jid, name) => setPrivacyState({ open: true, jid, name })}
                   />
                 ))}
               </div>
@@ -384,6 +410,18 @@ export function ChatSidebar({ className, onToggleCollapse }: ChatSidebarProps) {
         cancelText="取消"
         confirmVariant="danger"
         loading={deleteLoading}
+      />
+
+      <ConfirmDialog
+        open={privacyState.open}
+        onClose={() => setPrivacyState({ open: false, jid: '', name: '' })}
+        onConfirm={handlePrivacyConfirm}
+        title="开启隐私模式"
+        message={`确认为工作区「${privacyState.name}」开启隐私模式吗？开启后，后续对话将不会被保存到数据库。此操作不可撤销。已有的历史消息不受影响。`}
+        confirmText="确认开启"
+        cancelText="取消"
+        confirmVariant="danger"
+        loading={privacyLoading}
       />
     </div>
   );

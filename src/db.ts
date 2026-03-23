@@ -1172,10 +1172,51 @@ export function initDatabase(): void {
     db.exec('ALTER TABLE agents ADD COLUMN last_im_jid TEXT');
   }
 
-  const SCHEMA_VERSION = '31';
+  // v31 → v32: Privacy mode for registered groups
+  ensureColumn('registered_groups', 'privacy_mode', 'INTEGER DEFAULT 0');
+
+  const SCHEMA_VERSION = '32';
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
+
+  // Initialize privacy cache after schema is ready
+  refreshPrivacyCache();
+}
+
+// ─── Privacy Mode Cache ────────────────────────────────────────
+// In-memory cache of JIDs and folders with privacy_mode=1.
+// storeMessageDirect() checks this set to silently skip message storage.
+// Refreshed on initDb(), setRegisteredGroup(), deleteRegisteredGroup().
+const privacyJids = new Set<string>();
+const privacyFolders = new Set<string>();
+
+export function refreshPrivacyCache(): void {
+  privacyJids.clear();
+  privacyFolders.clear();
+  try {
+    const rows = db
+      .prepare(
+        'SELECT jid, folder FROM registered_groups WHERE privacy_mode = 1',
+      )
+      .all() as Array<{ jid: string; folder: string }>;
+    for (const row of rows) {
+      privacyJids.add(row.jid);
+      privacyFolders.add(row.folder);
+    }
+  } catch {
+    // DB not ready yet (e.g. called during init before table exists)
+  }
+}
+
+/** Check if a folder has privacy mode enabled. */
+export function isPrivacyFolder(folder: string): boolean {
+  return privacyFolders.has(folder);
+}
+
+/** Check if a JID has privacy mode enabled. */
+export function isPrivacyJid(jid: string): boolean {
+  return privacyJids.has(jid);
 }
 
 /**
@@ -1293,6 +1334,11 @@ export function storeMessageDirect(
     meta?: StoredMessageMeta;
   },
 ): string {
+  // Privacy mode: silently skip message storage.
+  // Chat metadata (chats table) is managed separately and remains intact
+  // so the group still appears in the sidebar.
+  if (privacyJids.has(chatJid)) return msgId;
+
   const { attachments, tokenUsage, sourceJid, meta } = opts ?? {};
   const existingFinalRow =
     meta?.sourceKind === 'sdk_final' && meta.turnId
@@ -2137,6 +2183,7 @@ type RegisteredGroupRow = {
   activation_mode: string | null;
   mcp_mode: string | null;
   selected_mcps: string | null;
+  privacy_mode: number;
 };
 
 /** Convert a raw DB row into a RegisteredGroup domain object. */
@@ -2162,6 +2209,7 @@ function parseGroupRow(
     reply_policy: row.reply_policy === 'mirror' ? 'mirror' : 'source_only',
     require_mention: row.require_mention === 1,
     activation_mode: parseActivationMode(row.activation_mode),
+    privacy_mode: row.privacy_mode === 1,
   };
 }
 
@@ -2192,8 +2240,8 @@ export function getRegisteredGroup(
 
 export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, mcp_mode, selected_mcps)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, added_at, container_config, execution_mode, custom_cwd, init_source_path, init_git_url, created_by, is_home, selected_skills, target_agent_id, target_main_jid, reply_policy, require_mention, activation_mode, mcp_mode, selected_mcps, privacy_mode)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -2214,11 +2262,27 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.activation_mode ?? 'auto',
     'inherit', // mcp_mode: deprecated, always inherit (user-level MCP applies globally)
     null, // selected_mcps: deprecated, always null
+    group.privacy_mode ? 1 : 0,
   );
+  refreshPrivacyCache();
 }
 
 export function deleteRegisteredGroup(jid: string): void {
   db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+  refreshPrivacyCache();
+}
+
+/**
+ * Enable privacy mode for all JIDs sharing the given folder.
+ * Privacy mode is one-way (public → private) and cannot be reversed.
+ */
+export function enablePrivacyForFolder(folder: string): string[] {
+  const jids = getJidsByFolder(folder);
+  db.prepare(
+    'UPDATE registered_groups SET privacy_mode = 1 WHERE folder = ?',
+  ).run(folder);
+  refreshPrivacyCache();
+  return jids;
 }
 
 /** Get all JIDs that share the same folder (e.g., all JIDs with folder='main'). */

@@ -432,6 +432,7 @@ function createPreCompactHook(
   isHome: boolean,
   _isAdminHome: boolean,
   deps: { emit: (output: ContainerOutput) => void; getFullText: () => string; resetFullText: () => void },
+  privacyMode = false,
 ): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
@@ -457,31 +458,35 @@ function createPreCompactHook(
       return {};
     }
 
-    try {
-      const content = fs.readFileSync(transcriptPath, 'utf-8');
-      const messages = parseTranscript(content);
+    // Privacy mode: skip conversation archiving (don't write to conversations/)
+    if (!privacyMode) {
+      try {
+        const content = fs.readFileSync(transcriptPath, 'utf-8');
+        const messages = parseTranscript(content);
 
-      if (messages.length === 0) {
-        log('No messages to archive');
-        return {};
+        if (messages.length === 0) {
+          log('No messages to archive');
+        } else {
+          const summary = getSessionSummary(sessionId, transcriptPath);
+          const name = summary ? sanitizeFilename(summary) : generateFallbackName();
+
+          const conversationsDir = path.join(WORKSPACE_GROUP, 'conversations');
+          fs.mkdirSync(conversationsDir, { recursive: true });
+
+          const date = new Date().toISOString().split('T')[0];
+          const filename = `${date}-${name}.md`;
+          const filePath = path.join(conversationsDir, filename);
+
+          const markdown = formatTranscriptMarkdown(messages, summary);
+          fs.writeFileSync(filePath, markdown);
+
+          log(`Archived conversation to ${filePath}`);
+        }
+      } catch (err) {
+        log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
       }
-
-      const summary = getSessionSummary(sessionId, transcriptPath);
-      const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-
-      const conversationsDir = path.join(WORKSPACE_GROUP, 'conversations');
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
-      const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-
-      const markdown = formatTranscriptMarkdown(messages, summary);
-      fs.writeFileSync(filePath, markdown);
-
-      log(`Archived conversation to ${filePath}`);
-    } catch (err) {
-      log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
+    } else {
+      log('Privacy mode: skipping conversation archiving');
     }
 
     // ── Trim session JSONL to prevent unbounded growth ──
@@ -1178,7 +1183,7 @@ async function runQuery(
           emit,
           getFullText: () => processor.getFullText(),
           resetFullText: () => processor.resetFullTextAccumulator(),
-        })] }]
+        }, !!containerInput.privacyMode)] }]
       },
       agents: PREDEFINED_AGENTS,
     }
@@ -1521,6 +1526,7 @@ async function main(): Promise<void> {
   let sessionId = containerInput.sessionId;
   latestSessionId = sessionId;
   const { isHome, isAdminHome } = normalizeHomeFlags(containerInput);
+  const privacyMode = !!containerInput.privacyMode;
 
   // Create in-process SDK MCP server (replaces the stdio subprocess)
   const mcpToolsConfig = {
@@ -1529,6 +1535,7 @@ async function main(): Promise<void> {
     isHome,
     isAdminHome,
     isScheduledTask: containerInput.isScheduledTask || false,
+    privacyMode,
     workspaceIpc: WORKSPACE_IPC,
     workspaceGroup: WORKSPACE_GROUP,
     workspaceGlobal: WORKSPACE_GLOBAL,
@@ -1558,6 +1565,9 @@ async function main(): Promise<void> {
   if (containerInput.isScheduledTask) {
     prompt = `[定时任务 - 以下内容由系统自动发送，并非来自用户或群组的直接消息。]\n\n${prompt}`;
   }
+  if (privacyMode) {
+    prompt = `[隐私模式] 当前对话处于隐私模式。对话内容不会被记录到数据库或归档。请谨慎处理敏感数据的文件写入和外部上传操作。\n\n${prompt}`;
+  }
   const pendingDrain = drainIpcInput();
   if (pendingDrain.modeChange) {
     currentPermissionMode = pendingDrain.modeChange as PermissionMode;
@@ -1570,6 +1580,12 @@ async function main(): Promise<void> {
     if (pendingImages.length > 0) {
       promptImages = [...(promptImages || []), ...pendingImages];
     }
+  }
+
+  // Privacy mode: restrict dangerous tools, skip conversation archiving
+  if (privacyMode) {
+    currentPermissionMode = 'default';
+    log('Privacy mode enabled: dangerous tools require confirmation, conversations will not be archived');
   }
 
   // Query loop: run query -> wait for IPC message -> run new query -> repeat
