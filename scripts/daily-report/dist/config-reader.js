@@ -130,8 +130,8 @@ export function loadDailyReportConfig() {
     return {
         enabled: true,
         runHour: 5,
-        pass1Model: 'claude-sonnet-4-5-20250929',
-        pass2Model: 'claude-sonnet-4-5-20250929',
+        pass1Model: 'claude-sonnet-4-20250514',
+        pass2Model: 'claude-sonnet-4-20250514',
         users: {},
     };
 }
