@@ -523,9 +523,12 @@ function createPreCompactHook(
     hadCompaction = true;
 
     // Flag memory flush for home containers (full memory write access)
-    if (isHome) {
+    // Privacy mode: skip memory flush to prevent conversation content leaking to memory/ directory
+    if (isHome && !privacyMode) {
       needsMemoryFlush = true;
       log('PreCompact: flagged memory flush for home container');
+    } else if (privacyMode) {
+      log('PreCompact: skipping memory flush (privacy mode)');
     }
 
     // Flag CLAUDE.md update for all containers
@@ -1613,7 +1616,15 @@ async function main(): Promise<void> {
     prompt = `[定时任务 - 以下内容由系统自动发送，并非来自用户或群组的直接消息。]\n\n${prompt}`;
   }
   if (privacyMode) {
-    prompt = `[隐私模式] 当前对话处于隐私模式。对话内容不会被记录到数据库或归档。请谨慎处理敏感数据的文件写入和外部上传操作。\n\n${prompt}`;
+    prompt = `[隐私模式] 当前对话处于隐私模式。对话内容不会被记录到数据库或归档。
+
+记忆管理规则：
+- 敏感信息（数字、金额、个人身份信息等）写入工作区根目录的 PRIVATE.md
+- 公开信息（工作区结构、项目状态等）继续写入 CLAUDE.md
+- PRIVATE.md 不会被外部系统（日报、认知观察等）读取，仅本工作区 Agent 可访问
+- 文件写入或上传到飞书文档/会话窗口等外部操作需要用户确认
+
+\n\n${prompt}`;
   }
   const pendingDrain = drainIpcInput();
   if (pendingDrain.modeChange) {
