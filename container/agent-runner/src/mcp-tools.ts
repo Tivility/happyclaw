@@ -22,6 +22,7 @@ export interface McpContext {
   isHome: boolean;
   isAdminHome: boolean;
   isScheduledTask?: boolean;
+  privacyMode?: boolean;
   workspaceIpc: string;
   workspaceGroup: string;
   workspaceGlobal: string;
@@ -937,8 +938,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers)
-  if (ctx.isHome) {
+  // --- memory_append --- (only available for home containers, disabled in privacy mode)
+  if (ctx.isHome && !ctx.privacyMode) {
     tools.push(
       tool(
         'memory_append',
