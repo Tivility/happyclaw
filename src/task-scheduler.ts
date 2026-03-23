@@ -417,6 +417,7 @@ async function runTask(
         isHome,
         isAdminHome,
         isScheduledTask: true,
+        privacyMode: !!group.privacy_mode,
         taskRunId: options?.taskRunId,
       },
       (proc, identifier, selectedProviderId) =>

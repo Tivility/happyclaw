@@ -133,6 +133,7 @@ export const GroupCreateSchema = z.object({
     .string()
     .optional()
     .transform((val) => (val && val.trim() ? val.trim() : undefined)),
+  privacy_mode: z.boolean().optional(),
 });
 
 export const GroupMemberAddSchema = z.object({
@@ -196,6 +197,7 @@ export const GroupPatchSchema = z.object({
     .enum(['auto', 'always', 'when_mentioned', 'owner_mentioned', 'disabled'])
     .optional(),
   execution_mode: z.enum(['container', 'host']).optional(),
+  privacy_mode: z.literal(true).optional(), // one-way: only accepts true
 });
 
 export const LoginSchema = z.object({

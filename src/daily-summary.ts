@@ -154,8 +154,10 @@ function generateUserSummary(
   const groups = getGroupsByOwner(userId);
   if (groups.length === 0) return false;
 
-  // Collect all chat_jids for the user's groups
-  const chatJids = groups.map((g) => g.jid);
+  // Collect all chat_jids for the user's groups (skip privacy mode groups)
+  const chatJids = groups
+    .filter((g) => !g.privacy_mode)
+    .map((g) => g.jid);
 
   // Fetch messages for all jids in the time range
   const sections: string[] = [];

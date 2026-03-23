@@ -71,6 +71,7 @@ export interface RegisteredGroup {
   binding_mode?: ImBindingMode; // IM 绑定模式（默认 single_context）
   feishu_chat_mode?: string; // 飞书群模式：group/topic/p2p 等
   feishu_group_message_type?: string; // 飞书群消息形式：chat/thread
+  privacy_mode?: boolean; // 隐私模式：对话不落盘，单方向切换（public → private），不可逆
 }
 
 export interface GroupMember {

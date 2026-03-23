@@ -191,6 +191,8 @@ export interface ContainerInput {
   isHome?: boolean;
   isAdminHome?: boolean;
   isScheduledTask?: boolean;
+  /** Privacy mode: messages not persisted to DB, conversations not archived. */
+  privacyMode?: boolean;
   /** Isolated task run ID — determines IPC namespace (tasks-run/{taskRunId}/) */
   taskRunId?: string;
   /** If the last unprocessed message was emitted by a scheduled task prompt,

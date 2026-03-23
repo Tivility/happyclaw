@@ -1,4 +1,4 @@
-import { MoreHorizontal, Pencil, Trash2, RotateCcw, Star, Pin, Timer } from 'lucide-react';
+import { MoreHorizontal, Pencil, Trash2, RotateCcw, Star, Pin, Timer, Lock } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -23,11 +23,13 @@ export interface ChatGroupItemProps {
   isRunning?: boolean;
   editable?: boolean;
   deletable?: boolean;
+  privacyMode?: boolean;
   onSelect: (jid: string, folder: string) => void;
   onRename?: (jid: string, name: string) => void;
   onClearHistory: (jid: string, name: string) => void;
   onDelete?: (jid: string, name: string) => void;
   onTogglePin?: (jid: string) => void;
+  onEnablePrivacy?: (jid: string, name: string) => void;
 }
 
 export function ChatGroupItem({
@@ -44,11 +46,13 @@ export function ChatGroupItem({
   isRunning,
   editable,
   deletable,
+  privacyMode,
   onSelect,
   onRename,
   onClearHistory,
   onDelete,
   onTogglePin,
+  onEnablePrivacy,
 }: ChatGroupItemProps) {
   const currentUser = useAuthStore((s) => s.user);
   const defaultHomeName = '我的工作区';
@@ -82,6 +86,9 @@ export function ChatGroupItem({
           )}
           {folder?.startsWith('task-') && (
             <Timer className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
+          )}
+          {privacyMode && (
+            <Lock className="w-3 h-3 text-amber-500 flex-shrink-0" />
           )}
           <span
             className={cn(
@@ -142,6 +149,15 @@ export function ChatGroupItem({
               <DropdownMenuItem onClick={() => onRename(jid, name)}>
                 <Pencil className="w-4 h-4" />
                 重命名
+              </DropdownMenuItem>
+            )}
+            {!privacyMode && onEnablePrivacy && (
+              <DropdownMenuItem
+                onClick={() => onEnablePrivacy(jid, displayName)}
+                className="text-amber-700 focus:text-amber-700"
+              >
+                <Lock className="w-4 h-4" />
+                开启隐私模式
               </DropdownMenuItem>
             )}
             <DropdownMenuItem

@@ -26,6 +26,7 @@ export interface McpContext {
    * Cleared between turns by the agent-runner main loop so that regular
    * follow-up messages aren't misattributed to the prior task. */
   currentTaskId?: string | null;
+  privacyMode?: boolean;
   workspaceIpc: string;
   workspaceGroup: string;
   workspaceGlobal: string;
@@ -979,8 +980,9 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers, skipped in native Claude mode)
-  if (ctx.isHome && !ctx.disableMemoryLayer) {
+  // --- memory_append --- (only available for home containers,
+  // skipped in native Claude mode and disabled in privacy mode)
+  if (ctx.isHome && !ctx.disableMemoryLayer && !ctx.privacyMode) {
     tools.push(
       tool(
         'memory_append',

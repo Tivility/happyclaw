@@ -25,6 +25,8 @@ export interface ContainerInput {
    * this is that task's ID; used to tag MCP send_message outputs so the host
    * routes results to the task's configured chat_jid / notify channels. */
   messageTaskId?: string;
+  /** Privacy mode: messages not persisted to DB, conversations not archived. */
+  privacyMode?: boolean;
   images?: Array<{ data: string; mimeType?: string }>;
   agentId?: string;
   agentName?: string;
