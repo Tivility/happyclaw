@@ -1098,7 +1098,9 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
         collectMemoryFiles(ctx.workspaceMemory, files, 4);
         collectMemoryFiles(ctx.workspaceGroup, files, 4);
         collectMemoryFiles(ctx.workspaceGlobal, files, 4);
-        const uniqueFiles = Array.from(new Set(files));
+        const uniqueFiles = Array.from(new Set(files)).filter(
+          (f) => !f.endsWith('/PRIVATE.md'),
+        );
         if (uniqueFiles.length === 0) {
           return {
             content: [
