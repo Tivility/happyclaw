@@ -36,7 +36,7 @@
 **`container/agent-runner/src/types.ts`**：
 - `ContainerInput` 新增 `privacyMode?: boolean`（与 `isHome`/`isAdminHome`/`isScheduledTask` 同级）
 
-### 2. 隐私缓存 + 消息存储拦截
+### 2. 隐私缓存 + 消息路由 + 延迟清理
 
 **`src/db.ts`** 新增模块级缓存：
 
@@ -53,15 +53,34 @@ export function isPrivacyJid(jid: string): boolean;
 
 刷新时机：`initDb()` 后、`setRegisteredGroup()` 后、`deleteRegisteredGroup()` 后。
 
-**`storeMessageDirect()` 拦截**：
+**`storeMessageDirect()` 不拦截**：
+隐私模式下消息**照常写入** `messages` 表。消息路由（`getNewMessages()` 轮询 → `getMessagesSince()` 拉取 → agent 处理）依赖 DB 中的消息记录，跳过写入会导致 agent 永远无法拾取消息。
+
+**延迟清理**：消息在 agent 处理完成后从 DB 删除。
+
 ```typescript
-export function storeMessageDirect(...): string {
-  if (privacyJids.has(chatJid)) return msgId; // 静默跳过
-  // ...原有逻辑
+// src/db.ts
+export function deletePrivacyMessages(chatJid: string): number {
+  return db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(chatJid).changes;
+}
+
+export function cleanupAllPrivacyMessages(): number {
+  // 启动时调用，清理上次进程崩溃残留的隐私消息
+  let total = 0;
+  for (const jid of privacyJids) {
+    total += db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid).changes;
+  }
+  return total;
 }
 ```
 
-**注意**：`ensureChatExists()` 是独立调用（在 IM 消息入口等处单独调用），不在 `storeMessageDirect` 内部。隐私模式下 `chats` 表记录照常存在（群组需要出现在侧边栏），只跳过 `messages` 表写入。
+**清理时机**：
+1. **Agent 回复后**：`processGroupMessages()` 中 `commitCursor()` 后，检查 `isPrivacyJid(chatJid)` 则调用 `deletePrivacyMessages(chatJid)`
+2. **进程启动时**：`loadState()` 末尾调用 `cleanupAllPrivacyMessages()` 清理崩溃残留
+
+**注意**：`ensureChatExists()` 是独立调用（在 IM 消息入口等处单独调用），不在 `storeMessageDirect` 内部。隐私模式下 `chats` 表记录照常存在（群组需要出现在侧边栏），`messages` 表短暂存储后清理。
+
+**安全性说明**：消息在 SQLite WAL 中短暂存在（秒级到分钟级），与 agent-runner 的 stderr 日志（设计文档明确保留）风险等级相当，可接受。
 
 ### 3. API（遵循现有 PATCH 模式）
 
@@ -138,8 +157,7 @@ const privacyMode = !!containerInput.privacyMode;
 
 **自然隔离（无需改动）**：
 - PreCompact Hook 归档 — 已跳过 conversations/ 写入
-- `recoverPendingMessages()` — 无消息可恢复
-- 定时任务框架 — 输出走 storeMessageDirect 已被拦截
+- 定时任务框架 — 输出走 storeMessageDirect，agent 完成后同样触发清理
 
 ### 7. 切换时机处理
 

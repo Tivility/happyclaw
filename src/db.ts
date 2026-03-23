@@ -1220,6 +1220,31 @@ export function isPrivacyJid(jid: string): boolean {
 }
 
 /**
+ * Delete all messages for a privacy-mode JID.
+ * Called after the agent finishes processing to remove ephemeral messages from DB.
+ */
+export function deletePrivacyMessages(chatJid: string): number {
+  return db
+    .prepare('DELETE FROM messages WHERE chat_jid = ?')
+    .run(chatJid).changes;
+}
+
+/**
+ * Cleanup all privacy-mode messages on startup.
+ * Handles crash recovery: if the process died before cleanup, orphaned messages
+ * from privacy JIDs are removed here.
+ */
+export function cleanupAllPrivacyMessages(): number {
+  let total = 0;
+  for (const jid of privacyJids) {
+    total += db
+      .prepare('DELETE FROM messages WHERE chat_jid = ?')
+      .run(jid).changes;
+  }
+  return total;
+}
+
+/**
  * Store chat metadata only (no message content).
  * Used for all chats to enable group discovery without storing sensitive content.
  */
@@ -1334,10 +1359,9 @@ export function storeMessageDirect(
     meta?: StoredMessageMeta;
   },
 ): string {
-  // Privacy mode: silently skip message storage.
-  // Chat metadata (chats table) is managed separately and remains intact
-  // so the group still appears in the sidebar.
-  if (privacyJids.has(chatJid)) return msgId;
+  // Privacy mode: messages are stored normally for routing (getNewMessages polling),
+  // then cleaned up after the agent finishes processing (deletePrivacyMessages).
+  // See docs/design-privacy-mode-upstream.md §2.
 
   const { attachments, tokenUsage, sourceJid, meta } = opts ?? {};
   const existingFinalRow =
