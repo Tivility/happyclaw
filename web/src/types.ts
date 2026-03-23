@@ -17,6 +17,7 @@ export interface GroupInfo {
   created_by?: string;
   pinned_at?: string;
   activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'disabled';
+  privacy_mode?: boolean;
 }
 
 export interface AgentInfo {
