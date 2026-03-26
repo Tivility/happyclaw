@@ -130,8 +130,8 @@ export function loadDailyReportConfig() {
     return {
         enabled: true,
         runHour: 5,
-        pass1Model: 'claude-sonnet-4-20250514',
-        pass2Model: 'claude-sonnet-4-20250514',
+        pass1Model: 'claude-sonnet-4-5-20250929',
+        pass2Model: 'claude-sonnet-4-5-20250929',
         users: {},
     };
 }
@@ -162,7 +162,7 @@ export function listActiveUsers() {
 }
 export function getGroupsByOwner(userId) {
     return getDb()
-        .prepare('SELECT jid, folder, name, created_by, is_home FROM registered_groups WHERE created_by = ? AND (privacy_mode IS NULL OR privacy_mode = 0)')
+        .prepare('SELECT jid, folder, name, created_by, is_home FROM registered_groups WHERE created_by = ?')
         .all(userId);
 }
 export function getUserHomeGroup(userId) {

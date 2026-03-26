@@ -67,6 +67,8 @@ function findField(
   return null;
 }
 
+const DONE_KEYWORDS = ['已完成', '已放弃', '已取消'];
+
 export async function fetchPendingTodos(
   client: lark.Client,
   appToken: string,
@@ -76,31 +78,29 @@ export async function fetchPendingTodos(
   try {
     const res = await client.bitable.v1.appTableRecord.search({
       path: { app_token: appToken, table_id: tableId },
-      params: { page_size: 100 },
+      params: { page_size: 500 },
       data: {
         field_names: [
           schema.taskNameField, schema.statusField, schema.priorityField,
           ...(schema.dueDateField ? [schema.dueDateField] : []),
         ],
-        filter: {
-          conjunction: 'and',
-          conditions: [
-            { field_name: schema.statusField, operator: 'isNot', value: ['已完成'] },
-            { field_name: schema.statusField, operator: 'isNot', value: ['已放弃'] },
-          ],
-        },
         sort: [{ field_name: schema.priorityField, desc: false }],
       },
     });
     const items = res?.data?.items;
     if (!items || items.length === 0) return [];
-    return items.map(item => ({
-      recordId: item.record_id || '',
-      name: extractText(item.fields[schema.taskNameField]),
-      status: extractText(item.fields[schema.statusField]),
-      priority: extractText(item.fields[schema.priorityField]),
-      dueDate: schema.dueDateField ? extractDate(item.fields[schema.dueDateField]) : undefined,
-    }));
+    return items
+      .filter(item => {
+        const status = extractText(item.fields[schema.statusField]);
+        return !DONE_KEYWORDS.some(kw => status.includes(kw));
+      })
+      .map(item => ({
+        recordId: item.record_id || '',
+        name: extractText(item.fields[schema.taskNameField]),
+        status: extractText(item.fields[schema.statusField]),
+        priority: extractText(item.fields[schema.priorityField]),
+        dueDate: schema.dueDateField ? extractDate(item.fields[schema.dueDateField]) : undefined,
+      }));
   } catch (err) {
     console.error('[bitable] fetchPendingTodos failed:', err);
     return [];

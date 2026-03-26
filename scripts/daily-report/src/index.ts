@@ -192,15 +192,24 @@ async function runAIAnalysis(
   for (const topic of analysis.topics) {
     if (topic.need_deep_analysis) {
       console.log(`[daily-report] Running Pass 2: ${topic.title}`);
-      const ws = workspaceData.find(w => w.name === topic.workspace || w.folder === topic.workspace);
+      const ws = workspaceData.find(w =>
+        w.name === topic.workspace || w.folder === topic.workspace ||
+        topic.workspace.includes(w.name) || topic.workspace.includes(w.folder));
       let convText = '';
       if (ws) {
         convText = readConversationArchives(ws.folder, dateStr) ||
           ws.messages.map(m => `${m.sender}: ${m.content}`).join('\n');
       }
+      if (!ws) {
+        console.log(`[daily-report]   ⚠ workspace not found: "${topic.workspace}" (available: ${workspaceData.map(w => w.name).join(', ')})`);
+      } else if (!convText) {
+        console.log(`[daily-report]   ⚠ no conversation text for workspace "${ws.name}" (folder: ${ws.folder})`);
+      }
       if (convText) {
         const trimmed = convText.length > 100_000 ? convText.slice(0, 100_000) + '\n\n[...截断]' : convText;
-        enrichedTopics.push({ ...topic, deepAnalysis: await deepAnalyzeTopic(topic.title, trimmed, config.pass2Model) });
+        const da = await deepAnalyzeTopic(topic.title, trimmed, config.pass2Model);
+        console.log(`[daily-report]   → summary=${da.summary ? 'yes' : 'EMPTY'}, decisions=${da.decisions.length}, action_items=${da.action_items.length}, insights=${da.insights.length}`);
+        enrichedTopics.push({ ...topic, deepAnalysis: da });
       } else {
         enrichedTopics.push(topic);
       }
@@ -281,11 +290,13 @@ function generateMarkdown(data: ReportData, username: string): string {
     }
   }
 
+  lines.push('## 🆕 建议新增待办', '', '> 以下行动项从当日对话中提取，可选择性加入待办清单', '');
   if (data.allActionItems.length > 0) {
-    lines.push('## 🆕 建议新增待办', '', '> 以下行动项从当日对话中提取，可选择性加入待办清单', '');
     data.allActionItems.forEach((item, idx) => lines.push(`${idx + 1}. ${item}`));
-    lines.push('');
+  } else {
+    lines.push('无');
   }
+  lines.push('');
 
   if (data.allInsights.length > 0) {
     lines.push('## 洞察与反思', '');
@@ -333,10 +344,14 @@ function buildDocumentBlocks(data: ReportData): ReturnType<typeof heading2Block>
     blocks.push(dividerBlock());
   }
 
-  if (data.allActionItems.length > 0) {
+  {
     blocks.push(heading2Block('建议新增待办'));
     blocks.push(textBlock('以下行动项从当日对话中提取，可选择性加入待办清单'));
-    data.allActionItems.forEach((item, idx) => blocks.push(bulletBlock(`${idx + 1}. ${item}`)));
+    if (data.allActionItems.length > 0) {
+      data.allActionItems.forEach((item, idx) => blocks.push(bulletBlock(`${idx + 1}. ${item}`)));
+    } else {
+      blocks.push(textBlock('无'));
+    }
     blocks.push(dividerBlock());
   }
 
@@ -392,7 +407,7 @@ async function sendReportCard(client: lark.Client, chatId: string, data: ReportD
       { tag: 'hr' },
       { tag: 'markdown', content: `**🎯 主题**\n${topicSummaries || '无主题'}` },
       ...(todosSummary ? [{ tag: 'hr' }, { tag: 'markdown', content: `**📋 当前待办** (${data.currentTodos.length} 项)\n${todosSummary}` }] : []),
-      ...(suggestedItems ? [{ tag: 'hr' }, { tag: 'markdown', content: `**🆕 建议新增待办**\n${suggestedItems}\n\n💡 回复 \`添加 1 3\` 可将对应项加入待办清单` }] : []),
+      { tag: 'hr' }, { tag: 'markdown', content: suggestedItems ? `**🆕 建议新增待办**\n${suggestedItems}\n\n💡 回复 \`添加 1 3\` 可将对应项加入待办清单` : `**🆕 建议新增待办**\n无` },
       { tag: 'hr' },
       { tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: '查看完整日报 →' }, url: docUrl, type: 'primary' }] },
     ],

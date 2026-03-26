@@ -95,7 +95,7 @@ async function callClaude(prompt, model) {
                 baseURL: config.baseUrl || undefined,
             });
             const response = await client.messages.create({
-                model: model || 'claude-haiku-4-20250506',
+                model: model || 'claude-haiku-4-5-20251001',
                 max_tokens: 4000,
                 messages: [{ role: 'user', content: prompt }],
             });
@@ -110,7 +110,7 @@ async function callClaude(prompt, model) {
     return callClaudeCli(prompt, model);
 }
 // ─── Analysis Functions ─────────────────────────────────────────
-export async function analyzeTopics(messagesText, model = 'claude-haiku-4-20250506') {
+export async function analyzeTopics(messagesText, model = 'claude-haiku-4-5-20251001') {
     const prompt = `你是一个对话分析助手。分析用户与 AI 助手之间的对话记录，识别讨论主题。
 
 要求：
@@ -153,14 +153,18 @@ ${messagesText}
         return { topics: [] };
     }
 }
-export async function deepAnalyzeTopic(topicTitle, conversationText, model = 'claude-sonnet-4-20250514') {
+export async function deepAnalyzeTopic(topicTitle, conversationText, model = 'claude-sonnet-4-5-20250929') {
     const empty = { topic: topicTitle, summary: '', decisions: [], action_items: [], insights: [] };
     const prompt = `你是一个对话分析助手。深入分析关于特定主题的完整对话，提取关键信息。
 
 要求：
 1. 概要总结讨论内容
 2. 提取做出的决策和结论
-3. 提取待办事项和行动项
+3. 提取待办事项和行动项（action_items）——这是重点，请仔细提取：
+   - 对话中明确提到「要做」「下一步」「待」「TODO」「需要」「得去」「回头」「后面再」等意图的事项
+   - 讨论后产生的、尚未执行的后续行动（如：方案待确认、功能待开发、问题待修复、需要跟进的事）
+   - 排除已经完成的事项，只保留未完成的
+   - 如果对话中确实没有待办事项，返回空数组即可，不要硬凑
 4. 提取有价值的洞察和反思
 
 只返回 JSON，不要其他内容。
@@ -174,7 +178,7 @@ ${conversationText}
   "topic": "${topicTitle}",
   "summary": "详细总结",
   "decisions": ["决策1", "决策2"],
-  "action_items": ["待办1", "待办2"],
+  "action_items": ["具体的待办事项描述，包含足够上下文让人知道要做什么"],
   "insights": ["洞察1", "洞察2"]
 }`;
     try {

@@ -62,7 +62,7 @@ export async function createDocument(client: lark.Client, title: string, folderT
     const doc = (res as any)?.data?.document || (res as any)?.document;
     const documentId = doc?.document_id;
     if (!documentId) { console.error('[feishu-doc] createDocument returned no id'); return null; }
-    const url = `https://open.feishu.cn/docx/${documentId}`;
+    const url = `https://my.feishu.cn/docx/${documentId}`;
     console.log(`[feishu-doc] document created: ${title} → ${documentId}`);
     return { documentId, url };
   } catch (err) {
