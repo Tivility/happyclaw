@@ -6821,46 +6821,70 @@ function buildOnNewChat(
       // produce false positives (e.g., admin's Telegram is still online while
       // their Feishu app was transferred → skip re-route incorrectly).
       if (!existing.is_home) {
-        const previousOwner = existing.created_by;
-        const channelType = getChannelType(chatJid);
-        const previousOwnerStillConnected = channelType
-          ? imManager
-              .getConnectedChannelTypes(previousOwner)
-              .includes(channelType)
-          : false;
+        // If the group has a dedicated (non-home) folder, never re-route it.
+        // Credential transfer only makes sense for groups auto-registered to
+        // a user's home folder (main / home-{userId}).  Groups with custom
+        // folders were explicitly bound by the user and must stay put.
+        // Home folders follow the pattern 'main' (admin) or 'home-{userId}'
+        // (member).  Anything else is a user-created dedicated workspace.
+        const isHomeFolderPattern =
+          existing.folder === 'main' ||
+          existing.folder.startsWith('home-');
+        const hasCustomFolder = !isHomeFolderPattern;
 
-        if (previousOwnerStillConnected) {
-          // Multi-bot: previous owner still has the same channel type active
+        if (hasCustomFolder) {
           logger.debug(
             {
               chatJid,
               chatName,
               userId,
-              channelType,
-              existingOwner: previousOwner,
+              existingOwner: existing.created_by,
               existingFolder: existing.folder,
             },
-            'Skipped IM chat re-route (previous owner still connected on same channel type)',
+            'Skipped IM chat re-route (group has dedicated folder)',
           );
         } else {
-          // Credential transfer: previous owner no longer connected on this channel
-          const previousFolder = existing.folder;
-          existing.folder = homeFolder;
-          existing.created_by = userId;
-          setRegisteredGroup(chatJid, existing);
-          registeredGroups[chatJid] = existing;
-          logger.info(
-            {
-              chatJid,
-              chatName,
-              userId,
-              homeFolder,
-              previousFolder,
-              previousOwner,
-              channelType,
-            },
-            'Re-routed IM chat to new user (IM credentials transferred)',
-          );
+          const previousOwner = existing.created_by;
+          const channelType = getChannelType(chatJid);
+          const previousOwnerStillConnected = channelType
+            ? imManager
+                .getConnectedChannelTypes(previousOwner)
+                .includes(channelType)
+            : false;
+
+          if (previousOwnerStillConnected) {
+            // Multi-bot: previous owner still has the same channel type active
+            logger.debug(
+              {
+                chatJid,
+                chatName,
+                userId,
+                channelType,
+                existingOwner: previousOwner,
+                existingFolder: existing.folder,
+              },
+              'Skipped IM chat re-route (previous owner still connected on same channel type)',
+            );
+          } else {
+            // Credential transfer: previous owner no longer connected on this channel
+            const previousFolder = existing.folder;
+            existing.folder = homeFolder;
+            existing.created_by = userId;
+            setRegisteredGroup(chatJid, existing);
+            registeredGroups[chatJid] = existing;
+            logger.info(
+              {
+                chatJid,
+                chatName,
+                userId,
+                homeFolder,
+                previousFolder,
+                previousOwner,
+                channelType,
+              },
+              'Re-routed IM chat to new user (IM credentials transferred)',
+            );
+          }
         }
       }
       return;
