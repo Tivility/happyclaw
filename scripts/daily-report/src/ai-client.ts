@@ -175,9 +175,15 @@ ${messagesText}
 
   try {
     const text = await callClaude(prompt, model);
-    if (!text) return { topics: [] };
+    if (!text) {
+      console.warn('[daily-report] Pass 1: callClaude returned empty');
+      return { topics: [] };
+    }
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return { topics: [] };
+    if (!jsonMatch) {
+      console.warn('[daily-report] Pass 1: no JSON found in response:', text.slice(0, 200));
+      return { topics: [] };
+    }
     return JSON.parse(jsonMatch[0]) as TopicAnalysis;
   } catch (err) {
     console.error('[daily-report] Pass 1 failed:', err);
@@ -221,12 +227,18 @@ ${conversationText}
 
   try {
     const text = await callClaude(prompt, model);
-    if (!text) return empty;
+    if (!text) {
+      console.warn(`[daily-report] Pass 2 (${topicTitle}): callClaude returned empty`);
+      return empty;
+    }
     const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return empty;
+    if (!jsonMatch) {
+      console.warn(`[daily-report] Pass 2 (${topicTitle}): no JSON found in response:`, text.slice(0, 200));
+      return empty;
+    }
     return JSON.parse(jsonMatch[0]) as DeepAnalysisResult;
   } catch (err) {
-    console.error('[daily-report] Pass 2 failed:', err);
+    console.error(`[daily-report] Pass 2 (${topicTitle}) failed:`, err);
     return empty;
   }
 }

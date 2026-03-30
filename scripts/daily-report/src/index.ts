@@ -35,17 +35,10 @@ import {
   type DeepAnalysisResult,
 } from './ai-client.js';
 import {
-  createDocument,
   createFolder,
-  writeDocumentBlocks,
   grantPermission,
-  heading2Block,
-  heading3Block,
-  textBlock,
-  bulletBlock,
-  todoBlock,
-  dividerBlock,
 } from './feishu-doc.js';
+import { execFile } from 'child_process';
 import {
   fetchBitableSchema,
   fetchPendingTodos,
@@ -309,58 +302,54 @@ function generateMarkdown(data: ReportData, username: string): string {
 
 // ─── Feishu Document ────────────────────────────────────────────
 
-function buildDocumentBlocks(data: ReportData): ReturnType<typeof heading2Block>[] {
-  const blocks: ReturnType<typeof heading2Block>[] = [];
+/**
+ * Create a Feishu document from markdown using lark-cli docs +create.
+ * Returns { docId, docUrl } or null on failure.
+ */
+async function createFeishuDocFromMarkdown(
+  title: string,
+  markdown: string,
+  opts: { wikiNode?: string; folderToken?: string },
+): Promise<{ docId: string; docUrl: string } | null> {
+  const args = ['docs', '+create', '--title', title, '--markdown', markdown];
+  if (opts.wikiNode) {
+    args.push('--wiki-node', opts.wikiNode);
+  } else if (opts.folderToken) {
+    args.push('--folder-token', opts.folderToken);
+  }
 
-  blocks.push(heading2Block('概览'));
-  blocks.push(textBlock(`对话消息: ${data.totalMessages} | 活跃工作区: ${data.activeWorkspaces.length} | 主题数: ${data.topics.length}`));
-  blocks.push(textBlock(`工作区: ${data.activeWorkspaces.join(', ')}`));
-  blocks.push(dividerBlock());
-
-  if (data.topics.length > 0) {
-    blocks.push(heading2Block('主题'));
-    for (const topic of data.topics) {
-      const label = topic.value === 'high' ? '[高价值]' : topic.value === 'medium' ? '[中价值]' : '[低价值]';
-      blocks.push(heading3Block(`${label} ${topic.title}`));
-      blocks.push(bulletBlock(`工作区: ${topic.workspace}`));
-      blocks.push(bulletBlock(`摘要: ${topic.brief}`));
-      if (topic.deepAnalysis) {
-        const da = topic.deepAnalysis;
-        if (da.summary) blocks.push(textBlock(da.summary));
-        if (da.decisions.length > 0) { blocks.push(textBlock('决策:', true)); for (const d of da.decisions) blocks.push(bulletBlock(d)); }
-        if (da.action_items.length > 0) { blocks.push(textBlock('行动项:', true)); for (const a of da.action_items) blocks.push(todoBlock(a)); }
-        if (da.insights.length > 0) { blocks.push(textBlock('洞察:', true)); for (const i of da.insights) blocks.push(bulletBlock(i)); }
+  return new Promise((resolve) => {
+    execFile('lark-cli', args, { timeout: 60_000, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        console.error('[feishu-doc] lark-cli docs +create failed:', err.message);
+        if (stderr) console.error('[feishu-doc] stderr:', stderr.slice(0, 500));
+        return resolve(null);
       }
-    }
-    blocks.push(dividerBlock());
-  }
+      try {
+        const result = JSON.parse(stdout);
+        const data = result.data || result;
+        const docId = data.doc_id;
+        const docUrl = data.doc_url;
+        if (docId) {
+          console.log(`[feishu-doc] document created: ${title} → ${docId}`);
+          return resolve({ docId, docUrl: docUrl || `https://my.feishu.cn/docx/${docId}` });
+        }
+        console.error('[feishu-doc] lark-cli returned no doc_id:', stdout.slice(0, 300));
+        resolve(null);
+      } catch {
+        console.error('[feishu-doc] failed to parse lark-cli output:', stdout.slice(0, 300));
+        resolve(null);
+      }
+    });
+  });
+}
 
-  if (data.currentTodos.length > 0) {
-    blocks.push(heading2Block('当前待办'));
-    for (const [priority, items] of groupTodosByPriority(data.currentTodos)) {
-      blocks.push(heading3Block(priority));
-      for (const item of items) blocks.push(todoBlock(`${item.name}${item.dueDate ? ` 📅 ${item.dueDate}` : ''}`));
-    }
-    blocks.push(dividerBlock());
-  }
-
-  {
-    blocks.push(heading2Block('建议新增待办'));
-    blocks.push(textBlock('以下行动项从当日对话中提取，可选择性加入待办清单'));
-    if (data.allActionItems.length > 0) {
-      data.allActionItems.forEach((item, idx) => blocks.push(bulletBlock(`${idx + 1}. ${item}`)));
-    } else {
-      blocks.push(textBlock('无'));
-    }
-    blocks.push(dividerBlock());
-  }
-
-  if (data.allInsights.length > 0) {
-    blocks.push(heading2Block('洞察与反思'));
-    for (const insight of data.allInsights) blocks.push(bulletBlock(insight));
-  }
-
-  return blocks;
+/**
+ * Strip the first H1 line from markdown (lark-cli docs +create uses --title for the doc title,
+ * having a duplicate H1 at the top creates a redundant heading).
+ */
+function stripLeadingH1(md: string): string {
+  return md.replace(/^# .+\n+/, '');
 }
 
 async function ensureFolder(
@@ -487,16 +476,17 @@ async function generateUserReport(
   if (larkClient) {
     try {
       const openId = findFeishuOpenIdByUser(userId);
-      const folderToken = await ensureFolder(config, larkClient, userId, openId);
-      const doc = await createDocument(larkClient, `${dateStr} 日报`, folderToken || undefined);
+      const wikiNode = userConfig.feishuWikiNodeToken;
+      const folderToken = wikiNode ? undefined : (await ensureFolder(config, larkClient, userId, openId)) || undefined;
+      const docMarkdown = stripLeadingH1(markdown);
+      const doc = await createFeishuDocFromMarkdown(`${dateStr} 日报`, docMarkdown, { wikiNode, folderToken });
       if (doc) {
-        if (openId) await grantPermission(larkClient, doc.documentId, 'docx', openId, 'openid', 'full_access');
-        await writeDocumentBlocks(larkClient, doc.documentId, buildDocumentBlocks(reportData));
-        console.log(`[daily-report] ${username}: Feishu doc published → ${doc.url}`);
+        if (openId) await grantPermission(larkClient, doc.docId, 'docx', openId, 'openid', 'full_access');
+        console.log(`[daily-report] ${username}: Feishu doc published → ${doc.docUrl}`);
 
         const chatId = findFeishuChatId(userId);
         if (chatId) {
-          await sendReportCard(larkClient, chatId, reportData, doc.url);
+          await sendReportCard(larkClient, chatId, reportData, doc.docUrl);
           console.log(`[daily-report] ${username}: card message sent`);
         }
       }

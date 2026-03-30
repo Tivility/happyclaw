@@ -162,6 +162,7 @@ export interface DailyReportConfig {
   pass2Model: string;
   users: Record<string, {
     feishuFolderToken?: string;
+    feishuWikiNodeToken?: string;
     lastRunDate?: string;
     bitableAppToken?: string;
     bitableTableId?: string;
