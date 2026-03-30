@@ -88,6 +88,9 @@ import {
   upsertImContextBinding,
   touchImContextBindingActivity,
   updateAgentContextInfo,
+  isPrivacyJid,
+  deletePrivacyMessages,
+  cleanupAllPrivacyMessages,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -2343,6 +2346,15 @@ function loadState(): void {
     }
   }
 
+  // Privacy mode: clean up any messages left behind by a previous crash.
+  const privacyCleaned = cleanupAllPrivacyMessages();
+  if (privacyCleaned > 0) {
+    logger.info(
+      { deleted: privacyCleaned },
+      'Privacy mode: cleaned up orphaned messages from previous session',
+    );
+  }
+
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
     'State loaded',
@@ -2743,6 +2755,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       id: lastProcessed.id,
     });
     cursorCommitted = true;
+
+    // Privacy mode: delete ephemeral messages after the agent finishes processing.
+    // Messages were stored temporarily to enable polling-based routing.
+    if (isPrivacyJid(chatJid)) {
+      const deleted = deletePrivacyMessages(chatJid);
+      if (deleted > 0) {
+        logger.info({ chatJid, deleted }, 'Privacy mode: cleaned up ephemeral messages');
+      }
+    }
   };
 
   if (effectiveGroup.created_by) {
