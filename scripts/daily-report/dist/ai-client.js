@@ -81,17 +81,19 @@ function callClaudeCli(prompt, model) {
     });
 }
 /**
- * Try SDK first (API key or OAuth token), fall back to CLI.
+ * Try SDK first (API key / OAuth token via x-api-key), fall back to CLI.
+ *
+ * OAuth tokens passed as apiKey work for Haiku but return 400 for Sonnet/Opus.
+ * When SDK fails, CLI fallback uses the Agent SDK's internal OAuth flow which
+ * supports all models.
  */
 async function callClaude(prompt, model) {
     const config = getClaudeApiConfig();
-    // Use SDK if we have an API key or OAuth bearer token
-    if (config?.apiKey || config?.authToken) {
+    if (config?.apiKey) {
         try {
             const { default: Anthropic } = await import('@anthropic-ai/sdk');
             const client = new Anthropic({
-                apiKey: config.apiKey || undefined,
-                authToken: config.authToken || undefined,
+                apiKey: config.apiKey,
                 baseURL: config.baseUrl || undefined,
             });
             const response = await client.messages.create({
@@ -103,10 +105,10 @@ async function callClaude(prompt, model) {
             return text;
         }
         catch (err) {
-            console.warn('[ai-client] SDK call failed, falling back to CLI:', err.message);
+            console.warn(`[ai-client] SDK call failed (model=${model || 'default'}), falling back to CLI:`, err.status || '', err.message?.slice(0, 100));
         }
     }
-    // Fall back to Claude CLI (with CLAUDE_CONFIG_DIR for OAuth)
+    // Fall back to Claude CLI — uses Agent SDK's internal OAuth flow, supports all models
     return callClaudeCli(prompt, model);
 }
 // ─── Analysis Functions ─────────────────────────────────────────
@@ -141,11 +143,15 @@ ${messagesText}
 }`;
     try {
         const text = await callClaude(prompt, model);
-        if (!text)
+        if (!text) {
+            console.warn('[daily-report] Pass 1: callClaude returned empty');
             return { topics: [] };
+        }
         const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch)
+        if (!jsonMatch) {
+            console.warn('[daily-report] Pass 1: no JSON found in response:', text.slice(0, 200));
             return { topics: [] };
+        }
         return JSON.parse(jsonMatch[0]);
     }
     catch (err) {
@@ -183,15 +189,19 @@ ${conversationText}
 }`;
     try {
         const text = await callClaude(prompt, model);
-        if (!text)
+        if (!text) {
+            console.warn(`[daily-report] Pass 2 (${topicTitle}): callClaude returned empty`);
             return empty;
+        }
         const jsonMatch = text.match(/\{[\s\S]*\}/);
-        if (!jsonMatch)
+        if (!jsonMatch) {
+            console.warn(`[daily-report] Pass 2 (${topicTitle}): no JSON found in response:`, text.slice(0, 200));
             return empty;
+        }
         return JSON.parse(jsonMatch[0]);
     }
     catch (err) {
-        console.error('[daily-report] Pass 2 failed:', err);
+        console.error(`[daily-report] Pass 2 (${topicTitle}) failed:`, err);
         return empty;
     }
 }

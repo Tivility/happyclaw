@@ -53,10 +53,25 @@ function decrypt(secrets) {
 export function getClaudeApiConfig() {
     try {
         const raw = JSON.parse(fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8'));
-        // V3 format (current)
+        // V4 format: providers array with encrypted secrets
+        if (raw.version === 4 && Array.isArray(raw.providers)) {
+            for (const p of raw.providers) {
+                if (!p.enabled || !p.secrets)
+                    continue;
+                const secrets = decrypt(p.secrets);
+                const apiKey = (secrets.anthropicApiKey || secrets.anthropicAuthToken || '');
+                if (apiKey)
+                    return { apiKey, baseUrl: p.anthropicBaseUrl || undefined };
+                // OAuth credentials from encrypted config
+                const oauthCreds = secrets.claudeOAuthCredentials;
+                if (oauthCreds?.accessToken && typeof oauthCreds.accessToken === 'string') {
+                    return { apiKey: oauthCreds.accessToken, baseUrl: p.anthropicBaseUrl || undefined };
+                }
+            }
+        }
+        // V3 format
         if (raw.version === 3) {
             const activeId = raw.activeProfileId || '__official__';
-            // Check third-party profiles first (if active profile is a custom one)
             if (activeId !== '__official__' && Array.isArray(raw.profiles)) {
                 for (const p of raw.profiles) {
                     if (p.id === activeId && p.secrets) {
@@ -67,16 +82,14 @@ export function getClaudeApiConfig() {
                     }
                 }
             }
-            // Official profile
             if (raw.official?.secrets) {
                 const secrets = decrypt(raw.official.secrets);
                 const apiKey = (secrets.anthropicApiKey || secrets.anthropicAuthToken || '');
                 if (apiKey)
                     return { apiKey, baseUrl: raw.official.anthropicBaseUrl || undefined };
-                // OAuth credentials: use authToken (Bearer header) not apiKey
                 const oauthCreds = secrets.claudeOAuthCredentials;
                 if (oauthCreds?.accessToken && typeof oauthCreds.accessToken === 'string') {
-                    return { authToken: oauthCreds.accessToken, baseUrl: raw.official.anthropicBaseUrl || undefined };
+                    return { apiKey: oauthCreds.accessToken, baseUrl: raw.official.anthropicBaseUrl || undefined };
                 }
             }
         }
@@ -92,7 +105,7 @@ export function getClaudeApiConfig() {
         if (fs.existsSync(credFile)) {
             const creds = JSON.parse(fs.readFileSync(credFile, 'utf-8'));
             if (creds.claudeAiOauth?.accessToken) {
-                return { authToken: creds.claudeAiOauth.accessToken };
+                return { apiKey: creds.claudeAiOauth.accessToken };
             }
         }
         return null;

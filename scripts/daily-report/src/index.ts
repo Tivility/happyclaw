@@ -181,33 +181,47 @@ async function runAIAnalysis(
   console.log('[daily-report] Running Pass 1 (topic scan)...');
   const analysis = await analyzeTopics(sections.join('\n\n'), config.pass1Model);
 
+  // Pass 2: deep analysis — run in parallel (max 5 concurrent) to avoid serial timeout
+  const MAX_PARALLEL = 5;
+  const deepTasks: Array<{ topic: TopicItem; convText: string }> = [];
   const enrichedTopics: Array<TopicItem & { deepAnalysis?: DeepAnalysisResult }> = [];
+
   for (const topic of analysis.topics) {
-    if (topic.need_deep_analysis) {
-      console.log(`[daily-report] Running Pass 2: ${topic.title}`);
-      const ws = workspaceData.find(w =>
-        w.name === topic.workspace || w.folder === topic.workspace ||
-        topic.workspace.includes(w.name) || topic.workspace.includes(w.folder));
-      let convText = '';
-      if (ws) {
-        convText = readConversationArchives(ws.folder, dateStr) ||
-          ws.messages.map(m => `${m.sender}: ${m.content}`).join('\n');
-      }
-      if (!ws) {
-        console.log(`[daily-report]   ⚠ workspace not found: "${topic.workspace}" (available: ${workspaceData.map(w => w.name).join(', ')})`);
-      } else if (!convText) {
-        console.log(`[daily-report]   ⚠ no conversation text for workspace "${ws.name}" (folder: ${ws.folder})`);
-      }
-      if (convText) {
+    if (!topic.need_deep_analysis) {
+      enrichedTopics.push(topic);
+      continue;
+    }
+    const ws = workspaceData.find(w =>
+      w.name === topic.workspace || w.folder === topic.workspace ||
+      topic.workspace.includes(w.name) || topic.workspace.includes(w.folder));
+    if (!ws) {
+      console.log(`[daily-report]   ⚠ workspace not found: "${topic.workspace}" (available: ${workspaceData.map(w => w.name).join(', ')})`);
+      enrichedTopics.push(topic);
+      continue;
+    }
+    const convText = readConversationArchives(ws.folder, dateStr) ||
+      ws.messages.map(m => `${m.sender}: ${m.content}`).join('\n');
+    if (!convText) {
+      console.log(`[daily-report]   ⚠ no conversation text for workspace "${ws.name}" (folder: ${ws.folder})`);
+      enrichedTopics.push(topic);
+      continue;
+    }
+    deepTasks.push({ topic, convText });
+  }
+
+  if (deepTasks.length > 0) {
+    console.log(`[daily-report] Running Pass 2: ${deepTasks.length} topics in parallel (max ${MAX_PARALLEL})...`);
+    // Process in batches of MAX_PARALLEL
+    for (let i = 0; i < deepTasks.length; i += MAX_PARALLEL) {
+      const batch = deepTasks.slice(i, i + MAX_PARALLEL);
+      const results = await Promise.all(batch.map(async ({ topic, convText }) => {
+        console.log(`[daily-report]   → starting: ${topic.title}`);
         const trimmed = convText.length > 100_000 ? convText.slice(0, 100_000) + '\n\n[...截断]' : convText;
         const da = await deepAnalyzeTopic(topic.title, trimmed, config.pass2Model);
-        console.log(`[daily-report]   → summary=${da.summary ? 'yes' : 'EMPTY'}, decisions=${da.decisions.length}, action_items=${da.action_items.length}, insights=${da.insights.length}`);
-        enrichedTopics.push({ ...topic, deepAnalysis: da });
-      } else {
-        enrichedTopics.push(topic);
-      }
-    } else {
-      enrichedTopics.push(topic);
+        console.log(`[daily-report]   → done: ${topic.title} (summary=${da.summary ? 'yes' : 'EMPTY'}, decisions=${da.decisions.length}, actions=${da.action_items.length}, insights=${da.insights.length})`);
+        return { ...topic, deepAnalysis: da };
+      }));
+      enrichedTopics.push(...results);
     }
   }
 

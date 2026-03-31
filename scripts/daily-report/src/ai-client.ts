@@ -108,18 +108,20 @@ function callClaudeCli(prompt: string, model?: string): Promise<string | null> {
 }
 
 /**
- * Try SDK first (API key or OAuth token), fall back to CLI.
+ * Try SDK first (API key / OAuth token via x-api-key), fall back to CLI.
+ *
+ * OAuth tokens passed as apiKey work for Haiku but return 400 for Sonnet/Opus.
+ * When SDK fails, CLI fallback uses the Agent SDK's internal OAuth flow which
+ * supports all models.
  */
 async function callClaude(prompt: string, model?: string): Promise<string | null> {
   const config = getClaudeApiConfig();
 
-  // Use SDK if we have an API key or OAuth bearer token
-  if (config?.apiKey || config?.authToken) {
+  if (config?.apiKey) {
     try {
       const { default: Anthropic } = await import('@anthropic-ai/sdk');
       const client = new Anthropic({
-        apiKey: config.apiKey || undefined,
-        authToken: config.authToken || undefined,
+        apiKey: config.apiKey,
         baseURL: config.baseUrl || undefined,
       });
       const response = await client.messages.create({
@@ -130,11 +132,11 @@ async function callClaude(prompt: string, model?: string): Promise<string | null
       const text = response.content[0]?.type === 'text' ? response.content[0].text : '';
       return text;
     } catch (err: any) {
-      console.warn('[ai-client] SDK call failed, falling back to CLI:', err.message);
+      console.warn(`[ai-client] SDK call failed (model=${model || 'default'}), falling back to CLI:`, err.status || '', err.message?.slice(0, 100));
     }
   }
 
-  // Fall back to Claude CLI (with CLAUDE_CONFIG_DIR for OAuth)
+  // Fall back to Claude CLI — uses Agent SDK's internal OAuth flow, supports all models
   return callClaudeCli(prompt, model);
 }
 
