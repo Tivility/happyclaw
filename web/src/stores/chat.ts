@@ -192,6 +192,7 @@ interface ChatState {
   deleteMessage: (jid: string, messageId: string) => Promise<boolean>;
   createFlow: (name: string, options?: { execution_mode?: 'container' | 'host'; custom_cwd?: string; init_source_path?: string; init_git_url?: string }) => Promise<{ jid: string; folder: string } | null>;
   renameFlow: (jid: string, name: string) => Promise<void>;
+  enablePrivacy: (jid: string) => Promise<void>;
   togglePin: (jid: string) => Promise<void>;
   deleteFlow: (jid: string) => Promise<void>;
   handleStreamEvent: (chatJid: string, event: StreamEvent, agentId?: string) => void;
@@ -1269,6 +1270,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
             },
           },
           error: null,
+        };
+      });
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
+
+  enablePrivacy: async (jid: string) => {
+    try {
+      await api.patch<{ success: boolean }>(
+        `/api/groups/${encodeURIComponent(jid)}`,
+        { privacy_mode: true },
+      );
+      set((s) => {
+        const g = s.groups[jid];
+        if (!g) return s;
+        return {
+          groups: {
+            ...s.groups,
+            [jid]: { ...g, privacy_mode: true },
+          },
         };
       });
     } catch (err) {
