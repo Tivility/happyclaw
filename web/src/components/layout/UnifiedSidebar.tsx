@@ -50,7 +50,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
 
   const {
     groups, currentGroup, selectGroup, loadGroups, loading,
-    deleteFlow, clearHistory, togglePin, enablePrivacy,
+    deleteFlow, togglePin, enablePrivacy,
   } = useChatStore();
   const runnerStates = useGroupsStore((s) => s.runnerStates);
 
