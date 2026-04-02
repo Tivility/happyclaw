@@ -114,26 +114,53 @@ function callClaudeCli(prompt: string, model?: string): Promise<string | null> {
  * When SDK fails, CLI fallback uses the Agent SDK's internal OAuth flow which
  * supports all models.
  */
+const SDK_MAX_RETRIES = 3;
+const SDK_RETRY_BASE_MS = 5_000;
+
+// OAuth tokens (sk-ant-oat-*) only support Haiku via SDK.
+// Sonnet/Opus always fail with 429, so skip SDK and go straight to CLI.
+const SDK_SUPPORTED_MODELS = ['claude-haiku-4-5-20251001'];
+
+function isSdkCompatibleModel(model: string | undefined): boolean {
+  if (!model) return true; // default is Haiku
+  return SDK_SUPPORTED_MODELS.some(m => model.includes(m) || model.includes('haiku'));
+}
+
 async function callClaude(prompt: string, model?: string): Promise<string | null> {
   const config = getClaudeApiConfig();
+  const isOAuthToken = config?.apiKey?.startsWith('sk-ant-oat');
 
-  if (config?.apiKey) {
-    try {
-      const { default: Anthropic } = await import('@anthropic-ai/sdk');
-      const client = new Anthropic({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl || undefined,
-      });
-      const response = await client.messages.create({
-        model: model || 'claude-haiku-4-5-20251001',
-        max_tokens: 4000,
-        messages: [{ role: 'user', content: prompt }],
-      });
-      const text = response.content[0]?.type === 'text' ? response.content[0].text : '';
-      return text;
-    } catch (err: any) {
-      console.warn(`[ai-client] SDK call failed (model=${model || 'default'}), falling back to CLI:`, err.status || '', err.message?.slice(0, 100));
+  // SDK path: only for real API keys, or OAuth tokens with Haiku
+  if (config?.apiKey && (!isOAuthToken || isSdkCompatibleModel(model))) {
+    const { default: Anthropic } = await import('@anthropic-ai/sdk');
+    const client = new Anthropic({
+      apiKey: config.apiKey,
+      baseURL: config.baseUrl || undefined,
+    });
+
+    for (let attempt = 0; attempt < SDK_MAX_RETRIES; attempt++) {
+      try {
+        const response = await client.messages.create({
+          model: model || 'claude-haiku-4-5-20251001',
+          max_tokens: 4000,
+          messages: [{ role: 'user', content: prompt }],
+        });
+        const text = response.content[0]?.type === 'text' ? response.content[0].text : '';
+        return text;
+      } catch (err: any) {
+        const status = err.status || err.statusCode;
+        if (status === 429 && attempt < SDK_MAX_RETRIES - 1) {
+          const delay = SDK_RETRY_BASE_MS * (attempt + 1);
+          console.log(`[ai-client] SDK 429 rate limited (model=${model || 'default'}), retrying in ${delay / 1000}s (attempt ${attempt + 1}/${SDK_MAX_RETRIES})...`);
+          await new Promise(r => setTimeout(r, delay));
+          continue;
+        }
+        console.log(`[ai-client] SDK call failed (model=${model || 'default'}), falling back to CLI: ${status || ''} ${err.message?.slice(0, 100)}`);
+        break;
+      }
     }
+  } else if (isOAuthToken && !isSdkCompatibleModel(model)) {
+    console.log(`[ai-client] OAuth token detected, skipping SDK for ${model}, using CLI directly`);
   }
 
   // Fall back to Claude CLI — uses Agent SDK's internal OAuth flow, supports all models
@@ -178,17 +205,21 @@ ${messagesText}
   try {
     const text = await callClaude(prompt, model);
     if (!text) {
-      console.warn('[daily-report] Pass 1: callClaude returned empty');
+      console.log('[daily-report] ⚠ Pass 1: AI 返回空结果，跳过主题分析');
       return { topics: [] };
     }
     const jsonMatch = text.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
-      console.warn('[daily-report] Pass 1: no JSON found in response:', text.slice(0, 200));
+      console.log('[daily-report] ⚠ Pass 1: AI 返回非 JSON 格式:', text.slice(0, 200));
       return { topics: [] };
     }
-    return JSON.parse(jsonMatch[0]) as TopicAnalysis;
+    const result = JSON.parse(jsonMatch[0]) as TopicAnalysis;
+    if (result.topics.length === 0) {
+      console.log('[daily-report] ⚠ Pass 1: AI 未识别出任何主题（输入消息可能全是系统/任务输出）');
+    }
+    return result;
   } catch (err) {
-    console.error('[daily-report] Pass 1 failed:', err);
+    console.log('[daily-report] ⚠ Pass 1 失败:', err);
     return { topics: [] };
   }
 }

@@ -645,6 +645,13 @@ async function runScriptTask(
       result = scriptResult.stdout.trim() || null;
     } else {
       result = scriptResult.stdout.trim() || null;
+      // Append stderr warnings to result so they're visible in task run logs
+      // (script-runner captures both streams, but on success only stdout was stored)
+      const stderrTrimmed = scriptResult.stderr.trim();
+      if (stderrTrimmed) {
+        const stderrSuffix = `\n[stderr]\n${stderrTrimmed.slice(0, 2000)}`;
+        result = result ? result + stderrSuffix : stderrSuffix;
+      }
     }
 
     // Send result to user (skip if no output and no error)
