@@ -388,10 +388,28 @@ async function ensureFolder(
 }
 
 async function sendReportCard(client: lark.Client, chatId: string, data: ReportData, docUrl: string): Promise<void> {
-  const topicSummaries = data.topics.slice(0, 5).map(t => {
+  // Sort topics by priority: high > medium > low
+  const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
+  const sortedTopics = [...data.topics].sort((a, b) =>
+    (priorityOrder[a.value] ?? 9) - (priorityOrder[b.value] ?? 9),
+  );
+
+  const topicSummaries = sortedTopics.slice(0, 8).map(t => {
     const emoji = t.value === 'high' ? '🔴' : t.value === 'medium' ? '🟡' : '🟢';
     return `${emoji} **${t.title}** — ${t.brief}`;
   }).join('\n');
+
+  // Extract key decisions from high-value topics (top 5)
+  const keyDecisions: string[] = [];
+  for (const t of sortedTopics) {
+    if (t.deepAnalysis?.decisions) {
+      keyDecisions.push(...t.deepAnalysis.decisions.slice(0, 2));
+    }
+    if (keyDecisions.length >= 5) break;
+  }
+  const decisionsText = keyDecisions.length > 0
+    ? keyDecisions.slice(0, 5).map((d, i) => `${i + 1}. ${d}`).join('\n')
+    : '';
 
   const todosSummary = data.currentTodos.length > 0
     ? data.currentTodos.slice(0, 5).map(t => `• ${t.priority} ${t.name}${t.dueDate ? ` 📅 ${t.dueDate}` : ''}`).join('\n')
@@ -399,7 +417,8 @@ async function sendReportCard(client: lark.Client, chatId: string, data: ReportD
     : '';
 
   const suggestedItems = data.allActionItems.length > 0
-    ? data.allActionItems.map((item, idx) => `${idx + 1}. ${item}`).join('\n')
+    ? data.allActionItems.slice(0, 8).map((item, idx) => `${idx + 1}. ${item}`).join('\n')
+      + (data.allActionItems.length > 8 ? `\n...及其他 ${data.allActionItems.length - 8} 项` : '')
     : '';
 
   const card = {
@@ -409,8 +428,9 @@ async function sendReportCard(client: lark.Client, chatId: string, data: ReportD
       { tag: 'markdown', content: `📊 **${data.totalMessages}** 条消息 · **${data.activeWorkspaces.length}** 个工作区 · **${data.topics.length}** 个主题` },
       { tag: 'hr' },
       { tag: 'markdown', content: `**🎯 主题**\n${topicSummaries || '无主题'}` },
+      ...(decisionsText ? [{ tag: 'hr' }, { tag: 'markdown', content: `**⚡ 关键决策**\n${decisionsText}` }] : []),
+      ...(suggestedItems ? [{ tag: 'hr' }, { tag: 'markdown', content: `**🆕 建议新增待办**\n${suggestedItems}` }] : []),
       ...(todosSummary ? [{ tag: 'hr' }, { tag: 'markdown', content: `**📋 当前待办** (${data.currentTodos.length} 项)\n${todosSummary}` }] : []),
-      { tag: 'hr' }, { tag: 'markdown', content: suggestedItems ? `**🆕 建议新增待办**\n${suggestedItems}\n\n💡 回复 \`添加 1 3\` 可将对应项加入待办清单` : `**🆕 建议新增待办**\n无` },
       { tag: 'hr' },
       { tag: 'action', actions: [{ tag: 'button', text: { tag: 'plain_text', content: '查看完整日报 →' }, url: docUrl, type: 'primary' }] },
     ],
