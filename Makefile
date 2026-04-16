@@ -255,6 +255,28 @@ ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
 		echo "✅ Claude Agent SDK 已是最新 ($$LOCAL)"; \
 	fi
 
+# ─── feishu-cli ──────────────────────────────────────────────
+
+FEISHU_CLI_BIN := bin/feishu-cli
+
+$(FEISHU_CLI_BIN): ## 下载 feishu-cli 到项目 bin/（自动检测平台）
+	@mkdir -p bin
+	@ARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/'); \
+	OS=$$(uname -s | tr '[:upper:]' '[:lower:]'); \
+	VERSION=$$(curl -sI "https://github.com/riba2534/feishu-cli/releases/latest" \
+		| grep -i '^location:' | head -1 \
+		| sed 's|.*/tag/\([^[:space:]]*\).*|\1|' | tr -d '\r\n'); \
+	if [ -z "$$VERSION" ]; then echo "❌ 无法获取 feishu-cli 最新版本"; exit 1; fi; \
+	echo "📥 下载 feishu-cli $$VERSION ($$OS-$$ARCH)..."; \
+	curl -fsSL "https://github.com/riba2534/feishu-cli/releases/download/$${VERSION}/feishu-cli_$${VERSION}_$${OS}-$${ARCH}.tar.gz" \
+		| tar -xz --strip-components=1 -C bin; \
+	chmod +x bin/feishu-cli; \
+	echo "✅ feishu-cli $$VERSION → bin/feishu-cli"
+
+update-feishu-cli: ## 更新 feishu-cli 到最新版本
+	@rm -f $(FEISHU_CLI_BIN)
+	@$(MAKE) $(FEISHU_CLI_BIN)
+
 # ─── Setup ───────────────────────────────────────────────────
 
 install-host-tools: ## 安装宿主机模式所需的外部工具（feishu-cli、agent-browser、uv）+ 刷新 builtin-skills 缓存
