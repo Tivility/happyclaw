@@ -7,8 +7,8 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>__NODE_BIN__</string>
-    <string>dist/index.js</string>
+    <string>/bin/bash</string>
+    <string>scripts/launchd-start.sh</string>
   </array>
 
   <key>WorkingDirectory</key>
