@@ -56,6 +56,9 @@ skills-lock.json
 log/
 .playwright-mcp/
 
+# Unrelated local probes / experiments
+/scripts/pixcake-probe/
+
 # OS
 .DS_Store
 Thumbs.db
