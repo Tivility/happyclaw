@@ -461,22 +461,16 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // 清理 session 目录中 SDK 遗留的 .claude.json（含 cachedGrowthBookFeatures，会导致初始化挂起）。
-  // 精简版（不含 feature flags）约 200-400B，SDK 写回的完整版通常 > 10KB。
-  const STRIPPED_CLAUDE_JSON_MAX_SIZE = 500;
-  const sessionClaudeJson = path.join(groupSessionsDir, '.claude.json');
-  try {
-    const st = fs.lstatSync(sessionClaudeJson);
-    if (!st.isSymbolicLink() && st.size > STRIPPED_CLAUDE_JSON_MAX_SIZE) {
-      fs.unlinkSync(sessionClaudeJson);
-    }
-  } catch { /* not found, ok */ }
-
-  // 挂载精简版 .claude.json（剥离 cachedGrowthBookFeatures），保留 deviceId 一致性
+  // 挂载精简版 .claude.json 模板（剥离 cachedGrowthBookFeatures + autoUpdates=false）。
+  // 挂载到 env-dir 模板路径而非直接挂载到 /home/node/.claude.json：
+  //   - entrypoint.sh 启动时复制为可写的 /home/node/.claude.json
+  //   - SDK 运行期间可正常写入（GrowthBook 缓存等），不触发 EROFS
+  //   - 容器销毁（--rm）后 SDK 写入的内容自动丢弃
+  //   - 模板文件始终保持精简版，不会被 SDK 污染
   const containerJson = getContainerClaudeJsonPath();
   mounts.push({
     hostPath: containerJson,
-    containerPath: '/home/node/.claude.json',
+    containerPath: '/workspace/env-dir/claude-json-template',
     readonly: true,
   });
 

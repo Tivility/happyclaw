@@ -13,6 +13,16 @@ umask 0000
 chown -R node:node /home/node/.claude 2>/dev/null || true
 chown -R node:node /workspace/group /workspace/global /workspace/memory /workspace/ipc 2>/dev/null || true
 
+# Copy .claude.json template to writable location.
+# The template is a stripped version (no cachedGrowthBookFeatures, autoUpdates=false)
+# mounted readonly at /workspace/env-dir/claude-json-template.
+# SDK needs to write to ~/.claude.json at runtime (GrowthBook feature cache, etc.);
+# copying makes it writable without polluting the shared template.
+if [ -f /workspace/env-dir/claude-json-template ]; then
+  cp /workspace/env-dir/claude-json-template /home/node/.claude.json
+  chown node:node /home/node/.claude.json
+fi
+
 # Mark mounted directories as safe for git (CVE-2022-24765 ownership check).
 # Host uid may differ from container node user, causing git to refuse operations.
 # 使用通配符 '*' 因为挂载路径动态（extra mounts、customCwd），无法枚举具体目录。
