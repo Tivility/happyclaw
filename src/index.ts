@@ -221,7 +221,11 @@ export function feedStreamEventToCard(
 ): void {
   switch (se.eventType) {
     case 'text_delta':
-      if (se.text) session.append(accumulatedText);
+      // Sub-agent text (parentToolUseId set) must NOT be appended to the main
+      // card body — it's the sub-agent's private narration, mixing it into the
+      // main text pollutes the user-facing reply. Upstream V2 dropped this
+      // guard when simplifying the sub-agent model; we keep it.
+      if (se.text && !se.parentToolUseId) session.append(accumulatedText);
       break;
     case 'thinking_delta':
       if (se.text) {
@@ -2812,15 +2816,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             broadcastStreamEvent(chatJid, result.streamEvent);
 
             // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
+            // Sub-agent text (parentToolUseId set) is skipped — only main-agent
+            // output is the user-facing reply worth persisting on interrupt.
             if (
               result.streamEvent.eventType === 'text_delta' &&
-              result.streamEvent.text
+              result.streamEvent.text &&
+              !result.streamEvent.parentToolUseId
             ) {
               streamingAccumulatedText += result.streamEvent.text;
             }
             if (
               result.streamEvent.eventType === 'thinking_delta' &&
-              result.streamEvent.text
+              result.streamEvent.text &&
+              !result.streamEvent.parentToolUseId
             ) {
               streamingAccumulatedThinking += result.streamEvent.text;
             }
@@ -5623,9 +5631,11 @@ async function processAgentConversation(
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
 
       // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
+      // Sub-agent text (parentToolUseId set) is skipped.
       if (
         output.streamEvent.eventType === 'text_delta' &&
-        output.streamEvent.text
+        output.streamEvent.text &&
+        !output.streamEvent.parentToolUseId
       ) {
         agentStreamingAccText += output.streamEvent.text;
       }
