@@ -613,6 +613,8 @@ function buildSchema2Card(
 function formatUsageNote(usage: {
   inputTokens: number;
   outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
   costUSD: number;
   durationMs: number;
   numTurns: number;
@@ -620,12 +622,16 @@ function formatUsageNote(usage: {
   const fmt = (n: number) =>
     n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
   const parts: string[] = [];
-  parts.push(`${fmt(usage.inputTokens)} / ${fmt(usage.outputTokens)} tokens`);
-  if (usage.costUSD > 0) parts.push(`$${usage.costUSD.toFixed(4)}`);
+  const newInput = usage.inputTokens + usage.cacheCreationInputTokens;
+  if (newInput > 0) parts.push(`🆕 ${fmt(newInput)} new`);
+  if (usage.cacheReadInputTokens > 0)
+    parts.push(`🗂 ${fmt(usage.cacheReadInputTokens)} cached`);
+  if (usage.outputTokens > 0) parts.push(`💡 ${fmt(usage.outputTokens)} out`);
+  if (usage.costUSD > 0) parts.push(`💰 $${usage.costUSD.toFixed(4)}`);
   if (usage.durationMs > 0)
     parts.push(`${(usage.durationMs / 1000).toFixed(1)}s`);
   if (usage.numTurns > 1) parts.push(`${usage.numTurns} turns`);
-  return `💰 ${parts.join(' · ')}`;
+  return parts.join(' · ');
 }
 
 // ─── Streaming Mode Card Builder ──────────────────────────────
@@ -1681,6 +1687,8 @@ export class StreamingCardController {
   async patchUsageNote(usage: {
     inputTokens: number;
     outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
     costUSD: number;
     durationMs: number;
     numTurns: number;
@@ -2256,6 +2264,8 @@ export class StreamingCardController {
     usage?: {
       inputTokens: number;
       outputTokens: number;
+      cacheReadInputTokens: number;
+      cacheCreationInputTokens: number;
       costUSD: number;
       durationMs: number;
       numTurns: number;
@@ -2307,6 +2317,8 @@ export class StreamingCardController {
         durationMs: usage?.durationMs,
         inputTokens: usage?.inputTokens,
         outputTokens: usage?.outputTokens,
+        cacheReadInputTokens: usage?.cacheReadInputTokens,
+        cacheCreationInputTokens: usage?.cacheCreationInputTokens,
         costUSD: usage?.costUSD,
         numTurns: usage?.numTurns,
       },

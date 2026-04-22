@@ -21,6 +21,10 @@ export interface CardMeta {
   durationMs?: number;
   inputTokens?: number;
   outputTokens?: number;
+  /** Tokens read from prompt cache this turn (charged at cache-read rate). */
+  cacheReadInputTokens?: number;
+  /** Tokens written to prompt cache this turn (charged at cache-write rate). */
+  cacheCreationInputTokens?: number;
   costUSD?: number;
   numTurns?: number;
   /** Per-tool aggregated counts. Takes precedence over `toolCount`. */

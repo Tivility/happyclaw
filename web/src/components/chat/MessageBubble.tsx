@@ -1,7 +1,7 @@
 import { useState, memo, lazy, Suspense } from 'react';
 import { Copy, Check, ChevronDown, ChevronUp, Ellipsis, ImageDown } from 'lucide-react';
 import { Link } from 'react-router-dom';
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+import { formatTokens } from '@/components/billing/utils';
 import { Message } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
 import { EmojiAvatar } from '../common/EmojiAvatar';
@@ -57,7 +57,31 @@ function ReasoningBlock({ content }: { content: string }) {
   );
 }
 
-/** Parse and display token usage for AI messages */
+// "claude-opus-4-7" → "opus-4.7"; keeps short names untouched, truncates long ones.
+function shortModel(model: string): string {
+  const m = model.match(/(opus|sonnet|haiku)-(\d+)-(\d+)/i);
+  if (m) return `${m[1].toLowerCase()}-${m[2]}.${m[3]}`;
+  return model.length > 20 ? model.slice(0, 17) + '...' : model;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const min = Math.floor(sec / 60);
+  const restSec = Math.floor(sec % 60);
+  return restSec === 0 ? `${min}m` : `${min}m ${restSec}s`;
+}
+
+/**
+ * Token usage summary for AI messages — mirrors the Feishu card metaRow format:
+ *   model · duration · 🆕 new · 🗂 cached · 💡 out · 💰 cost
+ *
+ * Token display is split into three categories (not input/output) because
+ * Anthropic's `inputTokens` excludes tokens routed through cache_read/
+ * cache_creation — showing only input+output hides the bulk of large-context
+ * requests and makes cost appear disproportionate.
+ */
 function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
   const usage = (() => {
     try {
@@ -78,57 +102,30 @@ function TokenUsageDisplay({ tokenUsageJson }: { tokenUsageJson: string }) {
 
   if (!usage) return null;
 
+  // Primary model = highest cost share (user-facing model; internal sub-agent
+  // models are not promoted to the summary line).
   const models = usage.modelUsage ? Object.entries(usage.modelUsage) : [];
-  // 主模型 = 费用最高的（即用户指定的模型），内部模型不向用户展示
   models.sort((a, b) => (b[1].costUSD || 0) - (a[1].costUSD || 0));
-  const primary = models.length > 0 ? models[0] : null;
-  const primaryInput = primary ? primary[1].inputTokens : (usage.inputTokens || 0);
-  const primaryOutput = primary ? primary[1].outputTokens : (usage.outputTokens || 0);
-  const totalTokens = primaryInput + primaryOutput;
+  const primaryModel = models.length > 0 ? models[0][0] : undefined;
 
-  const formatNum = (n: number): string => {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-    return String(n);
-  };
+  const newInput = (usage.inputTokens ?? 0) + (usage.cacheCreationInputTokens ?? 0);
+  const cachedInput = usage.cacheReadInputTokens ?? 0;
+  const output = usage.outputTokens ?? 0;
+  const cost = usage.costUSD ?? 0;
 
-  const summaryContent = (
-    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-default">
-      <span>{formatNum(totalTokens)} tokens</span>
-      {usage.durationMs ? (
-        <>
-          <span className="opacity-40">·</span>
-          <span>{(usage.durationMs / 1000).toFixed(1)}s</span>
-        </>
-      ) : null}
-    </span>
-  );
+  const parts: string[] = [];
+  if (primaryModel) parts.push(shortModel(primaryModel));
+  if (usage.durationMs !== undefined) parts.push(formatDuration(usage.durationMs));
+  if (newInput > 0) parts.push(`🆕 ${formatTokens(newInput)} new`);
+  if (cachedInput > 0) parts.push(`🗂 ${formatTokens(cachedInput)} cached`);
+  if (output > 0) parts.push(`💡 ${formatTokens(output)} out`);
+  if (cost > 0) parts.push(`💰 $${cost.toFixed(4)}`);
 
-  const hasDetails = primary || (usage.cacheReadInputTokens || 0) > 0;
-
-  if (!hasDetails) {
-    return <div className="mt-1.5">{summaryContent}</div>;
-  }
+  if (parts.length === 0) return null;
 
   return (
-    <div className="mt-1.5">
-      <TooltipProvider delayDuration={200}>
-        <Tooltip>
-          <TooltipTrigger asChild>{summaryContent}</TooltipTrigger>
-          <TooltipContent side="bottom" align="start">
-            <div className="text-xs space-y-0.5">
-              {primary && <div className="opacity-70 font-medium mb-1">{primary[0]}</div>}
-              {primary && <div>In {formatNum(primaryInput)} / Out {formatNum(primaryOutput)}</div>}
-              {(usage.cacheReadInputTokens || 0) > 0 && (
-                <div className="opacity-70">
-                  Read {formatNum(usage.cacheReadInputTokens || 0)}
-                  {(usage.cacheCreationInputTokens || 0) > 0 && ` / Write ${formatNum(usage.cacheCreationInputTokens || 0)}`}
-                </div>
-              )}
-            </div>
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+    <div className="mt-1.5 text-xs text-muted-foreground">
+      {parts.join(' · ')}
     </div>
   );
 }

@@ -167,17 +167,23 @@ export function buildMetaRow(
   _completedAtMs?: number,  // accepted for compat; no longer rendered
 ): El[] {
   if (!meta) return [];
-  // Single compact line: model · duration · tokens · cost.
-  // Tool count and timestamp intentionally omitted — the card line is already
-  // tight and these add little value in the final view.
+  // Single compact line: model · duration · new · cached · out · cost.
+  // Token display is split into three categories to match Anthropic's usage
+  // breakdown (and avoid the "few tokens but expensive" confusion from the
+  // old `input / output` display that hid cache_read/cache_creation):
+  //   🆕 new    = inputTokens + cacheCreationInputTokens (this turn's new input)
+  //   🗂 cached = cacheReadInputTokens (history hitting the prompt cache)
+  //   💡 out    = outputTokens
+  // `cached` is shown only when > 0 (first turn / new sessions have none).
   const parts: string[] = [];
   if (meta.model) parts.push(`🤖 ${shortModel(meta.model)}`);
   if (meta.durationMs !== undefined) parts.push(`⏱ ${formatDuration(meta.durationMs)}`);
-  if (meta.inputTokens !== undefined || meta.outputTokens !== undefined) {
-    parts.push(
-      `💡 ${formatTokens(meta.inputTokens)} / ${formatTokens(meta.outputTokens)} tokens`,
-    );
-  }
+  const newInput = (meta.inputTokens ?? 0) + (meta.cacheCreationInputTokens ?? 0);
+  const cachedInput = meta.cacheReadInputTokens ?? 0;
+  const output = meta.outputTokens ?? 0;
+  if (newInput > 0) parts.push(`🆕 ${formatTokens(newInput)} new`);
+  if (cachedInput > 0) parts.push(`🗂 ${formatTokens(cachedInput)} cached`);
+  if (output > 0) parts.push(`💡 ${formatTokens(output)} out`);
   if (meta.costUSD !== undefined && meta.costUSD > 0) {
     parts.push(`💰 $${meta.costUSD.toFixed(4)}`);
   }
