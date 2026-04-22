@@ -47,11 +47,28 @@ export interface AgentCardInput {
   /** Optional footer note (source, session id, etc.). Rendered grey at notation size. */
   footer?: string;
   /**
-   * Epoch milliseconds when the Agent finished replying. Appended to the
-   * footer via Feishu's <local_datetime> tag so each viewer sees their own
+   * Epoch milliseconds when the Agent finished replying. Rendered inside the
+   * metaRow via Feishu's <local_datetime> tag so each viewer sees their own
    * timezone. Omit (or 0) to skip the timestamp.
    */
   completedAtMs?: number;
+  /**
+   * Prior assistant text segments (before the final one).
+   * When an agent produces N top-level assistant messages in a single query
+   * (e.g. "analyze → call tool → report"), the last one becomes the Body text,
+   * the first N-1 render as individual collapsible panels before the Body.
+   */
+  priorTextSegments?: string[];
+  /**
+   * Sub-agent (Task/Agent tool) execution results.
+   * Each rendered as a collapsible panel with description as title.
+   */
+  subAgentResults?: Array<{
+    toolUseId: string;
+    description: string;
+    summary: string;
+    text: string;
+  }>;
 }
 
 /** Opaque JSON shape for a Feishu v2 card. Consumers stringify it for the SDK. */

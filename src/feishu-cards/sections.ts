@@ -93,28 +93,29 @@ export interface TitleExtractResult {
 }
 
 /**
- * Extract a short title (≤40 chars) from the first H1-H3 heading, or from the
- * first non-empty line. `bodyStartIndex` is the line index where the body starts
- * so the caller can strip the heading from the rendered body.
+ * Extract a short title from the first explicit H1-H3 heading (`# / ## / ###`).
+ * If the body does NOT start with a heading, return a fixed default title
+ * ("Agent 回复") and preserve the body unchanged — the first prose sentence
+ * was previously hoisted as the title, which resulted in awkward cards like
+ * "[Title: 4 个 subagent 都跑完了...] + Body: 4 个 subagent 都跑完了..."
+ * (the sentence is part of the reply, not a heading).
+ *
+ * `bodyStartIndex` is the line index where the body content begins so the
+ * caller can strip the heading line from the rendered body.
  */
 export function extractTitle(text: string): TitleExtractResult {
   const lines = text.split('\n');
   for (let i = 0; i < lines.length; i++) {
     if (!lines[i].trim()) continue;
     if (/^#{1,3}\s+/.test(lines[i])) {
-      return {
-        title: lines[i].replace(/^#+\s*/, '').trim(),
-        bodyStartIndex: i + 1,
-      };
+      const raw = lines[i].replace(/^#+\s*/, '').trim();
+      const title = raw.length > 40 ? raw.slice(0, 37) + '...' : raw;
+      return { title, bodyStartIndex: i + 1 };
     }
     break;
   }
-  const firstLine = (lines.find((l) => l.trim()) || '')
-    .replace(/[*_`#\[\]]/g, '')
-    .trim();
-  const title =
-    firstLine.length > 40 ? firstLine.slice(0, 37) + '...' : firstLine || 'Reply';
-  return { title, bodyStartIndex: 0 };
+  // No explicit heading — use a fixed default title and keep the body intact.
+  return { title: 'Agent 回复', bodyStartIndex: 0 };
 }
 
 export function stripTitleFromBody(text: string, bodyStartIndex: number): string {
@@ -130,6 +131,9 @@ export function buildHeader(input: AgentCardInput): El {
     ? `${input.titlePrefix}${baseTitle}`
     : baseTitle;
 
+  // Icon intentionally omitted — status is already conveyed via the colored
+  // template (header background) and the text_tag below; the extra icon feels
+  // noisy alongside our collapsible panels.
   const header: El = {
     title: { tag: 'plain_text', content: displayTitle },
     template: theme.template,
@@ -158,29 +162,34 @@ export function buildHeader(input: AgentCardInput): El {
 }
 
 /** 2×2 metadata row via div.fields. Returns [] when no meta is useful. */
-export function buildMetaRow(meta: CardMeta | undefined): El[] {
+export function buildMetaRow(
+  meta: CardMeta | undefined,
+  _completedAtMs?: number,  // accepted for compat; no longer rendered
+): El[] {
   if (!meta) return [];
-  const fields: El[] = [];
-  const push = (title: string, value: string): void => {
-    fields.push({
-      is_short: true,
-      text: { tag: 'lark_md', content: `**${title}**\n${value}` },
-    });
-  };
-  if (meta.durationMs !== undefined) push('⏱ 耗时', formatDuration(meta.durationMs));
-  if (meta.model) push('🤖 模型', `\`${shortModel(meta.model)}\``);
+  // Single compact line: model · duration · tokens · cost.
+  // Tool count and timestamp intentionally omitted — the card line is already
+  // tight and these add little value in the final view.
+  const parts: string[] = [];
+  if (meta.model) parts.push(`🤖 ${shortModel(meta.model)}`);
+  if (meta.durationMs !== undefined) parts.push(`⏱ ${formatDuration(meta.durationMs)}`);
   if (meta.inputTokens !== undefined || meta.outputTokens !== undefined) {
-    push(
-      '💡 Token',
-      `${formatTokens(meta.inputTokens)} / ${formatTokens(meta.outputTokens)}`,
+    parts.push(
+      `💡 ${formatTokens(meta.inputTokens)} / ${formatTokens(meta.outputTokens)} tokens`,
     );
   }
-  const toolCount = meta.toolCalls?.length
-    ? meta.toolCalls.reduce((s, t) => s + t.count, 0)
-    : meta.toolCount;
-  if (toolCount !== undefined && toolCount > 0) push('🛠 工具', `${toolCount} 次`);
-  if (fields.length === 0) return [];
-  return [{ tag: 'div', fields, element_id: CARD_ELEMENT_IDS.META_ROW }];
+  if (meta.costUSD !== undefined && meta.costUSD > 0) {
+    parts.push(`💰 $${meta.costUSD.toFixed(4)}`);
+  }
+  if (parts.length === 0) return [];
+  return [
+    {
+      tag: 'markdown',
+      text_size: 'notation',
+      content: `<font color='grey'>${parts.join(' · ')}</font>`,
+      element_id: CARD_ELEMENT_IDS.META_ROW,
+    },
+  ];
 }
 
 /** Main content + collapsible "continue reading" sections for overflow. */
@@ -226,6 +235,66 @@ export function buildThinkingPanel(thinking: string | undefined): El[] {
       ],
     }),
   ];
+}
+
+/**
+ * Render prior assistant text segments (N-1 segments before the final one).
+ * Each segment becomes a collapsed panel with its position indicator.
+ *
+ * Used when the agent produces multiple top-level assistant messages in a
+ * single query (e.g. "analyze → call tool → report"). Only the last segment
+ * is the Body text; earlier segments are preserved here as collapsed panels.
+ */
+export function buildPriorSegmentsPanels(
+  segments: string[] | undefined,
+): El[] {
+  if (!segments || segments.length === 0) return [];
+  const total = segments.length;
+  const MAX_SEGMENT_CHARS = 4000;
+  return segments.map((text, i) => {
+    const trimmed = text.trim();
+    const display = trimmed.length > MAX_SEGMENT_CHARS
+      ? trimmed.slice(0, MAX_SEGMENT_CHARS) + '\n\n_…（已截断）_'
+      : trimmed;
+    return collapsiblePanel({
+      title: `**📝 前置输出 · 第 ${i + 1}/${total} 段**`,
+      expanded: false,
+      elements: [{ tag: 'markdown', content: display }],
+    });
+  });
+}
+
+/**
+ * Render sub-agent (Task/Agent) execution results as collapsed panels.
+ * Title fallback chain: description → summary → "子任务"
+ * Content fallback: text → summary → "(无输出)"
+ */
+export function buildSubAgentPanels(
+  results:
+    | Array<{ description: string; summary: string; text: string }>
+    | undefined,
+): El[] {
+  if (!results || results.length === 0) return [];
+  const MAX_TITLE_LEN = 40;
+  const MAX_CONTENT_CHARS = 6000;
+  return results.map((r) => {
+    const rawTitle = r.description.trim() || r.summary.trim() || '子任务';
+    const title =
+      rawTitle.length > MAX_TITLE_LEN
+        ? rawTitle.slice(0, MAX_TITLE_LEN) + '…'
+        : rawTitle;
+    const rawContent = (r.text || r.summary || '').trim();
+    const content = !rawContent
+      ? '_(无输出)_'
+      : rawContent.length > MAX_CONTENT_CHARS
+        ? rawContent.slice(0, MAX_CONTENT_CHARS) + '\n\n_…（已截断）_'
+        : rawContent;
+    return collapsiblePanel({
+      title: `**🤖 子任务：${title}**`,
+      expanded: false,
+      elements: [{ tag: 'markdown', content }],
+    });
+  });
 }
 
 export function buildToolsPanel(toolCalls: ToolCallStat[] | undefined): El[] {

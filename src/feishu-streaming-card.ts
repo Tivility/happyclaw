@@ -1320,6 +1320,33 @@ export class StreamingCardController {
   private recentEvents: Array<{ text: string }> = [];
   private stateVersion = 0;
 
+  /**
+   * Final-only thinking text (accumulated via appendThinking, NEVER cleared
+   * by append()). `thinkingText` is cleared when text arrives so the streaming
+   * card hides thinking once the real reply begins; the final card still
+   * needs the full thinking trace, so we keep a separate accumulator.
+   */
+  private finalThinkingText = '';
+
+  /**
+   * Prior assistant text segments (accumulated via assistant_text_boundary).
+   * Rendered as collapsed panels ONLY in the final card — does NOT affect
+   * streaming rendering.
+   */
+  private priorTextSegments: string[] = [];
+
+  /**
+   * Sub-agent execution results (accumulated via sub_agent_result).
+   * Rendered as collapsed panels ONLY in the final card — does NOT affect
+   * streaming rendering.
+   */
+  private subAgentResults: Array<{
+    toolUseId: string;
+    description: string;
+    summary: string;
+    text: string;
+  }> = [];
+
   constructor(opts: StreamingCardOptions) {
     this.client = opts.client;
     this.chatId = opts.chatId;
@@ -1446,6 +1473,9 @@ export class StreamingCardController {
       this.thinkingText =
         '...' + this.thinkingText.slice(-(MAX_THINKING_CHARS - 3));
     }
+    // Final-only copy: accumulated without rolling truncation, NEVER cleared
+    // by append(). Used to populate the thinking panel in the final card.
+    this.finalThinkingText += text;
     this.thinking = true;
     this.stateVersion++;
     if (this.state === 'idle') {
@@ -1463,6 +1493,53 @@ export class StreamingCardController {
         ? this.scheduleAuxFlush()
         : this.schedulePatch();
     }
+  }
+
+  /**
+   * Append a prior assistant text segment. Called when SDK produces a new
+   * top-level assistant message, indicating the previous text was a discrete
+   * segment (e.g. "analyze" before tool call, "report" after).
+   *
+   * Does NOT affect streaming rendering — only appears in the final card as
+   * a collapsed panel before the Body.
+   */
+  addPriorTextSegment(text: string): void {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    this.priorTextSegments.push(trimmed);
+  }
+
+  /**
+   * Register a sub-agent (Task/Agent) execution result. Dedupe by toolUseId
+   * in case the same event fires twice.
+   *
+   * Does NOT affect streaming rendering — only appears in the final card.
+   */
+  addSubAgentResult(result: {
+    toolUseId: string;
+    description: string;
+    summary: string;
+    text: string;
+  }): void {
+    const existing = this.subAgentResults.findIndex(
+      (r) => r.toolUseId === result.toolUseId,
+    );
+    if (existing >= 0) {
+      this.subAgentResults[existing] = result;
+    } else {
+      this.subAgentResults.push(result);
+    }
+  }
+
+  /**
+   * Reset non-streaming accumulator state at query boundaries (e.g. when an
+   * IPC-injected message triggers a new query). Must be called in the same
+   * place `streamingAccumulatedText` is reset in the main process.
+   */
+  resetNonStreamingState(): void {
+    this.priorTextSegments = [];
+    this.subAgentResults = [];
+    this.finalThinkingText = '';
   }
 
   /**
@@ -1607,6 +1684,13 @@ export class StreamingCardController {
     costUSD: number;
     durationMs: number;
     numTurns: number;
+    modelUsage?: Record<string, {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadInputTokens: number;
+      cacheCreationInputTokens: number;
+      costUSD: number;
+    }>;
   }): Promise<void> {
     if (this.state !== 'completed') return;
 
@@ -1619,12 +1703,25 @@ export class StreamingCardController {
         const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
         if (cardSize > CARD_SIZE_LIMIT) return;
         await this.streamingBackend.updateCardFull(cardJson);
-      } else if (this.messageId || this.multiCard) {
-        // For CardKit v1 / legacy: skip if multiCard has split content
+      } else if (this.messageId) {
+        // Legacy / CardKit v1: rebuild the full structured card (same shape as
+        // streaming mode) so the metaRow shows model/tokens/cost. Previously
+        // we only patched a footer note, which didn't populate the metaRow.
         if (this.multiCard && this.multiCard.getCardCount() > 1) return;
-        const note = formatUsageNote(usage);
-        if (!note) return;
-        await this.patchCard('completed', note);
+        const cardJson = this.buildStructuredFinalCard('completed', usage);
+        const content = JSON.stringify(cardJson);
+        const cardSize = Buffer.byteLength(content, 'utf-8');
+        if (cardSize > CARD_SIZE_LIMIT) {
+          // Card too large — fall back to the text-note patch to preserve some
+          // info rather than silently drop it.
+          const note = formatUsageNote(usage);
+          if (note) await this.patchCard('completed', note);
+          return;
+        }
+        await this.client.im.v1.message.patch({
+          path: { message_id: this.messageId },
+          data: { content },
+        });
       }
     } catch (err) {
       logger.debug(
@@ -2162,6 +2259,13 @@ export class StreamingCardController {
       costUSD: number;
       durationMs: number;
       numTurns: number;
+      modelUsage?: Record<string, {
+        inputTokens: number;
+        outputTokens: number;
+        cacheReadInputTokens: number;
+        cacheCreationInputTokens: number;
+        costUSD: number;
+      }>;
     },
   ): object {
     const status: CardStatus = finalState === 'aborted' ? 'warning' : 'done';
@@ -2173,12 +2277,32 @@ export class StreamingCardController {
       toolCounts,
       ([name, count]) => ({ name, count }),
     );
-    const thinking = this.thinkingText.trim() || undefined;
+    // Primary model name: pick the most-used model from modelUsage breakdown
+    // (by output tokens). Usage events from agent-runner populate this map;
+    // patchUsageNote is where model info actually arrives.
+    let primaryModel: string | undefined;
+    if (usage?.modelUsage) {
+      const entries = Object.entries(usage.modelUsage);
+      if (entries.length > 0) {
+        entries.sort((a, b) => (b[1].outputTokens || 0) - (a[1].outputTokens || 0));
+        primaryModel = entries[0][0];
+      }
+    }
+    // Use finalThinkingText (never cleared by append()) so the final card
+    // shows the full thinking trace even after the real reply has arrived.
+    // Cap to prevent unbounded card size (Feishu markdown limit ~4000 chars).
+    const MAX_FINAL_THINKING = 3800;
+    let thinking: string | undefined = this.finalThinkingText.trim() || undefined;
+    if (thinking && thinking.length > MAX_FINAL_THINKING) {
+      thinking = '...' + thinking.slice(-(MAX_FINAL_THINKING - 3));
+    }
+    const dedupedPriorSegments = this.dedupePriorSegments();
     return buildAgentReplyCard({
       status,
       text: this.accumulatedText || '...',
       thinking,
       meta: {
+        model: primaryModel,
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
         durationMs: usage?.durationMs,
         inputTokens: usage?.inputTokens,
@@ -2186,7 +2310,29 @@ export class StreamingCardController {
         costUSD: usage?.costUSD,
         numTurns: usage?.numTurns,
       },
+      completedAtMs: Date.now(),
+      priorTextSegments:
+        dedupedPriorSegments.length > 0 ? dedupedPriorSegments : undefined,
+      subAgentResults:
+        this.subAgentResults.length > 0 ? this.subAgentResults : undefined,
     });
+  }
+
+  /**
+   * Dedupe prior segments to avoid the last segment being shown both as a
+   * prior panel AND as the Body text — happens when the final assistant
+   * message's text equals what was recorded as the last boundary.
+   */
+  private dedupePriorSegments(): string[] {
+    if (this.priorTextSegments.length === 0) return [];
+    const body = (this.accumulatedText || '').trim();
+    if (!body) return [...this.priorTextSegments];
+    const last =
+      this.priorTextSegments[this.priorTextSegments.length - 1]?.trim();
+    if (last === body) {
+      return this.priorTextSegments.slice(0, -1);
+    }
+    return [...this.priorTextSegments];
   }
 
   /**

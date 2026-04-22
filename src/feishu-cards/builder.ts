@@ -20,8 +20,8 @@ import {
   buildMetaRow,
   buildBodyChunks,
   buildThinkingPanel,
-  buildToolsPanel,
-  buildFooter,
+  buildPriorSegmentsPanels,
+  buildSubAgentPanels,
   buildStreamingPanels,
   buildStatusBannerText,
   extractTitle,
@@ -55,27 +55,45 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
   };
 
   const header = buildHeader(normalizedInput);
-  const elements: Array<Record<string, unknown>> = [];
-  elements.push(...buildBodyChunks(body || optimizedText.trim()));
 
-  const metaRow = buildMetaRow(input.meta);
+  // New layout: Header → process panels (collapsed) → hr → Body → metaRow.
+  //
+  // Process-area panels in order of "abstract → concrete → prelude":
+  //   1. thinking     (what the agent was reasoning about)
+  //   2. sub-agents   (discrete sub-tasks delegated to Task/Agent tools)
+  //   3. prior text   (earlier assistant segments, closest to final Body)
+  //
+  // Note: tools panel intentionally omitted — per-tool stats clutter the
+  //       final card; users care about sub-agent results, not tool counts.
   const thinkingPanel = buildThinkingPanel(optimizedThinking);
-  const toolsPanel = buildToolsPanel(input.meta?.toolCalls);
-  const footer = buildFooter(input.footer, input.completedAtMs);
+  const subAgentPanels = buildSubAgentPanels(input.subAgentResults);
+  const priorSegmentsPanels = buildPriorSegmentsPanels(input.priorTextSegments);
+  const metaRow = buildMetaRow(input.meta, input.completedAtMs);
 
-  const hasFooterArea =
-    metaRow.length + thinkingPanel.length + toolsPanel.length + footer.length >
-    0;
-  if (hasFooterArea) {
+  const elements: Array<Record<string, unknown>> = [];
+
+  // ── Process area (all collapsed by default) ──
+  elements.push(...thinkingPanel);
+  elements.push(...subAgentPanels);
+  elements.push(...priorSegmentsPanels);
+
+  const hasProcessArea =
+    thinkingPanel.length +
+    subAgentPanels.length +
+    priorSegmentsPanels.length > 0;
+
+  // ── Divider between process area and main content ──
+  if (hasProcessArea) {
     // Native v2 hr — components.md §hr confirms it's a valid component outside
     // of CardKit's live-streaming patch surface.
     elements.push({ tag: 'hr' });
   }
 
+  // ── Main content (Body) ──
+  elements.push(...buildBodyChunks(body || optimizedText.trim()));
+
+  // ── Footer: metaRow carries timestamp (replaces the old standalone footer) ──
   elements.push(...metaRow);
-  elements.push(...thinkingPanel);
-  elements.push(...toolsPanel);
-  elements.push(...footer);
 
   return {
     schema: '2.0',
