@@ -1498,6 +1498,8 @@ async function runQuery(
 
     // ── 子 Agent 消息转 StreamEvent ──
     processor.processSubAgentMessage(message as any);
+    // ── 从顶层 user 消息的 tool_result 块提取 sub-agent 结果 ──
+    processor.extractAgentResult(message as any);
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
@@ -1511,6 +1513,19 @@ async function runQuery(
               .join('')
           : '';
         if (topLevelText) {
+          // 多段 assistant 场景：新段到达前，把上一段作为 boundary emit 出去。
+          // 最后一段不会触发 boundary（之后不会再有新的 topLevelText），
+          // 它作为 canonicalAssistantText → finalText → 完成卡正文。
+          if (canonicalAssistantText) {
+            emit({
+              status: 'stream',
+              result: null,
+              streamEvent: {
+                eventType: 'assistant_text_boundary',
+                segmentText: canonicalAssistantText,
+              },
+            });
+          }
           canonicalAssistantText = topLevelText;
           canonicalAssistantUuid = assistantMsg.uuid as string;
         }

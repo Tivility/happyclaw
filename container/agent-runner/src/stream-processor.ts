@@ -90,6 +90,21 @@ export class StreamEventProcessor {
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
 
+  /**
+   * Track completed Agent/Task tool_use_ids whose tool_result has not yet
+   * been extracted. Populated by processTaskNotification/processToolUseSummary,
+   * consumed by extractAgentResult.
+   *
+   * Value: { description from task_start, summary from task_notification }
+   */
+  private readonly pendingAgentResults = new Map<string, {
+    description: string;
+    summary: string;
+  }>();
+
+  /** Track description from task_start events, keyed by tool_use_id */
+  private readonly taskDescriptions = new Map<string, string>();
+
   // 主 Agent thinking 是否已通过 content_block_delta 路径流出过。
   // 某些模型仍按 delta 下发 thinking；若 delta 路径已消费，processAssistantMessage
   // 必须跳过完整 block 的补发，避免同一段思考被 emit 两次。
@@ -440,13 +455,16 @@ export class StreamEventProcessor {
         this.pendingTaskInput.delete(blockIndex);
         const isTeammate = pendingTask.isTeammate || false;
         if (isTeammate) this.teammateTaskToolUseIds.add(pendingTask.toolUseId);
+        const description = descMatch[1].replace(/\\"/g, '"').slice(0, 200);
+        // Remember description for later extractAgentResult() title lookup.
+        this.taskDescriptions.set(pendingTask.toolUseId, description);
         this.emit({
           status: 'stream', result: null,
           streamEvent: {
             eventType: 'task_start',
             toolUseId: pendingTask.toolUseId,
             toolName: 'Task',
-            taskDescription: descMatch[1].replace(/\\"/g, '"').slice(0, 200),
+            taskDescription: description,
             ...(isTeammate ? { isTeammate: true } : {}),
           },
         });
@@ -519,6 +537,11 @@ export class StreamEventProcessor {
       // Foreground Task completion: synthesize task_notification
       if (this.taskToolUseIds.has(id) && !this.backgroundTaskToolUseIds.has(id)) {
         this.log(`Synthesizing task_notification for foreground Task ${id.slice(0, 12)}`);
+        // Register as pending BEFORE cleanup (cleanup may delete related state).
+        this.pendingAgentResults.set(id, {
+          description: this.taskDescriptions.get(id) || '',
+          summary: '',
+        });
         this.cleanupTaskTools(id);
         this.emit({
           status: 'stream', result: null,
@@ -707,6 +730,70 @@ export class StreamEventProcessor {
     return true;
   }
 
+  /**
+   * Extract sub-agent result text from a top-level user message's tool_result
+   * blocks. Called from the main message loop AFTER processSubAgentMessage()
+   * for each message.
+   *
+   * When a sub-agent (Agent/Task tool) completes, SDK sends:
+   *   1. system/task_notification — registers the toolUseId in pendingAgentResults
+   *   2. user message (parent_tool_use_id=null) containing tool_result blocks —
+   *      THIS method extracts the content and emits sub_agent_result.
+   */
+  extractAgentResult(message: any): void {
+    // Only top-level user messages carry sub-agent tool_results.
+    if (message.type !== 'user') return;
+    const parentToolUseId = message.parent_tool_use_id ?? null;
+    if (parentToolUseId !== null) return;
+    if (this.pendingAgentResults.size === 0) return;
+
+    const rawContent = message.message?.content;
+    if (!Array.isArray(rawContent)) return;
+
+    for (const block of rawContent as Array<{
+      type: string;
+      tool_use_id?: string;
+      content?: string | Array<{ type: string; text?: string }>;
+    }>) {
+      if (block.type !== 'tool_result' || !block.tool_use_id) continue;
+      const pending = this.pendingAgentResults.get(block.tool_use_id);
+      if (!pending) continue;
+
+      // tool_result.content can be string OR array of { type, text } blocks.
+      let text = '';
+      if (typeof block.content === 'string') {
+        text = block.content;
+      } else if (Array.isArray(block.content)) {
+        text = block.content
+          .filter((b) => b.type === 'text' && typeof b.text === 'string')
+          .map((b) => b.text!)
+          .join('');
+      }
+
+      this.log(
+        `[extractAgentResult] toolUseId=${block.tool_use_id.slice(0, 12)} ` +
+        `description="${pending.description.slice(0, 30)}" textLen=${text.length}`,
+      );
+
+      this.emit({
+        status: 'stream',
+        result: null,
+        streamEvent: {
+          eventType: 'sub_agent_result',
+          subAgentResult: {
+            toolUseId: block.tool_use_id,
+            description: pending.description,
+            summary: pending.summary,
+            text,
+          },
+        },
+      });
+
+      this.pendingAgentResults.delete(block.tool_use_id);
+      this.taskDescriptions.delete(block.tool_use_id);
+    }
+  }
+
   /** Check if a tool_use was already resolved by the streaming accumulator. */
   private isPendingResolved(
     pendingMap: Map<number, { toolUseId: string; resolved: boolean }>,
@@ -843,6 +930,12 @@ export class StreamEventProcessor {
         isBackground: true,
       },
     });
+    // Register as pending — wait for the upcoming user(tool_result) message
+    // to extract the full sub-agent output via extractAgentResult().
+    this.pendingAgentResults.set(effectiveToolUseId, {
+      description: this.taskDescriptions.get(effectiveToolUseId) || '',
+      summary: message.summary || '',
+    });
     this.cleanupTaskTools(effectiveToolUseId);
     this.backgroundTaskToolUseIds.delete(effectiveToolUseId);
     if (this.taskToolUseIds.has(effectiveToolUseId)) {
@@ -947,6 +1040,8 @@ export class StreamEventProcessor {
       }
     }
     this.activeSubAgentToolsByTask.clear();
+    this.pendingAgentResults.clear();
+    this.taskDescriptions.clear();
   }
 
   /** Get the accumulated full text (for result comparison). */

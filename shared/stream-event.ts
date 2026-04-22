@@ -16,7 +16,9 @@ export type StreamEventType =
   | 'task_start' | 'task_notification'
   | 'todo_update'
   | 'usage'
-  | 'status' | 'init';
+  | 'status' | 'init'
+  | 'assistant_text_boundary'
+  | 'sub_agent_result';
 
 export interface StreamEvent {
   eventType: StreamEventType;
@@ -64,5 +66,14 @@ export interface StreamEvent {
       cacheCreationInputTokens: number;
       costUSD: number;
     }>;
+  };
+  /** Previous assistant text segment (before a new top-level assistant message). */
+  segmentText?: string;
+  /** Sub-agent (Task/Agent tool) execution result extracted from tool_result block. */
+  subAgentResult?: {
+    toolUseId: string;
+    description: string;
+    summary: string;
+    text: string;
   };
 }

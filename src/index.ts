@@ -228,6 +228,9 @@ export function feedStreamEventToCard(
       if (se.text && !se.parentToolUseId) session.append(accumulatedText);
       break;
     case 'thinking_delta':
+      // Sub-agent thinking must NOT be merged into the main thinking panel —
+      // it's the sub-agent's private narration, not user-facing.
+      if (se.parentToolUseId) break;
       if (se.text) {
         session.appendThinking(se.text);
       } else if (!accumulatedText) {
@@ -305,6 +308,26 @@ export function feedStreamEventToCard(
           ? `Task: ${se.taskSummary.slice(0, 40)}`
           : 'Task 完成';
         session.pushRecentEvent(`✅ ${label}`);
+      }
+      break;
+    case 'assistant_text_boundary':
+      // New top-level assistant message arrived; previous text is a discrete
+      // prior segment. Only the feishu card renders these as collapsed panels.
+      if (
+        se.segmentText &&
+        session instanceof StreamingCardController
+      ) {
+        session.addPriorTextSegment(se.segmentText);
+      }
+      break;
+    case 'sub_agent_result':
+      // Sub-agent (Task/Agent tool) completed; its tool_result text is
+      // extracted and rendered as a collapsed panel in the final card.
+      if (
+        se.subAgentResult &&
+        session instanceof StreamingCardController
+      ) {
+        session.addSubAgentResult(se.subAgentResult);
       }
       break;
     case 'hook_progress':
@@ -2670,6 +2693,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingAccumulatedText = '';
   let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
+  // Retain reference to the session that was just completed via complete(),
+  // so a subsequent 'usage' event (which arrives ~500ms AFTER the final result
+  // and the session rebuild) can still patchUsageNote() onto the right card.
+  // Cleared when the next complete() cycle is about to begin.
+  let lastCompletedStreamingSession: StreamingSession | null = null;
   logger.info(
     { chatJid, streamingSessionJid, hasSession: !!streamingSession },
     'Streaming session creation result',
@@ -2727,6 +2755,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       streamingAccumulatedText = '';
       streamingAccumulatedThinking = '';
       if (streamingSession) {
+        if (streamingSession instanceof StreamingCardController) {
+          streamingSession.resetNonStreamingState();
+        }
         registerStreamingSession(streamingSessionJid, streamingSession);
       }
     }
@@ -2840,6 +2871,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               unregisterStreamingSession(streamingSessionJid);
               streamingAccumulatedText = '';
               streamingAccumulatedThinking = '';
+              if (streamingSession instanceof StreamingCardController) {
+                streamingSession.resetNonStreamingState();
+              }
               // Note: sentReply is NOT reset here. Resetting it would cause
               // subsequent SDK Task results to be sent to IM as separate messages,
               // spamming the IM channel. The first substantive reply already
@@ -2858,11 +2892,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               }
             }
             if (streamingSession) {
+              // 'usage' arrives AFTER the final result (agent-runner emits it
+              // after emitting success). By that time, complete() has already
+              // fired and we may have rebuilt streamingSession into a fresh
+              // (state=idle) controller. Route usage to the *just-completed*
+              // session instead, so patchUsageNote() actually runs.
+              const targetSession =
+                result.streamEvent.eventType === 'usage' &&
+                lastCompletedStreamingSession
+                  ? lastCompletedStreamingSession
+                  : streamingSession;
               feedStreamEventToCard(
-                streamingSession,
+                targetSession,
                 result.streamEvent,
                 streamingAccumulatedText,
               );
+              // After usage is consumed, release the completed session so it
+              // can be GC'd and so a later turn doesn't leak data into it.
+              if (
+                result.streamEvent.eventType === 'usage' &&
+                lastCompletedStreamingSession
+              ) {
+                lastCompletedStreamingSession = null;
+              }
             }
 
             // ── 中断时立即保存已输出内容 ──
@@ -2903,6 +2955,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   clearStreamingSnapshot(chatJid);
                   streamingAccumulatedText = '';
                   streamingAccumulatedThinking = '';
+                  if (streamingSession instanceof StreamingCardController) {
+                    streamingSession.resetNonStreamingState();
+                  }
                   commitCursor();
                 } catch (err) {
                   logger.warn(
@@ -3243,6 +3298,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   }
                 }
 
+                // Preserve reference to the completed session for the
+                // upcoming 'usage' event's patchUsageNote() call.
+                lastCompletedStreamingSession = streamingSession ?? null;
+
                 unregisterStreamingSession(streamingSessionJid);
                 streamingAccumulatedText = '';
                 streamingAccumulatedThinking = '';
@@ -3251,6 +3310,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   makeOnCardCreated(streamingSessionJid),
                 );
                 if (streamingSession) {
+                  if (streamingSession instanceof StreamingCardController) {
+                    streamingSession.resetNonStreamingState();
+                  }
                   registerStreamingSession(
                     streamingSessionJid,
                     streamingSession,
@@ -3338,6 +3400,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               clearStreamingSnapshot(chatJid);
               streamingAccumulatedText = '';
               streamingAccumulatedThinking = '';
+              if (streamingSession instanceof StreamingCardController) {
+                streamingSession.resetNonStreamingState();
+              }
               // Persist cursor as soon as a visible reply is emitted.
               // Long-lived runners may stay alive for idleTimeout, and waiting
               // until process exit would cause duplicate replay after restart.
