@@ -11,7 +11,7 @@ umask 0000
 # rootless podman where uid remapping causes EACCES on bind mounts.
 # Running as root here so chown works regardless of host uid.
 chown -R node:node /home/node/.claude 2>/dev/null || true
-chown -R node:node /workspace/group /workspace/global /workspace/memory /workspace/ipc 2>/dev/null || true
+chown -R node:node /workspace/group /workspace/global /workspace/memory /workspace/ipc /workspace/codex-home 2>/dev/null || true
 
 # Copy .claude.json template to writable location.
 # The template is a stripped version (no cachedGrowthBookFeatures, autoUpdates=false)
@@ -90,6 +90,7 @@ chmod 644 /tmp/input.json
 cleanup() {
   chmod -R a+rwX /home/node/.claude 2>/dev/null || true
   chmod -R a+rwX /workspace/group 2>/dev/null || true
+  chmod -R a+rwX /workspace/codex-home 2>/dev/null || true
 }
 trap cleanup EXIT
 
