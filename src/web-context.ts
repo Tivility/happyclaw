@@ -25,8 +25,6 @@ export interface WsClientInfo {
 export interface WebDeps {
   queue: GroupQueue;
   getRegisteredGroups: () => Record<string, RegisteredGroup>;
-  sessions: Record<string, string>;
-  getSessions: () => Record<string, string>;
   processGroupMessages: (chatJid: string) => Promise<boolean>;
   ensureTerminalContainerStarted: (chatJid: string) => boolean;
   formatMessages: (messages: NewMessage[], isShared?: boolean) => string;

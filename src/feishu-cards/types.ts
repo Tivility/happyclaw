@@ -73,6 +73,18 @@ export interface AgentCardInput {
     summary: string;
     text: string;
   }>;
+  /**
+   * Codex final card process artifacts. Unlike Claude's Task/sub-agent panels,
+   * these come from Codex SDK todo/tool/status events and are shown only when
+   * the turn actually produced them.
+   */
+  codexTodos?: Array<{
+    content: string;
+    status: 'pending' | 'in_progress' | 'completed';
+  }>;
+  codexOperations?: Array<{
+    text: string;
+  }>;
 }
 
 /** Opaque JSON shape for a Feishu v2 card. Consumers stringify it for the SDK. */

@@ -30,6 +30,30 @@ export interface ContainerInput {
   images?: Array<{ data: string; mimeType?: string }>;
   agentId?: string;
   agentName?: string;
+  runtime?: 'claude' | 'codex';
+  providerPoolId?: string;
+  providerId?: string | null;
+  authProfileGeneration?: number;
+  authProfileFingerprint?: string | null;
+  selectedModel?: string | null;
+  modelKind?: 'provider_default' | 'runtime_default' | 'alias' | 'explicit_version' | 'custom';
+  resolvedModel?: string | null;
+  modelKey?: string;
+  modelOverride?: string | null;
+  resumeMode?: 'resume' | 'fresh' | 'soft_inject';
+  inputContextHash?: string | null;
+  workspaceInstructionHash?: string | null;
+  softInjectionReason?: string | null;
+  /**
+   * Pre-built by the host for runtimes that discover native resume failure
+   * inside the runner process. The runner cannot query HappyClaw's DB for
+   * recent messages, so it must use this prompt when falling back to a fresh
+   * native thread.
+   */
+  resumeFailureFallbackPrompt?: string | null;
+  resumeFailureFallbackInputContextHash?: string | null;
+  resumeFailureFallbackWorkspaceInstructionHash?: string | null;
+  resumeFailureFallbackSoftInjectionReason?: string | null;
 }
 
 export interface ContainerOutput {
@@ -43,6 +67,12 @@ export interface ContainerOutput {
   sdkMessageUuid?: string;
   sourceKind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'overflow_partial' | 'compact_partial' | 'legacy' | 'auto_continue';
   finalizationReason?: 'completed' | 'interrupted' | 'error';
+  runtimeContext?: {
+    resumeMode?: 'resume' | 'fresh' | 'soft_inject';
+    inputContextHash?: string | null;
+    workspaceInstructionHash?: string | null;
+    softInjectionReason?: string | null;
+  };
 }
 
 export interface SessionEntry {

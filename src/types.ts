@@ -34,9 +34,134 @@ export interface ContainerConfig {
 }
 
 export type ExecutionMode = 'container' | 'host';
+export type AgentRuntime = 'claude' | 'codex';
+export type ProviderFamily = 'claude' | 'gpt';
+export type ModelSelectionKind =
+  | 'provider_default'
+  | 'runtime_default'
+  | 'alias'
+  | 'explicit_version'
+  | 'custom';
+export type BindingSource =
+  | 'system_default'
+  | 'workspace_default'
+  | 'copied_workspace_default'
+  | 'user_pinned';
+export type ModelOptionStatus =
+  | 'available'
+  | 'unverified'
+  | 'unsupported'
+  | 'stale'
+  | 'hidden';
+export type ModelOptionSource =
+  | 'runtime_default'
+  | 'admin_configured'
+  | 'observed_success'
+  | 'observed_failure'
+  | 'api_discovered';
+export type RuntimeAvailabilityStatus =
+  | 'available'
+  | 'unconfigured'
+  | 'pool_disabled'
+  | 'model_hidden'
+  | 'unsupported'
+  | 'no_provider';
 export type ConversationSource = 'manual' | 'feishu_thread';
 export type ConversationNavMode = 'horizontal' | 'vertical_threads';
 export type ImBindingMode = 'single_context' | 'thread_map';
+
+export interface ModelBinding {
+  runtime: AgentRuntime;
+  provider_family: ProviderFamily;
+  provider_pool_id: string;
+  selected_model: string | null;
+  model_kind: ModelSelectionKind;
+  resolved_model: string | null;
+}
+
+export interface SystemModelDefault extends ModelBinding {
+  id: 'global';
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface WorkspaceModelDefault extends ModelBinding {
+  group_folder: string;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface ConversationRuntimeState extends ModelBinding {
+  group_folder: string;
+  agent_id: string;
+  binding_source: BindingSource;
+  binding_revision: number;
+  active_runtime: AgentRuntime | null;
+  active_provider_family: ProviderFamily | null;
+  active_provider_pool_id: string | null;
+  active_selected_model: string | null;
+  active_model_kind: ModelSelectionKind | null;
+  active_resolved_model: string | null;
+  pending_runtime: AgentRuntime | null;
+  pending_provider_family: ProviderFamily | null;
+  pending_provider_pool_id: string | null;
+  pending_selected_model: string | null;
+  pending_model_kind: ModelSelectionKind | null;
+  pending_resolved_model: string | null;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface ProviderPool {
+  provider_pool_id: string;
+  runtime: AgentRuntime;
+  provider_family: ProviderFamily;
+  display_name: string;
+  balancing_strategy: string;
+  enabled: boolean;
+  unhealthy_threshold: number;
+  recovery_interval_ms: number;
+  metadata_json: string | null;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface ProviderPoolModelOption {
+  runtime: AgentRuntime;
+  provider_family: ProviderFamily;
+  provider_pool_id: string;
+  model_id: string;
+  model_kind: ModelSelectionKind;
+  display_name: string | null;
+  source: ModelOptionSource;
+  status: ModelOptionStatus;
+  metadata_json: string | null;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface RuntimeSessionKey extends ModelBinding {
+  group_folder: string;
+  agent_id: string;
+  provider_id: string;
+  auth_profile_generation: number;
+  auth_profile_fingerprint: string | null;
+  model_key: string;
+}
+
+export interface RuntimeNativeSession extends RuntimeSessionKey {
+  native_session_id: string;
+  native_resume_at: string | null;
+  based_on_message_id: string | null;
+  based_on_message_timestamp: string | null;
+  based_on_turn_id: string | null;
+  input_context_hash: string | null;
+  workspace_instruction_hash: string | null;
+  summary_id: string | null;
+  metadata_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
 
 /** 飞书消息的话题/线程元数据，用于 thread_map 路由 */
 export interface FeishuMessageMeta {
@@ -403,6 +528,7 @@ export type WsMessageOut =
   | { type: 'terminal_stopped'; chatJid: string; reason?: string }
   | { type: 'terminal_error'; chatJid: string; error: string }
   | { type: 'group_created'; jid: string; folder: string; name: string }
+  | { type: 'model_changed'; chatJid: string; agentId?: string }
   | { type: 'docker_build_log'; line: string }
   | { type: 'docker_build_complete'; success: boolean; error?: string }
   | {

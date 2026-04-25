@@ -72,6 +72,7 @@ export interface IMChannelConnectOpts {
     chatJid: string,
     command: string,
     senderImId?: string,
+    messageMeta?: FeishuMessageMeta,
   ) => Promise<string | null>;
   /** 根据 jid 解析群组 folder，用于下载文件/图片到工作区 */
   resolveGroupFolder?: (jid: string) => string | undefined;

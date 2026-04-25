@@ -41,6 +41,18 @@ import {
 import { StreamEventProcessor } from './stream-processor.js';
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
+import { codexCliAdapter } from './codex-cli-runner.js';
+import { codexSdkAdapter } from './codex-sdk-runner.js';
+import { buildRuntimeBackgroundTaskGuidelines } from './runtime-guidelines.js';
+import {
+  CLAUDEMD_UPDATE_ALLOWED_TOOLS,
+  CLAUDEMD_UPDATE_DISALLOWED_TOOLS,
+  DEFAULT_ALLOWED_TOOLS,
+  MEMORY_FLUSH_ALLOWED_TOOLS,
+  MEMORY_FLUSH_DISALLOWED_TOOLS,
+  resolveClaudePermissionOptions,
+} from './runtime-permissions.js';
+import { buildCodexMemoryLifecyclePrompt } from './runtime-memory.js';
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP = process.env.HAPPYCLAW_WORKSPACE_GROUP || '/workspace/group';
@@ -61,71 +73,12 @@ const IPC_FALLBACK_POLL_MS = 5000; // 后备轮询间隔（仅防止 inotify 事
 let needsMemoryFlush = false;
 let hadCompaction = false;
 let needsClaudeMdUpdate = false;
-let currentPermissionMode: PermissionMode = 'bypassPermissions';
 // Module-level session ID so SIGTERM handler can emit it before exit.
 // Updated in main() whenever a query returns a new session.
 let latestSessionId: string | undefined;
 
-const DEFAULT_ALLOWED_TOOLS = [
-  'Bash',
-  'Read', 'Write', 'Edit', 'Glob', 'Grep',
-  'WebSearch', 'WebFetch',
-  'Task', 'TaskOutput', 'TaskStop',
-  'TeamCreate', 'TeamDelete', 'SendMessage',
-  'TodoWrite', 'ToolSearch', 'Skill',
-  'NotebookEdit',
-  'mcp__happyclaw__*'
-];
-
-const MEMORY_FLUSH_ALLOWED_TOOLS = [
-  'mcp__happyclaw__memory_search',
-  'mcp__happyclaw__memory_get',
-  'mcp__happyclaw__memory_append',
-  'Read',  // 读取全局 CLAUDE.md 当前内容
-  'Edit',  // 编辑全局 CLAUDE.md（永久记忆）
-];
-
-// Memory flush 期间禁用的工具（disallowedTools 会从模型上下文中完全移除这些工具）
-// 注意：allowedTools 仅控制自动审批，不限制工具可见性；
-//       bypassPermissions 模式下所有工具都自动通过，所以必须用 disallowedTools 来限制
-const MEMORY_FLUSH_DISALLOWED_TOOLS = [
-  'Bash', 'Write', 'WebSearch', 'WebFetch', 'Glob', 'Grep',
-  'Task', 'TaskOutput', 'TaskStop',
-  'TeamCreate', 'TeamDelete', 'SendMessage',
-  'TodoWrite', 'ToolSearch', 'Skill', 'NotebookEdit',
-  'mcp__happyclaw__send_message',
-  'mcp__happyclaw__schedule_task',
-  'mcp__happyclaw__list_tasks',
-  'mcp__happyclaw__pause_task',
-  'mcp__happyclaw__resume_task',
-  'mcp__happyclaw__cancel_task',
-  'mcp__happyclaw__register_group',
-];
-
-// CLAUDE.md 更新：非 home 容器压缩后的轻量更新（仅 Read + Edit）
-const CLAUDEMD_UPDATE_ALLOWED_TOOLS = ['Read', 'Edit'];
-const CLAUDEMD_UPDATE_DISALLOWED_TOOLS = [
-  'Bash', 'Write', 'WebSearch', 'WebFetch', 'Glob', 'Grep',
-  'Task', 'TaskOutput', 'TaskStop',
-  'TeamCreate', 'TeamDelete', 'SendMessage',
-  'TodoWrite', 'ToolSearch', 'Skill', 'NotebookEdit',
-  'mcp__happyclaw__send_message',
-  'mcp__happyclaw__send_image',
-  'mcp__happyclaw__send_file',
-  'mcp__happyclaw__schedule_task',
-  'mcp__happyclaw__list_tasks',
-  'mcp__happyclaw__pause_task',
-  'mcp__happyclaw__resume_task',
-  'mcp__happyclaw__cancel_task',
-  'mcp__happyclaw__register_group',
-  'mcp__happyclaw__install_skill',
-  'mcp__happyclaw__uninstall_skill',
-  'mcp__happyclaw__memory_append',
-  'mcp__happyclaw__memory_search',
-  'mcp__happyclaw__memory_get',
-];
-
 const IMAGE_MAX_DIMENSION = 8000; // Anthropic API 限制
+const GLOBAL_MEMORY_CONTEXT_MAX_CHARS = 60000;
 
 // ── 系统提示词优化：安全守则（从独立 Markdown 文件加载，始终注入所有容器） ──
 
@@ -196,6 +149,13 @@ const SKILL_ROUTING_GUIDELINES = [
   '- 无匹配 → 使用基础工具或直接回答',
 ].join('\n');
 
+const CODEX_SKILL_FILE_GUIDELINES = [
+  '',
+  'Codex 运行时时，skills 以普通文件目录形式提供，而不是 Claude 的 Skill 工具。',
+  '如果用户意图匹配某个 skill，请先阅读该 skill 的 `SKILL.md`，再按其中流程执行。',
+  '不要把同一个 skill 拆成另一套格式；维护时保持 `SKILL.md` 格式和目录结构不变。',
+].join('\n');
+
 const WEB_FETCH_GUIDELINES = [
   '',
   '## 网页访问策略',
@@ -205,25 +165,9 @@ const WEB_FETCH_GUIDELINES = [
   '且 agent-browser 可用，立即改用 agent-browser 通过真实浏览器访问。不要反复重试 WebFetch。',
 ].join('\n');
 
-const BACKGROUND_TASK_GUIDELINES = [
-  '',
-  '## 后台任务',
-  '',
-  '当用户要求执行耗时较长的批量任务（如批量文件处理、大规模数据操作等），',
-  '你应该使用 Task 工具并设置 `run_in_background: true`，让任务在后台运行。',
-  '这样用户无需等待，可以继续与你交流其他事项。',
-  '任务结束时你会自动收到通知，届时在对话中向用户汇报即可。',
-  '告知用户：「已为您在后台启动该任务，完成后我会第一时间反馈。现在有其他问题也可以随时问我。」',
-  '',
-  '### 任务通知处理（重要）',
-  '',
-  '当你收到多条后台任务的完成或失败通知时：',
-  '- **禁止逐条回复**。不要对每条通知都调用 `send_message`，这会导致 IM 群刷屏。',
-  '- **等待所有通知到齐后，汇总为一条消息回复用户**，例如：「N 个任务完成，M 个失败，失败原因：...」',
-  '- 对于已知的无害失败（如浏览器进程被回收、临时资源超时），**不需要通知用户**，静默忽略即可。',
-].join('\n');
-
-const GUIDELINES_BLOCK = `<guidelines>\n${OUTPUT_GUIDELINES}\n${WEB_FETCH_GUIDELINES}\n${BACKGROUND_TASK_GUIDELINES}\n</guidelines>`;
+function buildGuidelinesBlock(runtime: 'claude' | 'codex'): string {
+  return `<guidelines>\n${OUTPUT_GUIDELINES}\n${WEB_FETCH_GUIDELINES}\n${buildRuntimeBackgroundTaskGuidelines(runtime)}\n</guidelines>`;
+}
 
 const CONVERSATION_AGENT_GUIDELINES = [
   '',
@@ -988,11 +932,62 @@ function waitForIpcMessage(): Promise<{ text: string; images?: Array<{ data: str
   });
 }
 
+function globalClaudeMdPath(): string {
+  return path.join(WORKSPACE_GLOBAL, 'CLAUDE.md');
+}
+
+function uniqueExistingDirectories(directories: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const dir of directories) {
+    if (!dir || seen.has(dir)) continue;
+    seen.add(dir);
+    try {
+      if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+        result.push(dir);
+      }
+    } catch {
+      // Ignore inaccessible memory directories; tool prompts stay best-effort.
+    }
+  }
+  return result;
+}
+
+function buildRuntimeAdditionalDirectories(disableMemoryLayer: boolean): string[] {
+  if (disableMemoryLayer) return [];
+  return uniqueExistingDirectories([WORKSPACE_GLOBAL, WORKSPACE_MEMORY]);
+}
+
+function buildGlobalMemoryContext(disableMemoryLayer: boolean): string {
+  if (disableMemoryLayer) return '';
+  const claudeMdPath = globalClaudeMdPath();
+  try {
+    if (!fs.existsSync(claudeMdPath)) return '';
+    const raw = fs.readFileSync(claudeMdPath, 'utf-8').trim();
+    if (!raw) return '';
+    const content = raw.length > GLOBAL_MEMORY_CONTEXT_MAX_CHARS
+      ? `${raw.slice(0, GLOBAL_MEMORY_CONTEXT_MAX_CHARS)}\n\n[...全局记忆已截断]`
+      : raw;
+    return [
+      `<global-memory source="${claudeMdPath.replace(/"/g, '&quot;')}">`,
+      '以下内容来自 HappyClaw 用户级全局 CLAUDE.md，适用于当前工作区。',
+      '回答用户身份、偏好、长期背景或跨工作区上下文时应优先参考；除非用户要求，不要逐字复述本块内容。',
+      '',
+      content,
+      '</global-memory>',
+    ].join('\n');
+  } catch (err) {
+    log(`Failed to read global CLAUDE.md context: ${err instanceof Error ? err.message : String(err)}`);
+    return '';
+  }
+}
+
 function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean, disableMemoryLayer: boolean): string {
   // 禁用记忆层：完全跳过 HappyClaw 的记忆系统提示，让用户本机 ~/.claude/ Playbook 接管
   if (disableMemoryLayer) {
     return '';
   }
+  const globalMemoryFile = globalClaudeMdPath();
   if (isHome) {
     // Home container (admin or member): full memory system with read/write access to user's global CLAUDE.md
     return [
@@ -1010,7 +1005,7 @@ function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean, disableM
       '获知重要信息后**必须立即保存**，不要等到上下文压缩。',
       '根据信息的**时效性**选择存储位置：',
       '',
-      '#### 全局记忆（永久）→ 直接编辑 `/workspace/global/CLAUDE.md`',
+      `#### 全局记忆（永久）→ 直接编辑 \`${globalMemoryFile}\``,
       '',
       '**优先使用全局记忆。** 适用于所有**跨会话仍然有用**的信息：',
       '- 用户身份：姓名、生日、联系方式、地址、工作单位',
@@ -1035,7 +1030,7 @@ function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean, disableM
       '',
       '#### 判断标准',
       '> **默认优先全局记忆。** 问自己：这条信息下次对话还可能用到吗？',
-      '> - 是 / 可能 → **全局记忆**（编辑 `/workspace/global/CLAUDE.md`）',
+      `> - 是 / 可能 → **全局记忆**（编辑 \`${globalMemoryFile}\`）`,
       '> - 明确只跟今天有关 → 日期记忆（`memory_append`）',
       '> - 用户说「记住这个」→ **一定写全局记忆**',
       '',
@@ -1055,7 +1050,7 @@ function buildMemoryRecallPrompt(isHome: boolean, isAdminHome: boolean, disableM
     '重要信息直接记录在当前工作区的 CLAUDE.md 或其他文件中。',
     'Claude 会自动维护你的会话记忆，无需额外操作。',
     '',
-    '全局记忆（`/workspace/global/CLAUDE.md`）为只读参考。',
+    `全局记忆（\`${globalMemoryFile}\`）为只读参考。`,
   ].join('\n');
 }
 
@@ -1084,6 +1079,65 @@ function loadUserMcpServers(): Record<string, unknown> {
     }
   } catch { /* ignore parse errors */ }
   return {};
+}
+
+function parseSkillDescription(skillMd: string): string {
+  const frontmatterMatch = skillMd.match(/^---\n([\s\S]*?)\n---/);
+  if (frontmatterMatch) {
+    const desc = frontmatterMatch[1]
+      .split('\n')
+      .find((line) => /^description\s*:/.test(line.trim()));
+    if (desc) return desc.replace(/^description\s*:\s*/, '').trim();
+  }
+  const firstHeading = skillMd
+    .split('\n')
+    .map((line) => line.trim())
+    .find((line) => line && !line.startsWith('# '));
+  return firstHeading || '';
+}
+
+function buildCodexSkillContext(): string {
+  const configDir =
+    process.env.CLAUDE_CONFIG_DIR ||
+    path.join(process.env.HOME || '/home/node', '.claude');
+  const candidateRoots = [
+    path.join(WORKSPACE_GROUP, '.claude', 'skills'),
+    path.join(configDir, 'skills'),
+    path.join(process.env.HOME || '/home/node', '.claude', 'skills'),
+  ];
+  const seenRoots = new Set<string>();
+  const lines: string[] = [];
+
+  for (const root of candidateRoots) {
+    let realRoot = root;
+    try {
+      if (!fs.existsSync(root)) continue;
+      realRoot = fs.realpathSync(root);
+      if (seenRoots.has(realRoot)) continue;
+      seenRoots.add(realRoot);
+      for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+        if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+        const skillDir = path.join(root, entry.name);
+        const skillMd = path.join(skillDir, 'SKILL.md');
+        if (!fs.existsSync(skillMd)) continue;
+        const description = parseSkillDescription(
+          fs.readFileSync(skillMd, 'utf-8').slice(0, 4000),
+        );
+        lines.push(
+          `- ${entry.name}: ${skillMd}${description ? ` — ${description}` : ''}`,
+        );
+        if (lines.length >= 50) break;
+      }
+    } catch {
+      // Skill discovery is best-effort.
+    }
+    if (lines.length >= 50) break;
+  }
+
+  if (lines.length === 0) {
+    return '当前未发现可用 skill 目录。';
+  }
+  return ['可用 skill（按需读取对应 `SKILL.md`）：', ...lines].join('\n');
 }
 
 function pruneProcessedHistoryImagesInTranscript(sessionId: string | undefined): void {
@@ -1299,6 +1353,7 @@ async function runQuery(
       } catch { /* skip */ }
     }
   }
+  const globalMemoryContext = buildGlobalMemoryContext(disableMemoryLayer);
 
   const channel = getChannelFromJid(containerInput.chatJid);
   const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
@@ -1309,23 +1364,19 @@ async function runQuery(
     `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
     `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>`,
     `<security>\n${SECURITY_RULES}\n</security>`,
+    globalMemoryContext,
     memoryRecall && `<memory-system>\n${memoryRecall}\n</memory-system>`,
     heartbeatContent && `<recent-work>\n${heartbeatContent}\n</recent-work>`,
-    GUIDELINES_BLOCK,
+    buildGuidelinesBlock('claude'),
     channelGuidelines && `<channel-format>\n${channelGuidelines}\n</channel-format>`,
     containerInput.agentId && CONVERSATION_AGENT_BLOCK,
   ].filter(Boolean).join('\n');
 
-  // Home containers (admin & member) can access global and memory directories.
-  // Non-home containers only access memory directory; global CLAUDE.md is NOT
-  // injected into systemPrompt but remains accessible via filesystem (readonly mount).
+  // Both home and non-home runs need the user-level global memory directory as a
+  // read reference, and the date memory directory for memory_search/memory_get.
   // 禁用记忆层时 WORKSPACE_GLOBAL/MEMORY 环境变量未设置，fallback 到 /workspace/xxx
   // 容器路径在宿主机不存在，会让 SDK 报警告；此时直接给空数组。
-  const extraDirs = disableMemoryLayer
-    ? []
-    : isHome
-      ? [WORKSPACE_GLOBAL, WORKSPACE_MEMORY]
-      : [WORKSPACE_MEMORY];
+  const extraDirs = buildRuntimeAdditionalDirectories(disableMemoryLayer);
 
   if (shouldInterrupt()) {
     log('Interrupt sentinel detected before query start, skipping query');
@@ -1371,6 +1422,11 @@ async function runQuery(
   }
 
   try {
+    const permissionOptions = resolveClaudePermissionOptions({
+      privacyMode: !!containerInput.privacyMode,
+      allowedTools,
+      disallowedTools,
+    });
     const q = query({
     prompt: stream,
     options: {
@@ -1381,11 +1437,14 @@ async function runQuery(
       resume: sessionId,
       resumeSessionAt: resumeAt,
       systemPrompt: { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptAppend },
-      allowedTools,
-      ...(disallowedTools && { disallowedTools }),
+      allowedTools: permissionOptions.allowedTools,
+      ...(permissionOptions.disallowedTools && {
+        disallowedTools: permissionOptions.disallowedTools,
+      }),
       thinking: { type: 'adaptive' as const, display: 'summarized' as const },
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
+      permissionMode: permissionOptions.permissionMode,
+      allowDangerouslySkipPermissions:
+        permissionOptions.allowDangerouslySkipPermissions,
       agentProgressSummaries: true,
       settingSources: ['project', 'user'],
       includePartialMessages: true,
@@ -1861,10 +1920,197 @@ async function main(): Promise<void> {
     }
   }
 
-  // Privacy mode: restrict dangerous tools, skip conversation archiving
+  if (containerInput.runtime === 'codex') {
+    const channel = getChannelFromJid(containerInput.chatJid);
+    const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
+    const codexSkillContext = buildCodexSkillContext();
+    const globalMemoryContext = buildGlobalMemoryContext(disableMemoryLayer);
+    const additionalDirectories = buildRuntimeAdditionalDirectories(disableMemoryLayer);
+    const systemPromptAppend = [
+      `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
+      `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n${CODEX_SKILL_FILE_GUIDELINES}\n\n${codexSkillContext}\n</skill-routing>`,
+      `<security>\n${SECURITY_RULES}\n</security>`,
+      globalMemoryContext,
+      memoryRecallPrompt && `<memory-system>\n${memoryRecallPrompt}\n</memory-system>`,
+      buildCodexMemoryLifecyclePrompt({
+        isHome,
+        privacyMode: !!containerInput.privacyMode,
+        disableMemoryLayer,
+        globalMemoryFile: globalClaudeMdPath(),
+        workspaceClaudeMdPath: path.join(WORKSPACE_GROUP, 'CLAUDE.md'),
+      }),
+      buildGuidelinesBlock('codex'),
+      channelGuidelines && `<channel-format>\n${channelGuidelines}\n</channel-format>`,
+      containerInput.agentId && CONVERSATION_AGENT_BLOCK,
+      '',
+      '<runtime-note>',
+      '当前运行时是 Codex。HappyClaw 会把你的最终文本作为本轮回复发送给用户；请直接完成用户当前请求。',
+      '</runtime-note>',
+    ].filter(Boolean).join('\n');
+
+    const emit = (output: ContainerOutput): void => {
+      if (output.streamEvent) {
+        output = {
+          ...output,
+          streamEvent: {
+            ...output.streamEvent,
+            runtime: output.streamEvent.runtime || containerInput.runtime,
+            turnId: containerInput.turnId,
+            sessionId,
+          },
+          turnId: containerInput.turnId,
+          sessionId,
+        };
+      } else {
+        output = {
+          ...output,
+          turnId: containerInput.turnId,
+          sessionId,
+        };
+      }
+      writeOutput(output);
+    };
+
+    const codexAdapter =
+      process.env.HAPPYCLAW_CODEX_RUNNER === 'cli'
+        ? codexCliAdapter
+        : codexSdkAdapter;
+    const abortController = new AbortController();
+    let codexInterrupted = false;
+    let codexClosed = false;
+
+    const checkCodexControlSentinels = () => {
+      if (codexClosed || codexInterrupted) return;
+      if (shouldClose()) {
+        codexClosed = true;
+        log('Close sentinel detected during Codex run, aborting turn');
+        abortController.abort();
+        return;
+      }
+      if (shouldInterrupt()) {
+        codexInterrupted = true;
+        log('Interrupt sentinel detected during Codex run, aborting turn');
+        emit({
+          status: 'stream',
+          result: null,
+          streamEvent: { eventType: 'status', statusText: 'interrupted' },
+          newSessionId: sessionId,
+        });
+        abortController.abort();
+        return;
+      }
+      if (shouldDrain()) {
+        log('Drain sentinel detected during Codex run; one-turn runtime will exit after current turn');
+      }
+    };
+
+    const codexControlWatcher = createIpcWatcher(checkCodexControlSentinels);
+    checkCodexControlSentinels();
+    if (codexClosed) {
+      codexControlWatcher.close();
+      writeOutput({
+        status: 'closed',
+        result: null,
+        newSessionId: sessionId,
+        turnId: containerInput.turnId,
+        sessionId,
+      });
+      return;
+    }
+    if (codexInterrupted) {
+      codexControlWatcher.close();
+      writeOutput({
+        status: 'success',
+        result: null,
+        newSessionId: sessionId,
+        turnId: containerInput.turnId,
+        sessionId,
+        sourceKind: 'interrupt_partial',
+        finalizationReason: 'interrupted',
+      });
+      return;
+    }
+
+    const result = await codexAdapter.run(
+      {
+        input: containerInput,
+        prompt,
+        sessionId,
+        signal: abortController.signal,
+        cwd: WORKSPACE_GROUP,
+        systemPromptAppend,
+        additionalDirectories,
+        model: containerInput.modelOverride || containerInput.selectedModel,
+        images: promptImages,
+        resumeMode: containerInput.resumeMode,
+        inputContextHash: containerInput.inputContextHash,
+        workspaceInstructionHash: containerInput.workspaceInstructionHash,
+        softInjectionReason: containerInput.softInjectionReason,
+        resumeFailureFallbackPrompt:
+          containerInput.resumeFailureFallbackPrompt,
+        resumeFailureFallbackInputContextHash:
+          containerInput.resumeFailureFallbackInputContextHash,
+        resumeFailureFallbackWorkspaceInstructionHash:
+          containerInput.resumeFailureFallbackWorkspaceInstructionHash,
+        resumeFailureFallbackSoftInjectionReason:
+          containerInput.resumeFailureFallbackSoftInjectionReason,
+      },
+      emit,
+    ).finally(() => {
+      codexControlWatcher.close();
+    });
+
+    if (result.newSessionId) {
+      sessionId = result.newSessionId;
+      latestSessionId = sessionId;
+    }
+
+    if (codexClosed || result.status === 'closed') {
+      writeOutput({
+        status: codexInterrupted ? 'success' : 'closed',
+        result: null,
+        error: codexInterrupted ? undefined : result.error,
+        newSessionId: result.newSessionId || sessionId,
+        turnId: containerInput.turnId,
+        sessionId: result.newSessionId || sessionId,
+        sourceKind: codexInterrupted ? 'interrupt_partial' : undefined,
+        finalizationReason: codexInterrupted ? 'interrupted' : undefined,
+        runtimeContext: result.runtimeContext,
+      });
+      return;
+    }
+    if (codexInterrupted) {
+      writeOutput({
+        status: 'success',
+        result: null,
+        newSessionId: result.newSessionId || sessionId,
+        turnId: containerInput.turnId,
+        sessionId: result.newSessionId || sessionId,
+        sourceKind: 'interrupt_partial',
+        finalizationReason: 'interrupted',
+        runtimeContext: result.runtimeContext,
+      });
+      return;
+    }
+
+    writeOutput({
+      status: result.status === 'success' ? 'success' : 'error',
+      result: result.result,
+      error: result.error,
+      newSessionId: result.newSessionId,
+      turnId: containerInput.turnId,
+      sessionId: result.newSessionId || sessionId,
+      sourceKind: result.status === 'success' ? 'sdk_final' : 'legacy',
+      finalizationReason: result.status === 'success' ? 'completed' : 'error',
+      runtimeContext: result.runtimeContext,
+    });
+    return;
+  }
+
+  // Privacy mode skips conversation archiving. Runtime/tool permissions are
+  // translated centrally in resolveClaudePermissionOptions().
   if (privacyMode) {
-    currentPermissionMode = 'default';
-    log('Privacy mode enabled: dangerous tools require confirmation, conversations will not be archived');
+    log('Privacy mode enabled: conversations will not be archived');
   }
 
   // Query loop: run query -> wait for IPC message -> run new query -> repeat
@@ -2060,10 +2306,11 @@ async function main(): Promise<void> {
 
         const today = new Date().toISOString().split('T')[0];
         const claudeMdPath = path.join(WORKSPACE_GROUP, 'CLAUDE.md');
+        const globalMemoryFile = globalClaudeMdPath();
         const hasClaudeMd = fs.existsSync(claudeMdPath);
         const flushPrompt = [
           '上下文压缩前记忆刷新。',
-          '**优先检查全局记忆**：先 Read /workspace/global/CLAUDE.md，如果有「待记录」字段且你已获知对应信息（用户身份、偏好、常用项目等），用 Edit 工具立即填写。',
+          `**优先检查全局记忆**：先 Read ${globalMemoryFile}，如果有「待记录」字段且你已获知对应信息（用户身份、偏好、常用项目等），用 Edit 工具立即填写。`,
           '用户明确要求记住的内容，以及下次对话仍可能用到的信息，也写入全局记忆。',
           `然后使用 memory_append 将时效性记忆保存到 memory/${today}.md（今日进展、临时决策、待办等）。`,
           '如需确认上下文，可先用 memory_search/memory_get 查阅。',
