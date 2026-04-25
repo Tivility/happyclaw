@@ -709,15 +709,17 @@ function buildVolumeMounts(
         );
       }
     }
-  }
 
-  // Third-party provider: remove any stale .credentials.json so the SDK
-  // does not detect OAuth credentials from a previous official-provider run.
-  if (mergedConfig.anthropicBaseUrl) {
-    try {
-      const staleCreds = path.join(groupSessionsDir, '.credentials.json');
-      if (fs.existsSync(staleCreds)) fs.unlinkSync(staleCreds);
-    } catch { /* ignore */ }
+    // Third-party provider: remove any stale .credentials.json so the SDK
+    // does not detect OAuth credentials from a previous official-provider run.
+    if (mergedConfig.anthropicBaseUrl) {
+      try {
+        const staleCreds = path.join(groupSessionsDir, '.credentials.json');
+        if (fs.existsSync(staleCreds)) fs.unlinkSync(staleCreds);
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   // Mount agent-runner source from host — recompiled on container startup.
