@@ -15,6 +15,43 @@ export function formatModelLabel(model: string | null | undefined): string {
   return model && model.trim() ? model : 'default';
 }
 
+export function formatModelKindLabel(
+  kind: ModelSelectionKind | ProviderPoolModelOption['model_kind'],
+): string {
+  switch (kind) {
+    case 'provider_default':
+    case 'runtime_default':
+      return '默认';
+    case 'alias':
+      return '自动跟随';
+    case 'explicit_version':
+      return '固定版本';
+    case 'custom':
+      return '自定义';
+    default:
+      return String(kind);
+  }
+}
+
+export function formatModelStatusLabel(
+  status: ProviderPoolModelOption['status'],
+): string {
+  switch (status) {
+    case 'available':
+      return '可用';
+    case 'unverified':
+      return '未验证';
+    case 'unsupported':
+      return '不支持';
+    case 'stale':
+      return '待更新';
+    case 'hidden':
+      return '隐藏';
+    default:
+      return String(status);
+  }
+}
+
 export function commandParts(content: string): string[] {
   return content.trim().split(/\s+/).filter(Boolean);
 }
@@ -43,12 +80,37 @@ function shouldShowInDefaultModelList(option: ProviderPoolModelOption): boolean 
   return option.status !== 'hidden' && option.status !== 'unsupported';
 }
 
-function formatModelOptionLine(option: ProviderPoolModelOption): string {
-  const displayName =
-    option.display_name && option.display_name !== option.model_id
-      ? ` - ${option.display_name}`
-      : '';
-  return `  - ${option.model_id}${displayName} (${option.model_kind}, ${option.status})`;
+function buildModelUseCommand(
+  option: ProviderPoolModelOption,
+  options: ProviderPoolModelOption[],
+): string {
+  if (option.model_id === 'default') {
+    return `/model use ${option.provider_pool_id} default`;
+  }
+  const sameModelCount = options.filter(
+    (item) =>
+      item.model_id.toLowerCase() === option.model_id.toLowerCase() &&
+      item.status !== 'hidden' &&
+      item.status !== 'unsupported',
+  ).length;
+  if (sameModelCount > 1) {
+    return `/model use ${option.provider_pool_id} ${option.model_id}`;
+  }
+  return `/model use ${option.model_id}`;
+}
+
+function formatModelOptionLine(
+  option: ProviderPoolModelOption,
+  options: ProviderPoolModelOption[],
+): string {
+  const displayName = option.display_name || option.model_id;
+  const command = buildModelUseCommand(option, options);
+  const details = [
+    displayName,
+    formatModelKindLabel(option.model_kind),
+    formatModelStatusLabel(option.status),
+  ].join(' · ');
+  return `  ${command}\n    ${details}`;
 }
 
 export function parseModelBindingFromArgs(
@@ -159,7 +221,11 @@ export function parseModelBindingFromArgs(
 export function formatModelList(includeAll = false): string {
   const pools = getProviderPools();
   const options = listProviderPoolModelOptions(undefined, includeAll);
-  const lines = [includeAll ? '模型目录（含隐藏/不可用）：' : '可用模型：'];
+  const lines = [
+    includeAll
+      ? '模型目录（含隐藏/不可用）：'
+      : '可用模型（直接复制下面的切换命令）：',
+  ];
   for (const pool of pools) {
     const poolOptions = options.filter(
       (item) => item.provider_pool_id === pool.provider_pool_id,
@@ -171,10 +237,10 @@ export function formatModelList(includeAll = false): string {
     }
     for (const option of poolOptions) {
       if (!includeAll && !shouldShowInDefaultModelList(option)) continue;
-      lines.push(formatModelOptionLine(option));
+      lines.push(formatModelOptionLine(option, options));
     }
   }
-  lines.push('\n切换用法：/model use <claude|gpt> [model]');
+  lines.push('\n说明：唯一模型可直接用短命令；default 或重名模型会自动带上模型池。展示名只用于阅读。');
   lines.push('查看完整目录：/model list --all');
   return lines.join('\n');
 }
@@ -188,7 +254,7 @@ export function formatRuntimeState(
     `当前模型：${formatModelLabel(state.selected_model)}`,
     `模型池：${pool?.display_name || state.provider_pool_id} (${state.provider_pool_id})`,
     `运行时：${state.runtime}`,
-    `选择类型：${state.model_kind}`,
+    `模型模式：${formatModelKindLabel(state.model_kind)}`,
     `作用域：${scopeName}`,
     `来源：${state.binding_source}`,
   ].join('\n');

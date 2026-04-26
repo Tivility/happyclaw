@@ -206,10 +206,15 @@ describe('model command parsing', () => {
   it('lists Claude and GPT pool options together', () => {
     const output = formatModelList();
 
+    expect(output).toContain('可用模型（直接复制下面的切换命令）');
     expect(output).toContain('Claude (claude)');
-    expect(output).toContain('opus - Opus (alias, available)');
+    expect(output).toContain('/model use opus');
+    expect(output).toContain('Opus · 自动跟随 · 可用');
+    expect(output).toContain('/model use claude fast');
+    expect(output).toContain('/model use gpt fast');
     expect(output).toContain('GPT (gpt)');
-    expect(output).toContain('gpt-5.5 - GPT-5.5 (explicit_version, available)');
+    expect(output).toContain('/model use gpt-5.5');
+    expect(output).toContain('GPT-5.5 · 固定版本 · 可用');
     expect(output).not.toContain('Claude Retired');
     expect(output).not.toContain('GPT Legacy Hidden');
   });
@@ -218,11 +223,9 @@ describe('model command parsing', () => {
     const output = formatModelList(true);
 
     expect(output).toContain('模型目录（含隐藏/不可用）');
-    expect(output).toContain(
-      'gpt-legacy-hidden - GPT Legacy Hidden (explicit_version, hidden)',
-    );
-    expect(output).toContain(
-      'claude-retired - Claude Retired (explicit_version, unsupported)',
-    );
+    expect(output).toContain('/model use gpt-legacy-hidden');
+    expect(output).toContain('GPT Legacy Hidden · 固定版本 · 隐藏');
+    expect(output).toContain('/model use claude-retired');
+    expect(output).toContain('Claude Retired · 固定版本 · 不支持');
   });
 });

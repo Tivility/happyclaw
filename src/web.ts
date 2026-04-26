@@ -109,6 +109,7 @@ import {
 import {
   commandParts,
   formatModelLabel,
+  formatModelKindLabel,
   formatModelList,
   parseModelBindingFromArgs,
   shouldIncludeAllModelOptions,
@@ -230,7 +231,7 @@ function handleWebModelCommand(input: {
       `当前模型：${formatModelLabel(currentState.selected_model)}`,
       `模型池：${pool?.display_name || currentState.provider_pool_id} (${currentState.provider_pool_id})`,
       `运行时：${currentState.runtime}`,
-      `选择类型：${currentState.model_kind}`,
+      `模型模式：${formatModelKindLabel(currentState.model_kind)}`,
       `作用域：${input.agentId ? `conversation agent ${input.agentId}` : 'workspace main'}`,
       `来源：${currentState.binding_source}`,
     ].join('\n');
