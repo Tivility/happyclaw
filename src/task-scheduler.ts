@@ -47,6 +47,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
+import { resolveTaskSourceImJid } from './task-routing.js';
 import { removeFlowArtifacts } from './file-manager.js';
 import { hasScriptCapacity, runScript } from './script-runner.js';
 import type { StreamEvent } from './stream-event.types.js';
@@ -77,6 +78,26 @@ function resolveTargetGroupJid(
   const preferred =
     sameFolder.find(([jid]) => jid.startsWith('web:')) || sameFolder[0];
   return preferred?.[0] || '';
+}
+
+function getJidChannelType(jid: string): string | null {
+  const prefix = jid.split(':', 1)[0];
+  if (!prefix || prefix === 'web') return null;
+  return prefix;
+}
+
+function resolveRegisteredJidFolder(
+  jid: string,
+  groups: Record<string, RegisteredGroup>,
+): string | null {
+  const group = groups[jid];
+  if (group) return group.folder;
+  if (!jid.startsWith('web:')) return null;
+
+  const legacyFolder = jid.slice(4);
+  return Object.values(groups).some((g) => g.folder === legacyFolder)
+    ? legacyFolder
+    : null;
 }
 
 function resolveTaskExecutionMode(
@@ -192,7 +213,7 @@ export interface SchedulerDependencies {
   broadcastStreamEvent?: (chatJid: string, event: StreamEvent) => void;
   onWorkspaceCreated?: (jid: string, folder: string, name: string, userId?: string) => void;
   /** Store task prompt as a user-visible message in the workspace chat */
-  storePromptMessage?: (chatJid: string, senderId: string, senderName: string, text: string, taskId?: string) => void;
+  storePromptMessage?: (chatJid: string, senderId: string, senderName: string, text: string, taskId?: string, sourceJid?: string) => void;
   /** Store task result in workspace chat and push to owner's IM channels */
   storeResultAndNotify?: (
     chatJid: string,
@@ -879,6 +900,20 @@ async function runGroupModeTask(
     // Resolve task owner for sender attribution
     const owner = task.created_by ? getUserById(task.created_by) : null;
     const senderName = owner?.display_name || owner?.username || '定时任务';
+    const groups = deps.registeredGroups();
+    const sourceJid = resolveTaskSourceImJid(
+      {
+        taskChatJid: task.chat_jid,
+        taskGroupFolder: task.group_folder,
+        targetGroupJid,
+        notifyChannels: task.notify_channels,
+      },
+      {
+        groups,
+        getChannelType: getJidChannelType,
+        resolveJidFolder: (jid) => resolveRegisteredJidFolder(jid, groups),
+      },
+    );
 
     if (!deps.storePromptMessage) {
       throw new Error('storePromptMessage dependency not available');
@@ -891,13 +926,14 @@ async function runGroupModeTask(
       senderName,
       task.prompt,
       task.id,
+      sourceJid,
     );
 
     // Trigger normal message processing for the source workspace
     deps.queue.enqueueMessageCheck(targetGroupJid);
 
     logger.info(
-      { taskId: task.id, targetGroupJid, contextMode: 'group' },
+      { taskId: task.id, targetGroupJid, sourceJid, contextMode: 'group' },
       'Group-mode task injected into source workspace',
     );
 

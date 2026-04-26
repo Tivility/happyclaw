@@ -2,6 +2,7 @@ import { describe, expect, test, vi } from 'vitest';
 
 import {
   resolveBroadcastFolder,
+  resolveTaskSourceImJid,
   resolveTaskRoutingDecision,
   type IpcMessageInputs,
   type ResolveTaskRoutingDeps,
@@ -214,5 +215,123 @@ describe('resolveBroadcastFolder', () => {
     // For admin on home workspace, both candidates are the same folder.
     // Behaviorally correct either way, but we still commit to sourceFolder.
     expect(resolveBroadcastFolder('main', 'main')).toBe('main');
+  });
+});
+
+describe('resolveTaskSourceImJid — group-mode scheduled task source routing', () => {
+  const getChannelType = (jid: string) =>
+    jid.startsWith('web:') ? null : jid.split(':', 1)[0] || null;
+
+  test('keeps the original IM chat as source_jid when it is bound to the target workspace', () => {
+    const groups = {
+      'web:ws-1': { folder: 'flow-1' },
+      'feishu:F1': { folder: 'main', target_main_jid: 'web:ws-1' },
+    };
+
+    const sourceJid = resolveTaskSourceImJid(
+      {
+        taskChatJid: 'feishu:F1',
+        taskGroupFolder: 'flow-1',
+        targetGroupJid: 'web:ws-1',
+      },
+      {
+        groups,
+        getChannelType,
+        resolveJidFolder: (jid) => groups[jid as keyof typeof groups]?.folder ?? null,
+      },
+    );
+
+    expect(sourceJid).toBe('feishu:F1');
+  });
+
+  test('can recover the bound IM source when the task chat_jid is already the web workspace', () => {
+    const groups = {
+      'web:ws-1': { folder: 'flow-1' },
+      'feishu:F1': { folder: 'main', target_main_jid: 'web:ws-1' },
+    };
+
+    const sourceJid = resolveTaskSourceImJid(
+      {
+        taskChatJid: 'web:ws-1',
+        taskGroupFolder: 'flow-1',
+        targetGroupJid: 'web:ws-1',
+      },
+      {
+        groups,
+        getChannelType,
+        resolveJidFolder: (jid) => groups[jid as keyof typeof groups]?.folder ?? null,
+      },
+    );
+
+    expect(sourceJid).toBe('feishu:F1');
+  });
+
+  test('respects notify_channels when recovering a bound IM source from a web task target', () => {
+    const groups = {
+      'web:ws-1': { folder: 'flow-1' },
+      'feishu:F1': { folder: 'main', target_main_jid: 'web:ws-1' },
+      'telegram:T1': { folder: 'flow-1' },
+    };
+
+    const sourceJid = resolveTaskSourceImJid(
+      {
+        taskChatJid: 'web:ws-1',
+        taskGroupFolder: 'flow-1',
+        targetGroupJid: 'web:ws-1',
+        notifyChannels: ['telegram'],
+      },
+      {
+        groups,
+        getChannelType,
+        resolveJidFolder: (jid) => groups[jid as keyof typeof groups]?.folder ?? null,
+      },
+    );
+
+    expect(sourceJid).toBe('telegram:T1');
+  });
+
+  test('keeps the configured IM task target even when notify_channels names another channel', () => {
+    const groups = {
+      'web:ws-1': { folder: 'flow-1' },
+      'feishu:F1': { folder: 'main', target_main_jid: 'web:ws-1' },
+      'telegram:T1': { folder: 'flow-1' },
+    };
+
+    const sourceJid = resolveTaskSourceImJid(
+      {
+        taskChatJid: 'feishu:F1',
+        taskGroupFolder: 'flow-1',
+        targetGroupJid: 'web:ws-1',
+        notifyChannels: ['telegram'],
+      },
+      {
+        groups,
+        getChannelType,
+        resolveJidFolder: (jid) => groups[jid as keyof typeof groups]?.folder ?? null,
+      },
+    );
+
+    expect(sourceJid).toBe('feishu:F1');
+  });
+
+  test('returns undefined for web-only workspaces', () => {
+    const groups = {
+      'web:ws-1': { folder: 'flow-1' },
+    };
+
+    const sourceJid = resolveTaskSourceImJid(
+      {
+        taskChatJid: 'web:ws-1',
+        taskGroupFolder: 'flow-1',
+        targetGroupJid: 'web:ws-1',
+      },
+      {
+        groups,
+        getChannelType,
+        resolveJidFolder: (jid) => groups[jid as keyof typeof groups]?.folder ?? null,
+      },
+    );
+
+    expect(sourceJid).toBeUndefined();
   });
 });

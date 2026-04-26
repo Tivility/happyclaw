@@ -162,6 +162,78 @@ export interface BroadcastToOwnerIMChannelsDeps {
   resolveJidFolder: (jid: string) => string | null;
 }
 
+export interface ResolveTaskSourceImJidDeps {
+  groups: Record<
+    string,
+    {
+      folder: string;
+      target_main_jid?: string | null;
+    }
+  >;
+  getChannelType: (jid: string) => string | null;
+  resolveJidFolder: (jid: string) => string | null;
+}
+
+export interface ResolveTaskSourceImJidInput {
+  taskChatJid: string;
+  taskGroupFolder: string;
+  targetGroupJid: string;
+  notifyChannels?: string[] | null;
+}
+
+/**
+ * Resolve the IM source for a group-mode scheduled task prompt.
+ *
+ * Group-mode tasks are injected into the bound web workspace so the message is
+ * visible in Web, but they must keep the original IM source_jid when the task
+ * was created from / bound to an IM group. processAgentConversation uses
+ * source_jid to create the Feishu/DingTalk/etc. streaming card and to route
+ * send_message tool calls back to the same IM conversation.
+ */
+export function resolveTaskSourceImJid(
+  input: ResolveTaskSourceImJidInput,
+  deps: ResolveTaskSourceImJidDeps,
+): string | undefined {
+  const targetFolder =
+    deps.groups[input.targetGroupJid]?.folder || input.taskGroupFolder;
+  const candidates = [
+    input.taskChatJid,
+    ...Object.keys(deps.groups).filter((jid) => jid !== input.taskChatJid),
+  ];
+  const seen = new Set<string>();
+
+  for (const jid of candidates) {
+    if (seen.has(jid)) continue;
+    seen.add(jid);
+
+    const channelType = deps.getChannelType(jid);
+    if (!channelType) continue;
+    const isConfiguredTaskTarget = jid === input.taskChatJid;
+    if (
+      !isConfiguredTaskTarget &&
+      input.notifyChannels &&
+      !input.notifyChannels.includes(channelType)
+    ) {
+      continue;
+    }
+
+    const group = deps.groups[jid];
+    if (!group) continue;
+    const effectiveFolder = resolveImGroupEffectiveFolder(
+      group,
+      deps.resolveJidFolder,
+    );
+    if (
+      effectiveFolder === input.taskGroupFolder ||
+      effectiveFolder === targetFolder
+    ) {
+      return jid;
+    }
+  }
+
+  return undefined;
+}
+
 /**
  * Compute the workspace folder an IM group should be considered to "belong"
  * to when the scheduled-task broadcaster is looking for recipients.

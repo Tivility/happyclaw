@@ -9292,7 +9292,14 @@ async function main(): Promise<void> {
     sendMessage,
     broadcastStreamEvent,
     onWorkspaceCreated: broadcastGroupCreated,
-    storePromptMessage: (chatJid, senderId, senderName, text, taskId) => {
+    storePromptMessage: (
+      chatJid,
+      senderId,
+      senderName,
+      text,
+      taskId,
+      sourceJid,
+    ) => {
       const msgId = crypto.randomUUID();
       const now = new Date().toISOString();
       ensureChatExists(chatJid);
@@ -9305,12 +9312,14 @@ async function main(): Promise<void> {
         now,
         false,
         {
+          sourceJid,
           meta: { sourceKind: 'scheduled_task_prompt', taskId },
         },
       );
       broadcastNewMessage(chatJid, {
         id: msgId,
         chat_jid: chatJid,
+        source_jid: sourceJid ?? chatJid,
         sender: senderId,
         sender_name: senderName,
         content: text,
