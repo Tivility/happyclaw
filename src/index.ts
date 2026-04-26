@@ -231,6 +231,42 @@ const OOM_EXIT_RE = /code 137/;
 
 type RuntimeUsage = NonNullable<StreamEvent['usage']>;
 
+function usageModelNameFromResolution(
+  resolution: RuntimeResolution | null,
+): string | null {
+  if (!resolution) return null;
+  return (
+    resolution.modelOverride ||
+    resolution.binding.resolved_model ||
+    resolution.binding.selected_model ||
+    resolution.modelKey ||
+    null
+  );
+}
+
+function enrichUsageWithRuntimeModel(
+  usage: RuntimeUsage,
+  resolution: RuntimeResolution | null,
+): RuntimeUsage {
+  if (usage.modelUsage && Object.keys(usage.modelUsage).length > 0) {
+    return usage;
+  }
+  const modelName = usageModelNameFromResolution(resolution);
+  if (!modelName) return usage;
+  return {
+    ...usage,
+    modelUsage: {
+      [modelName]: {
+        inputTokens: usage.inputTokens,
+        outputTokens: usage.outputTokens,
+        cacheReadInputTokens: usage.cacheReadInputTokens,
+        cacheCreationInputTokens: usage.cacheCreationInputTokens,
+        costUSD: usage.costUSD ?? 0,
+      },
+    },
+  };
+}
+
 /**
  * Feed a stream event into a Feishu streaming card controller.
  * Centralizes the event → card mapping for both main and sub-agent handlers.
@@ -3030,12 +3066,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const persistUsageForReply = async (
     usage: RuntimeUsage,
     messageId: string,
-  ): Promise<void> => {
+  ): Promise<RuntimeUsage> => {
+    const normalizedUsage = enrichUsageWithRuntimeModel(
+      usage,
+      activeRuntimeResolution,
+    );
     updateLatestMessageTokenUsage(
       chatJid,
-      JSON.stringify(usage),
+      JSON.stringify(normalizedUsage),
       messageId,
-      usage.costUSD,
+      normalizedUsage.costUSD,
     );
 
     writeUsageRecords({
@@ -3043,29 +3083,34 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       groupFolder: effectiveGroup.folder,
       messageId,
       runtimeResolution: activeRuntimeResolution,
-      usage,
+      usage: normalizedUsage,
     });
 
     logger.debug(
       {
         chatJid,
         msgId: messageId,
-        costUSD: usage.costUSD,
-        inputTokens: usage.inputTokens,
+        costUSD: normalizedUsage.costUSD,
+        inputTokens: normalizedUsage.inputTokens,
       },
       'Token usage persisted',
     );
 
     const ownerGroup = registeredGroups[chatJid];
-    if (ownerGroup?.created_by && usage.costUSD) {
+    if (ownerGroup?.created_by && normalizedUsage.costUSD) {
       try {
         const effective = updateUsage(
           ownerGroup.created_by,
-          usage.costUSD,
-          usage.inputTokens || 0,
-          usage.outputTokens || 0,
+          normalizedUsage.costUSD,
+          normalizedUsage.inputTokens || 0,
+          normalizedUsage.outputTokens || 0,
         );
-        deductUsageCost(ownerGroup.created_by, usage.costUSD, messageId, effective);
+        deductUsageCost(
+          ownerGroup.created_by,
+          normalizedUsage.costUSD,
+          messageId,
+          effective,
+        );
         const owner = getUserById(ownerGroup.created_by);
         if (owner && owner.role !== 'admin') {
           const freshAccess = checkBillingAccessFresh(
@@ -3082,6 +3127,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         logger.warn({ err: billingErr, chatJid }, 'Failed to update billing usage');
       }
     }
+    return normalizedUsage;
   };
 
   const flushPendingUsageForReply = async (
@@ -3091,8 +3137,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     const usage = pendingUsage;
     pendingUsage = null;
     try {
-      await persistUsageForReply(usage, messageId);
-      await patchCompletedStreamingSessionUsage(usage);
+      const normalizedUsage = await persistUsageForReply(usage, messageId);
+      await patchCompletedStreamingSessionUsage(normalizedUsage);
     } catch (err) {
       logger.warn({ err, chatJid }, 'Failed to persist deferred token usage');
     }
@@ -3547,8 +3593,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 );
               } else {
                 try {
-                  await persistUsageForReply(se.usage, lastReplyMsgId);
-                  await patchCompletedStreamingSessionUsage(se.usage);
+                  const normalizedUsage = await persistUsageForReply(
+                    se.usage,
+                    lastReplyMsgId,
+                  );
+                  await patchCompletedStreamingSessionUsage(normalizedUsage);
                 } catch (err) {
                   logger.warn(
                     { err, chatJid },
@@ -6229,12 +6278,16 @@ async function processAgentConversation(
   const persistAgentUsageForReply = async (
     usage: RuntimeUsage,
     messageId: string,
-  ): Promise<void> => {
+  ): Promise<RuntimeUsage> => {
+    const normalizedUsage = enrichUsageWithRuntimeModel(
+      usage,
+      activeAgentRuntimeResolution,
+    );
     updateLatestMessageTokenUsage(
       virtualChatJid,
-      JSON.stringify(usage),
+      JSON.stringify(normalizedUsage),
       messageId,
-      usage.costUSD,
+      normalizedUsage.costUSD,
     );
 
     writeUsageRecords({
@@ -6246,8 +6299,9 @@ async function processAgentConversation(
       agentId,
       messageId,
       runtimeResolution: activeAgentRuntimeResolution,
-      usage,
+      usage: normalizedUsage,
     });
+    return normalizedUsage;
   };
 
   const flushPendingAgentUsageForReply = async (
@@ -6257,8 +6311,8 @@ async function processAgentConversation(
     const usage = pendingAgentUsage;
     pendingAgentUsage = null;
     try {
-      await persistAgentUsageForReply(usage, messageId);
-      await patchCompletedAgentStreamingSessionUsage(usage);
+      const normalizedUsage = await persistAgentUsageForReply(usage, messageId);
+      await patchCompletedAgentStreamingSessionUsage(normalizedUsage);
     } catch (err) {
       logger.warn(
         { err, chatJid, agentId },
@@ -6480,13 +6534,11 @@ async function processAgentConversation(
           );
         } else {
           try {
-            await persistAgentUsageForReply(
+            const normalizedUsage = await persistAgentUsageForReply(
               output.streamEvent.usage,
               lastAgentReplyMsgId,
             );
-            await patchCompletedAgentStreamingSessionUsage(
-              output.streamEvent.usage,
-            );
+            await patchCompletedAgentStreamingSessionUsage(normalizedUsage);
           } catch (err) {
             logger.warn(
               { err, chatJid, agentId },

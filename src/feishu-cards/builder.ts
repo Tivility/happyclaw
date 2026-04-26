@@ -26,6 +26,7 @@ import {
   buildCodexOperationsPanel,
   buildStreamingPanels,
   buildStatusBannerText,
+  buildLocalDatetimeWithSeconds,
   extractTitle,
   stripTitleFromBody,
   CARD_ELEMENT_IDS,
@@ -138,8 +139,8 @@ export interface StreamingCardBuildOptions {
   /** Initial content for structured runtime panels. */
   panels?: StreamingPanelsInit;
   /**
-   * If true, use the "rich" structured skeleton (STATUS_BANNER + 4 collapsible
-   * panels). If false, use the legacy flat skeleton (AUX_BEFORE/AUX_AFTER).
+   * If true, use the "rich" structured skeleton (runtime panels + footer
+   * status). If false, use the legacy flat skeleton (AUX_BEFORE/AUX_AFTER).
    * Default: true.
    */
   rich?: boolean;
@@ -150,13 +151,14 @@ export function buildStreamingAgentCard(
 ): FeishuCardV2 {
   const initialText = opts.initialText ?? '';
   const { title: autoTitle } = extractTitle(initialText);
-  const displayTitle = opts.title ?? autoTitle ?? '...';
+  const baseTitle = opts.title ?? autoTitle ?? 'Agent 回复';
+  const displayTitle = `${baseTitle} · 生成中`;
   const useRich = opts.rich !== false;
 
   const header = buildHeader({
     text: initialText,
     status: 'running',
-    title: opts.title,
+    title: displayTitle,
     titlePrefix: opts.titlePrefix,
     subtitle: opts.subtitle,
     meta: opts.meta ? { model: opts.meta.model } : undefined,
@@ -179,7 +181,7 @@ export function buildStreamingAgentCard(
     content: `<font color='grey'>${buildStatusBannerText({
       phase: 'streaming',
       runtimeProfile: opts.runtimeProfile,
-    })}</font>`,
+    }).replace(/<[^>]+>/g, '').trim()} · 更新 ${buildLocalDatetimeWithSeconds(Date.now())}</font>`,
     element_id: CARD_ELEMENT_IDS.FOOTER_NOTE,
     text_size: 'notation',
   };
@@ -231,8 +233,8 @@ export function buildStreamingAgentCard(
 
   // Default panel expansion for the streaming skeleton:
   //   thinking → expanded so the user can watch reasoning stream in as it arrives
-  //   tools / progress → folded to keep the card compact; STATUS_BANNER still
-  //                       surfaces the active tool / todo count at the top.
+  //   tools / progress → folded to keep the card compact; live status is kept
+  //                       in FOOTER_NOTE to avoid duplicating it at the top.
   const panelsInit: StreamingPanelsInit = {
     runtimeProfile: opts.runtimeProfile,
     expandThinking: true,

@@ -33,6 +33,7 @@ import {
   buildAskQuestionText,
   collectAskQuestions,
   buildTimelineText,
+  buildLocalDatetimeWithSeconds,
   type StreamingCardRuntimeProfile,
   type StreamingPhase,
   type TodoItemView,
@@ -62,6 +63,23 @@ export interface StreamingCardOptions {
   onCardCreated?: (messageId: string) => void;
   /** Runtime profile for card wording. Defaults to Claude-compatible. */
   runtimeProfile?: StreamingCardRuntimeProfile;
+}
+
+interface UsageNoteData {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  costUSD: number;
+  durationMs: number;
+  numTurns: number;
+  modelUsage?: Record<string, {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadInputTokens: number;
+    cacheCreationInputTokens: number;
+    costUSD: number;
+  }>;
 }
 
 // ─── Code-Block-Safe Splitting ───────────────────────────────
@@ -313,6 +331,11 @@ const MAX_TODO_DISPLAY = 10;
 const MAX_TOOL_SUMMARY_CHARS = 60;
 const MAX_ELEMENT_CHARS = 4000;
 const MAX_COMPLETED_TOOL_AGE = 30000; // 30s — purge completed tools after this
+// Card liveness is SDK-agnostic: every controller method below records generic
+// card activity (text/status/tool/todo/log), then the card refreshes only its
+// status slots so long-running work does not look stuck.
+const LIVENESS_HEARTBEAT_INTERVAL_MS = 15000;
+const LIVENESS_STALE_MS = 120000;
 
 export interface AuxiliaryState {
   thinkingText: string;
@@ -501,7 +524,7 @@ function buildStreamingCard(
   // Streaming state — flat v2 layout for cheap full-card patches.
   const optimized = optimizeMarkdownStyle(text || '...', 2);
   const { title } = extractTitleAndBody(optimized);
-  const displayTitle = title || '...';
+  const displayTitle = titleWithStreamingStatus(title || 'Agent 回复');
   const elements: Array<Record<string, unknown>> = [
     {
       tag: 'markdown',
@@ -556,6 +579,10 @@ const SCHEMA2_HEADER_MAP: Record<Schema2State, string> = {
   frozen: 'grey',
 };
 
+function titleWithStreamingStatus(title: string): string {
+  return `${title} · 生成中`;
+}
+
 function buildSchema2Card(
   text: string,
   state: Schema2State,
@@ -569,7 +596,11 @@ function buildSchema2Card(
     splitCodeBlockSafe,
     overrideTitle,
   );
-  const displayTitle = titlePrefix ? `${titlePrefix}${title}` : title;
+  const baseDisplayTitle = titlePrefix ? `${titlePrefix}${title}` : title;
+  const displayTitle =
+    state === 'streaming'
+      ? titleWithStreamingStatus(baseDisplayTitle)
+      : baseDisplayTitle;
 
   // Build final elements array with auxiliary sections
   const elements: Array<Record<string, unknown>> = [];
@@ -619,15 +650,7 @@ function buildSchema2Card(
 
 // ─── Usage Note Formatter ─────────────────────────────────────
 
-function formatUsageNote(usage: {
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadInputTokens: number;
-  cacheCreationInputTokens: number;
-  costUSD: number;
-  durationMs: number;
-  numTurns: number;
-}): string {
+function formatUsageNote(usage: UsageNoteData): string {
   const fmt = (n: number) =>
     n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
   const parts: string[] = [];
@@ -649,13 +672,13 @@ function buildStreamingModeCard(
   initialText: string,
   runtimeProfile: StreamingCardRuntimeProfile,
 ): object {
-  // Delegate to the shared rich skeleton: STATUS_BANNER + PROGRESS / TOOLS /
-  // THINKING collapsible_panels + MAIN_CONTENT (typewriter) + INTERRUPT button
-  // + FOOTER_NOTE. Each panel wraps a markdown element with its own element_id
-  // so the controller can patch slots independently.
+  // Delegate to the shared rich skeleton: runtime collapsible panels +
+  // MAIN_CONTENT (typewriter) + INTERRUPT button + FOOTER_NOTE. Each panel
+  // wraps a markdown element with its own element_id so the controller can
+  // patch slots independently.
   return buildStreamingAgentCard({
     initialText,
-    rich: runtimeProfile !== 'codex',
+    rich: true,
     runtimeProfile,
   });
 }
@@ -1345,6 +1368,9 @@ export class StreamingCardController {
   private stateVersion = 0;
   private firstTextFlushLogged = false;
   private firstAuxFlushLogged = false;
+  private usageNote: UsageNoteData | null = null;
+  private livenessTimer: ReturnType<typeof setInterval> | null = null;
+  private lastCardActivityAt = 0;
 
   /**
    * Final-only thinking text (accumulated via appendThinking, NEVER cleared
@@ -1418,36 +1444,73 @@ export class StreamingCardController {
     return this.messageId ? [this.messageId] : [];
   }
 
+  private ensureCardCreating(reason: string): void {
+    if (this.state !== 'idle') return;
+    this.state = 'creating';
+    this.createInitialCard().catch((err) => {
+      logger.warn(
+        { err, chatId: this.chatId, reason },
+        'Streaming card: initial create failed, will use fallback',
+      );
+      this.state = 'error';
+      this.stopLivenessHeartbeat();
+      this.onFallback?.();
+    });
+  }
+
+  private recordCardActivity(): void {
+    this.lastCardActivityAt = Date.now();
+  }
+
+  private startLivenessHeartbeat(): void {
+    if (this.livenessTimer) return;
+    if (!this.lastCardActivityAt) this.recordCardActivity();
+    this.livenessTimer = setInterval(() => {
+      if (!this.isActive()) {
+        this.stopLivenessHeartbeat();
+        return;
+      }
+      if (this.state !== 'streaming') return;
+
+      if (this.backendMode === 'streaming') {
+        this.scheduleAuxFlush();
+      } else {
+        this.stateVersion++;
+        this.schedulePatch();
+      }
+    }, LIVENESS_HEARTBEAT_INTERVAL_MS);
+    (this.livenessTimer as { unref?: () => void }).unref?.();
+  }
+
+  private stopLivenessHeartbeat(): void {
+    if (!this.livenessTimer) return;
+    clearInterval(this.livenessTimer);
+    this.livenessTimer = null;
+  }
+
   /**
    * Signal that the agent is in thinking state (before text arrives).
    */
   setThinking(): void {
+    this.recordCardActivity();
     this.thinking = true;
-    if (this.state === 'idle') {
-      // Create card immediately with thinking placeholder
-      this.state = 'creating';
-      this.createInitialCard().catch((err) => {
-        logger.warn(
-          { err, chatId: this.chatId },
-          'Streaming card: initial create failed (thinking), will use fallback',
-        );
-        this.state = 'error';
-        this.onFallback?.();
-      });
-    }
+    this.ensureCardCreating('thinking');
   }
 
   /**
    * Signal that a tool has started executing.
    */
   startTool(toolId: string, toolName: string): void {
+    this.recordCardActivity();
     this.toolCalls.set(toolId, {
       name: toolName,
       status: 'running',
       startTime: Date.now(),
     });
     this.stateVersion++;
-    if (this.state === 'streaming') {
+    if (this.state === 'idle') {
+      this.ensureCardCreating('tool_start');
+    } else if (this.state === 'streaming') {
       this.backendMode === 'streaming'
         ? this.scheduleAuxFlush()
         : this.schedulePatch();
@@ -1465,6 +1528,7 @@ export class StreamingCardController {
     if (meta.skillName !== undefined) tc.skillName = meta.skillName;
     if (meta.isNested !== undefined) tc.isNested = meta.isNested;
     if (meta.toolInput !== undefined) tc.toolInput = meta.toolInput;
+    this.recordCardActivity();
     this.stateVersion++;
     if (this.state === 'streaming') {
       this.backendMode === 'streaming'
@@ -1479,6 +1543,7 @@ export class StreamingCardController {
   endTool(toolId: string, isError: boolean): void {
     const tc = this.toolCalls.get(toolId);
     if (tc) {
+      this.recordCardActivity();
       tc.status = isError ? 'error' : 'complete';
       this.stateVersion++;
       this.purgeOldTools();
@@ -1506,6 +1571,7 @@ export class StreamingCardController {
    * Append thinking text (accumulated, tail-truncated at MAX_THINKING_CHARS).
    */
   appendThinking(text: string): void {
+    this.recordCardActivity();
     this.thinkingText += text;
     if (this.thinkingText.length > MAX_THINKING_CHARS) {
       this.thinkingText =
@@ -1517,15 +1583,7 @@ export class StreamingCardController {
     this.thinking = true;
     this.stateVersion++;
     if (this.state === 'idle') {
-      this.state = 'creating';
-      this.createInitialCard().catch((err) => {
-        logger.warn(
-          { err, chatId: this.chatId },
-          'Streaming card: initial create failed (thinking), will use fallback',
-        );
-        this.state = 'error';
-        this.onFallback?.();
-      });
+      this.ensureCardCreating('thinking_delta');
     } else if (this.state === 'streaming') {
       this.backendMode === 'streaming'
         ? this.scheduleAuxFlush()
@@ -1544,6 +1602,7 @@ export class StreamingCardController {
   addPriorTextSegment(text: string): void {
     const trimmed = text.trim();
     if (!trimmed) return;
+    this.recordCardActivity();
     this.priorTextSegments.push(trimmed);
   }
 
@@ -1559,6 +1618,7 @@ export class StreamingCardController {
     summary: string;
     text: string;
   }): void {
+    this.recordCardActivity();
     const existing = this.subAgentResults.findIndex(
       (r) => r.toolUseId === result.toolUseId,
     );
@@ -1581,15 +1641,19 @@ export class StreamingCardController {
     this.operationHistory = [];
     this.recentEvents = [];
     this.todos = null;
+    this.lastCardActivityAt = 0;
   }
 
   /**
    * Set or clear system status text (e.g. "上下文压缩中").
    */
   setSystemStatus(status: string | null): void {
+    if (status) this.recordCardActivity();
     this.systemStatus = status;
     this.stateVersion++;
-    if (this.state === 'streaming') {
+    if (this.state === 'idle' && status) {
+      this.ensureCardCreating('system_status');
+    } else if (this.state === 'streaming') {
       this.backendMode === 'streaming'
         ? this.scheduleAuxFlush()
         : this.schedulePatch();
@@ -1600,9 +1664,12 @@ export class StreamingCardController {
    * Set or clear active hook state.
    */
   setHook(hook: { hookName: string; hookEvent: string } | null): void {
+    if (hook) this.recordCardActivity();
     this.activeHook = hook;
     this.stateVersion++;
-    if (this.state === 'streaming') {
+    if (this.state === 'idle' && hook) {
+      this.ensureCardCreating('hook');
+    } else if (this.state === 'streaming') {
       this.backendMode === 'streaming'
         ? this.scheduleAuxFlush()
         : this.schedulePatch();
@@ -1615,9 +1682,12 @@ export class StreamingCardController {
   setTodos(
     todos: Array<{ id: string; content: string; status: string }>,
   ): void {
+    if (todos.length > 0) this.recordCardActivity();
     this.todos = todos;
     this.stateVersion++;
-    if (this.state === 'streaming') {
+    if (this.state === 'idle' && todos.length > 0) {
+      this.ensureCardCreating('todo_update');
+    } else if (this.state === 'streaming') {
       this.backendMode === 'streaming'
         ? this.scheduleAuxFlush()
         : this.schedulePatch();
@@ -1629,6 +1699,7 @@ export class StreamingCardController {
    * Does NOT trigger schedulePatch — piggybacks on other events.
    */
   pushRecentEvent(text: string): void {
+    this.recordCardActivity();
     const event = { text };
     this.recentEvents.push(event);
     if (this.recentEvents.length > MAX_RECENT_EVENTS) {
@@ -1646,6 +1717,7 @@ export class StreamingCardController {
   updateToolSummary(toolId: string, summary: string): void {
     const tc = this.toolCalls.get(toolId);
     if (tc) {
+      this.recordCardActivity();
       tc.toolInputSummary = summary;
       this.stateVersion++;
       if (this.state === 'streaming') {
@@ -1669,20 +1741,13 @@ export class StreamingCardController {
    * Creates the card on first call, then patches on subsequent calls.
    */
   append(text: string): void {
+    this.recordCardActivity();
     this.accumulatedText = text;
     this.thinking = false; // Text arrived, no longer just thinking
     this.thinkingText = ''; // Clear thinking text once real text arrives
 
     if (this.state === 'idle') {
-      this.state = 'creating';
-      this.createInitialCard().catch((err) => {
-        logger.warn(
-          { err, chatId: this.chatId },
-          'Streaming card: initial create failed, will use fallback',
-        );
-        this.state = 'error';
-        this.onFallback?.();
-      });
+      this.ensureCardCreating('text_delta');
       return;
     }
 
@@ -1703,6 +1768,7 @@ export class StreamingCardController {
     const prevState = this.state;
     this.accumulatedText = finalText;
     this.state = 'completed';
+    this.stopLivenessHeartbeat();
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
@@ -1724,22 +1790,8 @@ export class StreamingCardController {
    * Patch a completed card to append a usage note at the bottom.
    * Called AFTER complete() because agent-runner emits usage after the final result.
    */
-  async patchUsageNote(usage: {
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadInputTokens: number;
-    cacheCreationInputTokens: number;
-    costUSD: number;
-    durationMs: number;
-    numTurns: number;
-    modelUsage?: Record<string, {
-      inputTokens: number;
-      outputTokens: number;
-      cacheReadInputTokens: number;
-      cacheCreationInputTokens: number;
-      costUSD: number;
-    }>;
-  }): Promise<void> {
+  async patchUsageNote(usage: UsageNoteData): Promise<void> {
+    this.usageNote = usage;
     if (this.state !== 'completed') return;
 
     try {
@@ -1787,6 +1839,7 @@ export class StreamingCardController {
 
     const wasActive = this.isActive();
     this.state = 'aborted';
+    this.stopLivenessHeartbeat();
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
@@ -1821,6 +1874,7 @@ export class StreamingCardController {
   }
 
   dispose(): void {
+    this.stopLivenessHeartbeat();
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
@@ -1993,6 +2047,7 @@ export class StreamingCardController {
     }
 
     this.state = 'streaming';
+    this.startLivenessHeartbeat();
     if (this.messageId) {
       this.onCardCreated?.(this.messageId);
     }
@@ -2040,6 +2095,7 @@ export class StreamingCardController {
       );
       this.state = 'error';
       this.flushCtrl.dispose();
+      this.stopLivenessHeartbeat();
       this.onFallback?.();
       return;
     }
@@ -2151,7 +2207,7 @@ export class StreamingCardController {
       const running = Array.from(this.toolCalls.values()).filter(
         (tc) => tc.status === 'running',
       );
-      if (running.length === 0) return undefined;
+      if (running.length === 0) return this.withLivenessSilence(undefined);
       const primary = running[0];
       const name =
         primary.name === 'Skill' && primary.skillName
@@ -2162,25 +2218,34 @@ export class StreamingCardController {
         : '';
       const extra =
         running.length > 1 ? ` <text_tag color='blue'>+${running.length - 1}</text_tag>` : '';
-      return `\`${name}\`${summary}${extra}`;
+      return this.withLivenessSilence(`\`${name}\`${summary}${extra}`);
     }
     if (phase === 'hook') {
-      return this.activeHook
-        ? `${this.activeHook.hookName || this.activeHook.hookEvent}`
-        : undefined;
+      return this.withLivenessSilence(
+        this.activeHook
+          ? `${this.activeHook.hookName || this.activeHook.hookEvent}`
+          : undefined,
+      );
     }
     if (phase === 'streaming') {
       const chars = this.accumulatedText.length;
-      return `已输出 ${chars} 字`;
+      return this.withLivenessSilence(`已输出 ${chars} 字`);
     }
     if (phase === 'working') {
-      return this.systemStatus ?? undefined;
+      return this.withLivenessSilence(this.systemStatus ?? undefined);
     }
-    return undefined;
+    return this.withLivenessSilence(undefined);
+  }
+
+  private withLivenessSilence(detail: string | undefined): string | undefined {
+    if (!this.lastCardActivityAt || this.state !== 'streaming') return detail;
+    const silenceMs = Date.now() - this.lastCardActivityAt;
+    if (silenceMs < LIVENESS_STALE_MS) return detail;
+    const staleText = `${formatElapsed(silenceMs)} 无新事件，仍在等待`;
+    return detail ? `${detail} · ${staleText}` : staleText;
   }
 
   private buildRichPanelPatches(): {
-    statusBanner: string;
     progressContent?: string;
     toolsContent: string;
     thinkingContent?: string;
@@ -2188,16 +2253,7 @@ export class StreamingCardController {
     timelineContent?: string;
     footerNote: string;
   } {
-    const phase = this.derivePhase();
-    const elapsedMs = this.startTime > 0 ? Date.now() - this.startTime : 0;
-    const statusBanner = buildStatusBannerText({
-      phase,
-      detail: this.deriveBannerDetail(phase),
-      elapsedMs,
-      runtimeProfile: this.runtimeProfile,
-    });
-    // Footer is the short status echo only — recent events have their own panel.
-    const footerNote = `<font color='grey'>${statusBanner.replace(/<[^>]+>/g, '').trim()}</font>`;
+    const footerNote = this.buildLiveFooterNote();
 
     const progressContent =
       this.todos && this.todos.length > 0
@@ -2248,7 +2304,6 @@ export class StreamingCardController {
         : undefined;
 
     return {
-      statusBanner,
       progressContent,
       toolsContent,
       thinkingContent,
@@ -2258,6 +2313,21 @@ export class StreamingCardController {
     };
   }
 
+  private buildLiveFooterNote(): string {
+    const phase = this.derivePhase();
+    const elapsedMs = this.startTime > 0 ? Date.now() - this.startTime : 0;
+    const statusBanner = buildStatusBannerText({
+      phase,
+      detail: this.deriveBannerDetail(phase),
+      elapsedMs,
+      runtimeProfile: this.runtimeProfile,
+    });
+    // Footer is the single live status line — recent events have their own
+    // panel. <local_datetime> renders in each viewer's local timezone.
+    const statusText = statusBanner.replace(/<[^>]+>/g, '').trim();
+    return `<font color='grey'>${statusText} · 更新 ${buildLocalDatetimeWithSeconds(Date.now())}</font>`;
+  }
+
   private scheduleAuxFlush(): void {
     if (!this.streamingBackend || !this.auxFlushCtrl) {
       this.schedulePatch();
@@ -2265,47 +2335,6 @@ export class StreamingCardController {
     }
 
     this.auxFlushCtrl.schedule(this.stateVersion * 1000, async () => {
-      if (this.runtimeProfile === 'codex') {
-        try {
-          const auxState = this.getAuxiliaryState();
-          const { before, after } = buildAuxiliaryElements(auxState);
-          await this.streamingBackend!.updateAuxiliary(
-            ELEMENT_IDS.AUX_BEFORE,
-            serializeAuxContent(before),
-          );
-          await this.streamingBackend!.updateAuxiliary(
-            ELEMENT_IDS.AUX_AFTER,
-            serializeAuxContent(after),
-          );
-          if (!this.firstAuxFlushLogged) {
-            this.firstAuxFlushLogged = true;
-            logger.info(
-              {
-                chatId: this.chatId,
-                messageId: this.messageId,
-                mode: 'streaming',
-                runtimeProfile: this.runtimeProfile,
-                beforeLength: serializeAuxContent(before).length,
-                afterLength: serializeAuxContent(after).length,
-              },
-              'Streaming card auxiliary pushed',
-            );
-          }
-        } catch (err) {
-          logger.warn(
-            {
-              err,
-              chatId: this.chatId,
-              messageId: this.messageId,
-              mode: 'streaming',
-              runtimeProfile: this.runtimeProfile,
-            },
-            'Codex compact aux patch failed',
-          );
-        }
-        return;
-      }
-
       const patches = this.buildRichPanelPatches();
 
       // Every flush goes through cardElement.content() to update the inner
@@ -2314,10 +2343,6 @@ export class StreamingCardController {
       // mid-stream structural rewrites, which Feishu's streaming_mode
       // sometimes rejects. The user can fold/expand each panel manually.
       try {
-        await this.streamingBackend!.updateMarkdownContent(
-          CARD_ELEMENT_IDS.STATUS_BANNER,
-          patches.statusBanner,
-        );
         if (patches.askContent) {
           await this.streamingBackend!.updateMarkdownContent(
             CARD_ELEMENT_IDS.ASK_CONTENT,
@@ -2432,22 +2457,7 @@ export class StreamingCardController {
    */
   private buildStructuredFinalCard(
     finalState: 'completed' | 'aborted',
-    usage?: {
-      inputTokens: number;
-      outputTokens: number;
-      cacheReadInputTokens: number;
-      cacheCreationInputTokens: number;
-      costUSD: number;
-      durationMs: number;
-      numTurns: number;
-      modelUsage?: Record<string, {
-        inputTokens: number;
-        outputTokens: number;
-        cacheReadInputTokens: number;
-        cacheCreationInputTokens: number;
-        costUSD: number;
-      }>;
-    },
+    usage?: UsageNoteData,
   ): object {
     const status: CardStatus = finalState === 'aborted' ? 'warning' : 'done';
     const toolCounts = new Map<string, number>();
@@ -2492,7 +2502,6 @@ export class StreamingCardController {
     return buildAgentReplyCard({
       status,
       text: this.accumulatedText || '...',
-      title: this.runtimeProfile === 'codex' ? 'Codex 回复' : undefined,
       thinking,
       meta: {
         model: primaryModel,
@@ -2550,13 +2559,28 @@ export class StreamingCardController {
       // 1. Disable streaming mode (allows header/button changes)
       await backend.disableStreamingMode();
 
-      // 2. Build structured final card (usage note comes later via patchUsageNote)
-      const cardJson = this.buildStructuredFinalCard(finalState);
+      // 2. Build structured final card.  Usage usually arrives after the final
+      // result, but very short replies can race: patchUsageNote() may run while
+      // the initial card creation is still finalizing.  Cache usage on the
+      // controller and include it here so the late finalization does not
+      // overwrite a usage-patched card with a usage-less final card.
+      const usageForFinal =
+        finalState === 'completed' ? this.usageNote ?? undefined : undefined;
+      const cardJson = this.buildStructuredFinalCard(finalState, usageForFinal);
       const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
 
       if (cardSize <= CARD_SIZE_LIMIT) {
         // 3a. Single card fits
         await backend.updateCardFull(cardJson);
+        if (
+          finalState === 'completed' &&
+          !usageForFinal &&
+          this.usageNote
+        ) {
+          await backend.updateCardFull(
+            this.buildStructuredFinalCard(finalState, this.usageNote),
+          );
+        }
       } else {
         // 3b. Too large for single card — split on finalize
         await this.splitOnFinalize(finalState);
@@ -2662,6 +2686,10 @@ export class StreamingCardController {
     displayState: 'streaming' | 'completed' | 'aborted',
     footerNote?: string,
   ): Promise<void> {
+    const effectiveFooterNote =
+      footerNote ??
+      (displayState === 'streaming' ? this.buildLiveFooterNote() : undefined);
+
     if (this.useCardKit && this.multiCard) {
       // CardKit v1 path — pass auxiliary state for rich display
       const auxState =
@@ -2671,7 +2699,7 @@ export class StreamingCardController {
           this.accumulatedText,
           displayState,
           auxState,
-          footerNote,
+          effectiveFooterNote,
         );
         this.flushCtrl.markFlushed(this.accumulatedText.length);
         this.patchFailCount = 0;
@@ -2695,7 +2723,7 @@ export class StreamingCardController {
       const card = buildStreamingCard(
         this.accumulatedText,
         displayState,
-        footerNote,
+        effectiveFooterNote,
       );
       const content = JSON.stringify(card);
 

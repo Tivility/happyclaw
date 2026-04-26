@@ -24,6 +24,7 @@ import {
   collectAskQuestions,
   buildTimelineText,
   parseToolParam,
+  buildLocalDatetimeWithSeconds,
 } from '../src/feishu-cards/sections.js';
 
 // ─── Recursive schema validation helpers ───────────────────────────
@@ -106,6 +107,27 @@ function collectElementIds(node: unknown, out: string[] = []): string[] {
   if (typeof obj.element_id === 'string') out.push(obj.element_id);
   for (const v of Object.values(obj)) collectElementIds(v, out);
   return out;
+}
+
+function findElementById(
+  node: unknown,
+  elementId: string,
+): Record<string, unknown> | undefined {
+  if (node === null || typeof node !== 'object') return undefined;
+  if (Array.isArray(node)) {
+    for (const v of node) {
+      const found = findElementById(v, elementId);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  const obj = node as Record<string, unknown>;
+  if (obj.element_id === elementId) return obj;
+  for (const v of Object.values(obj)) {
+    const found = findElementById(v, elementId);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 function countTag(node: unknown, tag: string): number {
@@ -236,6 +258,13 @@ describe('formatters', () => {
     expect(shortModel('claude-sonnet-4-6')).toBe('sonnet-4.6');
     expect(shortModel('claude-haiku-4-5-20251001')).toBe('haiku-4.5');
     expect(shortModel('gpt-4o-mini')).toBe('gpt-4o-mini');
+  });
+
+  test('buildLocalDatetimeWithSeconds composes date and seconds-local time', () => {
+    const text = buildLocalDatetimeWithSeconds(1_700_000_000_000);
+    expect(text).toContain("format_type='date_num'");
+    expect(text).toContain("format_type='time_sec'");
+    expect(text).toContain("millisecond='1700000000000'");
   });
 
   test('extractTitle picks H1-H3 heading', () => {
@@ -553,10 +582,9 @@ describe('buildStreamingAgentCard', () => {
     const header = card.header as Record<string, unknown>;
     expect(header.template).toBe('blue');
 
-    // Rich skeleton: STATUS_BANNER + 3 collapsible panels + MAIN_CONTENT + BUTTON + FOOTER_NOTE
+    // Rich skeleton: runtime panels + MAIN_CONTENT + BUTTON + FOOTER_NOTE
     const ids = new Set(collectElementIds(card));
     for (const required of [
-      CARD_ELEMENT_IDS.STATUS_BANNER,
       CARD_ELEMENT_IDS.PROGRESS_PANEL,
       CARD_ELEMENT_IDS.PROGRESS_CONTENT,
       CARD_ELEMENT_IDS.TOOLS_PANEL,
@@ -569,6 +597,21 @@ describe('buildStreamingAgentCard', () => {
     ]) {
       expect(ids.has(required)).toBe(true);
     }
+    expect(ids.has(CARD_ELEMENT_IDS.STATUS_BANNER)).toBe(false);
+    const footer = findElementById(card, CARD_ELEMENT_IDS.FOOTER_NOTE);
+    expect(String(footer?.content)).toContain('更新 <local_datetime');
+    expect(String(footer?.content)).toContain("format_type='time_sec'");
+  });
+
+  test('streaming title includes generating state in header and summary', () => {
+    const card = buildStreamingAgentCard({ initialText: '' });
+    const header = card.header as Record<string, unknown>;
+    const title = header.title as Record<string, unknown>;
+    const config = card.config as Record<string, unknown>;
+    const summary = config.summary as Record<string, unknown>;
+
+    expect(title.content).toBe('Agent 回复 · 生成中');
+    expect(summary.content).toBe('Agent 回复 · 生成中');
   });
 
   test('rich streaming card contains 5 collapsible panels (Phase F adds ask + timeline)', () => {
@@ -582,13 +625,14 @@ describe('buildStreamingAgentCard', () => {
       runtimeProfile: 'codex',
     });
     const json = JSON.stringify(card);
-    expect(json).toContain('Codex 准备中');
     expect(json).toContain('计划 / Todo');
     expect(json).toContain('操作时间轴');
     expect(json).toContain('推理过程');
     expect(json).toContain('运行日志');
     expect(json).toContain('暂无计划');
     expect(json).toContain('尚未执行操作');
+    expect(json).toContain('更新 <local_datetime');
+    expect(json).toContain("format_type='time_sec'");
     expect(json).not.toContain('等待任务规划');
     expect(json).not.toContain('尚未调用工具');
   });

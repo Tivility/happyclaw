@@ -378,6 +378,15 @@ function clampNumberTag(n: number): number {
   return Math.floor(n);
 }
 
+export function buildLocalDatetimeWithSeconds(ms: number): string {
+  // local_datetime supports either date OR time. Compose date_num + time_sec
+  // to get a viewer-local timestamp with seconds precision.
+  return [
+    `<local_datetime millisecond='${ms}' format_type='date_num'></local_datetime>`,
+    `<local_datetime millisecond='${ms}' format_type='time_sec'></local_datetime>`,
+  ].join(' ');
+}
+
 export function buildFooter(
   footer: string | undefined,
   completedAtMs?: number,
@@ -389,10 +398,7 @@ export function buildFooter(
   const parts: string[] = [];
   if (text) parts.push(text);
   if (hasTimestamp) {
-    // <local_datetime> renders per-viewer timezone; date_num = "2026/04/18 18:09"
-    parts.push(
-      `<local_datetime millisecond='${completedAtMs}' format_type='date_num'></local_datetime>`,
-    );
+    parts.push(buildLocalDatetimeWithSeconds(completedAtMs));
   }
   return [
     {
@@ -668,7 +674,6 @@ function truncate(text: string, limit: number): string {
 
 export interface StreamingPanelsInit {
   /** Initial markdown content for each slot — empty strings get placeholder text. */
-  statusBanner?: string;
   progressContent?: string;
   toolsContent?: string;
   thinkingContent?: string;
@@ -687,9 +692,11 @@ export interface StreamingPanelsInit {
  * Build the full runtime panel column for the streaming skeleton (ordered).
  *
  * Panel order aligns with the web StreamingDisplay component:
- *   status banner → ask (if any) → progress → tools → thinking → timeline
+ *   ask (if any) → progress → tools → thinking → timeline
  * Each panel's inner markdown has its own element_id so the controller can
  * patch it via cardElement.content() without touching the panel structure.
+ * The live status/heartbeat line is rendered in FOOTER_NOTE instead of a top
+ * banner to avoid showing the same "phase / elapsed" text twice.
  */
 export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
   const profile = init.runtimeProfile ?? 'claude';
@@ -719,13 +726,6 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
     "<font color='grey'>暂无运行日志</font>",
   );
   return [
-    {
-      tag: 'markdown',
-      element_id: CARD_ELEMENT_IDS.STATUS_BANNER,
-      content:
-        init.statusBanner ??
-        buildStatusBannerText({ phase: 'idle', runtimeProfile: profile }),
-    },
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.ASK_PANEL,
       contentElementId: CARD_ELEMENT_IDS.ASK_CONTENT,
