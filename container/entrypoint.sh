@@ -15,11 +15,11 @@ chown -R node:node /workspace/group /workspace/global /workspace/memory /workspa
 
 # Copy .claude.json template to writable location.
 # The template is a stripped version (no cachedGrowthBookFeatures, autoUpdates=false)
-# mounted readonly at /workspace/env-dir/claude-json-template.
+# mounted readonly at /workspace/claude-json-template.
 # SDK needs to write to ~/.claude.json at runtime (GrowthBook feature cache, etc.);
 # copying makes it writable without polluting the shared template.
-if [ -f /workspace/env-dir/claude-json-template ]; then
-  cp /workspace/env-dir/claude-json-template /home/node/.claude.json
+if [ -f /workspace/claude-json-template ]; then
+  cp /workspace/claude-json-template /home/node/.claude.json
   chown node:node /home/node/.claude.json
 fi
 
@@ -33,6 +33,23 @@ if [ -f /workspace/env-dir/env ]; then
   set -a
   source /workspace/env-dir/env
   set +a
+fi
+
+# Ensure Claude Code resolves to the Linux binary inside the container. On some
+# macOS multi-arch builds the package-level bin points at a Mach-O wrapper even
+# though the Linux optional binary is installed.
+arch=$(dpkg --print-architecture 2>/dev/null || uname -m)
+case "$arch" in
+  amd64|x86_64) claude_arch="x64" ;;
+  arm64|aarch64) claude_arch="arm64" ;;
+  *) claude_arch="" ;;
+esac
+if [ -n "$claude_arch" ]; then
+  claude_linux_bin="/app/node_modules/@anthropic-ai/claude-code-linux-${claude_arch}/claude"
+  if [ -x "$claude_linux_bin" ]; then
+    rm -f /app/node_modules/.bin/claude 2>/dev/null || true
+    ln -s "$claude_linux_bin" /app/node_modules/.bin/claude 2>/dev/null || true
+  fi
 fi
 
 # Prepend agent-runner 的本地 node_modules/.bin 到 PATH。

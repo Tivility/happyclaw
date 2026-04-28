@@ -565,15 +565,17 @@ function buildVolumeMounts(
   });
 
   // 挂载精简版 .claude.json 模板（剥离 cachedGrowthBookFeatures + autoUpdates=false）。
-  // 挂载到 env-dir 模板路径而非直接挂载到 /home/node/.claude.json：
+  // 挂载到独立模板路径而非直接挂载到 /home/node/.claude.json：
   //   - entrypoint.sh 启动时复制为可写的 /home/node/.claude.json
   //   - SDK 运行期间可正常写入（GrowthBook 缓存等），不触发 EROFS
   //   - 容器销毁（--rm）后 SDK 写入的内容自动丢弃
   //   - 模板文件始终保持精简版，不会被 SDK 污染
+  // 不要放在 /workspace/env-dir 下；该目录会以只读 env 卷挂载，Docker 在
+  // 只读父目录中创建文件挂载点时会失败。
   const containerJson = getContainerClaudeJsonPath();
   mounts.push({
     hostPath: containerJson,
-    containerPath: '/workspace/env-dir/claude-json-template',
+    containerPath: '/workspace/claude-json-template',
     readonly: true,
   });
 

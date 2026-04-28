@@ -260,6 +260,7 @@ describe('Codex container runtime conformance', () => {
         `${path.join(groupsDir, 'user-global', 'user-1')}:/workspace/global:ro`,
         `${path.join(groupsDir, group.folder)}:/workspace/group`,
         `${path.join(dataDir, 'memory', 'home-main')}:/workspace/memory:ro`,
+        `${path.join(dataDir, 'config', 'container-claude-json.json')}:/workspace/claude-json-template:ro`,
         `${path.join(dataDir, 'ipc', group.folder)}:/workspace/ipc`,
         `${path.join(dataDir, 'config', 'codex', provider.id)}:/workspace/codex-home`,
         `${path.join(dataDir, 'env', group.folder)}:/workspace/env-dir:ro`,

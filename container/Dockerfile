@@ -115,6 +115,26 @@ ARG CACHEBUST=1
 RUN npm install -g agent-browser
 RUN npm install
 
+# Claude Code's package-level bin can resolve to the host-platform wrapper on
+# some multi-arch macOS builds even though the Linux optional binary is present.
+# Force the command used inside the container to the Linux binary and fail the
+# image build if it cannot execute.
+RUN set -eux; \
+    ARCH="$(dpkg --print-architecture)"; \
+    case "$ARCH" in \
+      amd64) CLAUDE_ARCH="x64" ;; \
+      arm64) CLAUDE_ARCH="arm64" ;; \
+      *) echo "Unsupported Claude Code architecture: $ARCH" >&2; exit 1 ;; \
+    esac; \
+    CLAUDE_BIN="/app/node_modules/@anthropic-ai/claude-code-linux-${CLAUDE_ARCH}/claude"; \
+    test -x "$CLAUDE_BIN"; \
+    rm -f /app/node_modules/.bin/claude; \
+    ln -s "$CLAUDE_BIN" /app/node_modules/.bin/claude; \
+    ln -sf "$CLAUDE_BIN" /usr/local/bin/claude; \
+    PATH="/app/node_modules/.bin:${PATH}"; \
+    test "$(readlink -f "$(command -v claude)")" = "$CLAUDE_BIN"; \
+    claude --version
+
 # Install feishu-cli (binary + builtin skills), 始终跟踪 latest release。
 # 通过 302 redirect 从 github.com/releases/latest 的 Location header 提取 tag
 # （和 install.sh 作者自己用的技巧一致），不经 api.github.com 规避 rate limit。

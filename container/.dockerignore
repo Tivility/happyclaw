@@ -1,2 +1,5 @@
 agent-runner/node_modules
 agent-runner/dist
+agent-runner/package-lock.json
+agent-runner/.tsbuildinfo
+**/.DS_Store
