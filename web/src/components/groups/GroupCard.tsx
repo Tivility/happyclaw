@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronDown, ChevronUp, Users } from 'lucide-react';
+import { Box, ChevronDown, ChevronUp, Monitor, Users } from 'lucide-react';
 import { Card } from '@/components/ui/card';
 import { GroupInfo } from '../../stores/groups';
 import { GroupDetail } from './GroupDetail';
@@ -10,6 +10,7 @@ interface GroupCardProps {
 
 export function GroupCard({ group }: GroupCardProps) {
   const [expanded, setExpanded] = useState(false);
+  const executionMode = group.execution_mode || 'container';
 
   // 截短 JID 显示（保留前缀和后缀）
   const truncateJid = (jid: string) => {
@@ -42,6 +43,20 @@ export function GroupCard({ group }: GroupCardProps) {
                   {group.member_count ?? 0}
                 </span>
               )}
+              <span
+                className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] font-medium border flex-shrink-0 ${
+                  executionMode === 'host'
+                    ? 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-950/30 dark:text-amber-300 dark:border-amber-800'
+                    : 'bg-sky-50 text-sky-700 border-sky-200 dark:bg-sky-950/30 dark:text-sky-300 dark:border-sky-800'
+                }`}
+              >
+                {executionMode === 'host' ? (
+                  <Monitor className="w-3 h-3" />
+                ) : (
+                  <Box className="w-3 h-3" />
+                )}
+                {executionMode === 'host' ? '宿主机' : 'Docker'}
+              </span>
             </div>
 
             {/* JID */}
