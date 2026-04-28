@@ -244,6 +244,11 @@ export function buildCodexConfigObject(
   };
 
   return {
+    service_tier: 'fast',
+    features: {
+      fast_mode: true,
+    },
+    model_reasoning_effort: 'xhigh',
     project_doc_fallback_filenames: ['CLAUDE.md'],
     mcp_servers: mcpServers,
   };
@@ -578,6 +583,14 @@ export const codexCliAdapter: AgentRuntimeAdapter = {
       permissionOptions.sandboxMode,
       '-c',
       `approval_policy="${permissionOptions.approvalPolicy}"`,
+    );
+    args.push(
+      '-c',
+      'service_tier="fast"',
+      '-c',
+      'features.fast_mode=true',
+      '-c',
+      'model_reasoning_effort="xhigh"',
     );
     args.push('-c', 'project_doc_fallback_filenames=["CLAUDE.md"]');
     pushMcpConfigArgs(args, mcpContextPath, input.cwd);

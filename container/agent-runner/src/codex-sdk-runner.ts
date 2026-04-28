@@ -114,6 +114,7 @@ export function createCodexSdkAdapter(
       skipGitRepoCheck: true,
       sandboxMode: permissionOptions.sandboxMode,
       approvalPolicy: permissionOptions.approvalPolicy,
+      modelReasoningEffort: 'xhigh',
       ...(model ? { model } : {}),
     };
     const thread = input.sessionId
