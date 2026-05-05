@@ -22,6 +22,7 @@ const CLAUDE_CONFIG_AUDIT_FILE = path.join(
   CLAUDE_CONFIG_DIR,
   'claude-provider.audit.log',
 );
+const CODEX_AUTH_SEED_METADATA_FILE = '.happyclaw-auth-seed.json';
 const CLAUDE_CUSTOM_ENV_FILE = path.join(
   CLAUDE_CONFIG_DIR,
   'claude-custom-env.json',
@@ -1643,6 +1644,64 @@ export function getEnabledCodexProviders(): UnifiedProvider[] {
   return getEnabledProvidersForPool('gpt').filter((p) => p.runtime === 'codex');
 }
 
+interface CodexAuthSeedMetadata {
+  providerId: string;
+  authProfileGeneration: number;
+  authHash: string;
+  writtenAt: string;
+}
+
+function hashCodexAuthJson(authJson: string): string {
+  return crypto
+    .createHash('sha256')
+    .update(authJson.trim())
+    .digest('hex');
+}
+
+function readCodexAuthSeedMetadata(
+  codexHomeDir: string,
+): CodexAuthSeedMetadata | null {
+  try {
+    const raw = fs.readFileSync(
+      path.join(codexHomeDir, CODEX_AUTH_SEED_METADATA_FILE),
+      'utf-8',
+    );
+    const parsed = JSON.parse(raw) as Partial<CodexAuthSeedMetadata>;
+    if (
+      typeof parsed.providerId === 'string' &&
+      typeof parsed.authProfileGeneration === 'number' &&
+      typeof parsed.authHash === 'string' &&
+      typeof parsed.writtenAt === 'string'
+    ) {
+      return parsed as CodexAuthSeedMetadata;
+    }
+  } catch {
+    // Missing or corrupt metadata should not block auth material preparation.
+  }
+  return null;
+}
+
+function writeCodexAuthSeedMetadata(
+  codexHomeDir: string,
+  provider: UnifiedProvider,
+  authHash: string,
+): void {
+  fs.writeFileSync(
+    path.join(codexHomeDir, CODEX_AUTH_SEED_METADATA_FILE),
+    JSON.stringify(
+      {
+        providerId: provider.id,
+        authProfileGeneration: provider.authProfileGeneration,
+        authHash,
+        writtenAt: new Date().toISOString(),
+      } satisfies CodexAuthSeedMetadata,
+      null,
+      2,
+    ) + '\n',
+    { encoding: 'utf-8', mode: 0o600 },
+  );
+}
+
 export function writeCodexProviderAuthMaterial(
   provider: UnifiedProvider,
 ): CodexProviderAuthMaterial {
@@ -1658,11 +1717,37 @@ export function writeCodexProviderAuthMaterial(
   if (provider.codexAuthJson) {
     configLines.unshift('forced_login_method = "chatgpt"');
     configLines.unshift('cli_auth_credentials_store = "file"');
-    fs.writeFileSync(
-      path.join(codexHomeDir, 'auth.json'),
-      provider.codexAuthJson.trim() + '\n',
-      { encoding: 'utf-8', mode: 0o600 },
-    );
+    const authPath = path.join(codexHomeDir, 'auth.json');
+    const authHash = hashCodexAuthJson(provider.codexAuthJson);
+    const metadata = readCodexAuthSeedMetadata(codexHomeDir);
+    const authStat = fs.existsSync(authPath) ? fs.statSync(authPath) : null;
+    const providerUpdatedAt = Date.parse(provider.updatedAt || '');
+    const providerUpdatedAfterAuth =
+      Number.isFinite(providerUpdatedAt) &&
+      authStat !== null &&
+      providerUpdatedAt > authStat.mtimeMs + 1000;
+    const metadataMismatch =
+      metadata !== null &&
+      (metadata.providerId !== provider.id ||
+        metadata.authProfileGeneration !== provider.authProfileGeneration ||
+        metadata.authHash !== authHash);
+    const shouldSeedAuthJson =
+      !authStat ||
+      providerUpdatedAfterAuth ||
+      metadataMismatch;
+
+    if (shouldSeedAuthJson) {
+      fs.writeFileSync(authPath, provider.codexAuthJson.trim() + '\n', {
+        encoding: 'utf-8',
+        mode: 0o600,
+      });
+    }
+    writeCodexAuthSeedMetadata(codexHomeDir, provider, authHash);
+  } else {
+    fs.rmSync(path.join(codexHomeDir, 'auth.json'), { force: true });
+    fs.rmSync(path.join(codexHomeDir, CODEX_AUTH_SEED_METADATA_FILE), {
+      force: true,
+    });
   }
   fs.writeFileSync(
     path.join(codexHomeDir, 'config.toml'),

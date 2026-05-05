@@ -111,4 +111,42 @@ describe('Codex provider auth material', () => {
     expect(publicProvider.hasCodexAuthJson).toBe(true);
     expect(publicProvider.hasOpenaiApiKey).toBe(false);
   });
+
+  it('preserves Codex-mutated auth.json until provider credentials rotate', () => {
+    const initialAuthJson = JSON.stringify({
+      refresh_token: 'refresh-token-v1',
+    });
+    const rotatedAuthJson = JSON.stringify({
+      refresh_token: 'refresh-token-v2-from-codex',
+    });
+    const nextAuthJson = JSON.stringify({
+      refresh_token: 'refresh-token-v3-from-user-login',
+    });
+    const initialProvider = provider({
+      id: 'gpt-oauth-test',
+      authMode: 'chatgpt_oauth',
+      authProfileGeneration: 3,
+      codexAuthJson: initialAuthJson,
+      updatedAt: '2026-04-25T00:00:00.000Z',
+    });
+
+    const material = writeCodexProviderAuthMaterial(initialProvider);
+    const authPath = path.join(material.codexHomeDir!, 'auth.json');
+    expect(fs.readFileSync(authPath, 'utf-8').trim()).toBe(initialAuthJson);
+
+    fs.writeFileSync(authPath, rotatedAuthJson + '\n', 'utf-8');
+    writeCodexProviderAuthMaterial(initialProvider);
+    expect(fs.readFileSync(authPath, 'utf-8').trim()).toBe(rotatedAuthJson);
+
+    writeCodexProviderAuthMaterial(
+      provider({
+        id: 'gpt-oauth-test',
+        authMode: 'chatgpt_oauth',
+        authProfileGeneration: 4,
+        codexAuthJson: nextAuthJson,
+        updatedAt: '2026-04-26T00:00:00.000Z',
+      }),
+    );
+    expect(fs.readFileSync(authPath, 'utf-8').trim()).toBe(nextAuthJson);
+  });
 });
