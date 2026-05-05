@@ -137,7 +137,9 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
     async (provider: ProviderWithHealth) => {
       setTogglingId(provider.id);
       try {
-        await api.post(`/api/config/claude/providers/${provider.id}/toggle`);
+        await api.patch(`/api/config/claude/providers/${provider.id}`, {
+          enabled: !provider.enabled,
+        });
         await loadProviders();
         setNotice(provider.enabled ? `已禁用「${provider.name}」` : `已启用「${provider.name}」`);
       } catch (err) {

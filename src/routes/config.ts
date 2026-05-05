@@ -362,7 +362,8 @@ async function applyClaudeConfigToAllGroups(
     throw new Error('Server not initialized');
   }
 
-  const groupJids = Object.keys(deps.getRegisteredGroups());
+  const registeredGroups = deps.getRegisteredGroups?.() ?? {};
+  const groupJids = Object.keys(registeredGroups);
   const results = await Promise.allSettled(
     groupJids.map((jid) => deps.queue.stopGroup(jid)),
   );
@@ -370,11 +371,12 @@ async function applyClaudeConfigToAllGroups(
   const stoppedCount = groupJids.length - failedCount;
 
   // 清除所有 session 记录，确保配置变更后下次启动创建全新 session
-  const registeredGroups = deps.getRegisteredGroups();
   for (const [_, group] of Object.entries(registeredGroups) as [string, RegisteredGroup][]) {
     if (group.folder) {
       deleteAllSessionsForFolder(group.folder);
-      delete deps.sessions[group.folder];
+      if (deps.sessions && typeof deps.sessions === 'object') {
+        delete deps.sessions[group.folder];
+      }
     }
   }
 
@@ -613,7 +615,17 @@ configRoutes.patch(
       if (!current || current.providerPoolId !== 'claude') {
         return c.json({ error: 'Claude provider not found' }, 404);
       }
-      const updated = updateProvider(id, validation.data);
+      const { enabled, ...providerPatch } = validation.data;
+      const hasProviderPatch = Object.keys(providerPatch).length > 0;
+      let updated = current;
+      if (hasProviderPatch) {
+        updated = updateProvider(id, providerPatch);
+      }
+      const enabledChanged =
+        enabled !== undefined && updated.enabled !== enabled;
+      if (enabledChanged) {
+        updated = toggleProvider(id);
+      }
       const changedFields = Object.keys(validation.data).map(
         (k) => `${k}:updated`,
       );
@@ -622,9 +634,9 @@ configRoutes.patch(
         ...changedFields,
       ]);
 
-      // If this provider is enabled, apply to running containers
+      // If this provider is enabled, or if its enabled state changed, apply to running containers.
       let applied: ClaudeApplyResultPayload | null = null;
-      if (updated.enabled) {
+      if (updated.enabled || enabledChanged) {
         applied = await applyClaudeConfigToAllGroups(actor, {
           trigger: 'provider_update',
           providerId: id,

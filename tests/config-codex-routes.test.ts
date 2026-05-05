@@ -5,6 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   dataDir: `/tmp/happyclaw-config-codex-routes-${process.pid}`,
   spawn: vi.fn(),
+  deleteAllSessionsForFolder: vi.fn(),
+  stopGroup: vi.fn(),
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -45,6 +47,7 @@ vi.mock('../src/db.js', () => ({
   ]),
   deleteRegisteredGroup: vi.fn(),
   deleteChatHistory: vi.fn(),
+  deleteAllSessionsForFolder: mocks.deleteAllSessionsForFolder,
   getRegisteredGroup: vi.fn(),
   setRegisteredGroup: vi.fn(),
   updateChatName: vi.fn(),
@@ -92,7 +95,7 @@ vi.mock('../src/im-channel.js', () => ({
   getChannelType: vi.fn(() => 'feishu'),
 }));
 
-import configRoutes from '../src/routes/config.js';
+import configRoutes, { injectConfigDeps } from '../src/routes/config.js';
 
 function cleanup(): void {
   fs.rmSync(mocks.dataDir, { recursive: true, force: true });
@@ -136,6 +139,17 @@ describe('Codex provider config routes', () => {
   beforeEach(() => {
     cleanup();
     mocks.spawn.mockReset();
+    mocks.deleteAllSessionsForFolder.mockReset();
+    mocks.stopGroup.mockReset();
+    mocks.stopGroup.mockResolvedValue(undefined);
+    injectConfigDeps({
+      getRegisteredGroups: () => ({
+        'web:test': { folder: 'flow-test' },
+      }),
+      queue: {
+        stopGroup: mocks.stopGroup,
+      },
+    });
     mockCodexDeviceLogin();
   });
 
@@ -243,5 +257,47 @@ describe('Codex provider config routes', () => {
       hasCodexAuthJson: true,
     });
     expect(fs.existsSync(authHome)).toBe(false);
+  });
+
+  it('sets Claude provider enabled state without requiring legacy in-memory sessions', async () => {
+    const firstRes = await configRoutes.request(
+      jsonRequest('/claude/providers', 'POST', {
+        name: 'Claude One',
+        type: 'official',
+        claudeCodeOauthToken: 'token-one',
+        enabled: true,
+      }),
+    );
+    const secondRes = await configRoutes.request(
+      jsonRequest('/claude/providers', 'POST', {
+        name: 'Claude Two',
+        type: 'official',
+        claudeCodeOauthToken: 'token-two',
+        enabled: true,
+      }),
+    );
+    expect(firstRes.status).toBe(201);
+    expect(secondRes.status).toBe(201);
+
+    const first = await firstRes.json();
+    const patchRes = await configRoutes.request(
+      jsonRequest(`/claude/providers/${first.id}`, 'PATCH', {
+        enabled: false,
+      }),
+    );
+
+    expect(patchRes.status).toBe(200);
+    const patched = await patchRes.json();
+    expect(patched.provider).toMatchObject({
+      id: first.id,
+      enabled: false,
+    });
+    expect(patched.applied).toMatchObject({
+      success: true,
+      stoppedCount: 1,
+      failedCount: 0,
+    });
+    expect(mocks.stopGroup).toHaveBeenCalledWith('web:test');
+    expect(mocks.deleteAllSessionsForFolder).toHaveBeenCalledWith('flow-test');
   });
 });

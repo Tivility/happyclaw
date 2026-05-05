@@ -671,6 +671,7 @@ export const UnifiedProviderPatchSchema = z
     anthropicModel: z.string().max(128).optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
+    enabled: z.boolean().optional(),
   })
   .refine(
     (data) =>
@@ -678,7 +679,8 @@ export const UnifiedProviderPatchSchema = z
       data.anthropicBaseUrl !== undefined ||
       data.anthropicModel !== undefined ||
       data.customEnv !== undefined ||
-      data.weight !== undefined,
+      data.weight !== undefined ||
+      data.enabled !== undefined,
     { message: 'At least one field must be provided' },
   );
 
