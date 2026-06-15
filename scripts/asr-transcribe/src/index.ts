@@ -24,13 +24,23 @@ function getArg(name: string): string {
   return args[idx + 1];
 }
 
+function getOptionalArg(name: string): string | undefined {
+  const idx = args.indexOf(`--${name}`);
+  if (idx === -1 || idx + 1 >= args.length) return undefined;
+  return args[idx + 1];
+}
+
 const audioFile = getArg('file');
 const outputDir = getArg('output');
 const title = getArg('title');
+const providedAudioUrl = getOptionalArg('url');
 
 const API_KEY = process.env.VOLC_ASR_API_KEY;
-if (!API_KEY) {
-  console.error('Missing VOLC_ASR_API_KEY environment variable');
+const APP_KEY = process.env.VOLC_ASR_APP_KEY;
+const ACCESS_KEY = process.env.VOLC_ASR_ACCESS_KEY;
+const RESOURCE_ID = process.env.VOLC_ASR_RESOURCE_ID || 'volc.bigasr.auc';
+if (!API_KEY && !(APP_KEY && ACCESS_KEY)) {
+  console.error('Missing VOLC_ASR_API_KEY or VOLC_ASR_APP_KEY/VOLC_ASR_ACCESS_KEY environment variables');
   process.exit(1);
 }
 
@@ -39,6 +49,14 @@ if (!API_KEY) {
 /* ------------------------------------------------------------------ */
 function log(msg: string) {
   process.stderr.write(`[asr] ${msg}\n`);
+}
+
+function authHeaders(): Record<string, string> {
+  if (API_KEY) return { 'x-api-key': API_KEY };
+  return {
+    'X-Api-App-Key': APP_KEY!,
+    'X-Api-Access-Key': ACCESS_KEY!,
+  };
 }
 
 function sleep(ms: number) {
@@ -212,8 +230,8 @@ async function submitJob(audioUrl: string): Promise<string> {
       },
     },
     {
-      'x-api-key': API_KEY!,
-      'X-Api-Resource-Id': 'volc.bigasr.auc',
+      ...authHeaders(),
+      'X-Api-Resource-Id': RESOURCE_ID,
       'X-Api-Request-Id': requestId,
       'X-Api-Sequence': '-1',
     },
@@ -238,8 +256,8 @@ async function pollResult(requestId: string): Promise<{ utterances: Utterance[];
       VOLC_QUERY_URL,
       {},
       {
-        'x-api-key': API_KEY!,
-        'X-Api-Resource-Id': 'volc.bigasr.auc',
+        ...authHeaders(),
+        'X-Api-Resource-Id': RESOURCE_ID,
         'X-Api-Request-Id': requestId,
       },
     );
@@ -349,8 +367,8 @@ async function main() {
 
   fs.mkdirSync(outputDir, { recursive: true });
 
-  // Upload
-  const audioUrl = await uploadToTmpFiles(audioFile);
+  // Upload, unless a public URL is provided by the caller.
+  const audioUrl = providedAudioUrl || await uploadToTmpFiles(audioFile);
 
   // Submit & poll
   const requestId = await submitJob(audioUrl);

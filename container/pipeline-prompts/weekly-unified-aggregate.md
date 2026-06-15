@@ -6,25 +6,60 @@
 
 宿主机模式：`/Users/tivility/happyclaw/data/db/messages.db`
 
-## Step 1: Daily Cron 健康检查
+## Step 1: 确定 owner 并做 Daily Cron 健康检查
+
+先确定当前任务对应的 owner user id。优先从当前任务临时工作区反查 `scheduled_tasks.created_by`；如果不是在任务临时工作区运行，则 fallback 到 main home workspace 的 owner：
+
+```bash
+CURRENT_FOLDER=$(basename "$PWD")
+TARGET_USER_ID=$(sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
+  "SELECT created_by FROM scheduled_tasks
+   WHERE workspace_folder = '$CURRENT_FOLDER' AND created_by IS NOT NULL AND created_by != ''
+   ORDER BY created_at DESC LIMIT 1")
+
+if [ -z "$TARGET_USER_ID" ]; then
+  TARGET_USER_ID=$(sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
+    "SELECT created_by FROM registered_groups
+     WHERE folder = 'main' AND is_home = 1 AND created_by IS NOT NULL AND created_by != ''
+     LIMIT 1")
+fi
+
+if [ -z "$TARGET_USER_ID" ]; then
+  echo "ERROR: cannot resolve TARGET_USER_ID"
+  exit 1
+fi
+```
 
 先读取 daily cron 的规格定义文件 `prompts/daily-cron-spec.md`（如存在），按其参数规格执行健康检查。
 
-1. 查询所有注册的工作区 folder：
+1. 查询当前 owner 名下注册的工作区 folder。必须排除 `user-global*` 和 `task-*`，避免跨用户污染和定时任务临时工作区回灌：
    ```bash
    sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
-     "SELECT DISTINCT folder FROM registered_groups WHERE folder NOT LIKE 'user-global%'"
+     "SELECT DISTINCT folder
+      FROM registered_groups
+      WHERE created_by = '$TARGET_USER_ID'
+        AND folder NOT LIKE 'user-global%'
+        AND folder NOT LIKE 'task-%'
+      ORDER BY folder"
    ```
 
 2. 查询所有活跃的 daily 统一提取 cron：
    ```bash
    sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
-     "SELECT group_folder, status FROM scheduled_tasks WHERE prompt LIKE '%统一提取%' AND schedule_type = 'cron'"
+     "SELECT group_folder, status
+      FROM scheduled_tasks
+      WHERE created_by = '$TARGET_USER_ID'
+        AND prompt LIKE '%统一提取%'
+        AND schedule_type = 'cron'"
    ```
    注：如果系统仍在使用旧版 prompt（包含「认知模式提取」），也要检查：
    ```bash
    sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
-     "SELECT group_folder, status FROM scheduled_tasks WHERE prompt LIKE '%认知模式提取%' AND schedule_type = 'cron'"
+     "SELECT group_folder, status
+      FROM scheduled_tasks
+      WHERE created_by = '$TARGET_USER_ID'
+        AND prompt LIKE '%认知模式提取%'
+        AND schedule_type = 'cron'"
    ```
 
 3. 对比两个列表。对于缺少 daily cron 的工作区：
@@ -39,9 +74,19 @@
 
 ### 2.1 认知维度输入
 
-动态发现所有工作区的 observations.md：
+动态发现当前 owner 名下工作区的 observations.md：
 ```bash
-find /Users/tivility/happyclaw/data/groups/ -maxdepth 2 -name "observations.md" -not -path "*/user-global/*"
+sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
+  "SELECT DISTINCT folder
+   FROM registered_groups
+   WHERE created_by = '$TARGET_USER_ID'
+     AND folder NOT LIKE 'user-global%'
+     AND folder NOT LIKE 'task-%'
+   ORDER BY folder" |
+while IFS= read -r folder; do
+  test -f "/Users/tivility/happyclaw/data/groups/$folder/observations.md" && \
+    printf '%s\n' "/Users/tivility/happyclaw/data/groups/$folder/observations.md"
+done
 ```
 
 读取每个文件，筛选出本周新增的观察（按日期判断，最近 7 天）。
@@ -67,7 +112,7 @@ find /Users/tivility/happyclaw/data/groups/ -maxdepth 2 -name "observations.md" 
 - `interaction/interaction-rules.md`
 
 如果 user-global 路径不可达（宿主机模式），使用绝对路径：
-`/Users/tivility/happyclaw/data/groups/user-global/{userId}/`
+`/Users/tivility/happyclaw/data/groups/user-global/$TARGET_USER_ID/`
 
 ## Step 3: 并行聚合
 

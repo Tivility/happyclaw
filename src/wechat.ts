@@ -836,11 +836,9 @@ export function createWeChatConnection(
 
       const contextToken = contextTokenCache.get(userId);
       if (!contextToken) {
-        logger.warn(
-          { chatId },
-          'No context_token available for WeChat user, cannot send message',
+        throw new Error(
+          `No context_token available for WeChat user ${chatId}, cannot send message`,
         );
-        return;
       }
 
       try {
@@ -869,11 +867,9 @@ export function createWeChatConnection(
 
       const contextToken = contextTokenCache.get(userId);
       if (!contextToken) {
-        logger.warn(
-          { chatId },
-          'No context_token for WeChat user, cannot send image',
+        throw new Error(
+          `No context_token for WeChat user ${chatId}, cannot send image`,
         );
-        return;
       }
 
       if (imageBuffer.length > MAX_FILE_SIZE) {
@@ -966,11 +962,9 @@ export function createWeChatConnection(
 
       const contextToken = contextTokenCache.get(userId);
       if (!contextToken) {
-        logger.warn(
-          { chatId },
-          'No context_token for WeChat user, cannot send file',
+        throw new Error(
+          `No context_token for WeChat user ${chatId}, cannot send file`,
         );
-        return;
       }
 
       // Single readFile + size check, then pass buffer to uploadMediaBuffer —

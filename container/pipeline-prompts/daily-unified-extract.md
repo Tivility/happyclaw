@@ -1,8 +1,8 @@
 # 天级统一提取任务
 
-你是认知×知识×交互三维度统一提取管线的主调度器。从所有工作区的对话数据中并行提取三个维度的观察。
+你是认知×知识×交互三维度统一提取管线的主调度器。从当前任务 owner 名下的工作区对话数据中并行提取三个维度的观察。
 
-本任务从 main 工作区执行，覆盖所有注册工作区。
+本任务从 main 工作区执行，只覆盖当前任务 owner 名下的注册工作区。
 
 ## 路径约定
 
@@ -11,13 +11,40 @@
 - Prompt 模板目录：`/Users/tivility/happyclaw/container/pipeline-prompts/sub-agents/`
 - Pipeline 输出目录：`/Users/tivility/happyclaw/data/groups/main/pipeline/`
 
-## Step 1: 发现所有工作区
+## Step 1: 确定 owner 并发现工作区
 
-查询所有注册的工作区 folder：
+先确定当前任务对应的 owner user id。优先从当前任务临时工作区反查 `scheduled_tasks.created_by`；如果不是在任务临时工作区运行，则 fallback 到 main home workspace 的 owner：
+
+```bash
+CURRENT_FOLDER=$(basename "$PWD")
+TARGET_USER_ID=$(sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
+  "SELECT created_by FROM scheduled_tasks
+   WHERE workspace_folder = '$CURRENT_FOLDER' AND created_by IS NOT NULL AND created_by != ''
+   ORDER BY created_at DESC LIMIT 1")
+
+if [ -z "$TARGET_USER_ID" ]; then
+  TARGET_USER_ID=$(sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
+    "SELECT created_by FROM registered_groups
+     WHERE folder = 'main' AND is_home = 1 AND created_by IS NOT NULL AND created_by != ''
+     LIMIT 1")
+fi
+
+if [ -z "$TARGET_USER_ID" ]; then
+  echo "ERROR: cannot resolve TARGET_USER_ID"
+  exit 1
+fi
+```
+
+只查询该 owner 名下的注册工作区 folder。必须排除 `user-global*` 和 `task-*`，避免跨用户污染和定时任务临时工作区回灌：
 
 ```bash
 sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
-  "SELECT DISTINCT folder FROM registered_groups WHERE folder NOT LIKE 'user-global%'"
+  "SELECT DISTINCT folder
+   FROM registered_groups
+   WHERE created_by = '$TARGET_USER_ID'
+     AND folder NOT LIKE 'user-global%'
+     AND folder NOT LIKE 'task-%'
+   ORDER BY folder"
 ```
 
 ## Step 2: 准备输入数据
@@ -30,23 +57,27 @@ sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
 
 ### 2.2 Messages 数据（认知 + 知识维度）
 
-查询该时间戳之后、所有工作区的用户消息：
+查询该时间戳之后、当前 owner 名下工作区的用户消息：
 
 ```bash
 sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
-  "SELECT chat_jid, sender_name, is_from_me, content, timestamp
-   FROM messages
-   WHERE timestamp > '{last_timestamp}'
-   ORDER BY chat_jid, timestamp"
+  "SELECT rg.folder, m.chat_jid, m.sender_name, m.is_from_me, m.content, m.timestamp
+   FROM messages m
+   JOIN registered_groups rg ON rg.jid = m.chat_jid
+   WHERE m.timestamp > '{last_timestamp}'
+     AND rg.created_by = '$TARGET_USER_ID'
+     AND rg.folder NOT LIKE 'user-global%'
+     AND rg.folder NOT LIKE 'task-%'
+   ORDER BY rg.folder, m.chat_jid, m.timestamp"
 ```
 
-按 chat_jid 分组。过滤掉无认知含量的消息（纯斜杠命令、单字确认、系统自动发送的 cron prompt）。
+按 `folder + chat_jid` 分组。过滤掉无认知含量的消息（纯斜杠命令、单字确认、系统自动发送的 cron prompt）。
 
 如果查询结果为空，记录"当天无新消息"，跳到 Step 4 收尾。
 
 ### 2.3 Conversations 归档（交互维度）
 
-遍历所有工作区的 `conversations/` 目录，找到上次时间戳之后新增/修改的归档文件。
+只遍历当前 owner 名下工作区的 `conversations/` 目录，找到上次时间戳之后新增/修改的归档文件。
 
 **重要**：使用 `.cognitive-last-date` 文件中的**内容**（ISO 时间戳字符串）作为时间基准，而不是文件的 mtime。这确保与认知/知识维度使用相同的时间窗口。
 
@@ -57,10 +88,28 @@ LAST_TS=$(cat /Users/tivility/happyclaw/data/groups/main/.cognitive-last-date 2>
 if [ -n "$LAST_TS" ]; then
   # 创建临时参考文件，设置 mtime 为 last_timestamp 对应时间
   touch -t $(date -j -f "%Y-%m-%dT%H:%M:%S" "${LAST_TS%%.*}" "+%Y%m%d%H%M.%S" 2>/dev/null || echo "202603210000.00") /tmp/.cognitive-ref
-  find /Users/tivility/happyclaw/data/groups/ -maxdepth 3 -path "*/conversations/*.md" -newer /tmp/.cognitive-ref -not -path "*/user-global/*" 2>/dev/null
+  sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
+    "SELECT DISTINCT folder
+     FROM registered_groups
+     WHERE created_by = '$TARGET_USER_ID'
+       AND folder NOT LIKE 'user-global%'
+       AND folder NOT LIKE 'task-%'
+     ORDER BY folder" |
+  while IFS= read -r folder; do
+    find "/Users/tivility/happyclaw/data/groups/$folder/conversations" -maxdepth 1 -name "*.md" -newer /tmp/.cognitive-ref 2>/dev/null
+  done
   rm -f /tmp/.cognitive-ref
 else
-  find /Users/tivility/happyclaw/data/groups/ -maxdepth 3 -path "*/conversations/*.md" -mtime -1 -not -path "*/user-global/*" 2>/dev/null
+  sqlite3 /Users/tivility/happyclaw/data/db/messages.db \
+    "SELECT DISTINCT folder
+     FROM registered_groups
+     WHERE created_by = '$TARGET_USER_ID'
+       AND folder NOT LIKE 'user-global%'
+       AND folder NOT LIKE 'task-%'
+     ORDER BY folder" |
+  while IFS= read -r folder; do
+    find "/Users/tivility/happyclaw/data/groups/$folder/conversations" -maxdepth 1 -name "*.md" -mtime -1 2>/dev/null
+  done
 fi
 ```
 
@@ -82,6 +131,7 @@ fi
 - 路径：`/Users/tivility/happyclaw/data/groups/{folder}/observations.md`
 - 在日期标题 `## YYYY-MM-DD` 下追加
 - 如果子任务输出"无观察"，跳过
+- 如果子任务输出了不在 Step 1 owner 工作区列表中的 folder，丢弃该条并在 `<internal>` 记录错误，绝不写入其他 owner 的工作区
 
 ### 子任务 2: 知识维度
 
