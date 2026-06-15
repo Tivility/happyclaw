@@ -6,6 +6,7 @@
  */
 import {
   createFeishuConnection,
+  parseFeishuRouteTarget,
   type FeishuConnection,
   type FeishuConnectionConfig,
 } from './feishu.js';
@@ -33,7 +34,17 @@ import {
   createDiscordConnection,
   type DiscordConnection,
   type DiscordConnectionConfig,
+  type DiscordHistoryMessage,
+  type DiscordHistoryOpts,
+  type DiscordChannelInfo,
+  type DiscordGuildInfo,
 } from './discord.js';
+import {
+  createWhatsAppConnection,
+  type WhatsAppConnection,
+  type WhatsAppConnectionConfig,
+  type WhatsAppConnectionState,
+} from './whatsapp.js';
 import { logger } from './logger.js';
 import type { FeishuMessageMeta } from './types.js';
 import {
@@ -80,7 +91,7 @@ export interface IMChannelConnectOpts {
   resolveEffectiveChatJid?: (
     chatJid: string,
     messageMeta?: FeishuMessageMeta,
-  ) => { effectiveJid: string; agentId: string | null } | null;
+  ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
   /** 当 IM 消息被路由到 conversation agent 后调用，触发 agent 处理 */
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   /** Bot 被添加到群聊时调用 */
@@ -288,11 +299,21 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       if (!inner) return undefined;
       const larkClient = inner.getLarkClient();
       if (!larkClient) return undefined;
+      const target = parseFeishuRouteTarget(chatId);
       const opts: StreamingCardOptions = {
         client: larkClient,
-        chatId,
+        chatId: target.chatId,
         replyToMsgId: inner.getLastMessageId(chatId),
+        replyInThread: target.replyInThread,
         onCardCreated,
+        // 降级可观测性：卡片连续更新失败进入 error 态时记一条 warn。
+        // 终态收口与静态消息兜底分别由 schedulePatch 的 best-effort patch
+        // 和 index.ts 的 result 路径负责，这里只补日志。
+        onFallback: () =>
+          logger.warn(
+            { chatId: target.chatId },
+            'Feishu streaming card degraded to static fallback',
+          ),
       };
       return new StreamingCardController(opts);
     },
@@ -759,15 +780,39 @@ export function createDingTalkChannel(
 
 // ─── Discord Adapter ────────────────────────────────────────────
 
+/**
+ * Discord-specific extensions on top of the unified IMChannel interface.
+ * Used by im-manager to route Discord-only capabilities (history, channel/guild metadata).
+ */
+export interface DiscordChannelExtensions {
+  getDiscordHistory(
+    chatId: string,
+    opts?: DiscordHistoryOpts,
+  ): Promise<DiscordHistoryMessage[]>;
+  getDiscordChannelInfo(chatId: string): Promise<DiscordChannelInfo>;
+  getDiscordGuildInfo(chatId: string): Promise<DiscordGuildInfo | null>;
+}
+
+/** Type guard: does this IMChannel expose Discord-specific extensions? */
+export function isDiscordChannel(
+  ch: IMChannel,
+): ch is IMChannel & DiscordChannelExtensions {
+  return (
+    ch.channelType === 'discord' &&
+    typeof (ch as Partial<DiscordChannelExtensions>).getDiscordHistory ===
+      'function'
+  );
+}
+
 export function createDiscordChannel(
   config: DiscordConnectionConfig,
   opts?: { streamingMode?: 'edit' | 'off' },
-): IMChannel {
+): IMChannel & DiscordChannelExtensions {
   const streamingEnabled = opts?.streamingMode === 'edit';
   let inner: DiscordConnection | null = null;
   let typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
-  const channel: IMChannel = {
+  const channel: IMChannel & DiscordChannelExtensions = {
     channelType: 'discord',
 
     async connect(opts: IMChannelConnectOpts): Promise<boolean> {
@@ -853,6 +898,140 @@ export function createDiscordChannel(
       if (!inner?.createStreamingSession) return undefined;
       return inner.createStreamingSession(chatId, onCardCreated);
     },
+
+    async getDiscordHistory(chatId, historyOpts?) {
+      if (!inner) {
+        throw new Error('Discord channel not connected');
+      }
+      return inner.getChannelHistory(chatId, historyOpts);
+    },
+
+    async getDiscordChannelInfo(chatId) {
+      if (!inner) {
+        throw new Error('Discord channel not connected');
+      }
+      return inner.getChannelInfo(chatId);
+    },
+
+    async getDiscordGuildInfo(chatId) {
+      if (!inner) {
+        throw new Error('Discord channel not connected');
+      }
+      return inner.getGuildInfo(chatId);
+    },
   };
+  return channel;
+}
+
+// ─── WhatsApp Adapter ───────────────────────────────────────────
+
+export function createWhatsAppChannel(
+  config: WhatsAppConnectionConfig,
+  onConnectionUpdate?: (state: WhatsAppConnectionState) => void,
+): IMChannel & { getWhatsAppState?: () => WhatsAppConnectionState } {
+  let inner: WhatsAppConnection | null = null;
+
+  const channel: IMChannel & {
+    getWhatsAppState?: () => WhatsAppConnectionState;
+  } = {
+    channelType: 'whatsapp',
+
+    async connect(opts: IMChannelConnectOpts): Promise<boolean> {
+      inner = createWhatsAppConnection(config);
+      try {
+        await inner.connect({
+          onReady: opts.onReady,
+          onNewChat: opts.onNewChat,
+          onCommand: opts.onCommand,
+          ignoreMessagesBefore: opts.ignoreMessagesBefore,
+          resolveGroupFolder: opts.resolveGroupFolder,
+          resolveEffectiveChatJid: opts.resolveEffectiveChatJid,
+          onAgentMessage: opts.onAgentMessage,
+          onBotAddedToGroup: opts.onBotAddedToGroup,
+          onBotRemovedFromGroup: opts.onBotRemovedFromGroup,
+          shouldProcessGroupMessage: opts.shouldProcessGroupMessage,
+          isGroupOwnerMessage: opts.isGroupOwnerMessage,
+          isSenderAllowedInGroup: opts.isSenderAllowedInGroup,
+          onConnectionUpdate,
+        });
+        // Baileys connect 是 async fire-and-forget：socket 建好后立刻返回，
+        // 真实的 connected 状态要等 connection.update -> 'open' 才到。
+        // 这里我们返回 true 表示 socket 启动成功，连接状态由 onConnectionUpdate 推送。
+        return true;
+      } catch (err) {
+        logger.warn({ err }, 'WhatsApp channel connect failed');
+        inner = null;
+        return false;
+      }
+    },
+
+    async disconnect(): Promise<void> {
+      if (inner) {
+        await inner.disconnect();
+        inner = null;
+      }
+    },
+
+    async sendMessage(
+      chatId: string,
+      text: string,
+      localImagePaths?: string[],
+    ): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'WhatsApp channel not connected, skip sending message',
+        );
+        return;
+      }
+      await inner.sendMessage(chatId, text, localImagePaths);
+    },
+
+    async sendImage(
+      chatId: string,
+      imageBuffer: Buffer,
+      mimeType: string,
+      caption?: string,
+      fileName?: string,
+    ): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'WhatsApp channel not connected, skip sending image',
+        );
+        return;
+      }
+      await inner.sendImage(chatId, imageBuffer, mimeType, caption, fileName);
+    },
+
+    async sendFile(
+      chatId: string,
+      filePath: string,
+      fileName: string,
+    ): Promise<void> {
+      if (!inner) {
+        logger.warn(
+          { chatId },
+          'WhatsApp channel not connected, skip sending file',
+        );
+        return;
+      }
+      await inner.sendFile(chatId, filePath, fileName);
+    },
+
+    async setTyping(chatId: string, isTyping: boolean): Promise<void> {
+      if (!inner) return;
+      await inner.sendTyping(chatId, isTyping);
+    },
+
+    isConnected(): boolean {
+      return inner?.isConnected() ?? false;
+    },
+
+    getWhatsAppState(): WhatsAppConnectionState {
+      return inner?.getState() ?? { status: 'disconnected' };
+    },
+  };
+
   return channel;
 }

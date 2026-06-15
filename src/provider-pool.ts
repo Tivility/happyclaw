@@ -203,9 +203,11 @@ export class ProviderPool {
     }
   }
 
-  reportFailure(profileId: string): void {
+  reportFailure(profileId: string, immediate = false): void {
     const health = this.getOrCreateHealth(profileId);
-    health.consecutiveErrors += 1;
+    health.consecutiveErrors = immediate
+      ? Math.max(health.consecutiveErrors + 1, this.unhealthyThreshold)
+      : health.consecutiveErrors + 1;
     health.lastErrorAt = Date.now();
 
     if (
@@ -301,8 +303,12 @@ export class ProviderPoolManager {
     this.getPool(providerPoolId).reportSuccess(profileId);
   }
 
-  reportFailure(providerPoolId: string, profileId: string): void {
-    this.getPool(providerPoolId).reportFailure(profileId);
+  reportFailure(
+    providerPoolId: string,
+    profileId: string,
+    immediate = false,
+  ): void {
+    this.getPool(providerPoolId).reportFailure(profileId, immediate);
   }
 
   acquireSession(providerPoolId: string, profileId: string): void {

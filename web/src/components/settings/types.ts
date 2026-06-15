@@ -112,7 +112,10 @@ export interface SystemSettings {
   billingCurrencyRate: number;
   externalClaudeDir: string;
   autoCompactWindow: number;
+  subagentModel: string;
   disableMemoryLayerForAdminHost: boolean;
+  pluginAutoScan: boolean;
+  taskBackfillGraceMs: number;
 }
 
 // ─── OAuth Usage ────────────────────────────────────────────
@@ -164,7 +167,7 @@ export interface ConversationRuntimeState {
   binding_source: 'system_default' | 'workspace_default' | 'copied_workspace_default' | 'user_pinned';
 }
 
-export type SettingsTab = 'models' | 'claude' | 'gpt' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'agent-definitions' | 'users' | 'about' | 'bindings' | 'usage' | 'monitor';
+export type SettingsTab = 'models' | 'claude' | 'gpt' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'plugins' | 'agent-definitions' | 'users' | 'about' | 'bindings' | 'usage' | 'monitor';
 
 export function getErrorMessage(err: unknown, fallback: string): string {
   if (typeof err === 'object' && err !== null && 'message' in err) {

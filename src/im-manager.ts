@@ -16,13 +16,28 @@ import {
   createWeChatChannel,
   createDingTalkChannel,
   createDiscordChannel,
+  isDiscordChannel,
+  createWhatsAppChannel,
 } from './im-channel.js';
+import type {
+  DiscordHistoryMessage,
+  DiscordHistoryOpts,
+  DiscordChannelInfo,
+  DiscordGuildInfo,
+} from './discord.js';
 import { parseFeishuRouteTarget, type FeishuConnectionConfig } from './feishu.js';
 import type { TelegramConnectionConfig } from './telegram.js';
 import type { QQConnectionConfig } from './qq.js';
 import type { WeChatConnectionConfig } from './wechat.js';
 import type { DingTalkConnectionConfig } from './dingtalk.js';
 import type { DiscordConnectionConfig } from './discord.js';
+import {
+  getWhatsAppAuthDir,
+  type WhatsAppConnectionConfig,
+  type WhatsAppConnectionState,
+} from './whatsapp.js';
+import { rm } from 'fs/promises';
+import { DATA_DIR } from './config.js';
 import type { StreamingSession } from './im-channel.js';
 import { getRegisteredGroup, getJidsByFolder } from './db.js';
 import { getUserDingTalkConfig } from './runtime-config.js';
@@ -73,6 +88,19 @@ export interface DiscordConnectConfig {
   streamingMode?: 'edit' | 'off';
 }
 
+export interface WhatsAppConnectConfig {
+  accountId?: string;
+  phoneNumber?: string;
+  authDir?: string;
+  enabled?: boolean;
+}
+
+/**
+ * Re-export from src/whatsapp.ts as the canonical state shape.
+ * Kept as a type alias so existing imports from im-manager continue to work.
+ */
+export type WhatsAppConnectionStateSnapshot = WhatsAppConnectionState;
+
 export interface ConnectFeishuOptions {
   ignoreMessagesBefore?: number;
   onCommand?: (
@@ -86,7 +114,7 @@ export interface ConnectFeishuOptions {
   resolveEffectiveChatJid?: (
     chatJid: string,
     messageMeta?: FeishuMessageMeta,
-  ) => { effectiveJid: string; agentId: string | null } | null;
+  ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
@@ -100,6 +128,69 @@ export interface ConnectFeishuOptions {
 class IMConnectionManager {
   private connections = new Map<string, UserIMConnection>();
   private adminUserIds = new Set<string>();
+  private lastWhatsAppState = new Map<string, WhatsAppConnectionStateSnapshot>();
+  // Per-(userId, channelType) 串行化锁。connectChannel / disconnectChannel
+  // 必须按顺序排队，否则两次重叠的 reconnect 会让旧 disconnect 的清理跨过新
+  // connect 的 channels.set，留下一条悬挂的 live channel（双发消息）。
+  private channelLocks = new Map<string, Promise<unknown>>();
+  // Per-user 串行化锁：disconnectAllUserChannels 必须独占整个 user 范围，
+  // 否则只锁 channelType 时与 in-flight connectChannel('其他 channelType')
+  // 的 channels.set 仍会 race，让 connections.delete 之后 channel 复活。
+  // 同时记录 'sealed' 状态：disconnectAll 完成后的窗口里禁止 connectChannel
+  // 重新创建该 userId 的 connections 入口，直到外层逻辑显式调用
+  // markUserConnectableAgain（loadState 重建路径）。
+  private userLocks = new Map<string, Promise<unknown>>();
+  private sealedUsers = new Set<string>();
+
+  private async withUserLock<T>(
+    userId: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const prev = this.userLocks.get(userId) ?? Promise.resolve();
+    let release: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const chain = prev.catch(() => undefined).then(() => next);
+    this.userLocks.set(userId, chain);
+    await prev.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release!();
+      // Drop tail entry once nothing else queued behind us, prevent unbounded
+      // growth of the lock map for short-lived users.
+      if (this.userLocks.get(userId) === chain) {
+        this.userLocks.delete(userId);
+      }
+    }
+  }
+
+  private async withChannelLock<T>(
+    userId: string,
+    channelType: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    const key = `${userId}:${channelType}`;
+    const prev = this.channelLocks.get(key) ?? Promise.resolve();
+    let release: () => void;
+    const next = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Chain `next` after the previous holder finishes (success or failure).
+    const chain = prev.catch(() => undefined).then(() => next);
+    this.channelLocks.set(key, chain);
+    await prev.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release!();
+      // 长跑回收：若没人在我之后排队，移除 Map 项；否则后人继续持有。
+      if (this.channelLocks.get(key) === chain) {
+        this.channelLocks.delete(key);
+      }
+    }
+  }
 
   /** Register a user ID as admin (for fallback routing) */
   registerAdminUser(userId: string): void {
@@ -126,22 +217,73 @@ class IMConnectionManager {
     channel: IMChannel,
     opts: IMChannelConnectOpts,
   ): Promise<boolean> {
-    // Disconnect existing channel of same type
-    await this.disconnectChannel(userId, channelType);
+    // user 维度锁 + sealed 检查：避免与 disconnectAllUserChannels race。
+    // disconnect-all 期间任何 connect 都被排到锁队列后面；disconnect-all
+    // 完成时把 user 标 sealed，新 connect 直接拒绝。运维流程：禁用/删除
+    // 用户后调用 markUserReconnectable 重新允许（loadState / 用户重新启用）。
+    return this.withUserLock(userId, async () => {
+      if (this.sealedUsers.has(userId)) {
+        logger.warn(
+          { userId, channelType },
+          'connectChannel rejected: user sealed (disabled/deleted)',
+        );
+        // 谨慎：仍然 disconnect 任何已构造的 channel 释放底层资源
+        try {
+          await channel.disconnect();
+        } catch {
+          /* ignore */
+        }
+        return false;
+      }
+      return this.withChannelLock(userId, channelType, async () => {
+        // Disconnect existing channel of same type
+        await this.disconnectChannelLocked(userId, channelType);
 
-    const conn = this.getOrCreate(userId);
-    const connected = await channel.connect(opts);
-    if (connected) {
-      conn.channels.set(channelType, channel);
-      logger.info({ userId, channelType }, 'IM channel connected');
-    }
-    return connected;
+        // Re-check sealed inside the channel-lock — disconnectAllUserChannels
+        // may have flipped it while we were waiting; in that case bail.
+        if (this.sealedUsers.has(userId)) {
+          try {
+            await channel.disconnect();
+          } catch {
+            /* ignore */
+          }
+          return false;
+        }
+        const conn = this.getOrCreate(userId);
+        const connected = await channel.connect(opts);
+        if (connected) {
+          // 第三次也是最后一次 sealed 检查：channel.connect 期间网络耗时，
+          // disconnectAllUserChannels 可能已经把所有 channel 都断完并 seal。
+          if (this.sealedUsers.has(userId)) {
+            try {
+              await channel.disconnect();
+            } catch {
+              /* ignore */
+            }
+            return false;
+          }
+          conn.channels.set(channelType, channel);
+          logger.info({ userId, channelType }, 'IM channel connected');
+        }
+        return connected;
+      });
+    });
   }
 
   /**
    * Disconnect a specific channel type for a user.
    */
   async disconnectChannel(userId: string, channelType: string): Promise<void> {
+    return this.withChannelLock(userId, channelType, async () => {
+      await this.disconnectChannelLocked(userId, channelType);
+    });
+  }
+
+  /** Caller must already hold the per-(userId, channelType) lock. */
+  private async disconnectChannelLocked(
+    userId: string,
+    channelType: string,
+  ): Promise<void> {
     const conn = this.connections.get(userId);
     const channel = conn?.channels.get(channelType);
     if (channel) {
@@ -228,6 +370,50 @@ class IMConnectionManager {
     } else {
       throw new Error(`通道 ${channelType} 不支持发送文件`);
     }
+  }
+
+  /**
+   * Fetch recent messages from a Discord channel/DM, auto-routing via JID prefix.
+   * Throws if the JID is not a Discord channel or no Discord connection is available.
+   */
+  async getDiscordHistory(
+    jid: string,
+    opts?: DiscordHistoryOpts,
+  ): Promise<DiscordHistoryMessage[]> {
+    const ch = this.requireDiscordChannel(jid, 'getDiscordHistory');
+    return ch.getDiscordHistory(extractChatId(jid), opts);
+  }
+
+  /**
+   * Get Discord channel/DM metadata.
+   */
+  async getDiscordChannelInfo(jid: string): Promise<DiscordChannelInfo> {
+    const ch = this.requireDiscordChannel(jid, 'getDiscordChannelInfo');
+    return ch.getDiscordChannelInfo(extractChatId(jid));
+  }
+
+  /**
+   * Get Discord guild (server) metadata for the channel's parent guild.
+   * Returns null if the JID points to a DM (no guild).
+   */
+  async getDiscordGuildInfo(jid: string): Promise<DiscordGuildInfo | null> {
+    const ch = this.requireDiscordChannel(jid, 'getDiscordGuildInfo');
+    return ch.getDiscordGuildInfo(extractChatId(jid));
+  }
+
+  /**
+   * Resolve the Discord channel adapter for a given JID, asserting type and connectivity.
+   */
+  private requireDiscordChannel(jid: string, op: string) {
+    const channelType = getChannelType(jid);
+    if (channelType !== 'discord') {
+      throw new Error(`${op}: JID is not a Discord channel: ${jid}`);
+    }
+    const ch = this.findChannelForJid(jid, 'discord');
+    if (!ch || !isDiscordChannel(ch)) {
+      throw new Error(`${op}: no connected Discord channel for ${jid}`);
+    }
+    return ch;
   }
 
   /**
@@ -415,7 +601,7 @@ class IMConnectionManager {
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (
         chatJid: string,
-      ) => { effectiveJid: string; agentId: string | null } | null;
+      ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
       onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
       onBotRemovedFromGroup?: (chatJid: string) => void;
@@ -466,7 +652,7 @@ class IMConnectionManager {
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (
         chatJid: string,
-      ) => { effectiveJid: string; agentId: string | null } | null;
+      ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
     },
   ): Promise<boolean> {
@@ -519,7 +705,7 @@ class IMConnectionManager {
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (
         chatJid: string,
-      ) => { effectiveJid: string; agentId: string | null } | null;
+      ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
     },
   ): Promise<boolean> {
@@ -554,6 +740,128 @@ class IMConnectionManager {
   }
 
   /**
+   * Connect a WhatsApp instance for a specific user.
+   *
+   * M1：接入 Baileys，QR 状态通过 onConnectionUpdate 推到上层（最终经 WS 推前端）。
+   * 缓存最近一次 state 到 lastWhatsAppState，前端刷新页面时通过 GET 接口拿到。
+   */
+  async connectUserWhatsApp(
+    userId: string,
+    config: WhatsAppConnectConfig,
+    onNewChat: (chatJid: string, chatName: string) => void,
+    options?: {
+      ignoreMessagesBefore?: number;
+      onCommand?: (chatJid: string, command: string) => Promise<string | null>;
+      resolveGroupFolder?: (jid: string) => string | undefined;
+      resolveEffectiveChatJid?: (
+        chatJid: string,
+      ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
+      onAgentMessage?: (baseChatJid: string, agentId: string) => void;
+      onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
+      onBotRemovedFromGroup?: (chatJid: string) => void;
+      shouldProcessGroupMessage?: (
+        chatJid: string,
+        senderImId?: string,
+      ) => boolean;
+      isGroupOwnerMessage?: (
+        chatJid: string,
+        senderImId?: string,
+      ) => boolean;
+      isSenderAllowedInGroup?: (
+        chatJid: string,
+        senderImId?: string,
+      ) => boolean;
+      onConnectionUpdate?: (
+        userId: string,
+        state: WhatsAppConnectionStateSnapshot,
+      ) => void;
+    },
+  ): Promise<boolean> {
+    const channel = createWhatsAppChannel(
+      {
+        accountId: config.accountId,
+        phoneNumber: config.phoneNumber,
+        authDir:
+          config.authDir ??
+          getWhatsAppAuthDir(DATA_DIR, userId, config.accountId),
+      },
+      (state) => {
+        this.lastWhatsAppState.set(userId, state);
+        options?.onConnectionUpdate?.(userId, state);
+      },
+    );
+
+    return this.connectChannel(userId, 'whatsapp', channel, {
+      onReady: () => {
+        logger.info({ userId }, 'User WhatsApp channel ready');
+      },
+      onNewChat,
+      ignoreMessagesBefore: options?.ignoreMessagesBefore,
+      onCommand: options?.onCommand,
+      resolveGroupFolder: options?.resolveGroupFolder,
+      resolveEffectiveChatJid: options?.resolveEffectiveChatJid,
+      onAgentMessage: options?.onAgentMessage,
+      onBotAddedToGroup: options?.onBotAddedToGroup,
+      onBotRemovedFromGroup: options?.onBotRemovedFromGroup,
+      shouldProcessGroupMessage: options?.shouldProcessGroupMessage,
+      isGroupOwnerMessage: options?.isGroupOwnerMessage,
+      isSenderAllowedInGroup: options?.isSenderAllowedInGroup,
+    });
+  }
+
+  getUserWhatsAppState(userId: string): WhatsAppConnectionStateSnapshot {
+    return (
+      this.lastWhatsAppState.get(userId) ?? { status: 'disconnected' as const }
+    );
+  }
+
+  async disconnectUserWhatsApp(userId: string): Promise<void> {
+    await this.disconnectChannel(userId, 'whatsapp');
+  }
+
+  /**
+   * Full logout for WhatsApp: send logout to WhatsApp servers, drop the socket,
+   * and wipe the local auth state directory so the next enable starts fresh
+   * (forces a new QR scan, possibly a different account).
+   *
+   * Distinct from disconnectUserWhatsApp, which only closes the socket but
+   * keeps the noise/Signal pre-keys on disk for silent reconnect.
+   */
+  async logoutUserWhatsApp(userId: string, accountId?: string): Promise<void> {
+    const conn = this.connections.get(userId);
+    const channel = conn?.channels.get('whatsapp');
+    // Best-effort: ask Baileys to send the logout to WhatsApp servers before
+    // we tear the socket down. If we already disconnected, the disk wipe below
+    // still clears the persisted credentials, so the user can rescan.
+    const maybeLogout = (
+      channel as unknown as { logout?: () => Promise<void> } | undefined
+    )?.logout;
+    if (typeof maybeLogout === 'function') {
+      try {
+        await maybeLogout.call(channel);
+      } catch (err) {
+        logger.warn(
+          { err, userId },
+          'WhatsApp channel.logout() threw, continuing with auth wipe',
+        );
+      }
+    }
+    await this.disconnectChannel(userId, 'whatsapp');
+    this.lastWhatsAppState.delete(userId);
+
+    const authDir = getWhatsAppAuthDir(DATA_DIR, userId, accountId || 'default');
+    try {
+      await rm(authDir, { recursive: true, force: true });
+      logger.info({ userId, authDir }, 'WhatsApp auth state wiped');
+    } catch (err) {
+      logger.warn(
+        { err, userId, authDir },
+        'WhatsApp authDir wipe failed (state already gone or perms)',
+      );
+    }
+  }
+
+  /**
    * Connect a DingTalk Stream instance for a specific user.
    */
   async connectUserDingTalk(
@@ -566,7 +874,7 @@ class IMConnectionManager {
       resolveGroupFolder?: (jid: string) => string | undefined;
       resolveEffectiveChatJid?: (
         chatJid: string,
-      ) => { effectiveJid: string; agentId: string | null } | null;
+      ) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
       onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
       onBotRemovedFromGroup?: (chatJid: string) => void;
@@ -619,7 +927,7 @@ class IMConnectionManager {
       isChatAuthorized?: (jid: string) => boolean;
       onCommand?: (chatJid: string, command: string) => Promise<string | null>;
       resolveGroupFolder?: (jid: string) => string | undefined;
-      resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string | null } | null;
+      resolveEffectiveChatJid?: (chatJid: string) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null;
       onAgentMessage?: (baseChatJid: string, agentId: string) => void;
       onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
       onBotRemovedFromGroup?: (chatJid: string) => void;
@@ -772,6 +1080,11 @@ class IMConnectionManager {
     return conn?.channels.get('discord')?.isConnected() ?? false;
   }
 
+  isWhatsAppConnected(userId: string): boolean {
+    const conn = this.connections.get(userId);
+    return conn?.channels.get('whatsapp')?.isConnected() ?? false;
+  }
+
   /** Get the Feishu channel for a user (for direct access like syncGroups) */
   getFeishuConnection(userId: string): IMChannel | undefined {
     return this.connections.get(userId)?.channels.get('feishu');
@@ -847,6 +1160,57 @@ class IMConnectionManager {
       }
     }
     return ids;
+  }
+
+  /**
+   * Disconnect all IM channels owned by a single user (feishu / telegram /
+   * qq / wechat / dingtalk / discord / whatsapp). Used when admin disables
+   * or deletes a user — without this, an active feishu bot would keep
+   * responding to that user's group messages until the next service restart
+   * (loadState filters out non-active users at startup).
+   */
+  async disconnectAllUserChannels(userId: string): Promise<void> {
+    // 必须用 user-scope 锁串行 + 设 sealed 标记：仅 channelType 锁锁不住与
+    // 同一 user 的其他 channelType 的 connectChannel 并发，会让被禁用用户的
+    // connections 在 connections.delete 之后又被 connectChannel.getOrCreate
+    // 复活，bot 持续响应消息。sealed 标记让后续 connectChannel 直接拒绝
+    // 直到 markUserReconnectable 调用（恢复用户启用时由 reconnectUserIMChannels 触发）。
+    await this.withUserLock(userId, async () => {
+      this.sealedUsers.add(userId);
+      const conn = this.connections.get(userId);
+      if (!conn) {
+        logger.info({ userId }, 'No IM connections for user, marked sealed');
+        return;
+      }
+      const channelTypes = Array.from(conn.channels.keys());
+      for (const ct of channelTypes) {
+        try {
+          await this.disconnectChannelLocked(userId, ct);
+        } catch (err) {
+          logger.warn(
+            { userId, channelType: ct, err },
+            'Error disconnecting user IM channel',
+          );
+        }
+      }
+      const remaining = this.connections.get(userId);
+      if (remaining && remaining.channels.size === 0) {
+        this.connections.delete(userId);
+      }
+      logger.info(
+        { userId, sealedDuringDisconnect: true },
+        'All IM channels for user disconnected',
+      );
+    });
+  }
+
+  /**
+   * Allow connectChannel for this userId again. Used by reconnectUserIMChannels
+   * when an admin re-enables a previously disabled/deleted user — without this
+   * the sealed flag would block all reconnection until process restart.
+   */
+  markUserReconnectable(userId: string): void {
+    this.sealedUsers.delete(userId);
   }
 
   /**

@@ -39,12 +39,11 @@ import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeType } from './image-detector.js';
-import { splitTextChunks } from './im-utils.js';
+import { splitTextChunks, createDedupCache } from './im-utils.js';
+import { ProcessingLock, isStale } from './im-safety/index.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
-const MSG_DEDUP_MAX = 1000;
-const MSG_DEDUP_TTL = 30 * 60 * 1000; // 30min
 const DISCORD_MSG_LIMIT = 2000; // Discord message character limit
 // Same 5MB threshold as other channels — only inline base64 for small images
 const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024;
@@ -79,6 +78,46 @@ export interface DiscordConnectOpts {
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
 }
 
+export interface DiscordHistoryMessage {
+  id: string;
+  authorId: string;
+  authorName: string;
+  authorBot: boolean;
+  content: string;
+  timestamp: string;
+  attachments: Array<{ name: string; url: string; size: number; contentType?: string }>;
+  replyToId?: string;
+  edited: boolean;
+}
+
+export interface DiscordChannelInfo {
+  id: string;
+  type: 'dm' | 'guild_text' | 'guild_voice' | 'guild_news' | 'guild_thread' | 'guild_other';
+  name: string;
+  topic?: string;
+  nsfw?: boolean;
+  guildId?: string;
+  parentId?: string;
+  recipientId?: string;
+  recipientName?: string;
+}
+
+export interface DiscordGuildInfo {
+  id: string;
+  name: string;
+  description?: string;
+  ownerId: string;
+  memberCount: number;
+  iconUrl?: string;
+  createdAt: string;
+}
+
+export interface DiscordHistoryOpts {
+  limit?: number;
+  before?: string;
+  after?: string;
+}
+
 export interface DiscordConnection {
   connect(opts: DiscordConnectOpts): Promise<boolean>;
   disconnect(): Promise<void>;
@@ -106,6 +145,12 @@ export interface DiscordConnection {
     | import('./discord-streaming-edit.js').DiscordStreamingEditController
     | undefined
   >;
+  getChannelHistory(
+    chatId: string,
+    opts?: DiscordHistoryOpts,
+  ): Promise<DiscordHistoryMessage[]>;
+  getChannelInfo(chatId: string): Promise<DiscordChannelInfo>;
+  getGuildInfo(chatId: string): Promise<DiscordGuildInfo | null>;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -216,7 +261,9 @@ export function createDiscordConnection(
   let readyFired = false;
 
   // Message deduplication — LRU Map, 1000 entries, 30min TTL
-  const msgCache = new Map<string, number>();
+  // LRU deduplication cache（共享 helper）
+  const dedup = createDedupCache({ ttlMs: 30 * 60 * 1000, max: 1000 });
+  const processingLock = new ProcessingLock();
 
   // Last message ID per chat (for reply context)
   const lastMessageIds = new Map<string, string>();
@@ -227,28 +274,7 @@ export function createDiscordConnection(
     { messageId: string; channelId: string }
   >();
 
-  function isDuplicate(msgId: string): boolean {
-    const now = Date.now();
-    // Map preserves insertion order; stop at first non-expired entry
-    for (const [id, ts] of msgCache.entries()) {
-      if (now - ts > MSG_DEDUP_TTL) {
-        msgCache.delete(id);
-      } else {
-        break;
-      }
-    }
-    if (msgCache.size >= MSG_DEDUP_MAX) {
-      const firstKey = msgCache.keys().next().value;
-      if (firstKey) msgCache.delete(firstKey);
-    }
-    return msgCache.has(msgId);
-  }
 
-  function markSeen(msgId: string): void {
-    // delete + set to refresh insertion order (move to end)
-    msgCache.delete(msgId);
-    msgCache.set(msgId, Date.now());
-  }
 
   // ─── Channel Resolution ──────────────────────────────────
 
@@ -339,12 +365,26 @@ export function createDiscordConnection(
 
       const msgId = msg.id;
 
+      // Global stale-message drop (>30min)
+      if (isStale(msg.createdTimestamp)) {
+        logger.debug(
+          { msgId, createdTimestamp: msg.createdTimestamp },
+          'Stale Discord message (>30min), dropping',
+        );
+        return;
+      }
+
       // Dedup check
-      if (isDuplicate(msgId)) {
+      if (dedup.isDuplicate(msgId)) {
         logger.debug({ msgId }, 'Discord dropped: duplicate');
         return;
       }
-      markSeen(msgId);
+      if (!processingLock.acquire(msgId)) {
+        logger.debug({ msgId }, 'Discord message already in-flight, skipping');
+        return;
+      }
+      dedup.markSeen(msgId);
+      try {
 
       // Skip stale messages from before connection (hot-reload scenario)
       if (opts.ignoreMessagesBefore && msg.createdTimestamp) {
@@ -588,6 +628,9 @@ export function createDiscordConnection(
           'Discord message stored',
         );
       }
+      } finally {
+        processingLock.release(msgId);
+      }
     } catch (err) {
       logger.error({ err }, 'Error handling Discord message');
     }
@@ -798,7 +841,7 @@ export function createDiscordConnection(
         discordClient = null;
       }
       readyFired = false;
-      msgCache.clear();
+      dedup.clear();
       lastMessageIds.clear();
       ackReactionByChat.clear();
       logger.info('Discord bot disconnected');
@@ -905,6 +948,119 @@ export function createDiscordConnection(
           fallbackSend: (text: string) => sendMessage(chatId, text),
         },
       );
+    },
+
+    async getChannelHistory(
+      chatId: string,
+      opts: DiscordHistoryOpts = {},
+    ): Promise<DiscordHistoryMessage[]> {
+      const channel = await resolveChannel(chatId);
+      if (!channel) {
+        throw new Error(`Discord getChannelHistory: unknown chat ${chatId}`);
+      }
+
+      // Discord API caps fetch at 100 messages per request.
+      const limit = Math.max(1, Math.min(opts.limit ?? 50, 100));
+      const fetchOpts: { limit: number; before?: string; after?: string } = {
+        limit,
+      };
+      if (opts.before) fetchOpts.before = opts.before;
+      if (opts.after) fetchOpts.after = opts.after;
+
+      const collection = await channel.messages.fetch(fetchOpts);
+      // Collection is keyed by snowflake; sort newest-first → oldest-first for readability.
+      const messages = Array.from(collection.values()).sort((a, b) =>
+        a.createdTimestamp - b.createdTimestamp,
+      );
+
+      return messages.map((m) => ({
+        id: m.id,
+        authorId: m.author.id,
+        authorName: m.author.username,
+        authorBot: m.author.bot,
+        content: m.content,
+        timestamp: m.createdAt.toISOString(),
+        attachments: Array.from(m.attachments.values()).map((a) => ({
+          name: a.name ?? 'attachment',
+          url: a.url,
+          size: a.size,
+          contentType: a.contentType ?? undefined,
+        })),
+        replyToId: m.reference?.messageId ?? undefined,
+        edited: m.editedTimestamp !== null,
+      }));
+    },
+
+    async getChannelInfo(chatId: string): Promise<DiscordChannelInfo> {
+      const channel = await resolveChannel(chatId);
+      if (!channel) {
+        throw new Error(`Discord getChannelInfo: unknown chat ${chatId}`);
+      }
+
+      // DM
+      if (channel.type === ChannelType.DM) {
+        const dm = channel as DMChannel;
+        return {
+          id: dm.id,
+          type: 'dm',
+          name: dm.recipient?.username
+            ? `DM: ${dm.recipient.username}`
+            : `DM: ${dm.recipientId ?? 'unknown'}`,
+          recipientId: dm.recipientId ?? undefined,
+          recipientName: dm.recipient?.username,
+        };
+      }
+
+      // Map ChannelType numeric enum to our friendlier labels.
+      const channelTypeNumber = channel.type as number;
+      let typeLabel: DiscordChannelInfo['type'] = 'guild_other';
+      if (channelTypeNumber === ChannelType.GuildText) typeLabel = 'guild_text';
+      else if (channelTypeNumber === ChannelType.GuildAnnouncement)
+        typeLabel = 'guild_news';
+      else if (channelTypeNumber === ChannelType.GuildVoice)
+        typeLabel = 'guild_voice';
+      else if (
+        channelTypeNumber === ChannelType.PublicThread ||
+        channelTypeNumber === ChannelType.PrivateThread ||
+        channelTypeNumber === ChannelType.AnnouncementThread
+      )
+        typeLabel = 'guild_thread';
+
+      const guildChannel = channel as TextChannel | NewsChannel;
+      return {
+        id: guildChannel.id,
+        type: typeLabel,
+        name: guildChannel.name,
+        topic: 'topic' in guildChannel ? guildChannel.topic ?? undefined : undefined,
+        nsfw: 'nsfw' in guildChannel ? guildChannel.nsfw : undefined,
+        guildId: guildChannel.guildId,
+        parentId: guildChannel.parentId ?? undefined,
+      };
+    },
+
+    async getGuildInfo(chatId: string): Promise<DiscordGuildInfo | null> {
+      const channel = await resolveChannel(chatId);
+      if (!channel) {
+        throw new Error(`Discord getGuildInfo: unknown chat ${chatId}`);
+      }
+
+      // DMs do not belong to a guild
+      if (channel.type === ChannelType.DM) return null;
+
+      const guild = (channel as TextChannel | NewsChannel).guild;
+      if (!guild) return null;
+
+      // Refresh guild data to get current memberCount where possible
+      const fresh = await guild.fetch();
+      return {
+        id: fresh.id,
+        name: fresh.name,
+        description: fresh.description ?? undefined,
+        ownerId: fresh.ownerId,
+        memberCount: fresh.memberCount,
+        iconUrl: fresh.iconURL({ size: 256 }) ?? undefined,
+        createdAt: fresh.createdAt.toISOString(),
+      };
     },
   };
 

@@ -54,6 +54,7 @@ import skillsRoutes from './routes/skills.js';
 import browseRoutes from './routes/browse.js';
 import agentRoutes from './routes/agents.js';
 import mcpServersRoutes from './routes/mcp-servers.js';
+import pluginsRoutes from './routes/plugins.js';
 import workspaceConfigRoutes from './routes/workspace-config.js';
 import agentDefinitionsRoutes from './routes/agent-definitions.js';
 import { usage as usageRoutes } from './routes/usage.js';
@@ -99,9 +100,20 @@ import {
   SESSION_COOKIE_NAME_SECURE,
   SESSION_COOKIE_NAME_PLAIN,
   ASSISTANT_NAME,
+  GROUPS_DIR,
 } from './config.js';
+import { expandPluginSlashCommandIfNeeded } from './plugin-expander-core.js';
+import { makeExpandContext } from './plugin-expander-context.js';
+import type { ExpandContext } from './plugin-expander-context.js';
+import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
+import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
+import { persistPluginExpansion } from './plugin-expander-store.js';
 import { logger } from './logger.js';
-import { executeSessionReset } from './commands.js';
+import {
+  executeSessionReset,
+  isClearCommand,
+  SESSION_RESET_FAILURE_MESSAGE,
+} from './commands.js';
 import {
   normalizeImageAttachments,
   toAgentImages,
@@ -134,6 +146,60 @@ function normalizeTerminalSize(
   if (intValue < min) return min;
   if (intValue > max) return max;
   return intValue;
+}
+
+/**
+ * Build an ExpandContext for plugin-command expansion against a registered
+ * group. Returns null when the group has no resolvable owner (no plugins to
+ * resolve in that case).
+ *
+ * Plugins are per-user config. On the admin-shared `web:main + isHome`
+ * workspace each admin owns a separate runtime, so the message sender wins
+ * over `group.created_by` — but only when the sender is an active admin
+ * (#24 round-16 P2-1). Non-admin / disabled / unknown senders fall back to
+ * `created_by`, mirroring `resolvePerMessageRuntimeOwner` used by the
+ * cold-start path; pre-fix the web fast-path blindly returned senderUserId
+ * on `web:main + isHome`, so `/foo` from a member resolved to the member's
+ * (empty) plugin runtime when the runner was active and to admin's runtime
+ * when idle — same command, two different behaviors.
+ *
+ * Host mode honors `group.customCwd` so inline `!` commands run against the
+ * user's real repo (#18 P2-bug-4).
+ */
+function buildWebExpandContext(
+  groupJid: string,
+  group: {
+    folder: string;
+    created_by?: string | null;
+    executionMode?: string | null;
+    customCwd?: string | null;
+    is_home?: boolean;
+  },
+  senderUserId?: string | null,
+): ExpandContext | null {
+  const deps = getWebDeps();
+  // Default getUserById: when the WebDeps wiring did not inject one (older
+  // tests / partial fixtures), `resolvePerMessageRuntimeOwner` falls back to
+  // `created_by` for any non-empty sender — admin gating is opt-in. The
+  // production wiring in src/index.ts ALWAYS injects the lookup.
+  const getUserById = deps?.getUserById ?? (() => null);
+  const ownerId = resolvePerMessageRuntimeOwner({
+    chatJid: groupJid,
+    isHome: !!group.is_home,
+    fallbackOwner: group.created_by,
+    message: { sender: senderUserId ?? '' },
+    getUserById,
+  });
+  const containerName = deps?.queue.getActiveContainerName(groupJid) ?? null;
+  return makeExpandContext({
+    chatJid: groupJid,
+    groupFolder: group.folder,
+    ownerId,
+    executionMode: group.executionMode,
+    customCwd: group.customCwd,
+    groupsDir: GROUPS_DIR,
+    containerName,
+  });
 }
 
 function releaseTerminalOwnership(ws: WebSocket, groupJid: string): void {
@@ -272,6 +338,10 @@ function handleWebModelCommand(input: {
 }
 
 // --- CORS Middleware ---
+// 默认空（只放行 localhost / 127.0.0.1）。WebSocket upgrade 已对同源请求放行
+// （origin==Host，见 setupWebSocket），公网域名访问无需配置即可用且保留 CSWSH
+// 防御。如需放行跨站来源，在 .env 配置 CORS_ALLOWED_ORIGINS 为逗号分隔白名单
+// 或 '*'（关闭防御）。
 const CORS_ALLOWED_ORIGINS = process.env.CORS_ALLOWED_ORIGINS || '';
 const CORS_ALLOW_LOCALHOST = process.env.CORS_ALLOW_LOCALHOST !== 'false'; // default: true
 
@@ -321,6 +391,7 @@ app.route('/api/skills', skillsRoutes);
 app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
 app.route('/api/mcp-servers', mcpServersRoutes);
+app.route('/api/plugins', pluginsRoutes);
 app.route('/api/agent-definitions', agentDefinitionsRoutes);
 app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
 app.route('/api/groups', workspaceConfigRoutes); // Workspace config under /api/groups/:jid/workspace-config
@@ -355,6 +426,57 @@ app.post('/api/messages', authMiddleware, async (c) => {
       { error: 'Insufficient permissions for host execution mode' },
       403,
     );
+  }
+
+  // /clear: reset session without entering message pipeline.
+  // Permission: owner-only (canModifyGroup) — aligned with `reset-session`
+  // route, since /clear has the same destructive effect (clears agent
+  // session files, stops sibling containers, drops conversation history).
+  if (isClearCommand(content)) {
+    if (
+      !canModifyGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: chatJid },
+      )
+    ) {
+      return c.json(
+        { error: 'Only the workspace owner can run /clear' },
+        403,
+      );
+    }
+    if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+    try {
+      await executeSessionReset(chatJid, group.folder, {
+        queue: deps.queue,
+        broadcast: broadcastNewMessage,
+        setLastAgentTimestamp: deps.setLastAgentTimestamp,
+      });
+      return c.json({ success: true, cleared: true });
+    } catch (err) {
+      logger.error({ chatJid, err }, '/clear command failed');
+      const errId = crypto.randomUUID();
+      const errTs = new Date().toISOString();
+      ensureChatExists(chatJid);
+      storeMessageDirect(
+        errId,
+        chatJid,
+        '__system__',
+        'system',
+        SESSION_RESET_FAILURE_MESSAGE,
+        errTs,
+        true,
+      );
+      broadcastNewMessage(chatJid, {
+        id: errId,
+        chat_jid: chatJid,
+        sender: '__system__',
+        sender_name: 'system',
+        content: SESSION_RESET_FAILURE_MESSAGE,
+        timestamp: errTs,
+        is_from_me: true,
+      });
+      return c.json({ error: '清除上下文失败' }, 500);
+    }
   }
 
   const result = await handleWebUserMessage(
@@ -521,6 +643,119 @@ async function handleWebUserMessage(
     }
   }
 
+  // Plugin command expander (DMI commands).
+  //
+  // Hybrid strategy avoiding the round-11/round-12 P2-4 double-exec while
+  // keeping active-runner DMI working:
+  //   - Active runner: expander runs here. `reply` short-circuits with an
+  //     in-band system message; `expanded` mutates `sendContent` to the
+  //     prompt that's piped via `queue.sendMessage`; `miss` passes through.
+  //   - Idle (no active runner): we DO NOT call the expander at all —
+  //     `expandPluginSlashCommandIfNeeded` itself runs inline `!` as a side
+  //     effect (not pure parse), so calling it then discarding the result
+  //     would still execute inline once here AND again when cold-start
+  //     re-reads the DB row and re-expands → double-fire (#20 P2-4 round 12).
+  //     The `enqueueMessageCheck → cold-start → expandMessagesIfNeeded`
+  //     path handles `reply`/`expanded`/`miss` uniformly with no race.
+  //
+  // Race window between the peek and `queue.sendMessage` is small and benign:
+  // if the runner exits in that gap, sendMessage returns 'no_active' and
+  // cold-start re-reads ORIGINAL from DB (we don't write `sendContent` back),
+  // so cold-start re-expands and inline runs again. Lead-approved tradeoff;
+  // log a warn line so we can confirm rarity in production.
+  let sendContent = content;
+  const eagerExpandActive =
+    deps.queue.hasActiveMainRunnerForMessage(chatJid);
+  if (eagerExpandActive) {
+    // Use the effective (sibling-resolved) group so non-home groups bound to a
+    // home sibling inherit executionMode / customCwd / created_by — otherwise
+    // buildWebExpandContext returns null on sibling JIDs and the active runner
+    // ends up receiving the literal `/foo` slash command (#21 round-13 P2-3).
+    const expandGroup = deps.resolveEffectiveGroup
+      ? deps.resolveEffectiveGroup(group).effectiveGroup
+      : group;
+    const expandCtx = buildWebExpandContext(chatJid, expandGroup, userId);
+    if (expandCtx) {
+      const expansion = await expandPluginSlashCommandIfNeeded(
+        expandCtx,
+        content,
+      );
+      if (expansion.kind === 'reply') {
+        const sysMsgId = `sys_plugin_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        const sysTimestamp = new Date().toISOString();
+        storeMessageDirect(
+          sysMsgId,
+          chatJid,
+          '__plugin__',
+          ASSISTANT_NAME,
+          expansion.text,
+          sysTimestamp,
+          true,
+        );
+        broadcastNewMessage(chatJid, {
+          id: sysMsgId,
+          chat_jid: chatJid,
+          sender: '__plugin__',
+          sender_name: ASSISTANT_NAME,
+          content: expansion.text,
+          timestamp: sysTimestamp,
+          is_from_me: true,
+        });
+        // Plugin reply is out-of-band — it does NOT consume an agent turn.
+        // Mirror the cold-start cursor logic (#22 round-14 P2):
+        //   - earlier pending exists → advanceNextPullCursorOnly so the
+        //     next poll skips this reply but lastCommittedCursor stays put
+        //     and recovery still surfaces the earlier message
+        //   - no earlier pending → advanceCursors fully commits with a
+        //     lex (timestamp, id) max-merge (#27 round-17 P2-2). Direct
+        //     overwrite via setCursors regressed the cursor when a same-
+        //     millisecond batch had a higher-UUID neighbor already
+        //     committed → already-processed messages re-polled and the
+        //     reply re-fired.
+        const replyCursor = { timestamp, id: messageId };
+        if (deps.hasEarlierPendingMessages(chatJid, replyCursor)) {
+          deps.advanceNextPullCursorOnly(chatJid, replyCursor);
+        } else {
+          deps.advanceCursors(chatJid, replyCursor);
+        }
+        deps.advanceGlobalCursor(replyCursor);
+        return { ok: true, messageId, timestamp };
+      }
+      if (expansion.kind === 'expanded') {
+        sendContent = expansion.prompt;
+        // Crash-safety (#23 round-15 P1-1): the cold-start path persists the
+        // sentinel before the cursor advances; the web eager-expand path was
+        // missing this write, so a runner crash between IPC inject and message
+        // consume left the DB row holding the original `/foo` slash command.
+        // Recovery's expandMessagesIfNeeded would then re-run inline `!` and
+        // fire side effects twice. Mirror the cold-start contract here:
+        // persist BEFORE handing the expanded prompt downstream, only when
+        // every inline succeeded — failed-inline expansions intentionally
+        // skip persistence so recovery legitimately retries.
+        if (expansion.inlineExecuted) {
+          try {
+            persistPluginExpansion(messageId, chatJid, {
+              type: PLUGIN_EXPANSION_ATTACHMENT_TYPE,
+              expanded: true,
+              prompt: expansion.prompt,
+              expandedAt: new Date().toISOString(),
+            });
+          } catch (err) {
+            // Non-fatal: prompt still reaches the agent on this run; recovery
+            // worst-case re-runs inline (the original bug, no regression).
+            logger.warn(
+              { err, chatJid, messageId },
+              'web eager expand: failed to persist expansion sentinel',
+            );
+          }
+        }
+      }
+      // `miss` → sendContent already holds the original.
+    }
+  }
+  // Idle path: skip expander entirely; cold-start will expand once from the
+  // original DB row via `expandMessagesIfNeeded` (handles reply/expanded/miss).
+
   const shared = !group.is_home && isGroupShared(group.folder);
   const formatted = deps.formatMessages(
     [
@@ -529,7 +764,7 @@ async function handleWebUserMessage(
         chat_jid: chatJid,
         sender: userId,
         sender_name: displayName,
-        content,
+        content: sendContent,
         timestamp,
       },
     ],
@@ -551,11 +786,30 @@ async function handleWebUserMessage(
       // Web messages have no IM source, so clear the IM route.
       updateRoute?.(group.folder, null);
     },
+    chatJid,
   );
   if (sendResult === 'sent') {
     pipedToActive = true;
   } else {
-    deps.queue.enqueueMessageCheck(chatJid);
+    if (eagerExpandActive && sendContent !== content) {
+      // Active runner exited between peek and sendMessage → cold-start will
+      // re-expand from the ORIGINAL DB content, so inline `!` runs again.
+      // Rare but possible — flagged so we can quantify in production.
+      logger.warn(
+        {
+          event: 'plugin_expander_race',
+          subtype: 'user_message',
+          chatJid,
+          userId,
+          messageId,
+        },
+        'Race: eager-expanded but runner exited before sendMessage; cold-start will re-expand (inline may run twice)',
+      );
+    }
+    // Pass the sender as the run initiator so the stop/interrupt routes can do
+    // a resource-level "owner OR initiator" check — a shared member can stop /
+    // interrupt the run they started, but not the owner's.
+    deps.queue.enqueueMessageCheck(chatJid, userId);
   }
 
   // Only advance per-group cursor when we piped directly into a running container.
@@ -685,6 +939,112 @@ async function handleAgentConversationMessage(
     return;
   }
 
+  // Plugin command expander (DMI commands).
+  //
+  // Hybrid strategy (mirrors handleWebUserMessage; #20 P2-4 round 12):
+  //   - Active runner: expander runs here. `reply` short-circuits;
+  //     `expanded` mutates `agentSendContent`; `miss` passes through.
+  //   - Idle: skip expander entirely. Calling expander runs inline `!` as a
+  //     side effect, and cold-start (`processAgentConversation` →
+  //     `expandMessagesIfNeeded`) would re-expand from the original DB row
+  //     → inline double-fire. Cold-start handles all three outcomes.
+  let agentSendContent = content;
+  const eagerExpandAgentActive =
+    deps.queue.hasActiveMainRunnerForMessage(virtualChatJid);
+  if (eagerExpandAgentActive) {
+    const parentGroup =
+      deps.getRegisteredGroups()[chatJid] ?? getRegisteredGroup(chatJid);
+    if (parentGroup) {
+      // Use the effective (sibling-resolved) parent group so a non-home parent
+      // bound to a home sibling expands plugins via the home's executionMode /
+      // customCwd / created_by — otherwise buildWebExpandContext returns null
+      // for the agent virtual JID and the active runner receives the raw
+      // slash command (#21 round-13 P2-3).
+      const expandParent = deps.resolveEffectiveGroup
+        ? deps.resolveEffectiveGroup(parentGroup).effectiveGroup
+        : parentGroup;
+      const expandCtx = buildWebExpandContext(
+        virtualChatJid,
+        expandParent,
+        userId,
+      );
+      if (expandCtx) {
+        const expansion = await expandPluginSlashCommandIfNeeded(
+          expandCtx,
+          content,
+        );
+        if (expansion.kind === 'reply') {
+          const sysMsgId = `sys_plugin_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          const sysTimestamp = new Date().toISOString();
+          storeMessageDirect(
+            sysMsgId,
+            virtualChatJid,
+            '__plugin__',
+            ASSISTANT_NAME,
+            expansion.text,
+            sysTimestamp,
+            true,
+          );
+          broadcastNewMessage(
+            virtualChatJid,
+            {
+              id: sysMsgId,
+              chat_jid: virtualChatJid,
+              sender: '__plugin__',
+              sender_name: ASSISTANT_NAME,
+              content: expansion.text,
+              timestamp: sysTimestamp,
+              is_from_me: true,
+            },
+            agentId,
+          );
+          // Plugin reply is out-of-band — it does NOT consume an agent turn.
+          // Mirror the cold-start cursor logic (#22 round-14 P2): commit
+          // both cursors when no earlier pending message exists, otherwise
+          // hold lastCommittedCursor so recovery still picks it up.
+          //
+          // Commit uses lex (timestamp, id) max-merge via `advanceCursors`
+          // (#27 round-17 P2-2) — direct overwrite would regress cursor on
+          // same-millisecond batches and re-fire the reply.
+          const replyCursor = { timestamp, id: messageId };
+          if (deps.hasEarlierPendingMessages(virtualChatJid, replyCursor)) {
+            deps.advanceNextPullCursorOnly(virtualChatJid, replyCursor);
+          } else {
+            deps.advanceCursors(virtualChatJid, replyCursor);
+          }
+          return;
+        }
+        if (expansion.kind === 'expanded') {
+          agentSendContent = expansion.prompt;
+          // Crash-safety mirror of handleWebUserMessage (#23 round-15 P1-1):
+          // persist the rendered prompt onto the message row BEFORE IPC
+          // injection so a runner crash before consume cannot trick the
+          // agent-conv cold-start into re-running inline `!` from the
+          // original DB content. Sentinel keys on virtualChatJid because
+          // that's the storeMessageDirect / read-back JID.
+          if (expansion.inlineExecuted) {
+            try {
+              persistPluginExpansion(messageId, virtualChatJid, {
+                type: PLUGIN_EXPANSION_ATTACHMENT_TYPE,
+                expanded: true,
+                prompt: expansion.prompt,
+                expandedAt: new Date().toISOString(),
+              });
+            } catch (err) {
+              logger.warn(
+                { err, chatJid, virtualChatJid, agentId, messageId },
+                'web eager expand (agent conv): failed to persist expansion sentinel',
+              );
+            }
+          }
+        }
+        // `miss` → agentSendContent already holds the original.
+      }
+    }
+  }
+  // Idle path: skip expander entirely; cold-start owns expansion via
+  // `expandMessagesIfNeeded` (handles reply/expanded/miss uniformly).
+
   // Format for agent
   const shared = false; // agent conversations are not shared
   const formatted = deps.formatMessages(
@@ -694,7 +1054,7 @@ async function handleAgentConversationMessage(
         chat_jid: virtualChatJid,
         sender: userId,
         sender_name: displayName,
-        content,
+        content: agentSendContent,
         timestamp,
       },
     ],
@@ -707,8 +1067,27 @@ async function handleAgentConversationMessage(
     virtualChatJid,
     formatted,
     agentImages,
+    undefined,
+    virtualChatJid,
   );
   if (agentSendResult === 'no_active') {
+    if (eagerExpandAgentActive && agentSendContent !== content) {
+      // Race: peek said active, but the runner exited before sendMessage.
+      // Cold-start re-expands from the original DB row → inline `!` may
+      // run twice. Lead-approved edge case; logged for telemetry.
+      logger.warn(
+        {
+          event: 'plugin_expander_race',
+          subtype: 'agent_conversation',
+          chatJid,
+          virtualChatJid,
+          userId,
+          agentId,
+          messageId,
+        },
+        'Race: eager-expanded agent conv but runner exited before sendMessage; cold-start will re-expand',
+      );
+    }
     // No running process — force close any stale state and start fresh.
     // Mirrors the reliable IM path in buildOnAgentMessage() (#240).
     deps.queue.closeStdin(virtualChatJid);
@@ -770,8 +1149,17 @@ app.use(
 
 // --- WebSocket ---
 
+// Origin 被 403 拒绝时，每个 origin 只 warn 一次，避免反复连接刷屏。
+// 反向代理 + 公网域名场景下，管理员只能通过日志定位"为什么 WS 连不上"
+// （前端只看到 onclose、后端默认静默 destroy socket），没有这行日志运维成本极高。
+const warnedRejectedOrigins = new Set<string>();
+
 function setupWebSocket(server: any): WebSocketServer {
-  const wss = new WebSocketServer({ noServer: true });
+  // 8 MiB 上限：覆盖单条消息含 10 张 5MB base64 image 的合法上限（~70MB 是
+  // attachments 上限里的极端情形——通过 schema 上的 attachments.max(10) 控制
+  // 而不是把 ws frame 单帧打到 100MB），也防止认证用户用单帧 OOM 服务器
+  // （ws 库默认 100 MiB；详见 node_modules/ws/lib/websocket-server.js）。
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
 
   server.on('upgrade', (request: any, socket: any, head: any) => {
     const { pathname } = new URL(request.url, `http://${request.headers.host}`);
@@ -779,6 +1167,42 @@ function setupWebSocket(server: any): WebSocketServer {
     if (pathname !== '/ws') {
       socket.destroy();
       return;
+    }
+
+    // Origin 校验：CORS 中间件不覆盖 WebSocket，浏览器对 WebSocket 也不发
+    // CORS preflight。SameSite=Strict cookie 是当前的主防御，origin 检查
+    // 是纵深防御 —— SameSite 实现不严的 UA / future SameSite=Lax 回退会
+    // 直接暴露 CSWSH（跨站 WebSocket 劫持）。Origin 缺失（同源、无浏览器
+    // origin）放行；同源放行；存在但不在白名单则拒绝。
+    const origin = request.headers.origin as string | undefined;
+    if (origin) {
+      // 同源请求放行：比较 Origin 的 host 与 Host header
+      const host = request.headers.host as string | undefined;
+      let sameOrigin = false;
+      if (host) {
+        try {
+          const originHost = new URL(origin).host;
+          sameOrigin = originHost === host;
+        } catch { /* invalid origin */ }
+      }
+      if (!sameOrigin) {
+        const allowed = isAllowedOrigin(origin);
+        if (!allowed) {
+          if (!warnedRejectedOrigins.has(origin)) {
+            warnedRejectedOrigins.add(origin);
+            logger.warn(
+              {
+                origin,
+                hint: 'add this origin to CORS_ALLOWED_ORIGINS env var (comma-separated) or set it to "*" to allow all',
+              },
+              'WebSocket upgrade rejected: Origin not in allowlist (CSWSH defense)',
+            );
+          }
+          socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          socket.destroy();
+          return;
+        }
+      }
     }
 
     // Verify session cookie (HMAC signature + DB lookup).
@@ -821,6 +1245,15 @@ function setupWebSocket(server: any): WebSocketServer {
       socket.destroy();
       return;
     }
+    // 强制改密码用户不能通过 WebSocket 发指令 / 操作终端，否则 HTTP 中
+    // PASSWORD_CHANGE_REQUIRED 形同虚设——admin 重置密码后用户仍能继续与
+    // agent 交互、开容器终端。HTTP 仍允许 /api/auth/me / /password / /sessions
+    // 完成强制改密流程。
+    if (session.must_change_password) {
+      socket.write('HTTP/1.1 403 Password Change Required\r\n\r\n');
+      socket.destroy();
+      return;
+    }
     request.__happyclawSessionId = token;
 
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -850,7 +1283,7 @@ function setupWebSocket(server: any): WebSocketServer {
           continue;
         }
         // Skip empty snapshots
-        if (!snap.partialText && snap.activeTools.length === 0 && snap.recentEvents.length === 0) {
+        if (!snap.partialText && !snap.thinkingText && snap.activeTools.length === 0 && snap.recentEvents.length === 0 && snap.traceEvents.length === 0 && Object.keys(snap.taskStates).length === 0 && !snap.contextAudit) {
           continue;
         }
         // Strip #agent: suffix for ACL lookup (virtual JIDs not in registered_groups)
@@ -863,10 +1296,16 @@ function setupWebSocket(server: any): WebSocketServer {
             chatJid: jid,
             snapshot: {
               partialText: snap.partialText,
+              thinkingText: snap.thinkingText,
               activeTools: snap.activeTools,
               recentEvents: snap.recentEvents,
+              traceEvents: snap.traceEvents,
+              taskStates: snap.taskStates,
+              contextAudit: snap.contextAudit,
               todos: snap.todos,
               systemStatus: snap.systemStatus,
+              isThinking: snap.isThinking,
+              activeHook: snap.activeHook,
               turnId: snap.turnId,
             },
           } satisfies WsMessageOut));
@@ -923,6 +1362,12 @@ function setupWebSocket(server: any): WebSocketServer {
           }
           invalidateSessionCache(sessionId);
           ws.close(1008, 'Unauthorized');
+          return;
+        }
+        // 与 upgrade 处一致：管理员重置密码后被强制改密的 session 不能继续
+        // 操作 agent / 终端；ws.close(1008) 让前端收到关闭再走改密流程。
+        if (session.must_change_password) {
+          ws.close(1008, 'Password change required');
           return;
         }
 
@@ -1029,6 +1474,78 @@ function setupWebSocket(server: any): WebSocketServer {
             return;
           }
 
+          // ── /clear command: reset session without entering message pipeline ──
+          // Must run before the agentId early return so /clear in a sub-agent tab
+          // resets the agent session (passing agentId) instead of being delivered
+          // to the agent as plain text.
+          // Permission: owner-only (canModifyGroup) — aligned with HTTP /clear
+          // and `reset-session` route. /clear has the same destructive effect.
+          // Success has no explicit ws_error/ack — the client sees the reset
+          // through the broadcastNewMessage(context_reset) push from executeSessionReset.
+          if (isClearCommand(content) && deps && targetGroup) {
+            if (
+              !canModifyGroup(
+                { id: session.user_id, role: session.role },
+                { ...targetGroup, jid: chatJid },
+              )
+            ) {
+              sendWsError('Only the workspace owner can run /clear', chatJid);
+              return;
+            }
+            // Validate agentId before passing to executeSessionReset →
+            // clearSessionFiles, which interpolates agentId into a filesystem
+            // path. Mirrors the reset-session route's check (routes/groups.ts).
+            if (agentId) {
+              const agent = getAgent(agentId);
+              if (!agent || agent.chat_jid !== chatJid) {
+                sendWsError('Agent not found', chatJid);
+                return;
+              }
+            }
+            const errorTargetJid = agentId
+              ? `${chatJid}#agent:${agentId}`
+              : chatJid;
+            try {
+              await executeSessionReset(
+                chatJid,
+                targetGroup.folder,
+                {
+                  queue: deps.queue,
+                  broadcast: broadcastNewMessage,
+                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
+                },
+                agentId,
+              );
+            } catch (err) {
+              logger.error(
+                { chatJid, agentId, err },
+                '/clear command failed',
+              );
+              const errId = crypto.randomUUID();
+              const errTs = new Date().toISOString();
+              ensureChatExists(errorTargetJid);
+              storeMessageDirect(
+                errId,
+                errorTargetJid,
+                '__system__',
+                'system',
+                SESSION_RESET_FAILURE_MESSAGE,
+                errTs,
+                true,
+              );
+              broadcastNewMessage(errorTargetJid, {
+                id: errId,
+                chat_jid: errorTargetJid,
+                sender: '__system__',
+                sender_name: 'system',
+                content: SESSION_RESET_FAILURE_MESSAGE,
+                timestamp: errTs,
+                is_from_me: true,
+              });
+            }
+            return;
+          }
+
           // Route to agent conversation handler if agentId is present
           if (agentId && deps) {
             await handleAgentConversationMessage(
@@ -1039,44 +1556,6 @@ function setupWebSocket(server: any): WebSocketServer {
               session.display_name || session.username,
               attachments,
             );
-            return;
-          }
-
-          // ── /clear command: reset session without entering message pipeline ──
-          if (content.trim().toLowerCase() === '/clear' && deps) {
-            const targetGroup = getRegisteredGroup(chatJid);
-            if (targetGroup) {
-              try {
-                await executeSessionReset(chatJid, targetGroup.folder, {
-                  queue: deps.queue,
-                  broadcast: broadcastNewMessage,
-                  setLastAgentTimestamp: deps.setLastAgentTimestamp,
-                });
-              } catch (err) {
-                logger.error({ chatJid, err }, '/clear command failed');
-                const errId = crypto.randomUUID();
-                const errTs = new Date().toISOString();
-                ensureChatExists(chatJid);
-                storeMessageDirect(
-                  errId,
-                  chatJid,
-                  '__system__',
-                  'system',
-                  'system_error:清除上下文失败，请稍后重试',
-                  errTs,
-                  true,
-                );
-                broadcastNewMessage(chatJid, {
-                  id: errId,
-                  chat_jid: chatJid,
-                  sender: '__system__',
-                  sender_name: 'system',
-                  content: 'system_error:清除上下文失败，请稍后重试',
-                  timestamp: errTs,
-                  is_from_me: true,
-                });
-              }
-            }
             return;
           }
 
@@ -1378,8 +1857,11 @@ function setupWebSocket(server: any): WebSocketServer {
  * @param adminOnly - If true, only admin users receive the message
  * @param allowedUserIds - Group access filtering:
  *   - undefined: no user-level filtering (e.g. system-wide admin broadcasts)
- *   - null: ownership unresolvable → default-deny, only admin can see
- *   - Set<string>: only these users + admin can see
+ *   - null: ownership unresolvable → default-deny (drop for ALL recipients,
+ *     including admin). 这是有意的硬拒绝，不区分角色，避免 ACL 解析失败时
+ *     管理员意外看到本不该看的群组事件。注意先前文档说"only admin can see"
+ *     与代码不一致，代码 default-deny 更安全所以保留代码、对齐注释。
+ *   - Set<string>: only these users (admin must be an explicit member to see)
  */
 function safeBroadcast(
   msg: WsMessageOut,
@@ -1427,8 +1909,9 @@ function safeBroadcast(
       continue;
     }
 
-    // Group isolation: only allowed users (owner + shared members) can see this group's events
-    // allowedUserIds === null means ownership unresolvable → default-deny (admin-only)
+    // Group isolation: only allowed users (owner + shared members) can see this group's events.
+    // allowedUserIds === null means ownership unresolvable → default-deny EVERYONE
+    // (including admin). 故意这样：解析失败时宁可不广播也不要意外泄漏。
     if (allowedUserIds !== undefined) {
       if (allowedUserIds === null || !allowedUserIds.has(session.user_id)) {
         continue;
@@ -1614,6 +2097,7 @@ export function broadcastTyping(chatJid: string, isTyping: boolean): void {
 
 interface StreamingSnapshotEntry {
   partialText: string;
+  thinkingText: string;
   activeTools: Array<{
     toolName: string;
     toolUseId: string;
@@ -1625,29 +2109,187 @@ interface StreamingSnapshotEntry {
     id: string;
     timestamp: number;
     text: string;
-    kind: 'tool' | 'skill' | 'hook' | 'status';
+    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission';
+  }>;
+  traceEvents: Array<{
+    id: string;
+    timestamp: number;
+    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission';
+    scope?: StreamEvent['agentScope'];
+    title: string;
+    summary?: string;
+    detail?: string;
+    taskId?: string;
+    toolUseId?: string;
+    parentToolUseId?: string | null;
+    displayLevel?: StreamEvent['displayLevel'];
+  }>;
+  contextAudit?: StreamEvent['contextAudit'];
+  taskStates: Record<string, {
+    id: string;
+    title: string;
+    status: 'running' | 'completed' | 'error' | 'backgrounded';
+    subagentType?: string;
+    latestSummary?: string;
+    lastToolName?: string;
+    thinkingTail: string;
+    textTail: string;
+    activeTools: StreamingSnapshotEntry['activeTools'];
+    recentTools: StreamingSnapshotEntry['recentEvents'];
+    updatedAt: number;
   }>;
   todos?: Array<{ id: string; content: string; status: string }>;
   systemStatus: string | null;
+  /** Whether the agent is mid-thinking (no text emitted yet) — kept in the
+   *  snapshot so a WS reconnect restores the "思考中" indicator instead of a
+   *  blank pause. */
+  isThinking?: boolean;
+  /** Currently-running hook, if any — restored on reconnect so the hook spinner
+   *  survives the reconnect instead of silently disappearing. */
+  activeHook?: { hookName: string; hookEvent: string } | null;
   turnId?: string;
   updatedAt: number;
 }
 
 const streamingSnapshots = new Map<string, StreamingSnapshotEntry>();
+/** runner idle 后的墓碑标记：阻止迟到 stream 事件重建已清理的快照。
+ * key 为完整 normalizedJid（主 jid 或 `web:folder#agent:id` 虚拟 jid），
+ * 与 runner/快照同粒度；下一个 run 的 'running' 状态清除。 */
+const snapshotTombstones = new Map<string, number>();
+const MAX_SNAPSHOT_TOMBSTONES = 500;
 /** Accumulates full (non-truncated) text per group for shutdown persistence & disk buffer. */
 const streamingFullTexts = new Map<string, string>();
 const MAX_SNAPSHOT_TEXT = 4000;
+const MAX_SNAPSHOT_THINKING = 8000;
 const MAX_SNAPSHOT_EVENTS = 20;
+const MAX_SNAPSHOT_TRACE_EVENTS = 200;
+const MAX_SNAPSHOT_TASK_TAIL = 4000;
 
 /** Push a recent event entry and truncate to MAX_SNAPSHOT_EVENTS. */
-function pushRecentEvent(snap: StreamingSnapshotEntry, event: { id: string; timestamp: number; text: string; kind: 'tool' | 'skill' | 'hook' | 'status' }): void {
+function pushRecentEvent(snap: StreamingSnapshotEntry, event: { id: string; timestamp: number; text: string; kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission' }): void {
   snap.recentEvents.push(event);
   if (snap.recentEvents.length > MAX_SNAPSHOT_EVENTS) {
     snap.recentEvents = snap.recentEvents.slice(-MAX_SNAPSHOT_EVENTS);
   }
 }
 
+function pushTraceEvent(snap: StreamingSnapshotEntry, event: StreamEvent): void {
+  if (event.eventType === 'text_delta' || event.eventType === 'thinking_delta' || event.eventType === 'usage' || event.eventType === 'init') return;
+  const kind =
+    event.eventType.startsWith('tool_') ? (event.skillName ? 'skill' : 'tool') :
+    event.eventType.startsWith('hook_') ? 'hook' :
+    event.eventType.startsWith('task_') ? 'task' :
+    event.eventType === 'memory_recall' || event.eventType === 'compact_boundary' ? 'memory' :
+    event.eventType === 'context_audit' ? 'context' :
+    event.eventType === 'permission_denied' ? 'permission' :
+    event.eventType === 'raw_sdk_event' ? 'debug' :
+    'status';
+  const title = event.title
+    || event.summary
+    || event.taskSummary
+    || event.statusText
+    || event.toolName
+    || event.rawType
+    || event.eventType;
+  snap.traceEvents.push({
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    timestamp: Date.now(),
+    kind,
+    scope: event.agentScope,
+    title,
+    summary: event.summary || event.taskSummary || event.toolInputSummary,
+    detail: event.detail,
+    taskId: event.taskId,
+    toolUseId: event.toolUseId,
+    parentToolUseId: event.parentToolUseId,
+    displayLevel: event.displayLevel,
+  });
+  if (snap.traceEvents.length > MAX_SNAPSHOT_TRACE_EVENTS) {
+    snap.traceEvents = snap.traceEvents.slice(-MAX_SNAPSHOT_TRACE_EVENTS);
+  }
+}
+
+function tailText(text: string, max: number): string {
+  return text.length > max ? text.slice(-max) : text;
+}
+
+function snapshotTaskId(event: StreamEvent): string | null {
+  return event.parentToolUseId || event.taskId || (
+    event.eventType.startsWith('task_') ? event.toolUseId || null : null
+  );
+}
+
+function updateSnapshotTask(snap: StreamingSnapshotEntry, event: StreamEvent): void {
+  const taskId = snapshotTaskId(event);
+  if (!taskId) return;
+  const task = snap.taskStates[taskId] || {
+    id: taskId,
+    title: event.taskDescription || event.toolInputSummary || event.summary || 'Task',
+    status: 'running' as const,
+    subagentType: event.subagentType,
+    thinkingTail: '',
+    textTail: '',
+    activeTools: [],
+    recentTools: [],
+    updatedAt: Date.now(),
+  };
+  task.updatedAt = Date.now();
+  if (event.taskDescription && (!task.title || task.title === 'Task')) task.title = event.taskDescription;
+  if (event.subagentType) task.subagentType = event.subagentType;
+  if (event.eventType === 'text_delta') {
+    task.textTail = tailText(task.textTail + (event.text || ''), MAX_SNAPSHOT_TASK_TAIL);
+  } else if (event.eventType === 'thinking_delta') {
+    task.thinkingTail = tailText(task.thinkingTail + (event.text || ''), MAX_SNAPSHOT_TASK_TAIL);
+  } else if (event.eventType === 'task_progress') {
+    task.latestSummary = event.summary || event.taskSummary || event.taskDescription || task.latestSummary;
+    task.lastToolName = event.lastToolName || task.lastToolName;
+    task.status = 'running';
+  } else if (event.eventType === 'task_updated') {
+    const patch = event.taskPatch;
+    if (patch?.status === 'completed') task.status = 'completed';
+    else if (patch?.status === 'failed' || patch?.status === 'killed') task.status = 'error';
+    else if (patch?.is_backgrounded) task.status = 'backgrounded';
+    task.latestSummary = event.summary || patch?.description || patch?.error || task.latestSummary;
+  } else if (event.eventType === 'task_notification') {
+    task.status = event.taskStatus === 'completed' ? 'completed' : 'error';
+    task.latestSummary = event.taskSummary || event.summary || task.latestSummary;
+  } else if (event.eventType === 'tool_use_start' && event.parentToolUseId) {
+    const tool = {
+      toolName: event.toolName || 'unknown',
+      toolUseId: event.toolUseId || '',
+      startTime: Date.now(),
+      toolInputSummary: event.toolInputSummary,
+      parentToolUseId: event.parentToolUseId,
+    };
+    task.activeTools = task.activeTools.some(t => t.toolUseId === tool.toolUseId && tool.toolUseId)
+      ? task.activeTools.map(t => (t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t))
+      : [...task.activeTools, tool];
+  } else if (event.eventType === 'tool_use_end' && event.parentToolUseId) {
+    task.activeTools = task.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+  }
+  snap.taskStates[taskId] = task;
+}
+
 function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): void {
+  // turn 干净结束（silent-success）：删除快照而非累积，避免 WS 重连恢复到
+  // 「生成中」僵尸快照。前端收到同一 idle 事件后清 waiting/streaming。
+  if (event.eventType === 'status' && event.statusText === 'idle') {
+    streamingSnapshots.delete(normalizedJid);
+    streamingFullTexts.delete(normalizedJid);
+    return;
+  }
+
+  // 终态守卫：runner 已 idle（run 结束）后 outputChain 的迟到事件不得重建
+  // 快照——重建出的「生成中」快照永远等不到清理，WS 重连/刷新会恢复出僵尸
+  // 转圈。下一个 run 启动时 runner_state 'running' 会清掉 tombstone。
+  // Web 客户端侧有对称的迟到守卫（chat.ts），此处补齐服务端快照的一侧。
+  //
+  // 键必须用完整 normalizedJid（含 #agent: 后缀），与 runner/快照同粒度：
+  // 主 runner idle 只 tombstone `web:folder`，不会误杀并发 sub-agent /
+  // 定时任务（虚拟 jid）的快照；agent runner idle tombstone 自己的
+  // `web:folder#agent:id`，其迟到事件才能被自己的 tombstone 拦住。
+  if (snapshotTombstones.has(normalizedJid)) return;
+
   let snap = streamingSnapshots.get(normalizedJid);
 
   // Reset on new turn
@@ -1659,8 +2301,11 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
   if (!snap) {
     snap = {
       partialText: '',
+      thinkingText: '',
       activeTools: [],
       recentEvents: [],
+      traceEvents: [],
+      taskStates: {},
       systemStatus: null,
       turnId: event.turnId,
       updatedAt: Date.now(),
@@ -1669,10 +2314,14 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
 
   snap.updatedAt = Date.now();
   if (event.turnId) snap.turnId = event.turnId;
+  pushTraceEvent(snap, event);
+  updateSnapshotTask(snap, event);
 
   switch (event.eventType) {
     case 'text_delta':
-      if (event.text) {
+      if (event.text && !event.parentToolUseId) {
+        // Real assistant text means the current thinking burst is over.
+        snap.isThinking = false;
         snap.partialText += event.text;
         if (snap.partialText.length > MAX_SNAPSHOT_TEXT) {
           snap.partialText = snap.partialText.slice(-MAX_SNAPSHOT_TEXT);
@@ -1682,8 +2331,20 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       }
       break;
 
+    case 'thinking_delta':
+      if (event.text && !event.parentToolUseId) {
+        snap.isThinking = true;
+        snap.thinkingText += event.text;
+        if (snap.thinkingText.length > MAX_SNAPSHOT_THINKING) {
+          snap.thinkingText = snap.thinkingText.slice(-MAX_SNAPSHOT_THINKING);
+        }
+      }
+      break;
+
     case 'tool_use_start':
       if (event.toolUseId && event.toolName) {
+        // A tool call ends the current thinking burst.
+        snap.isThinking = false;
         snap.activeTools.push({
           toolName: event.toolName,
           toolUseId: event.toolUseId,
@@ -1715,6 +2376,33 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       }
       break;
 
+    case 'task_start':
+      pushRecentEvent(snap, {
+        id: event.toolUseId || event.taskId || `task-${Date.now()}`,
+        timestamp: Date.now(),
+        text: `Task 启动: ${event.taskDescription || event.toolInputSummary || 'Task'}`,
+        kind: 'task',
+      });
+      break;
+
+    case 'task_progress':
+      pushRecentEvent(snap, {
+        id: `task-progress-${Date.now()}`,
+        timestamp: Date.now(),
+        text: `${event.lastToolName ? `Task 进度 [${event.lastToolName}]` : 'Task 进度'}: ${event.summary || event.taskDescription || ''}`,
+        kind: 'task',
+      });
+      break;
+
+    case 'task_notification':
+      pushRecentEvent(snap, {
+        id: `task-done-${event.taskId || Date.now()}`,
+        timestamp: Date.now(),
+        text: `Task ${event.taskStatus === 'completed' ? '完成' : '结束'}: ${event.taskSummary || event.summary || ''}`,
+        kind: 'task',
+      });
+      break;
+
     case 'status':
       snap.systemStatus = event.statusText || null;
       if (event.statusText) {
@@ -1728,12 +2416,43 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       break;
 
     case 'hook_started':
+      snap.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
       if (event.hookName) {
         pushRecentEvent(snap, {
           id: `hook-${Date.now()}`,
           timestamp: Date.now(),
           text: `${event.hookName} (${event.hookEvent || ''})`,
           kind: 'hook',
+        });
+      }
+      break;
+
+    case 'hook_progress':
+      snap.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      break;
+
+    case 'hook_response':
+      snap.activeHook = null;
+      break;
+
+    case 'memory_recall':
+    case 'compact_boundary':
+      pushRecentEvent(snap, {
+        id: `${event.eventType}-${Date.now()}`,
+        timestamp: Date.now(),
+        text: event.summary || event.title || event.eventType,
+        kind: 'memory',
+      });
+      break;
+
+    case 'context_audit':
+      snap.contextAudit = event.contextAudit;
+      if (event.contextAudit?.warnings?.length) {
+        pushRecentEvent(snap, {
+          id: `context-audit-${Date.now()}`,
+          timestamp: Date.now(),
+          text: `Agent Context: ${event.contextAudit.warnings[0]}`,
+          kind: 'context',
         });
       }
       break;
@@ -1811,6 +2530,26 @@ export function broadcastBillingUpdate(
   safeBroadcast(msg, false, allowedUserIds);
 }
 
+export function broadcastWhatsAppStatus(
+  userId: string,
+  state: {
+    status: 'connecting' | 'qr' | 'connected' | 'disconnected' | 'logged_out';
+    qr?: string;
+    qrDataUrl?: string;
+    error?: string;
+    meJid?: string;
+    meName?: string;
+  },
+): void {
+  const msg: WsMessageOut = {
+    type: 'whatsapp_status',
+    userId,
+    ...state,
+  };
+  const allowedUserIds = new Set([userId]);
+  safeBroadcast(msg, false, allowedUserIds);
+}
+
 export function broadcastAgentStatus(
   chatJid: string,
   agentId: string,
@@ -1837,6 +2576,14 @@ export function broadcastAgentStatus(
     titleGenerating,
   };
   safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+}
+
+export function broadcastAgentRemoved(
+  chatJid: string,
+  agentId: string,
+  name: string,
+): void {
+  broadcastAgentStatus(chatJid, agentId, 'error', name, '', '__removed__', 'conversation');
 }
 
 /**
@@ -1888,6 +2635,19 @@ export function broadcastRunnerState(
     const fullTextKeysToDelete = [...streamingFullTexts.keys()].filter(k => k.startsWith(agentPrefix));
     for (const key of snapshotKeysToDelete) streamingSnapshots.delete(key);
     for (const key of fullTextKeysToDelete) streamingFullTexts.delete(key);
+    // 墓碑：拦截本 run 残留 outputChain 回调对快照的迟到重建。同粒度落键——
+    // 主 runner idle 落 `web:folder`，agent/task runner idle 落各自虚拟 jid，
+    // 互不误伤。容量上限防 Map 无界增长（长期运行会累积大量短命虚拟 jid）。
+    snapshotTombstones.set(jid, Date.now());
+    if (snapshotTombstones.size > MAX_SNAPSHOT_TOMBSTONES) {
+      for (const k of snapshotTombstones.keys()) {
+        if (snapshotTombstones.size <= MAX_SNAPSHOT_TOMBSTONES) break;
+        snapshotTombstones.delete(k);
+      }
+    }
+  } else {
+    // 新 run 启动，恢复快照写入
+    snapshotTombstones.delete(jid);
   }
 }
 
@@ -1925,6 +2685,34 @@ function broadcastStatus(): void {
 let statusInterval: ReturnType<typeof setInterval> | null = null;
 let httpServer: ReturnType<typeof serve> | null = null;
 let wss: WebSocketServer | null = null;
+
+/**
+ * Test-only factory: wires the given `WebDeps` into module + route state and
+ * returns the fully-configured Hono `app` (every route is already mounted at
+ * module load) so integration tests can exercise HTTP routes via
+ * `app.request(...)` — most notably `POST /api/messages` and its `/clear`
+ * interception — without starting the HTTP server, WebSocket server, container
+ * exit callbacks, or the status-broadcast interval.
+ *
+ * Mirrors the dependency wiring in {@link startWebServer} minus all the
+ * runtime side effects. NOT for production use.
+ *
+ * The supplied `webDeps` must be complete for the routes a test actually
+ * drives — this only re-binds deps, it does not validate them, so a route that
+ * reaches a `WebDeps` field the stub omits throws at request time (not at
+ * construction). The current caller stays within the `/clear` ACL path, which
+ * needs only `queue.stopGroup` / `getSessions` / `setLastAgentTimestamp`.
+ */
+export function createAppForTest(webDeps: WebDeps): typeof app {
+  deps = webDeps;
+  setWebDeps(webDeps);
+  injectConfigDeps(webDeps);
+  injectMonitorDeps({
+    broadcastDockerBuildLog,
+    broadcastDockerBuildComplete,
+  });
+  return app;
+}
 
 export function startWebServer(webDeps: WebDeps): void {
   deps = webDeps;

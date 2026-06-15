@@ -8,7 +8,6 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "dev:bun": "bun src/index.ts",
     "reset:admin": "tsx src/reset-admin.ts",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write \"src/**/*.ts\"",
@@ -20,12 +19,13 @@
     "build:all": "npx concurrently --group -n backend,web,agent-runner \"npm run build\" \"npm run build:web\" \"npm --prefix container/agent-runner run build\""
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2.85",
+    "@anthropic-ai/claude-agent-sdk": "*",
+    "@hapi/boom": "^10.0.1",
     "@hono/node-server": "^1.19.9",
     "@larksuiteoapi/node-sdk": "^1.58.0",
     "@openai/codex": "^0.125.0",
     "@openai/codex-sdk": "*",
-    "@types/qrcode": "^1.5.6",
+    "@whiskeysockets/baileys": "^6.17.16",
     "bcryptjs": "^3.0.3",
     "better-sqlite3": "^11.8.1",
     "cron-parser": "^5.5.0",
@@ -39,12 +39,14 @@
     "proxy-agent": "^6.5.0",
     "qrcode": "^1.5.4",
     "ws": "^8.19.0",
+    "yaml": "^2.8.3",
     "zod": "^4.3.6"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
     "@types/better-sqlite3": "^7.6.12",
     "@types/node": "^22.10.0",
+    "@types/qrcode": "^1.5.6",
     "@types/ws": "^8.18.1",
     "concurrently": "^9.2.1",
     "prettier": "^3.8.1",

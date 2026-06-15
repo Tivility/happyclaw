@@ -193,7 +193,6 @@ Agent 自主维护跨会话的持久记忆：
 - **会话记忆** — `data/groups/{folder}/CLAUDE.md`，会话私有
 - **日期记忆** — `memory/YYYY-MM-DD.md`，时效性信息
 - **对话归档** — PreCompact Hook 在上下文压缩前自动归档到 `conversations/`
-- **每日汇总** — 凌晨 2-3 点自动生成对话摘要，写入 HEARTBEAT.md（保留最近 3 天）
 - **全文检索** — Web 界面在线编辑 + 搜索
 
 
@@ -588,7 +587,6 @@ happyclaw/
 │   ├── billing.ts                #   计费引擎（计划、钱包、配额）
 │   ├── runtime-config.ts         #   AES-256-GCM 加密配置
 │   ├── task-scheduler.ts         #   定时任务调度
-│   ├── daily-summary.ts          #   每日对话汇总
 │   ├── script-runner.ts          #   脚本任务执行器
 │   ├── file-manager.ts           #   文件安全（路径遍历防护）
 │   ├── mount-security.ts         #   挂载白名单 / 黑名单
@@ -704,9 +702,10 @@ cd web && npx vite --port 3001
 | `MAX_CONCURRENT_CONTAINERS` | `20` | 最大并发容器数（可通过 Web 设置覆盖） |
 | `MAX_CONCURRENT_HOST_PROCESSES` | `5` | 宿主机进程并发上限（可通过 Web 设置覆盖） |
 | `TRUST_PROXY` | `false` | 信任反向代理的 `X-Forwarded-For` 头 |
+| `CORS_ALLOWED_ORIGINS` | `*`（见 `.env.example`） | 跨站来源白名单（WebSocket + CORS 共用）。`*` 放行任意来源；公网部署改为逗号分隔白名单收紧 |
 | `TZ` | 系统时区 | 定时任务时区 |
 
-> 更多运行参数（容器超时、并发限制、登录保护、计费设置等）可在 Web 界面「设置 → 系统设置」中配置，无需设置环境变量。
+> 完整示例见 `.env.example`。更多运行参数（容器超时、并发限制、登录保护、计费设置等）可在 Web 界面「设置 → 系统设置」中配置，无需设置环境变量。
 
 ### 管理员密码恢复
 

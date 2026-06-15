@@ -2,9 +2,12 @@
  * Top-level Feishu v2 Agent reply card builders.
  *
  *   buildAgentReplyCard(input)
- *       Terminal (static) card. Structured body: title + body with collapsible
- *       overflow sections + metadata row (2×2) + optional thinking/tool panels
- *       + footer. Suitable for finalized Agent replies and error cards.
+ *       Terminal (static) card. Header is status-driven: a successful `done`
+ *       reply drops the header (unless an explicit title is passed) so short
+ *       status messages aren't reduced to a truncated header, while
+ *       running/warning/error keep a status-coloured header. Followed by body
+ *       chunks + metadata row (2×2) + optional thinking/tool panels + footer.
+ *       Suitable for finalized Agent replies and error cards.
  *
  *   buildStreamingAgentCard(opts)
  *       Initial streaming skeleton. Preserves the 5 slot element_ids that
@@ -28,7 +31,7 @@ import {
   buildStatusBannerText,
   buildLocalDatetimeWithSeconds,
   extractTitle,
-  stripTitleFromBody,
+  statusHeadline,
   CARD_ELEMENT_IDS,
   type StreamingCardRuntimeProfile,
   type StreamingPanelsInit,
@@ -48,13 +51,26 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
     ? optimizeMarkdownStyle(input.thinking, 2)
     : undefined;
 
-  const { title: autoTitle, bodyStartIndex } = extractTitle(optimizedText);
-  const displayTitle = input.title ?? autoTitle;
-  const body = stripTitleFromBody(optimizedText, bodyStartIndex);
+  const explicitTitle = input.title?.trim();
+  const body = optimizedText.trim();
+
+  // Header policy: always render a status-coloured header so the
+  // streaming→terminal transition stays visually consistent (blue「生成中」→
+  // violet「已完成」is a colour change, not a header that suddenly vanishes).
+  // The header title is the explicit title when present, otherwise a minimal
+  // status word ('已完成'/'已中断'/'出错') — NEVER the body's first line, which
+  // was the root cause of the header/first-line duplication (issue #488). Using
+  // a fixed status word for `done` keeps issue #488 fixed while still giving the
+  // completed reply a clear status anchor.
+  const headlineTitle = explicitTitle ?? statusHeadline(input.status);
+  const summaryTitle = input.titlePrefix
+    ? `${input.titlePrefix}${headlineTitle}`
+    : headlineTitle;
 
   const normalizedInput: AgentCardInput = {
     ...input,
     text: optimizedText,
+    title: explicitTitle,
     thinking: optimizedThinking,
   };
 
@@ -106,14 +122,18 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
   // ── Footer: metaRow carries timestamp (replaces the old standalone footer) ──
   elements.push(...metaRow);
 
-  return {
+  const config: Record<string, unknown> = {
+    update_multi: true,
+    enable_forward: true,
+    width_mode: 'fill',
+  };
+  if (summaryTitle) {
+    config.summary = { content: summaryTitle };
+  }
+
+  const card: FeishuCardV2 = {
     schema: '2.0',
-    config: {
-      update_multi: true,
-      enable_forward: true,
-      width_mode: 'fill',
-      summary: { content: displayTitle },
-    },
+    config,
     header,
     body: {
       direction: 'vertical',
@@ -121,6 +141,7 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
       elements,
     },
   };
+  return card;
 }
 
 export interface StreamingCardBuildOptions {

@@ -185,6 +185,7 @@ export interface FeishuMessageMeta {
   threadId?: string;
   rootId?: string;
   parentId?: string;
+  messageId?: string;
   text?: string;
 }
 
@@ -351,6 +352,14 @@ export interface User {
   ai_avatar_emoji: string | null;
   ai_avatar_color: string | null;
   ai_avatar_url: string | null;
+  /**
+   * Per-user default for require_mention on auto-registered IM group chats.
+   * When true, newly auto-registered Feishu/Telegram/etc groups start with
+   * require_mention=1 (only @bot triggers a response). false preserves the
+   * legacy default of responding to every owner-sent message in the group.
+   * Existing groups are not retroactively changed.
+   */
+  default_require_mention: boolean;
   created_at: string;
   updated_at: string;
   last_login_at: string | null;
@@ -374,6 +383,7 @@ export interface UserPublic {
   ai_avatar_emoji: string | null;
   ai_avatar_color: string | null;
   ai_avatar_url: string | null;
+  default_require_mention: boolean;
   created_at: string;
   last_login_at: string | null;
   last_active_at: string | null;
@@ -466,7 +476,7 @@ export interface SubAgent {
   last_im_jid: string | null;
   /** 发起 /spawn 命令的源会话 JID，用于完成后结果回注 */
   spawned_from_jid: string | null;
-  source_kind?: 'manual' | 'feishu_thread' | null;
+  source_kind?: 'manual' | 'feishu_thread' | 'auto_im' | null;
   thread_id?: string | null;
   root_message_id?: string | null;
   title_source?: 'manual' | 'feishu_root' | 'auto' | 'auto_pending' | null;
@@ -551,6 +561,21 @@ export type WsMessageOut =
   | { type: 'docker_build_log'; line: string }
   | { type: 'docker_build_complete'; success: boolean; error?: string }
   | {
+      type: 'whatsapp_status';
+      userId: string;
+      status:
+        | 'connecting'
+        | 'qr'
+        | 'connected'
+        | 'disconnected'
+        | 'logged_out';
+      qr?: string;
+      qrDataUrl?: string;
+      error?: string;
+      meJid?: string;
+      meName?: string;
+    }
+  | {
       type: 'billing_update';
       userId: string;
       usage: BillingAccessResult;
@@ -561,6 +586,7 @@ export type WsMessageOut =
       chatJid: string;
       snapshot: {
         partialText: string;
+        thinkingText?: string;
         activeTools: Array<{
           toolName: string;
           toolUseId: string;
@@ -572,10 +598,27 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: 'tool' | 'skill' | 'hook' | 'status';
+          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
         }>;
+        traceEvents?: Array<{
+          id: string;
+          timestamp: number;
+          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+          scope?: StreamEvent['agentScope'];
+          title: string;
+          summary?: string;
+          detail?: string;
+          taskId?: string;
+          toolUseId?: string;
+          parentToolUseId?: string | null;
+          displayLevel?: StreamEvent['displayLevel'];
+        }>;
+        taskStates?: Record<string, unknown>;
+        contextAudit?: StreamEvent['contextAudit'];
         todos?: Array<{ id: string; content: string; status: string }>;
         systemStatus: string | null;
+        isThinking?: boolean;
+        activeHook?: { hookName: string; hookEvent: string } | null;
         turnId?: string;
       };
     };

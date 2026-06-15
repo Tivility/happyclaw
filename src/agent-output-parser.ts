@@ -25,6 +25,8 @@ export interface StdoutParserState {
   hasSuccessOutput: boolean;
   /** True when agent emitted a { status: 'closed' } marker (exit due to _close sentinel). */
   hasClosedOutput: boolean;
+  /** True when SDK returned an API/provider failure as a successful final text. */
+  hasProviderFailureOutput: boolean;
   /** True when agent emitted a stream event with statusText='interrupted'. */
   hasInterruptedOutput: boolean;
 }
@@ -46,6 +48,7 @@ export function createStdoutParserState(): StdoutParserState {
     outputChain: Promise.resolve(),
     hasSuccessOutput: false,
     hasClosedOutput: false,
+    hasProviderFailureOutput: false,
     hasInterruptedOutput: false,
   };
 }
@@ -111,6 +114,10 @@ export function attachStdoutHandler(
           }
           if (parsed.status === 'success') {
             state.hasSuccessOutput = true;
+            if (isProviderFailureResult(parsed.result)) {
+              state.hasProviderFailureOutput = true;
+              parsed.providerFailure = true;
+            }
           }
           if (parsed.status === 'closed') {
             state.hasClosedOutput = true;
@@ -499,7 +506,7 @@ export function handleSuccessClose(
 
   // Streaming mode: wait for output chain to settle
   if (ctx.onOutput) {
-    const { hasClosedOutput } = ctx.stdoutState;
+    const { hasClosedOutput, hasProviderFailureOutput } = ctx.stdoutState;
     waitForOutputChain(
       outputChain,
       ctx.groupName,
@@ -518,6 +525,7 @@ export function handleSuccessClose(
           status: finalStatus,
           result: null,
           newSessionId,
+          providerFailure: hasProviderFailureOutput,
         });
       },
     );
@@ -597,9 +605,60 @@ const API_ERROR_PATTERNS = [
   /\binvalid[_ ]?api\b/i,
   /\bbilling\s+(error|issue|limit)\b/i,
   /\bcredit(s)?\s+(exhausted|insufficient)\b/i,
+  /\bout of extra usage\b/i,
+  /\byou(?:'ve|'re| are)\s+(?:hit|out of)\s+(?:your\s+)?(?:limit|extra usage)\b/i,
+  /\bresets?\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*\([^)]*\)/i,
   /connection\s*(refused|reset|timed?\s*out)/i,
   /ECONNREFUSED|ECONNRESET|ETIMEDOUT/,
 ];
+
+/**
+ * Detection for "the provider returned a quota/limit notice as the agent's
+ * final text" (rather than a normal reply).
+ *
+ * CRITICAL: this runs against the agent's *normal reply body* (parsed.result),
+ * not stderr. A match triggers killing the container, clearing the Claude
+ * session and marking the provider unhealthy — all user-visible side effects.
+ * So the match must be near-zero false-positive: generic substrings like
+ * "rate limit" or "quota exceeded" appear constantly in legitimate technical
+ * conversations ("to avoid hitting the API rate limit…", "disk quota
+ * exceeded") and must NEVER be treated as a provider failure here.
+ *
+ * We therefore require a *structured* Claude account-limit signal:
+ *  - a Claude-specific limit phrase ("out of extra usage", "you've hit your
+ *    limit", "usage limit reached", "upgrade to increase your usage limit"),
+ *    AND
+ *  - the message reads as a short system-style notice, not a long answer that
+ *    merely quotes the phrase. Real Claude limit notices are a single terse
+ *    line; agent replies discussing rate limits are much longer.
+ *
+ * The strongest, length-independent signal is the reset timestamp Claude
+ * appends to genuine limit notices ("· resets 2:10am (Asia/Shanghai)"); when a
+ * Claude limit phrase co-occurs with that timestamp we accept regardless of
+ * length, since no normal reply produces both together.
+ */
+
+/** Claude-specific account/usage-limit phrases (not generic provider errors). */
+const CLAUDE_LIMIT_PHRASE_PATTERNS = [
+  /\bout of extra usage\b/i,
+  /\byou(?:'ve|'re| are)\s+(?:hit|out of)\s+(?:your\s+)?(?:limit|extra usage)\b/i,
+  // "usage limit reached" — anchored on "usage" so a generic "rate limit
+  // reached" / "request limit reached" in a normal reply does not match.
+  /\busage\s+limit\s+reached\b/i,
+  /\bupgrade\s+to\s+(?:increase|raise)\s+your\s+usage\s+limit\b/i,
+  /\byour\s+(?:usage\s+)?limit\s+will\s+reset\b/i,
+];
+
+/** The reset-timestamp suffix Claude appends to genuine limit notices. */
+const CLAUDE_LIMIT_RESET_PATTERN =
+  /\bresets?\b[^.\n]*?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*\([^)]*\)/i;
+
+/**
+ * Upper bound (chars) for treating a Claude limit phrase as a *standalone*
+ * system notice. Genuine notices are a single short line; this guards against
+ * a long agent reply that merely mentions the phrase mid-answer.
+ */
+const CLAUDE_LIMIT_NOTICE_MAX_LEN = 200;
 
 /**
  * Classify whether stderr output indicates an API-level error
@@ -611,4 +670,28 @@ const API_ERROR_PATTERNS = [
 export function isApiError(stderr: string): boolean {
   if (!stderr) return false;
   return API_ERROR_PATTERNS.some((pattern) => pattern.test(stderr));
+}
+
+/**
+ * Whether the agent's final text is actually a Claude account-limit notice the
+ * SDK surfaced as a "successful" result. See CLAUDE_LIMIT_* above for why this
+ * deliberately avoids generic rate-limit/quota substrings.
+ */
+export function isProviderFailureResult(result: string | null): boolean {
+  if (!result) return false;
+  const trimmed = result.trim();
+  if (!trimmed) return false;
+
+  const hasLimitPhrase = CLAUDE_LIMIT_PHRASE_PATTERNS.some((p) =>
+    p.test(trimmed),
+  );
+  if (!hasLimitPhrase) return false;
+
+  // Accept when a Claude reset timestamp accompanies the phrase (length-
+  // independent: no normal reply emits both), or when the whole result is a
+  // short standalone notice rather than a long answer quoting the phrase.
+  return (
+    CLAUDE_LIMIT_RESET_PATTERN.test(trimmed) ||
+    trimmed.length <= CLAUDE_LIMIT_NOTICE_MAX_LEN
+  );
 }

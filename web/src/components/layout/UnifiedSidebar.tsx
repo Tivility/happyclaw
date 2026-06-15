@@ -50,7 +50,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
 
   const {
     groups, currentGroup, selectGroup, loadGroups, loading,
-    deleteFlow, togglePin, enablePrivacy,
+    deleteFlow, togglePin,
   } = useChatStore();
   const runnerStates = useGroupsStore((s) => s.runnerStates);
 
@@ -84,10 +84,6 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
   }, [otherGroups]);
 
   const handleGroupSelect = (jid: string, folder: string) => { selectGroup(jid); navigate(`/chat/${folder}`); };
-  const handleEnablePrivacy = async (jid: string, name: string) => {
-    if (!confirm(`确定为「${name}」启用隐私模式？启用后对话记录不会持久保存，且无法撤销。`)) return;
-    await enablePrivacy(jid);
-  };
   const handleCreated = (jid: string, folder: string) => { selectGroup(jid); navigate(`/chat/${folder}`); };
 
   const handleDeleteConfirm = async () => {
@@ -124,14 +120,12 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
             memberCount={showCollabBadge ? g.member_count : undefined}
             isActive={currentGroup === g.jid} isHome={false}
             isRunning={runnerStates[g.jid] === 'running'}
-            editable={g.editable} deletable={g.deletable}
-            privacyMode={g.privacy_mode}
+            canModify={g.can_modify}
             onSelect={handleGroupSelect}
             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
             onClearHistory={openClear}
             onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
             onTogglePin={(jid) => togglePin(jid)}
-            onEnablePrivacy={handleEnablePrivacy}
           />
         ))}
       </div>
@@ -244,7 +238,7 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                         <ChatGroupItem
                           jid={mainGroup.jid} name={mainGroup.name} folder={mainGroup.folder}
                           lastMessage={mainGroup.lastMessage}                          isActive={currentGroup === mainGroup.jid} isHome
-                          isRunning={runnerStates[mainGroup.jid] === 'running'} editable
+                          isRunning={runnerStates[mainGroup.jid] === 'running'} canModify={mainGroup.can_modify}
                           onSelect={handleGroupSelect}
                           onRename={(jid, name) => setRenameState({ open: true, jid, name })}
                           onClearHistory={openClear}
@@ -264,14 +258,12 @@ export function UnifiedSidebar({ collapsed, onToggleCollapse }: UnifiedSidebarPr
                             lastMessage={g.lastMessage}                            isShared={g.is_shared} memberRole={g.member_role} memberCount={g.member_count}
                             isActive={currentGroup === g.jid} isHome={false} isPinned
                             isRunning={runnerStates[g.jid] === 'running'}
-                            editable={g.editable} deletable={g.deletable}
-                            privacyMode={g.privacy_mode}
+                            canModify={g.can_modify}
                             onSelect={handleGroupSelect}
                             onRename={(jid, name) => setRenameState({ open: true, jid, name })}
                             onClearHistory={openClear}
                             onDelete={(jid, name) => setDeleteState({ open: true, jid, name })}
                             onTogglePin={(jid) => togglePin(jid)}
-                            onEnablePrivacy={handleEnablePrivacy}
                           />
                         ))}
                       </div>

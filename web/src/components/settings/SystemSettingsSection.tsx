@@ -131,14 +131,28 @@ const fields: FieldConfig[] = [
     label: '对话自动压缩阈值',
     description:
       '达到该 token 数时主动触发 SDK 对话压缩。0 = 保留 SDK 默认（约 1M）。'
-      + '经验值：Opus 1M 建议 300-500，Sonnet/Haiku 200K 建议 80-120。'
+      + 'SDK 实际只接受 100K–1M，超出会被静默忽略并回退默认。'
+      + '经验值：Opus 1M 建议 300-500，Sonnet/Haiku 建议 100-200。'
       + '压缩前会通过 PreCompact hook 归档对话',
     unit: 'K tokens',
     toDisplay: (v) => Math.round(v / 1000),
     toStored: (v) => v * 1000,
     min: 0,
-    max: 2000,
+    max: 1000,
     step: 10,
+  },
+  {
+    key: 'taskBackfillGraceMs',
+    label: '定时任务逾期容忍窗口',
+    description:
+      '停机/重启后，next_run 落在过去且距今超过该窗口的任务直接跳过本次（推到下一次触发），'
+      + '避免跨天积压的多个任务在重启那一秒集体并发刷屏。0 = 关闭（旧行为）。',
+    unit: '分钟',
+    toDisplay: (v) => Math.round(v / 60000),
+    toStored: (v) => v * 60000,
+    min: 0,
+    max: 1440,
+    step: 1,
   },
 ];
 
@@ -153,6 +167,8 @@ export function SystemSettingsSection() {
   const [billingCurrencyRate, setBillingCurrencyRate] = useState(1);
   const [externalClaudeDir, setExternalClaudeDir] = useState('');
   const [disableMemoryLayerForAdminHost, setDisableMemoryLayerForAdminHost] = useState(false);
+  const [pluginAutoScan, setPluginAutoScan] = useState<boolean>(true);
+  const [subagentModel, setSubagentModel] = useState('inherit');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
 
@@ -179,6 +195,8 @@ export function SystemSettingsSection() {
         setBillingCurrencyRate(data.billingCurrencyRate ?? 1);
         setExternalClaudeDir(data.externalClaudeDir ?? '');
         setDisableMemoryLayerForAdminHost(data.disableMemoryLayerForAdminHost ?? false);
+        setPluginAutoScan(data.pluginAutoScan ?? true);
+        setSubagentModel(data.subagentModel ?? 'inherit');
       } catch (err) {
         toast.error(getErrorMessage(err, '加载系统参数失败'));
       } finally {
@@ -225,6 +243,8 @@ export function SystemSettingsSection() {
         billingCurrencyRate,
         externalClaudeDir,
         disableMemoryLayerForAdminHost,
+        pluginAutoScan,
+        subagentModel,
       };
       for (const f of fields) {
         const val = displayValues[f.key];
@@ -245,6 +265,8 @@ export function SystemSettingsSection() {
       setBillingCurrencyRate(data.billingCurrencyRate ?? 1);
       setExternalClaudeDir(data.externalClaudeDir ?? '');
       setDisableMemoryLayerForAdminHost(data.disableMemoryLayerForAdminHost ?? false);
+      setPluginAutoScan(data.pluginAutoScan ?? true);
+      setSubagentModel(data.subagentModel ?? 'inherit');
       // 刷新计费状态，更新导航栏可见性
       loadBillingStatus();
       toast.success('系统参数已保存，新参数将对后续启动的容器/进程生效');
@@ -304,6 +326,24 @@ export function SystemSettingsSection() {
             </p>
           </div>
         ))}
+
+        {/* SubAgent 模型（字符串型，独立于 number 型 fields） */}
+        <div>
+          <Label className="mb-1">SubAgent 模型</Label>
+          <select
+            value={subagentModel}
+            onChange={(e) => setSubagentModel(e.target.value)}
+            className="h-9 px-3 text-sm border border-border rounded-md bg-transparent max-w-64"
+          >
+            <option value="inherit">inherit（继承主模型，默认）</option>
+            <option value="sonnet">sonnet</option>
+            <option value="opus">opus</option>
+            <option value="haiku">haiku</option>
+          </select>
+          <p className="text-xs text-muted-foreground mt-1">
+            预定义 SubAgent（代码审查 / 网页调研）使用的模型。默认 inherit（继承主会话模型，与原行为一致）；想给子任务单独指定更便宜/更强的模型时再改。第三方 provider 用别名需配 ANTHROPIC_DEFAULT_* 映射。仅在主 Agent 委派任务时生效。
+          </p>
+        </div>
       </div>
 
       {/* 计费设置 */}
@@ -421,6 +461,34 @@ export function SystemSettingsSection() {
             </div>
           </>
         )}
+      </div>
+
+      {/* Plugin Catalog 自动扫描 */}
+      <div className="border-t border-border pt-6 space-y-5">
+        <h3 className="text-sm font-semibold text-foreground">Plugin Catalog 自动扫描</h3>
+
+        <div className="flex items-center justify-between">
+          <div className="flex-1 pr-4">
+            <Label>启动 5s + 每小时自动扫描宿主机 marketplace</Label>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              开启时（默认）服务启动 5 秒后扫一次 ~/.claude/plugins/marketplaces/ 入共享 catalog，
+              并每小时自动扫一次。关闭后定时扫描全部停掉，admin 仍可在 Plugins 页手动点扫描按钮。
+            </p>
+            <p className="text-xs text-muted-foreground mt-2">
+              <strong>适用场景</strong>：本机有不希望被自动入共享 catalog 的私有 plugin、
+              或需要严格控制 catalog 变更时机的环境。关闭时已 enable 的 plugin 不受影响。
+            </p>
+            <p className="text-xs text-orange-600 mt-2">
+              <strong>注意</strong>：定时扫描器仅在服务启动时按当前值注册一次，
+              修改后需重启服务才能生效（关闭后已运行的 interval 仍会继续到下次重启）。
+            </p>
+          </div>
+          <Switch
+            checked={pluginAutoScan}
+            onCheckedChange={setPluginAutoScan}
+            aria-label="Plugin Catalog 自动扫描"
+          />
+        </div>
       </div>
 
       {/* 禁用 HappyClaw 记忆层（admin 主容器专用） */}

@@ -61,7 +61,7 @@ import {
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
 let db: InstanceType<typeof Database>;
-const SCHEMA_VERSION = '38';
+const SCHEMA_VERSION = '40';
 const DB_BACKUP_ENV_OVERRIDE = 'HAPPYCLAW_ALLOW_DB_MIGRATION_WITHOUT_BACKUP';
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
@@ -234,6 +234,21 @@ function getNewMessagesStmt(jidCount: number): any {
          AND COALESCE(source_kind, '') NOT IN ('user_command', 'scheduled_task_prompt')
        ORDER BY timestamp ASC, id ASC`,
     );
+    // Cap cache size to avoid unbounded growth in deployments where the
+    // distinct jidCount values shift over time. better-sqlite3 does not
+    // explicitly require finalization for prepared statements (it relies on
+    // GC), so dropping the reference is safe. 64 entries covers any plausible
+    // workload (the cache key is # of jids polled in one batch, normally 1..32).
+    if (_newMsgStmtCache.size >= 64) {
+      const firstKey = _newMsgStmtCache.keys().next().value as
+        | number
+        | undefined;
+      if (firstKey !== undefined) _newMsgStmtCache.delete(firstKey);
+    }
+    _newMsgStmtCache.set(jidCount, s);
+  } else {
+    // touch — LRU: re-insert to move to end (Map preserves insertion order).
+    _newMsgStmtCache.delete(jidCount);
     _newMsgStmtCache.set(jidCount, s);
   }
   return s;
@@ -309,6 +324,34 @@ export function initDatabase(): void {
   // Enable WAL mode for better concurrency and performance
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA busy_timeout = 5000');
+  // Enable foreign-key enforcement. SQLite defaults to OFF for backward
+  // compatibility, so all FK declarations on existing schemas are silent
+  // no-ops without this PRAGMA. We log existing orphans (if any) but only
+  // for visibility — enforcement is reset to OFF when violations exist
+  // because turning it on with violations would refuse the next write.
+  // Operators can clean up via PRAGMA foreign_key_check then restart.
+  try {
+    db.exec('PRAGMA foreign_keys = ON');
+    const violations = db.prepare('PRAGMA foreign_key_check').all() as Array<{
+      table: string;
+      rowid: number;
+      parent: string;
+      fkid: number;
+    }>;
+    if (violations.length > 0) {
+      const summary = violations
+        .slice(0, 10)
+        .map((v) => `${v.table} → ${v.parent}`)
+        .join(', ');
+      logger.warn(
+        { violationCount: violations.length, sample: summary },
+        'Foreign-key violations detected; disabling enforcement to avoid blocking writes. Clean up orphans (PRAGMA foreign_key_check) and restart to re-enable.',
+      );
+      db.exec('PRAGMA foreign_keys = OFF');
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to enable foreign-key enforcement');
+  }
   db.exec(`
     CREATE TABLE IF NOT EXISTS chats (
       jid TEXT PRIMARY KEY,
@@ -428,6 +471,7 @@ export function initDatabase(): void {
       ai_avatar_emoji TEXT,
       ai_avatar_color TEXT,
       ai_avatar_url TEXT,
+      default_require_mention INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       last_login_at TEXT,
@@ -908,6 +952,11 @@ export function initDatabase(): void {
   ensureColumn('users', 'ai_avatar_emoji', 'TEXT');
   ensureColumn('users', 'ai_avatar_color', 'TEXT');
   ensureColumn('users', 'ai_avatar_url', 'TEXT');
+  ensureColumn(
+    'users',
+    'default_require_mention',
+    'INTEGER NOT NULL DEFAULT 0',
+  );
   ensureColumn('scheduled_tasks', 'created_by', 'TEXT');
   ensureColumn('scheduled_tasks', 'execution_type', "TEXT DEFAULT 'agent'");
   ensureColumn('scheduled_tasks', 'script_command', 'TEXT');
@@ -1102,6 +1151,7 @@ export function initDatabase(): void {
     'ai_avatar_emoji',
     'ai_avatar_color',
     'ai_avatar_url',
+    'default_require_mention',
     'created_at',
     'updated_at',
     'last_login_at',
@@ -1522,6 +1572,67 @@ export function initDatabase(): void {
 
   initializeModelSwitchingDefaults();
 
+  // v37 → v38: Added users.default_require_mention column (per-user default
+  // for require_mention on auto-registered IM group chats). The actual
+  // ensureColumn migration runs above with the other users.* additions —
+  // its position before assertSchema('users', …) matters because the
+  // schema check would otherwise reject pre-v38 databases on startup.
+
+  // v38 → v39: Lowercase usernames + add COLLATE NOCASE uniqueness.
+  // R1 added `username.toLowerCase()` to login/register/setup/admin-create/
+  // profile-update routes for case-insensitive auth; without this migration
+  // any pre-existing mixed-case username (e.g. 'Admin') is permanently
+  // locked out (login lowercases input → DB lookup misses → 401).
+  // We only run UPDATE; the existing UNIQUE constraint already prevents
+  // future mixed-case inserts because the routes lowercase before INSERT.
+  // Conflicts (e.g. both 'admin' and 'Admin' rows already exist) are rare
+  // because the original UNIQUE was case-sensitive, so they exist only when
+  // the operator manually inserted both. We log the conflict and refuse to
+  // mutate that row, leaving the operator to clean up by hand.
+  {
+    const v = getRouterStateInternal('schema_version');
+    const numV = v ? parseInt(v, 10) : 0;
+    if (numV < 39 || !v) {
+      const mixedCaseRows = db
+        .prepare(
+          // ORDER BY 让多次 dry-run 结果稳定 + 让"早创建的真账号"优先被
+          // lowercase 化，避免后注册的混淆账号顶替原账号。
+          "SELECT id, username FROM users WHERE username != lower(username) ORDER BY created_at ASC, id ASC",
+        )
+        .all() as Array<{ id: string; username: string }>;
+      if (mixedCaseRows.length > 0) {
+        const txn = db.transaction(() => {
+          for (const row of mixedCaseRows) {
+            const lower = row.username.toLowerCase();
+            const conflict = db
+              .prepare('SELECT id FROM users WHERE id != ? AND username = ?')
+              .get(row.id, lower) as { id: string } | undefined;
+            if (conflict) {
+              logger.error(
+                {
+                  userId: row.id,
+                  username: row.username,
+                  conflictUserId: conflict.id,
+                },
+                'Username case-normalization migration: conflict, leaving row as-is',
+              );
+              continue;
+            }
+            db.prepare('UPDATE users SET username = ? WHERE id = ?').run(
+              lower,
+              row.id,
+            );
+          }
+        });
+        txn();
+        logger.info(
+          { rows: mixedCaseRows.length },
+          'Username case-normalization migration v39 completed',
+        );
+      }
+    }
+  }
+
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', SCHEMA_VERSION);
@@ -1887,6 +1998,65 @@ export function setLastGroupSync(): void {
 }
 
 /**
+ * Coerce a value flowing through a TEXT-affinity column into a JS string.
+ *
+ * SQLite is dynamically typed: a TEXT column will silently accept a
+ * Buffer/Uint8Array binding and store it as BLOB. better-sqlite3 reads such
+ * cells back as Buffer, which propagates through JSON.stringify as
+ * `{type:"Buffer",data:[…]}` and breaks any consumer expecting a string.
+ *
+ * Wraps both write paths (where `warnField` surfaces the offending caller)
+ * and read paths (no `warnField`, silent normalization of legacy bad data).
+ */
+function toUtf8String(value: unknown, warnField?: string): string {
+  if (typeof value === 'string') return value;
+  if (value == null) return '';
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    const decoded = Buffer.from(value as Uint8Array).toString('utf8');
+    if (warnField) {
+      logger.warn(
+        { field: warnField, byteLen: (value as Uint8Array).byteLength, sample: decoded.slice(0, 80) },
+        'toUtf8String: Buffer on TEXT column, decoded as UTF-8',
+      );
+    }
+    return decoded;
+  }
+  const coerced = String(value);
+  if (warnField) {
+    logger.warn(
+      { field: warnField, jsType: typeof value, sample: coerced.slice(0, 80) },
+      'toUtf8String: non-string on TEXT column, coerced via String()',
+    );
+  }
+  return coerced;
+}
+
+/** Variant that preserves null (vs the default '' fallback). */
+function toUtf8StringOrNull(value: unknown): string | null {
+  return value == null ? null : toUtf8String(value);
+}
+
+/** Normalize a raw message row from sqlite: decode content + boolify is_from_me.
+ *  The is_from_me overload must come first — TS overload resolution stops at
+ *  the first match and `NewMessage & { is_from_me: number }` is a subtype of
+ *  `NewMessage`. */
+function normalizeMessageRow(
+  row: NewMessage & { is_from_me: number },
+): NewMessage & { is_from_me: boolean };
+function normalizeMessageRow(row: NewMessage): NewMessage;
+function normalizeMessageRow(row: NewMessage & { is_from_me?: number }): NewMessage & { is_from_me?: boolean } {
+  const { is_from_me, content, ...rest } = row;
+  const out: NewMessage & { is_from_me?: boolean } = {
+    ...rest,
+    content: toUtf8String(content),
+  };
+  if (typeof is_from_me === 'number') {
+    out.is_from_me = is_from_me === 1;
+  }
+  return out;
+}
+
+/**
  * Ensure a chat row exists in the chats table (avoids FK violation on messages insert).
  */
 export function ensureChatExists(chatJid: string): void {
@@ -1932,7 +2102,7 @@ export function storeMessageDirect(
     sourceJid ?? chatJid,
     sender,
     senderName,
-    content,
+    toUtf8String(content, 'messages.content'),
     timestamp,
     isFromMe ? 1 : 0,
     attachments ?? null,
@@ -1945,6 +2115,41 @@ export function storeMessageDirect(
     meta?.taskId ?? null,
   );
   return effectiveMsgId;
+}
+
+/**
+ * Overwrite the `attachments` JSON column for a single message row.
+ *
+ * Used by the plugin-command expander to persist the expanded-prompt
+ * sentinel after inline `!` commands run successfully (P1 round-14
+ * crash-safety): the next recovery pass reads the sentinel and reuses
+ * the stored prompt instead of re-executing inline.
+ */
+export function updateMessageAttachments(
+  chatJid: string,
+  msgId: string,
+  attachmentsJson: string,
+): void {
+  db.prepare(
+    `UPDATE messages SET attachments = ? WHERE id = ? AND chat_jid = ?`,
+  ).run(attachmentsJson, msgId, chatJid);
+}
+
+/**
+ * Read the `attachments` JSON column for a single message row, or null
+ * if the row is missing (caller treats null as "no persisted state").
+ */
+export function getMessageAttachments(
+  chatJid: string,
+  msgId: string,
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT attachments FROM messages WHERE id = ? AND chat_jid = ? LIMIT 1`,
+    )
+    .get(msgId, chatJid) as { attachments: string | null } | undefined;
+  if (!row) return null;
+  return row.attachments ?? null;
 }
 
 /**
@@ -2425,12 +2630,13 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newCursor: MessageCursor } {
   if (jids.length === 0) return { messages: [], newCursor: cursor };
 
-  const rows = getNewMessagesStmt(jids.length).all(
+  const rawRows = getNewMessagesStmt(jids.length).all(
     cursor.timestamp,
     cursor.timestamp,
     cursor.id,
     ...jids,
   ) as NewMessage[];
+  const rows = rawRows.map((r) => normalizeMessageRow(r));
   const last = rows[rows.length - 1];
   return {
     messages: rows,
@@ -2442,12 +2648,13 @@ export function getMessagesSince(
   chatJid: string,
   cursor: MessageCursor,
 ): NewMessage[] {
-  return stmts().getMessagesSince.all(
+  const rows = stmts().getMessagesSince.all(
     chatJid,
     cursor.timestamp,
     cursor.timestamp,
     cursor.id,
   ) as NewMessage[];
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 export function createTask(
@@ -2462,12 +2669,14 @@ export function createTask(
     task.id,
     task.group_folder,
     task.chat_jid,
-    task.prompt,
+    toUtf8String(task.prompt, 'scheduled_tasks.prompt'),
     task.schedule_type,
     task.schedule_value,
     task.context_mode || 'group',
     task.execution_type || 'agent',
-    task.script_command ?? null,
+    task.script_command == null
+      ? null
+      : toUtf8String(task.script_command, 'scheduled_tasks.script_command'),
     task.execution_mode ?? null,
     task.next_run,
     task.status,
@@ -2493,6 +2702,9 @@ function mapTaskRow(row: unknown): ScheduledTask {
   if (r.execution_mode === undefined) r.execution_mode = null;
   if (r.workspace_jid === undefined) r.workspace_jid = null;
   if (r.workspace_folder === undefined) r.workspace_folder = null;
+  // Defensive: legacy BLOB cells in TEXT-affinity columns come back as Buffer.
+  r.prompt = toUtf8String(r.prompt);
+  if (r.script_command !== undefined) r.script_command = toUtf8StringOrNull(r.script_command);
   return r as ScheduledTask;
 }
 
@@ -2542,7 +2754,7 @@ export function updateTask(
 
   if (updates.prompt !== undefined) {
     fields.push('prompt = ?');
-    values.push(updates.prompt);
+    values.push(toUtf8String(updates.prompt, 'scheduled_tasks.prompt'));
   }
   if (updates.schedule_type !== undefined) {
     fields.push('schedule_type = ?');
@@ -2566,7 +2778,11 @@ export function updateTask(
   }
   if (updates.script_command !== undefined) {
     fields.push('script_command = ?');
-    values.push(updates.script_command);
+    values.push(
+      updates.script_command == null
+        ? null
+        : toUtf8String(updates.script_command, 'scheduled_tasks.script_command'),
+    );
   }
   if (updates.next_run !== undefined) {
     fields.push('next_run = ?');
@@ -2661,6 +2877,19 @@ export function updateTaskAfterRun(
     WHERE id = ?
   `,
   ).run(nextRun, now, lastResult, nextRun, id);
+}
+
+// Advance next_run for a task we deliberately did NOT execute (e.g. overdue
+// beyond the backfill grace window). Does not touch last_run, so the task
+// detail view continues to reflect the last *actual* run.
+export function advanceSkippedTask(id: string, nextRun: string | null): void {
+  db.prepare(
+    `
+    UPDATE scheduled_tasks
+    SET next_run = ?, status = CASE WHEN ? IS NULL THEN 'completed' ELSE status END
+    WHERE id = ?
+  `,
+  ).run(nextRun, nextRun, id);
 }
 
 export function logTaskRun(log: TaskRunLog): void {
@@ -2922,6 +3151,42 @@ export function setSessionProviderId(
 export function deleteAllSessionsForFolder(groupFolder: string): void {
   db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
   deleteRuntimeNativeSessionsForFolder(groupFolder);
+}
+
+/**
+ * Delete all session rows bound to the given provider_id.
+ *
+ * Used when a provider's protocol-level fields (anthropicBaseUrl /
+ * anthropicModel) change: any session whose history contains thinking blocks /
+ * model-specific framing produced by this provider must restart fresh,
+ * otherwise resuming under the new config can fail with "Invalid signature in
+ * thinking block" or "model mismatch" errors. Sessions bound to *other*
+ * providers are left intact so unrelated sticky bindings survive a partial
+ * config update — see issue #476.
+ *
+ * Returns the affected `group_folder` values so callers can also evict the
+ * in-memory sessions cache and the row count for telemetry.
+ */
+export function deleteSessionsByProviderId(providerId: string): {
+  deletedCount: number;
+  affectedFolders: string[];
+} {
+  const tx = db.transaction((id: string) => {
+    const rows = db
+      .prepare(
+        'SELECT DISTINCT group_folder FROM sessions WHERE provider_id = ?',
+      )
+      .all(id) as Array<{ group_folder: string }>;
+    const affectedFolders = rows.map((r) => r.group_folder);
+    const result = db
+      .prepare('DELETE FROM sessions WHERE provider_id = ?')
+      .run(id);
+    return {
+      deletedCount: result.changes,
+      affectedFolders,
+    };
+  });
+  return tx(providerId);
 }
 
 export function getAllSessions(): Record<string, string> {
@@ -3700,21 +3965,57 @@ type RegisteredGroupRow = {
   feishu_chat_mode: string | null;
   feishu_group_message_type: string | null;
   sender_allowlist: string | null;
-  privacy_mode: number;
 };
 
 /** Convert a raw DB row into a RegisteredGroup domain object. */
 function parseGroupRow(
   row: RegisteredGroupRow,
 ): RegisteredGroup & { jid: string } {
+  // 防御性 JSON.parse：parseGroupRow 在启动期 loadState 路径上被调用，单条
+  // 损坏的 row（手工 SQL / 部分写入 / migration 失误）不能让进程退出。
+  // 用 warn 日志保留可观测性，损坏字段 fallback 到 undefined。
+  let containerConfig: RegisteredGroup['containerConfig'];
+  if (row.container_config) {
+    try {
+      containerConfig = JSON.parse(row.container_config);
+    } catch (err) {
+      logger.warn(
+        { jid: row.jid, err, raw: row.container_config.slice(0, 200) },
+        'parseGroupRow: container_config JSON malformed, dropping',
+      );
+    }
+  }
+  let senderAllowlist: string[] | undefined;
+  if (row.sender_allowlist != null) {
+    try {
+      const parsed = JSON.parse(row.sender_allowlist) as unknown;
+      if (Array.isArray(parsed) && parsed.every((v) => typeof v === 'string')) {
+        senderAllowlist = parsed as string[];
+      } else {
+        // Fail-closed：semantics 层把 [] 视为「禁止所有发送者」。坏数据回退
+        // 到 [] 比 undefined（=允许全部）更安全 —— 与 R0 的 owner-only 默认
+        // 一致，不会把限制群默默改成开放群。
+        senderAllowlist = [];
+        logger.warn(
+          { jid: row.jid },
+          'parseGroupRow: sender_allowlist not a string[], falling back to [] (fail-closed)',
+        );
+      }
+    } catch (err) {
+      // 解析失败同样 fail-closed：[] = 禁止所有，等待运维修复。
+      senderAllowlist = [];
+      logger.warn(
+        { jid: row.jid, err, raw: row.sender_allowlist.slice(0, 200) },
+        'parseGroupRow: sender_allowlist JSON malformed, falling back to [] (fail-closed)',
+      );
+    }
+  }
   return {
     jid: row.jid,
     name: row.name,
     folder: row.folder,
     added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
+    containerConfig,
     executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
     customCwd: row.custom_cwd ?? undefined,
     initSourcePath: row.init_source_path ?? undefined,
@@ -3737,10 +4038,7 @@ function parseGroupRow(
       row.binding_mode === 'thread_map' ? 'thread_map' : 'single_context',
     feishu_chat_mode: row.feishu_chat_mode ?? undefined,
     feishu_group_message_type: row.feishu_group_message_type ?? undefined,
-    sender_allowlist: row.sender_allowlist != null
-      ? (JSON.parse(row.sender_allowlist) as string[])
-      : undefined,
-    privacy_mode: row.privacy_mode === 1,
+    sender_allowlist: senderAllowlist,
   };
 }
 
@@ -3827,6 +4125,54 @@ export function enablePrivacyForFolder(folder: string): string[] {
   ).run(folder);
   refreshPrivacyCache();
   return jids;
+}
+
+/**
+ * Find groups owned by `userId` whose sender_allowlist is the empty array `[]` —
+ * the "owner-locked trap" state where no one (not even the owner) can trigger
+ * the bot. Created by buildOnNewChat when a Feishu group is auto-registered
+ * before the owner has DM'd the bot. Used by Feishu owner backfill.
+ */
+export function findEmptyAllowlistFeishuGroupsForUser(userId: string): string[] {
+  const rows = db
+    .prepare(
+      "SELECT jid FROM registered_groups WHERE created_by = ? AND jid LIKE 'feishu:%' AND sender_allowlist = '[]'",
+    )
+    .all(userId) as Array<{ jid: string }>;
+  return rows.map((r) => r.jid);
+}
+
+/**
+ * Replace empty `sender_allowlist=[]` with `[ownerOpenId]` for the user's
+ * Feishu groups. Returns the JIDs that were updated. Run once when the
+ * Feishu owner is first identified via P2P DM, to unstick groups that were
+ * registered before the owner was known.
+ */
+export function backfillEmptyAllowlistsForUser(
+  userId: string,
+  ownerOpenId: string,
+): string[] {
+  const jids = findEmptyAllowlistFeishuGroupsForUser(userId);
+  if (jids.length === 0) return [];
+  const allowlistJson = JSON.stringify([ownerOpenId]);
+  const stmt = db.prepare(
+    'UPDATE registered_groups SET sender_allowlist = ? WHERE jid = ?',
+  );
+  const tx = db.transaction((targets: string[]) => {
+    for (const jid of targets) stmt.run(allowlistJson, jid);
+  });
+  tx(jids);
+  return jids;
+}
+
+/**
+ * Clear `sender_allowlist` for a single group (set to NULL = unrestricted).
+ * Used as a manual escape hatch from the owner-locked trap.
+ */
+export function clearSenderAllowlist(jid: string): void {
+  db.prepare(
+    'UPDATE registered_groups SET sender_allowlist = NULL WHERE jid = ?',
+  ).run(jid);
 }
 
 /** Get all JIDs that share the same folder (e.g., all JIDs with folder='main'). */
@@ -4118,6 +4464,33 @@ export function deleteChatHistory(chatJid: string): void {
   tx(chatJid);
 }
 
+/**
+ * Delete an IM group's registered_groups entry and all jid-scoped data
+ * (messages, chat record, pinned references). Does NOT touch folder-scoped
+ * data (sessions, scheduled_tasks, group_members) because IM groups typically
+ * share their folder with the owner's home workspace.
+ *
+ * Used when an IM group is detected as dead (bot removed, group disbanded,
+ * health-check unreachable, or repeated send failures) and for the manual
+ * "delete this IM binding" UI button.
+ */
+export function deleteImGroupRecord(jid: string): void {
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
+    db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
+    db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
+    db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
+    // Feishu thread agents (source_kind='feishu_thread') and other chat-scoped
+    // agents reference this jid via agents.chat_jid — without this, deleting
+    // an IM group leaves orphan agent rows visible in the agents list.
+    db.prepare('DELETE FROM agents WHERE chat_jid = ?').run(jid);
+    db.prepare(
+      'UPDATE scheduled_tasks SET workspace_jid = NULL, workspace_folder = NULL WHERE workspace_jid = ?',
+    ).run(jid);
+  });
+  tx();
+}
+
 export function deleteGroupData(jid: string, folder: string): void {
   const tx = db.transaction(() => {
     // 1. 删除定时任务运行日志 + 定时任务
@@ -4211,10 +4584,7 @@ export function getMessagesPage(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -4237,10 +4607,7 @@ export function getMessagesAfter(
     )
     .all(chatJid, after, limit) as Array<NewMessage & { is_from_me: number }>;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 export interface SessionTokenUsageSnapshot {
@@ -4351,10 +4718,7 @@ export function getMessagesPageMulti(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -4382,10 +4746,7 @@ export function getMessagesAfterMulti(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -4431,10 +4792,7 @@ export function getMessagesByTimeRange(
     NewMessage & { is_from_me: number }
   >;
 
-  return rows.map((row) => ({
-    ...row,
-    is_from_me: row.is_from_me === 1,
-  }));
+  return rows.map((row) => normalizeMessageRow(row));
 }
 
 /**
@@ -4462,23 +4820,34 @@ export function getGroupsByOwner(
     target_agent_id: string | null;
   }>;
 
-  return rows.map((row) => ({
-    jid: row.jid,
-    name: row.name,
-    folder: row.folder,
-    added_at: row.added_at,
-    containerConfig: row.container_config
-      ? JSON.parse(row.container_config)
-      : undefined,
-    executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
-    customCwd: row.custom_cwd ?? undefined,
-    initSourcePath: row.init_source_path ?? undefined,
-    initGitUrl: row.init_git_url ?? undefined,
-    created_by: row.created_by ?? undefined,
-    is_home: row.is_home === 1,
-    target_main_jid: row.target_main_jid ?? undefined,
-    target_agent_id: row.target_agent_id ?? undefined,
-  }));
+  return rows.map((row) => {
+    let containerConfig: RegisteredGroup['containerConfig'];
+    if (row.container_config) {
+      try {
+        containerConfig = JSON.parse(row.container_config);
+      } catch (err) {
+        logger.warn(
+          { jid: row.jid, err },
+          'getGroupsByOwner: container_config JSON malformed, dropping',
+        );
+      }
+    }
+    return {
+      jid: row.jid,
+      name: row.name,
+      folder: row.folder,
+      added_at: row.added_at,
+      containerConfig,
+      executionMode: parseExecutionMode(row.execution_mode, `group ${row.jid}`),
+      customCwd: row.custom_cwd ?? undefined,
+      initSourcePath: row.init_source_path ?? undefined,
+      initGitUrl: row.init_git_url ?? undefined,
+      created_by: row.created_by ?? undefined,
+      is_home: row.is_home === 1,
+      target_main_jid: row.target_main_jid ?? undefined,
+      target_agent_id: row.target_agent_id ?? undefined,
+    };
+  });
 }
 
 // ===================== Auth CRUD =====================
@@ -4544,6 +4913,7 @@ function mapUserRow(row: Record<string, unknown>): User {
       typeof row.ai_avatar_color === 'string' ? row.ai_avatar_color : null,
     ai_avatar_url:
       typeof row.ai_avatar_url === 'string' ? row.ai_avatar_url : null,
+    default_require_mention: !!row.default_require_mention,
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
     last_login_at:
@@ -4570,6 +4940,7 @@ function toUserPublic(user: User, lastActiveAt: string | null): UserPublic {
     ai_avatar_emoji: user.ai_avatar_emoji,
     ai_avatar_color: user.ai_avatar_color,
     ai_avatar_url: user.ai_avatar_url,
+    default_require_mention: user.default_require_mention,
     created_at: user.created_at,
     last_login_at: user.last_login_at,
     last_active_at: lastActiveAt,
@@ -4857,6 +5228,7 @@ export function updateUserFields(
       | 'ai_avatar_emoji'
       | 'ai_avatar_color'
       | 'ai_avatar_url'
+      | 'default_require_mention'
       | 'deleted_at'
     >
   >,
@@ -4931,6 +5303,10 @@ export function updateUserFields(
   if (updates.ai_avatar_url !== undefined) {
     fields.push('ai_avatar_url = ?');
     values.push(updates.ai_avatar_url);
+  }
+  if (updates.default_require_mention !== undefined) {
+    fields.push('default_require_mention = ?');
+    values.push(updates.default_require_mention ? 1 : 0);
   }
   if (updates.deleted_at !== undefined) {
     fields.push('deleted_at = ?');
@@ -5499,8 +5875,8 @@ export function getUserMemberFolders(
 
 export function createAgent(agent: SubAgent): void {
   db.prepare(
-    `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary, spawned_from_jid, source_kind, thread_id, root_message_id, title_source, last_active_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO agents (id, group_folder, chat_jid, name, prompt, status, kind, created_by, created_at, completed_at, result_summary, spawned_from_jid, source_kind, thread_id, root_message_id, title_source, last_active_at, last_im_jid)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     agent.id,
     agent.group_folder,
@@ -5519,6 +5895,7 @@ export function createAgent(agent: SubAgent): void {
     agent.root_message_id ?? null,
     agent.title_source ?? null,
     agent.last_active_at ?? null,
+    agent.last_im_jid ?? null,
   );
 }
 
@@ -5725,7 +6102,7 @@ function mapAgentRow(row: Record<string, unknown>): SubAgent {
       typeof row.spawned_from_jid === 'string' ? row.spawned_from_jid : null,
     source_kind:
       typeof row.source_kind === 'string'
-        ? (row.source_kind as 'manual' | 'feishu_thread')
+        ? (row.source_kind as 'manual' | 'feishu_thread' | 'auto_im')
         : null,
     thread_id: typeof row.thread_id === 'string' ? row.thread_id : null,
     root_message_id:
@@ -5991,13 +6368,16 @@ export function updateBillingPlan(
 }
 
 export function deleteBillingPlan(id: string): boolean {
-  // Don't delete if users are subscribed
-  const hasSubscribers = db
+  // Don't delete if any subscription (any status) references this plan.
+  // PRAGMA foreign_keys=ON 会因 cancelled/expired 残留行让 DELETE 抛
+  // SQLITE_CONSTRAINT_FOREIGNKEY 把请求 500；先在应用层校验给 caller 一个
+  // 干净的 false 返回，运维需要手动迁移残留订阅再删 plan。
+  const hasReferences = db
     .prepare(
-      "SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ? AND status = 'active'",
+      'SELECT COUNT(*) as cnt FROM user_subscriptions WHERE plan_id = ?',
     )
     .get(id) as { cnt: number };
-  if (hasSubscribers.cnt > 0) return false;
+  if (hasReferences.cnt > 0) return false;
   const result = db.prepare('DELETE FROM billing_plans WHERE id = ?').run(id);
   return result.changes > 0;
 }
@@ -6077,33 +6457,39 @@ export function getUserActiveSubscription(
 }
 
 export function createUserSubscription(sub: UserSubscription): void {
-  // Cancel existing active subscriptions
-  db.prepare(
-    "UPDATE user_subscriptions SET status = 'cancelled', cancelled_at = ? WHERE user_id = ? AND status = 'active'",
-  ).run(new Date().toISOString(), sub.user_id);
+  // Wrap in a transaction so partial failure can't leave the user without an
+  // active subscription (cancel succeeded, insert/update failed). Same shape
+  // as expireSubscriptions / batchAssignPlan elsewhere in this file.
+  const txn = db.transaction(() => {
+    // Cancel existing active subscriptions
+    db.prepare(
+      "UPDATE user_subscriptions SET status = 'cancelled', cancelled_at = ? WHERE user_id = ? AND status = 'active'",
+    ).run(new Date().toISOString(), sub.user_id);
 
-  db.prepare(
-    `INSERT INTO user_subscriptions (id, user_id, plan_id, status, started_at, expires_at, cancelled_at, trial_ends_at, notes, auto_renew, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(
-    sub.id,
-    sub.user_id,
-    sub.plan_id,
-    sub.status,
-    sub.started_at,
-    sub.expires_at,
-    sub.cancelled_at,
-    sub.trial_ends_at,
-    sub.notes,
-    sub.auto_renew ? 1 : 0,
-    sub.created_at,
-  );
+    db.prepare(
+      `INSERT INTO user_subscriptions (id, user_id, plan_id, status, started_at, expires_at, cancelled_at, trial_ends_at, notes, auto_renew, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      sub.id,
+      sub.user_id,
+      sub.plan_id,
+      sub.status,
+      sub.started_at,
+      sub.expires_at,
+      sub.cancelled_at,
+      sub.trial_ends_at,
+      sub.notes,
+      sub.auto_renew ? 1 : 0,
+      sub.created_at,
+    );
 
-  // Update user's subscription_plan_id
-  db.prepare('UPDATE users SET subscription_plan_id = ? WHERE id = ?').run(
-    sub.plan_id,
-    sub.user_id,
-  );
+    // Update user's subscription_plan_id
+    db.prepare('UPDATE users SET subscription_plan_id = ? WHERE id = ?').run(
+      sub.plan_id,
+      sub.user_id,
+    );
+  });
+  txn();
 }
 
 export function cancelUserSubscription(userId: string): void {
@@ -6558,6 +6944,27 @@ export function incrementMonthlyUsage(
   ).run(userId, month, inputTokens, outputTokens, costUsd, now);
 }
 
+/**
+ * Atomic monthly+daily usage increment. Wraps the two UPSERTs in a single
+ * SQLite transaction so a crash between them can't leave the two tables
+ * divergent for that turn (silent drift over time). billing.ts uses this
+ * instead of calling the two helpers in sequence.
+ */
+export function incrementUsageBoth(
+  userId: string,
+  month: string,
+  date: string,
+  inputTokens: number,
+  outputTokens: number,
+  costUsd: number,
+): void {
+  const txn = db.transaction(() => {
+    incrementMonthlyUsage(userId, month, inputTokens, outputTokens, costUsd);
+    incrementDailyUsage(userId, date, inputTokens, outputTokens, costUsd);
+  });
+  txn();
+}
+
 export function getUserMonthlyUsageHistory(
   userId: string,
   months = 6,
@@ -6708,10 +7115,9 @@ export function getBillingAuditLog(
       event_type: String(r.event_type) as BillingAuditEventType,
       user_id: String(r.user_id),
       actor_id: typeof r.actor_id === 'string' ? r.actor_id : null,
-      details:
-        typeof r.details === 'string'
-          ? (JSON.parse(r.details) as Record<string, unknown>)
-          : null,
+      // 防御性 parse：单行损坏不应让整个审计 API 500（事故排查的关键时刻
+      // 不能因一行坏数据看不到日志）。parseJsonDetails 出错时返回 null。
+      details: parseJsonDetails(r.details),
       created_at: String(r.created_at),
     })),
     total,

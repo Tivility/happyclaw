@@ -9,12 +9,14 @@ import type {
   MessageCursor,
   UserSessionWithUser,
 } from './types.js';
+import type { RuntimeOwnerCandidateUser } from './runtime-owner.js';
 import {
   getJidsByFolder,
   getRegisteredGroup,
   getGroupMemberRole,
   getSessionWithUser,
 } from './db.js';
+import type { WhatsAppConnectionState } from './whatsapp.js';
 
 export interface WsClientInfo {
   sessionId: string;
@@ -30,7 +32,46 @@ export interface WebDeps {
   formatMessages: (messages: NewMessage[], isShared?: boolean) => string;
   getLastAgentTimestamp: () => Record<string, MessageCursor>;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
+  /**
+   * Lex-max-merge advance for BOTH cursors (lastAgentTimestamp +
+   * lastCommittedCursor). Comparison uses lexicographic (timestamp, id) so a
+   * later candidate never regresses the cursor below the current value.
+   *
+   * Use for plugin-expander reply fast-paths that fully commit when no
+   * earlier pending exists — direct overwrite (`setLastAgentTimestamp`) on
+   * same-millisecond batches with a smaller-UUID candidate would regress
+   * the cursor and re-fire the reply on the next poll (#27 round-17 P2-2).
+   */
+  advanceCursors: (jid: string, cursor: MessageCursor) => void;
+  /**
+   * Advance only the next-pull cursor (lastAgentTimestamp). lastCommittedCursor
+   * stays put so a crash before earlier same-batch messages reach the agent
+   * still surfaces them on recovery.
+   *
+   * Use for plugin-expander system replies that are delivered out-of-band
+   * (no agent involvement) — the user message itself has not been processed
+   * yet, so the recovery cursor must not advance past it.
+   */
+  advanceNextPullCursorOnly: (jid: string, cursor: MessageCursor) => void;
   advanceGlobalCursor: (cursor: MessageCursor) => void;
+  /**
+   * Returns true iff there exists at least one unprocessed (`is_from_me=0`)
+   * message strictly **before** `candidate` in the lexicographic
+   * (timestamp, id) ordering, relative to `lastCommittedCursor[chatJid]`.
+   *
+   * Used by the web plugin-expander reply fast-path (P2 round-14) to mirror
+   * the cold-start cursor logic: when the reply is the only outstanding
+   * work, fully commit; when an earlier user message is still queued, hold
+   * the recovery cursor and only advance the next-pull cursor.
+   *
+   * Without this gate the fast-path always held the recovery cursor —
+   * which means a clean restart after a no-earlier-pending reply would
+   * replay the reply on recovery (the same DB row is still <= the cursor).
+   */
+  hasEarlierPendingMessages: (
+    jid: string,
+    candidate: MessageCursor,
+  ) => boolean;
   reloadFeishuConnection?: (config: {
     appId: string;
     appSecret: string;
@@ -42,8 +83,23 @@ export interface WebDeps {
   }) => Promise<boolean>;
   reloadUserIMConfig?: (
     userId: string,
-    channel: 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord',
+    channel:
+      | 'feishu'
+      | 'telegram'
+      | 'qq'
+      | 'wechat'
+      | 'dingtalk'
+      | 'discord'
+      | 'whatsapp',
   ) => Promise<boolean>;
+  /**
+   * Reconnect all of a user's IM channels from their persisted config.
+   * Symmetric counterpart to `imManager.disconnectAllUserChannels` — called
+   * when admin re-enables (or restores) a previously disabled/deleted user so
+   * their bots come back without a service restart. Only enabled channels
+   * with valid credentials actually connect.
+   */
+  reconnectUserIMChannels?: (userId: string) => Promise<void>;
   isFeishuConnected?: () => boolean;
   isTelegramConnected?: () => boolean;
   isUserFeishuConnected?: (userId: string) => boolean;
@@ -52,6 +108,10 @@ export interface WebDeps {
   isUserWeChatConnected?: (userId: string) => boolean;
   isUserDingTalkConnected?: (userId: string) => boolean;
   isUserDiscordConnected?: (userId: string) => boolean;
+  isUserWhatsAppConnected?: (userId: string) => boolean;
+  getUserWhatsAppState?: (userId: string) => WhatsAppConnectionState;
+  /** Hard logout: clears WhatsApp auth state on disk so next enable starts fresh. */
+  logoutUserWhatsApp?: (userId: string, accountId?: string) => Promise<void>;
   processAgentConversation?: (
     chatJid: string,
     agentId: string,
@@ -68,6 +128,14 @@ export interface WebDeps {
     group_message_type?: string;
   } | null>;
   clearImFailCounts?: (jid: string) => void;
+  /**
+   * Fully remove an IM group's registered_groups entry (plus jid-scoped data
+   * and fail counters). Used by DELETE /api/groups/:jid for IM-prefixed JIDs
+   * — shared with the auto-cleanup paths (bot removed / health check / send
+   * fail) so the manual delete path also resets imSendFailCounts /
+   * imHealthCheckFailCounts.
+   */
+  removeImGroupRecord?: (jid: string, reason: string) => void;
   updateReplyRoute?: (folder: string, sourceJid: string | null) => void;
   triggerTaskRun?: (taskId: string) => { success: boolean; error?: string };
   handleSpawnCommand?: (
@@ -75,6 +143,28 @@ export interface WebDeps {
     message: string,
     sourceImJid?: string,
   ) => Promise<string>;
+  applyAutoIsolateContext?: (userId: string, enable: boolean) => number;
+  /**
+   * Resolve a registered group to its effective sibling-aware form. For non-home
+   * groups bound (or auto-mapped) to a home sibling, returns the merged group
+   * with executionMode/customCwd/created_by inherited from the home — without
+   * this, web.ts plugin expansion on sibling JIDs (e.g. an IM group bound to a
+   * home workspace) would build an ExpandContext from incomplete fields and
+   * either return null (no plugins resolved) or pipe the literal `/foo` to the
+   * active runner instead of the expanded prompt (#21 round-13 P2-3).
+   */
+  resolveEffectiveGroup?: (group: RegisteredGroup) => {
+    effectiveGroup: RegisteredGroup;
+    isHome: boolean;
+  };
+  /**
+   * User-by-id lookup used by plugin-runtime owner resolution. Web eager-expand
+   * delegates to `resolvePerMessageRuntimeOwner` (#24 round-16 P2-1) so the
+   * web fast-path applies the same admin-gating as the cold-start path —
+   * non-admin / disabled / unknown senders on `web:main + isHome` fall back
+   * to `created_by` instead of being treated as the runtime owner.
+   */
+  getUserById?: (id: string) => RuntimeOwnerCandidateUser | null | undefined;
 }
 
 export type Variables = {
@@ -236,7 +326,27 @@ export function canModifyGroup(
   group: RegisteredGroup & { jid: string },
 ): boolean {
   if (group.is_home) return group.created_by === user.id;
-  if (!group.jid.startsWith('web:')) return group.created_by === user.id;
+  if (!group.jid.startsWith('web:')) {
+    if (group.created_by) return group.created_by === user.id;
+    // Legacy IM group (created_by=null): resolve owner via group_members first.
+    // Necessary for legacy IM groups bound to a non-home shared workspace —
+    // they have no is_home sibling so the sibling fallback alone returns false
+    // and the real owner (group_members role='owner') gets 403 on every
+    // destructive op despite canAccessGroup letting them through.
+    // owner-only here is stricter than canAccessGroup (which accepts 'member').
+    const memberRole = getGroupMemberRole(group.folder, user.id);
+    if (memberRole === 'owner') return true;
+    // Sibling home group fallback for legacy IM groups auto-bound to a home folder.
+    const siblingJids = getJidsByFolder(group.folder);
+    for (const jid of siblingJids) {
+      if (jid === group.jid) continue;
+      const sibling = getRegisteredGroup(jid);
+      if (sibling?.is_home && sibling.created_by) {
+        return sibling.created_by === user.id;
+      }
+    }
+    return false;
+  }
   return group.created_by === user.id;
 }
 

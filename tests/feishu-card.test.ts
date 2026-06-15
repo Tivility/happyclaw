@@ -272,13 +272,52 @@ describe('formatters', () => {
     expect(extractTitle('## Hi\nbody').title).toBe('Hi');
     expect(extractTitle('### Yo\nbody').title).toBe('Yo');
     // 4 levels of # — not a heading, falls back to first-line preview
-    expect(extractTitle('#### Deep\nbody').title).toBe('Agent 回复');
+    // (the `#` chars are stripped from the prose preview, leaving 'Deep').
+    expect(extractTitle('#### Deep\nbody').title).toBe('Deep');
   });
 
   test('extractTitle falls back to first-line preview (≤40 chars)', () => {
     const text = 'Just some plain text that has no markdown heading at all';
     const { title, bodyStartIndex } = extractTitle(text);
     expect(title.length).toBeLessThanOrEqual(40);
+    // First line was consumed as the title — bodyStartIndex must skip past it
+    // so the body doesn't echo the same line back (issue #488).
+    expect(bodyStartIndex).toBe(1);
+  });
+
+  test('extractTitle: single-line input yields empty body to avoid duplication', () => {
+    const text = '~/.claude 同步完成：远端已是最新，无本地变更需要推送。';
+    const { title, bodyStartIndex } = extractTitle(text);
+    expect(title).toBe(text);
+    expect(bodyStartIndex).toBe(1);
+    // Stripping past line 1 of a single-line input gives empty body
+    expect(text.split('\n').slice(bodyStartIndex).join('\n').trim()).toBe('');
+  });
+
+  test('extractTitle: long single-line input gets truncated and body still empty', () => {
+    const text =
+      'a'.repeat(60) + ' end of long single line that exceeds the 40 char title cap';
+    const { title, bodyStartIndex } = extractTitle(text);
+    expect(title.length).toBeLessThanOrEqual(40);
+    expect(title.endsWith('...')).toBe(true);
+    expect(bodyStartIndex).toBe(1);
+    expect(text.split('\n').slice(bodyStartIndex).join('\n').trim()).toBe('');
+  });
+
+  test('extractTitle: multi-line fallback strips only the first non-empty line', () => {
+    const text = '\n\nFirst line summary\nSecond line detail\nThird line';
+    const { title, bodyStartIndex } = extractTitle(text);
+    expect(title).toBe('First line summary');
+    // Two leading blank lines + the first content line → bodyStartIndex = 3
+    expect(bodyStartIndex).toBe(3);
+    expect(text.split('\n').slice(bodyStartIndex).join('\n').trim()).toBe(
+      'Second line detail\nThird line',
+    );
+  });
+
+  test('extractTitle: empty input returns default title with no body', () => {
+    const { title, bodyStartIndex } = extractTitle('');
+    expect(title).toBe('Agent 回复');
     expect(bodyStartIndex).toBe(0);
   });
 });
@@ -286,7 +325,7 @@ describe('formatters', () => {
 // ─── buildAgentReplyCard shape ─────────────────────────────────
 
 describe('buildAgentReplyCard', () => {
-  test('minimal card: v2 schema + violet done template', () => {
+  test('minimal card: v2 schema, done status header (已完成), body visible', () => {
     const card = buildAgentReplyCard({ status: 'done', text: 'Hello world' });
     expect(card.schema).toBe('2.0');
     const config = card.config as Record<string, unknown>;
@@ -294,19 +333,28 @@ describe('buildAgentReplyCard', () => {
     expect(config.update_multi).toBe(true);
     expect(config.enable_forward).toBe(true);
     expect(config.wide_screen_mode).toBeUndefined();
-
-    const header = card.header as Record<string, unknown>;
-    expect(header.template).toBe('violet');
+    // done now renders a violet status header titled with the status word
+    // ('已完成'), never the body's first line (issue #488 stays fixed).
+    expect(config.summary).toEqual({ content: '已完成' });
+    const header = card.header as Record<string, unknown> | undefined;
+    expect(header).toBeDefined();
+    expect(header!.template).toBe('violet');
+    expect((header!.title as Record<string, unknown>).content).toBe('已完成');
     // header.icon removed — standard_icon tokens are not supported on all clients
-    expect(header.icon).toBeUndefined();
+    expect(header!.icon).toBeUndefined();
 
-    const tags = header.text_tag_list as Array<Record<string, unknown>>;
+    const tags = header!.text_tag_list as Array<Record<string, unknown>>;
     expect(tags.length).toBeGreaterThan(0);
     expect((tags.at(-1)!.text as Record<string, unknown>).content).toBe('完成');
 
-    const body = card.body as Record<string, unknown>;
+    const body = card.body as { elements: Array<Record<string, unknown>> } &
+      Record<string, unknown>;
     expect(body.vertical_spacing).toBe('medium');
     expect(body.direction).toBe('vertical');
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toBe('Hello world');
   });
 
   test('header.template reflects CardStatus and omits icon', () => {
@@ -320,33 +368,169 @@ describe('buildAgentReplyCard', () => {
       ['error', 'red'],
     ];
     for (const [status, template] of cases) {
-      const card = buildAgentReplyCard({ status, text: 'x' });
+      const card = buildAgentReplyCard({ status, title: '执行结果', text: 'x' });
       const header = card.header as Record<string, unknown>;
       expect(header.template).toBe(template);
       expect(header.icon).toBeUndefined();
     }
   });
 
-  test('running / warning / error status maps to correct template', () => {
-    for (const [status, template] of [
-      ['running', 'blue'],
-      ['warning', 'orange'],
-      ['error', 'red'],
-    ] as const) {
-      const card = buildAgentReplyCard({ status, text: 'x' });
-      const header = card.header as Record<string, unknown>;
-      expect(header.template).toBe(template);
-    }
+  test('warning terminal state keeps an orange status header even without a title', () => {
+    const text = '部分文件写入失败，已回滚。';
+    const card = buildAgentReplyCard({ status: 'warning', text });
+    const header = card.header as Record<string, unknown> | undefined;
+    expect(header).toBeDefined();
+    expect(header!.template).toBe('orange');
+    const title = (header!.title as Record<string, unknown>).content as string;
+    expect(title).toBe('已中断');
+    const config = card.config as Record<string, unknown>;
+    expect(config.summary).toEqual({ content: '已中断' });
+    // Body must still carry the full reply text (never promoted into the header).
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toBe(text);
   });
 
-  test('short body → single main_content element, no collapsible overflow', () => {
-    const card = buildAgentReplyCard({ status: 'done', text: 'short reply' });
+  test('error terminal state keeps a red status header even without a title', () => {
+    const text = '执行 Bash 命令时崩溃。';
+    const card = buildAgentReplyCard({ status: 'error', text });
+    const header = card.header as Record<string, unknown> | undefined;
+    expect(header).toBeDefined();
+    expect(header!.template).toBe('red');
+    const title = (header!.title as Record<string, unknown>).content as string;
+    expect(title).toBe('出错');
+    const config = card.config as Record<string, unknown>;
+    expect(config.summary).toEqual({ content: '出错' });
     const body = card.body as { elements: Array<Record<string, unknown>> };
-    const mainCount = body.elements.filter(
+    const main = body.elements.find(
       (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
-    ).length;
-    expect(mainCount).toBe(1);
+    );
+    expect(main?.content).toBe(text);
+  });
+
+  test('status header never derives its title from the body first line', () => {
+    // The first line is a long heading-ish sentence; it must stay in the body
+    // and never be lifted into the header (issue #488 regression guard).
+    const text = '# 这是一段很长的标题文本，超过四十个字符，绝不能被提升到卡片 header 上当作标题展示\n正文细节';
+    const card = buildAgentReplyCard({ status: 'warning', text });
+    const header = card.header as Record<string, unknown>;
+    const title = (header.title as Record<string, unknown>).content as string;
+    expect(title).toBe('已中断');
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toContain('这是一段很长的标题文本');
+    expect(main?.content).toContain('正文细节');
+  });
+
+  test('explicit title on a warning state uses the title, not the status word', () => {
+    const card = buildAgentReplyCard({
+      status: 'warning',
+      title: '部分成功',
+      text: 'detail',
+    });
+    const header = card.header as Record<string, unknown>;
+    expect(header.template).toBe('orange');
+    const title = (header.title as Record<string, unknown>).content as string;
+    expect(title).toBe('部分成功');
+  });
+
+  test('short multi-line reply without explicit title → 已完成 header, keeps full text in body', () => {
+    const text = 'Summary line\nDetail body text';
+    const card = buildAgentReplyCard({
+      status: 'done',
+      text,
+    });
+    // header title is the status word, NOT the body's first line ('Summary line').
+    const header = card.header as Record<string, unknown>;
+    expect((header.title as Record<string, unknown>).content).toBe('已完成');
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main).toBeDefined();
+    expect(main?.content).toBe(text);
     expect(countTag(card, 'collapsible_panel')).toBe(0);
+  });
+
+  test('single-line reply → 已完成 header, keeps text in body', () => {
+    const card = buildAgentReplyCard({ status: 'done', text: 'short reply' });
+    const header = card.header as Record<string, unknown>;
+    expect((header.title as Record<string, unknown>).content).toBe('已完成');
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main).toBeDefined();
+    expect(main?.content).toBe('short reply');
+  });
+
+  test('long single-line reply → 已完成 header, keeps full text in body', () => {
+    const text =
+      'HappyClaw: 脚本 Updated slot: Token usage 明细很长，需要在卡片正文完整展示，不能只剩截断标题';
+    const card = buildAgentReplyCard({ status: 'done', text });
+    // a long reply must NOT be lifted/truncated into the header title.
+    const header = card.header as Record<string, unknown>;
+    expect((header.title as Record<string, unknown>).content).toBe('已完成');
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main).toBeDefined();
+    expect(main?.content).toBe(text);
+  });
+
+  test('markdown heading without explicit title → 已完成 header, stays in body', () => {
+    const text = '# Token usage\n明细正文';
+    const card = buildAgentReplyCard({
+      status: 'done',
+      text,
+    });
+    // the '# Token usage' heading must stay in the body, not become the title.
+    const header = card.header as Record<string, unknown>;
+    expect((header.title as Record<string, unknown>).content).toBe('已完成');
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toContain('Token usage');
+    expect(main?.content).toContain('明细正文');
+  });
+
+  test('list-like first line → 已完成 header, not promoted to title', () => {
+    const card = buildAgentReplyCard({
+      status: 'done',
+      text: '- item one\n- item two',
+    });
+    // the list first line must NOT be promoted into the header title.
+    const header = card.header as Record<string, unknown>;
+    expect((header.title as Record<string, unknown>).content).toBe('已完成');
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toContain('- item one');
+  });
+
+  test('explicit title override → uses override and keeps full text in body', () => {
+    const card = buildAgentReplyCard({
+      status: 'done',
+      title: '执行结果',
+      text: 'short reply',
+    });
+    const header = card.header as Record<string, unknown>;
+    const title = (header.title as Record<string, unknown>).content as string;
+    expect(title).toBe('执行结果');
+    const config = card.config as Record<string, unknown>;
+    expect(config.summary).toEqual({ content: '执行结果' });
+    const body = card.body as { elements: Array<Record<string, unknown>> };
+    const main = body.elements.find(
+      (e) => e.element_id === CARD_ELEMENT_IDS.MAIN_CONTENT,
+    );
+    expect(main?.content).toBe('short reply');
   });
 
   test('long body → multiple flat markdown chunks, no "继续阅读" panels', () => {
@@ -587,6 +771,8 @@ describe('buildStreamingAgentCard', () => {
     for (const required of [
       CARD_ELEMENT_IDS.PROGRESS_PANEL,
       CARD_ELEMENT_IDS.PROGRESS_CONTENT,
+      CARD_ELEMENT_IDS.TASK_PANEL,
+      CARD_ELEMENT_IDS.TASK_CONTENT,
       CARD_ELEMENT_IDS.TOOLS_PANEL,
       CARD_ELEMENT_IDS.TOOLS_CONTENT,
       CARD_ELEMENT_IDS.THINKING_PANEL,
@@ -597,6 +783,8 @@ describe('buildStreamingAgentCard', () => {
     ]) {
       expect(ids.has(required)).toBe(true);
     }
+    // The local skeleton keeps the live status in FOOTER_NOTE, not a top
+    // STATUS_BANNER element — STATUS_BANNER stays an ID constant only.
     expect(ids.has(CARD_ELEMENT_IDS.STATUS_BANNER)).toBe(false);
     const footer = findElementById(card, CARD_ELEMENT_IDS.FOOTER_NOTE);
     expect(String(footer?.content)).toContain('更新 <local_datetime');
@@ -614,9 +802,9 @@ describe('buildStreamingAgentCard', () => {
     expect(summary.content).toBe('Agent 回复 · 生成中');
   });
 
-  test('rich streaming card contains 5 collapsible panels (Phase F adds ask + timeline)', () => {
-    const card = buildStreamingAgentCard({ initialText: 'x' });
-    expect(countTag(card, 'collapsible_panel')).toBe(5);
+    test('rich streaming card contains 6 collapsible panels (ask/task/timeline included)', () => {
+      const card = buildStreamingAgentCard({ initialText: 'x' });
+      expect(countTag(card, 'collapsible_panel')).toBe(6);
   });
 
   test('codex streaming card uses Codex-native panel wording', () => {
@@ -657,7 +845,8 @@ describe('buildStreamingAgentCard', () => {
       runtimeProfile: 'claude',
     });
     const json = JSON.stringify(card);
-    expect(countTag(card, 'collapsible_panel')).toBe(5);
+    // ask / progress / task / tools / thinking / timeline = 6 panels.
+    expect(countTag(card, 'collapsible_panel')).toBe(6);
     expect(json).toContain('任务进度');
     expect(json).toContain('等待任务规划');
   });
@@ -988,23 +1177,22 @@ describe('buildStreamingAgentCard rich skeleton (Phase F)', () => {
     expect(ids.has(CARD_ELEMENT_IDS.TIMELINE_CONTENT)).toBe(true);
   });
 
-  test('rich skeleton now has 5 collapsible panels', () => {
-    const card = buildStreamingAgentCard({ initialText: 'x' });
-    expect(countTag(card, 'collapsible_panel')).toBe(5);
-  });
+    test('rich skeleton now has 6 collapsible panels', () => {
+      const card = buildStreamingAgentCard({ initialText: 'x' });
+      expect(countTag(card, 'collapsible_panel')).toBe(6);
+    });
 });
 
 // ─── feishu.ts:buildInteractiveCard backward-compat ─────────────
 
 describe('feishu.ts wrapper uses new builder', () => {
-  test('buildInteractiveCard delegates to buildAgentReplyCard with done status', async () => {
+  test('buildInteractiveCard delegates to buildAgentReplyCard without default header', async () => {
     const { buildInteractiveCard } = (await import('../src/feishu.js')) as unknown as {
       buildInteractiveCard?: (t: string) => object;
     };
     // buildInteractiveCard is module-private; skip silently if not exported.
     if (!buildInteractiveCard) return;
-    const card = buildInteractiveCard('hi');
-    const header = (card as { header: Record<string, unknown> }).header;
-    expect(header.template).toBe('violet');
+    const card = buildInteractiveCard('hi') as Record<string, unknown>;
+    expect(card.header).toBeUndefined();
   });
 });

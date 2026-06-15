@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
@@ -26,6 +26,7 @@ import { ImBindingDialog } from './ImBindingDialog';
 import { TopicSidebar } from './TopicSidebar';
 import { WorkspaceModelSelector } from './WorkspaceModelSelector';
 import { showToast } from '../../utils/toast';
+import { getWorkspaceLastAgent, setWorkspaceLastAgent } from '../../utils/workspaceLastAgent';
 import { CHANNEL_LABEL } from '../settings/channel-meta';
 
 /** Sentinel value for binding the main conversation (vs. a specific agent) */
@@ -110,6 +111,22 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const agents = useChatStore(s => s.agents[groupJid] ?? EMPTY_AGENTS);
   const activeAgentTab = useChatStore(s => s.activeAgentTab[groupJid] ?? null);
   const setActiveAgentTab = useChatStore(s => s.setActiveAgentTab);
+
+  // URL `?agent=` is the source of truth for the active sub-conversation tab.
+  // Refresh, browser back/forward, route restore, and direct deep-links all
+  // converge here. `selectTab` updates the URL only; an effect below mirrors
+  // the URL value into the store for consumers that read it directly.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlAgentId = searchParams.get('agent') || null;
+  const selectTab = useCallback((id: string | null) => {
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      if (id) next.set('agent', id);
+      else next.delete('agent');
+      return next;
+    }, { replace: true });
+    setWorkspaceLastAgent(groupJid, id);
+  }, [groupJid, setSearchParams]);
   const loadAgents = useChatStore(s => s.loadAgents);
   const deleteAgentAction = useChatStore(s => s.deleteAgentAction);
   const agentStreaming = useChatStore(s => s.agentStreaming);
@@ -117,6 +134,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const renameConversation = useChatStore(s => s.renameConversation);
   const reorderConversations = useChatStore(s => s.reorderConversations);
   const loadAgentMessages = useChatStore(s => s.loadAgentMessages);
+  const hydrateAgentMessages = useChatStore(s => s.hydrateAgentMessages);
   const refreshAgentMessages = useChatStore(s => s.refreshAgentMessages);
   const sendAgentMessage = useChatStore(s => s.sendAgentMessage);
   const agentMessages = useChatStore(s => s.agentMessages);
@@ -132,6 +150,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   // Sidebar: members tab visibility
   const isHome = !!group?.is_home;
   const showMembersTab = (!!group?.is_shared || group?.member_role === 'owner') && !isHome;
+  // Workspace config (skills + MCP) write permission. Backend `canModifyGroup`
+  // ACL result is propagated via the `can_modify` field; trust it as the
+  // single source of truth to avoid frontend/backend divergence.
+  const canModifyWorkspaceConfig = !!group?.can_modify;
   const visibleTabs = SIDEBAR_TABS.filter(t => t.id !== 'members' || showMembersTab);
 
   // Fallback: if current tab is hidden, reset to files
@@ -220,8 +242,9 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     const unsub = wsManager.on('connected', () => {
       restoreActiveState();
       // Reconcile agent list with backend truth — picks up any agent_status
-      // events that were missed during WS disconnection.
-      loadAgents(groupJid);
+      // events that were missed during WS disconnection.  Force-refresh
+      // bypasses the per-group memoize so reconnect always hits the API.
+      loadAgents(groupJid, { force: true });
       // Refresh conversation agent messages that may have been missed during WS disconnection
       const state = useChatStore.getState();
       const currentTab = state.activeAgentTab[groupJid];
@@ -271,6 +294,50 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     loadAgents(groupJid);
   }, [groupJid, loadAgents]);
 
+  // Mirror URL → store so consumers reading activeAgentTab stay in sync.
+  useEffect(() => {
+    setActiveAgentTab(groupJid, urlAgentId);
+  }, [urlAgentId, groupJid, setActiveAgentTab]);
+
+  // If URL points to an agent that no longer exists in this workspace
+  // (e.g., deleted while we were on it, or stale deep link), strip the param
+  // and clear the workspace memory so we don't try to restore it again.
+  useEffect(() => {
+    if (!urlAgentId) return;
+    if (agents.length === 0) return;
+    if (agents.some((a) => a.id === urlAgentId)) return;
+    setWorkspaceLastAgent(groupJid, null);
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete('agent');
+      return next;
+    }, { replace: true });
+  }, [urlAgentId, agents, groupJid, setSearchParams]);
+
+  // On entering a workspace without ?agent=, restore the last sub-tab the
+  // user was on in this workspace (per-workspace memory, persisted across
+  // PWA restarts via localStorage). Stale entries (agent deleted) get cleaned.
+  // Guarded by `params.groupFolder` so this doesn't fire when the URL is on
+  // the workspace picker (mobile back) but ChatView is still mounted with
+  // a stale `currentGroup`.
+  const params = useParams<{ groupFolder?: string }>();
+  useEffect(() => {
+    if (!params.groupFolder) return;
+    if (urlAgentId) return;
+    if (agents.length === 0) return;
+    const remembered = getWorkspaceLastAgent(groupJid);
+    if (!remembered) return;
+    if (!agents.some((a) => a.id === remembered)) {
+      setWorkspaceLastAgent(groupJid, null);
+      return;
+    }
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.set('agent', remembered);
+      return next;
+    }, { replace: true });
+  }, [groupJid, urlAgentId, agents, setSearchParams, params.groupFolder]);
+
   useEffect(() => {
     setTopicFilter('');
   }, [groupJid]);
@@ -285,25 +352,32 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   useEffect(() => {
     if (!isTopicWorkspace || !isDesktop || activeAgentTab || filteredTopicAgents.length === 0) return;
-    setActiveAgentTab(groupJid, filteredTopicAgents[0].id);
-  }, [isTopicWorkspace, isDesktop, activeAgentTab, filteredTopicAgents, groupJid, setActiveAgentTab]);
+    selectTab(filteredTopicAgents[0].id);
+  }, [isTopicWorkspace, isDesktop, activeAgentTab, filteredTopicAgents, selectTab]);
 
   useEffect(() => {
     if (!isTopicWorkspace || !activeAgentTab) return;
     const existsInTopics = topicAgents.some((agent) => agent.id === activeAgentTab);
     if (existsInTopics) return;
-    setActiveAgentTab(groupJid, isDesktop && topicAgents[0] ? topicAgents[0].id : null);
-  }, [isTopicWorkspace, activeAgentTab, topicAgents, isDesktop, groupJid, setActiveAgentTab]);
+    selectTab(isDesktop && topicAgents[0] ? topicAgents[0].id : null);
+  }, [isTopicWorkspace, activeAgentTab, topicAgents, isDesktop, selectTab]);
 
-  // Load messages for conversation agent tabs
+  // Load messages for conversation agent tabs.
+  // hydrate-then-calibrate: 先把 IndexedDB 快照灌回 store（避免首屏回退），
+  // 再走网络以服务端为准。不要用 useEffect cleanup 的 cancelled flag —— hydrate
+  // 的 set() 会改 agentMessages 触发 effect 重跑，cleanup 会把上一轮的 cancelled
+  // 置 true，导致网络校准被自己取消。改成 hydrate 完成后直接读 store 判断
+  // 「用户是否仍停留在这个 conversation tab」。
   useEffect(() => {
-    if (activeAgentTab && isConversationTab) {
-      const existing = agentMessages[activeAgentTab];
-      if (!existing) {
-        loadAgentMessages(groupJid, activeAgentTab);
-      }
-    }
-  }, [activeAgentTab, isConversationTab, groupJid, loadAgentMessages, agentMessages]);
+    if (!activeAgentTab || !isConversationTab) return;
+    if (agentMessages[activeAgentTab]) return;
+    const agentId = activeAgentTab;
+    void (async () => {
+      await hydrateAgentMessages(groupJid, agentId);
+      if (useChatStore.getState().activeAgentTab[groupJid] !== agentId) return;
+      await loadAgentMessages(groupJid, agentId);
+    })();
+  }, [activeAgentTab, isConversationTab, groupJid, hydrateAgentMessages, loadAgentMessages, agentMessages]);
 
   // 监听 WebSocket 流式事件
   useEffect(() => {
@@ -459,7 +533,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   const handleBackAction = () => {
     if (isTopicWorkspace && !isDesktop && activeAgentTab) {
-      setActiveAgentTab(groupJid, null);
+      selectTab(null);
       return;
     }
     onBack?.();
@@ -595,7 +669,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         <AgentTabBar
           agents={agents}
           activeTab={activeAgentTab}
-          onSelectTab={(id) => setActiveAgentTab(groupJid, id)}
+          canModify={canModifyWorkspaceConfig}
+          onSelectTab={(id) => selectTab(id)}
           onDeleteAgent={(id) => {
             const agent = agents.find((a) => a.id === id);
             if (agent?.linked_im_groups && agent.linked_im_groups.length > 0) {
@@ -609,7 +684,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           onRenameAgent={(id, currentName) => setRenameTarget({ agentId: id, name: currentName })}
           onCreateConversation={() => {
             createConversation(groupJid, '').then((agent) => {
-              if (agent) setActiveAgentTab(groupJid, agent.id);
+              if (agent) selectTab(agent.id);
             });
           }}
           onBindIm={setBindingAgentId}
@@ -631,7 +706,8 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 <TopicSidebar
                   topicAgents={filteredTopicAgents}
                   activeAgentTab={activeAgentTab}
-                  onSelectAgent={(id) => setActiveAgentTab(groupJid, id)}
+                  canModify={canModifyWorkspaceConfig}
+                  onSelectAgent={(id) => selectTab(id)}
                   onDeleteAgent={(id) => deleteAgentAction(groupJid, id)}
                   topicFilter={topicFilter}
                   onFilterChange={setTopicFilter}
@@ -645,7 +721,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                     {!isDesktop && (
                       <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
                         <button
-                          onClick={() => setActiveAgentTab(groupJid, null)}
+                          onClick={() => selectTab(null)}
                           className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-muted cursor-pointer"
                           aria-label="返回话题列表"
                         >
@@ -676,7 +752,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                         return ok;
                       }}
                       groupJid={groupJid}
-                      onResetSession={() => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); }}
+                      onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); } : undefined}
                     />
                   </>
                 ) : (
@@ -712,7 +788,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                   return ok;
                 }}
                 groupJid={groupJid}
-                onResetSession={() => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); }}
+                onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); } : undefined}
               />
             </>
           ) : (
@@ -732,7 +808,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
               <MessageInput
                 onSend={handleSend}
                 groupJid={groupJid}
-                onResetSession={() => { setResetAgentId(null); setShowResetConfirm(true); }}
+                onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(null); setShowResetConfirm(true); } : undefined}
                 onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
               />
             </>
@@ -781,9 +857,15 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             ) : sidebarTab === 'env' ? (
               <ContainerEnvPanel groupJid={groupJid} />
             ) : sidebarTab === 'skills' ? (
-              <WorkspaceSkillsPanel groupJid={groupJid} />
+              <WorkspaceSkillsPanel
+                groupJid={groupJid}
+                canModify={canModifyWorkspaceConfig}
+              />
             ) : sidebarTab === 'mcp' ? (
-              <WorkspaceMcpPanel groupJid={groupJid} />
+              <WorkspaceMcpPanel
+                groupJid={groupJid}
+                canModify={canModifyWorkspaceConfig}
+              />
             ) : (
               <GroupMembersPanel groupJid={groupJid} />
             )}
@@ -863,6 +945,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           <div className="flex-1 overflow-hidden h-[calc(80dvh-56px)]">
             <WorkspaceSkillsPanel
               groupJid={groupJid}
+              canModify={canModifyWorkspaceConfig}
               onClose={() => setMobilePanel(null)}
             />
           </div>
@@ -878,6 +961,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           <div className="flex-1 overflow-hidden h-[calc(80dvh-56px)]">
             <WorkspaceMcpPanel
               groupJid={groupJid}
+              canModify={canModifyWorkspaceConfig}
               onClose={() => setMobilePanel(null)}
             />
           </div>

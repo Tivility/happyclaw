@@ -8,6 +8,8 @@ export interface GroupInfo {
   is_shared?: boolean;
   member_role?: 'owner' | 'member';
   member_count?: number;
+  can_modify?: boolean;
+  can_manage_members?: boolean;
   editable?: boolean;
   deletable?: boolean;
   lastMessage?: string;
@@ -32,7 +34,7 @@ export interface AgentInfo {
   completed_at?: string;
   result_summary?: string;
   linked_im_groups?: Array<{ jid: string; name: string }>;
-  source_kind?: 'manual' | 'feishu_thread' | null;
+  source_kind?: 'manual' | 'feishu_thread' | 'auto_im' | null;
   thread_id?: string | null;
   root_message_id?: string | null;
   title_source?: 'manual' | 'feishu_root' | 'auto' | 'auto_pending' | null;
@@ -58,6 +60,7 @@ export interface AvailableImGroup {
   chat_mode?: string;
   group_message_type?: string;
   is_thread_capable?: boolean;
+  sender_allowlist_locked?: boolean;
 }
 
 export interface GroupMember {

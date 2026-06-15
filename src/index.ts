@@ -1,3 +1,4 @@
+import './load-env.js'; // 必须最先执行：加载 .env 到 process.env，供后续模块（config/web 等）读取
 import { ChildProcess, execFile } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
@@ -26,6 +27,7 @@ import {
   ContainerOutput,
   runContainerAgent,
   runHostAgent,
+  willClearSessionOnProviderSwitch,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -68,7 +70,9 @@ import {
   updateAgentStatus,
   updateAgentLastImJid,
   updateAgentInfo,
+  deleteAgent,
   deleteCompletedAgents,
+  deleteImGroupRecord,
   getRunningTaskAgentsByChat,
   markRunningTaskAgentsAsError,
   markAllRunningTaskAgentsAsError,
@@ -85,6 +89,7 @@ import {
   upsertImContextBinding,
   touchImContextBindingActivity,
   updateAgentContextInfo,
+  // 隐私相关 import 保留为死代码暂留（决策4：合并后统一清理，本次只让位）
   isPrivacyJid,
   deletePrivacyMessages,
   cleanupAllPrivacyMessages,
@@ -93,6 +98,7 @@ import {
   getConversationRuntimeState,
   promotePendingConversationRuntimeBinding,
   setConversationRuntimeBinding,
+  backfillEmptyAllowlistsForUser,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -116,6 +122,9 @@ import {
   formatSystemStatus,
   resolveBoundChatTarget,
   resolveLocationInfo,
+  checkImOwnerCommand,
+  isDirectMessageJid,
+  OWNER_REQUIRED_IM_COMMANDS,
   type WorkspaceInfo,
 } from './im-command-utils.js';
 import {
@@ -124,6 +133,12 @@ import {
   resolveBroadcastFolder,
   resolveTaskRoutingDecision,
 } from './task-routing.js';
+import { resolveImGroupDefaults } from './im-group-defaults.js';
+import {
+  applyAutoIsolateContextForGroups,
+  getUserContextIsolationConfig,
+} from './im-context-isolation.js';
+import { canSendCrossGroupMessage as canSendCrossGroupMessagePure } from './cross-group-acl.js';
 import { invalidateSessionCache, getWebDeps } from './web-context.js';
 import {
   persistRuntimeNativeSession,
@@ -151,6 +166,7 @@ import {
   getUserWeChatConfig,
   getUserDingTalkConfig,
   getUserDiscordConfig,
+  getUserWhatsAppConfig,
   getSystemSettings,
   saveUserFeishuConfig,
   saveFeishuOwnerOpenId,
@@ -164,6 +180,7 @@ import type {
   WeChatConnectConfig,
   DingTalkConnectConfig,
   DiscordConnectConfig,
+  WhatsAppConnectConfig,
 } from './im-manager.js';
 import { GroupQueue } from './group-queue.js';
 import { startSchedulerLoop, triggerTaskNow } from './task-scheduler.js';
@@ -190,6 +207,8 @@ import {
 } from './types.js';
 import { logger } from './logger.js';
 import { resolveTaskOwner } from './task-utils.js';
+import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
+import { checkOwnerActive } from './owner-gate.js';
 import {
   ensureAgentDirectories,
   isSystemMaintenanceNoise,
@@ -205,9 +224,11 @@ import {
   broadcastTyping,
   broadcastStreamEvent,
   broadcastAgentStatus,
+  broadcastAgentRemoved,
   broadcastTitleGenerating,
   broadcastGroupCreated,
   broadcastBillingUpdate,
+  broadcastWhatsAppStatus,
   shutdownTerminals,
   shutdownWebServer,
   getActiveStreamingTexts,
@@ -220,6 +241,19 @@ import {
 import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
 import { executeSessionReset } from './commands.js';
+import {
+  claimOwner,
+  releaseOwner,
+  addToAllowlist,
+  removeFromAllowlist,
+  persistGroupUpdate,
+} from './group-owner.js';
+import { buildRecentConversationHistoryContext } from './conversation-history.js';
+import { scanHostMarketplaces } from './plugin-importer.js';
+import { expandMessagesIfNeeded } from './plugin-expander-core.js';
+import { makeExpandContext } from './plugin-expander-context.js';
+import type { ExpandContext } from './plugin-expander-context.js';
+import { persistPluginExpansion } from './plugin-expander-store.js';
 
 // Set timezone so all child processes (host agents, containers) inherit it
 process.env.TZ = process.env.TZ || TIMEZONE;
@@ -269,6 +303,15 @@ function enrichUsageWithRuntimeModel(
   };
 }
 
+function buildWebTraceUrl(folder: string | undefined, turnId?: string): string | null {
+  const base = process.env.HAPPYCLAW_WEB_URL || process.env.PUBLIC_BASE_URL || process.env.WEB_BASE_URL;
+  if (!base || !folder) return null;
+  const url = new URL(`/chat/${encodeURIComponent(folder)}`, base);
+  if (turnId) url.searchParams.set('turn', turnId);
+  url.searchParams.set('trace', '1');
+  return url.toString();
+}
+
 /**
  * Feed a stream event into a Feishu streaming card controller.
  * Centralizes the event → card mapping for both main and sub-agent handlers.
@@ -277,6 +320,7 @@ export function feedStreamEventToCard(
   session: StreamingSession,
   se: StreamEvent,
   accumulatedText: string,
+  traceUrl?: string | null,
 ): void {
   if (
     se.runtime &&
@@ -284,6 +328,9 @@ export function feedStreamEventToCard(
     (se.runtime === 'claude' || se.runtime === 'codex')
   ) {
     session.setRuntimeProfile(se.runtime);
+  }
+  if (traceUrl && session instanceof StreamingCardController) {
+    session.setTraceUrl(traceUrl);
   }
   switch (se.eventType) {
     case 'text_delta':
@@ -294,8 +341,9 @@ export function feedStreamEventToCard(
       if (se.text && !se.parentToolUseId) session.append(accumulatedText);
       break;
     case 'thinking_delta':
-      // Sub-agent thinking must NOT be merged into the main thinking panel —
-      // it's the sub-agent's private narration, not user-facing.
+      // 子 Agent（SDK Task）的思考带 parentToolUseId，在 task 面板独立呈现；
+      // 混入主卡思考面板会反复重新激活 thinking 态并污染内容（Web 端
+      // applyStreamEvent 与服务端快照均已隔离，此处对齐）。
       if (se.parentToolUseId) break;
       if (se.text) {
         session.appendThinking(se.text);
@@ -332,9 +380,31 @@ export function feedStreamEventToCard(
         if (info) session.pushRecentEvent(`✅ ${info.name}`);
       }
       break;
+    case 'tool_result': {
+      // Surface the (truncated + sanitized) tool output in the timeline so the
+      // card shows *what* a tool returned, aligning with Claude Code's trace.
+      if (se.toolResult) {
+        const resultInfo = se.toolUseId ? session.getToolInfo(se.toolUseId) : undefined;
+        const toolLabel = resultInfo?.name ? `\`${resultInfo.name}\` ` : '';
+        session.pushRecentEvent(
+          `↳ <font color='grey'>结果</font> ${toolLabel}${se.toolResult.slice(0, 120)}`,
+        );
+      }
+      break;
+    }
     case 'tool_progress':
       if (se.toolUseId && se.toolInputSummary) {
         session.updateToolSummary(se.toolUseId, se.toolInputSummary);
+      }
+      // AskUserQuestion 等工具的结构化输入（questions/options）经 tool_progress
+      // 的 toolInput 字段下发（非 toolInputSummary，因流式 tool_use_start 时 input 恒空）。
+      // 写入 tc.toolInput 以驱动飞书 ASK 面板渲染，与 Web 端 applyStreamEvent 对齐。
+      if (
+        se.toolUseId &&
+        se.toolInput &&
+        session instanceof StreamingCardController
+      ) {
+        session.setToolMeta(se.toolUseId, { toolInput: se.toolInput });
       }
       break;
     case 'status':
@@ -365,13 +435,58 @@ export function feedStreamEventToCard(
         const label = se.taskDescription
           ? `Task: ${se.taskDescription.slice(0, 40)}`
           : 'Task';
+        if (session instanceof StreamingCardController) {
+          session.updateTask(se.toolUseId, {
+            title: se.taskDescription || se.toolInputSummary || 'Task',
+            status: 'running',
+            subagentType: se.subagentType,
+            summary: se.summary,
+          });
+        }
         session.startTool(se.toolUseId, label);
         session.pushRecentEvent(`🚀 ${label}`);
       }
       break;
+    case 'task_progress': {
+      const id = se.toolUseId || se.taskId;
+      if (id && session instanceof StreamingCardController) {
+        session.updateTask(id, {
+          title: se.taskDescription || 'Task',
+          status: 'running',
+          subagentType: se.subagentType,
+          lastToolName: se.lastToolName,
+          summary: se.summary || se.taskSummary,
+        });
+      }
+      if (se.summary) session.pushRecentEvent(`🔄 Task: ${se.summary.slice(0, 60)}`);
+      break;
+    }
+    case 'task_updated': {
+      const id = se.toolUseId || se.taskId;
+      if (id && session instanceof StreamingCardController) {
+        const patchStatus = se.taskPatch?.status;
+        session.updateTask(id, {
+          status: patchStatus === 'completed'
+            ? 'completed'
+            : patchStatus === 'failed' || patchStatus === 'killed'
+              ? 'error'
+              : se.taskPatch?.is_backgrounded
+                ? 'backgrounded'
+                : 'running',
+          summary: se.summary || se.taskPatch?.description || se.taskPatch?.error,
+        });
+      }
+      break;
+    }
     case 'task_notification':
       if (se.toolUseId || se.taskId) {
         const id = se.toolUseId || se.taskId || '';
+        if (session instanceof StreamingCardController) {
+          session.updateTask(id, {
+            status: se.taskStatus === 'completed' ? 'completed' : 'error',
+            summary: se.taskSummary || se.summary,
+          });
+        }
         session.endTool(id, false);
         const label = se.taskSummary
           ? `Task: ${se.taskSummary.slice(0, 40)}`
@@ -408,6 +523,50 @@ export function feedStreamEventToCard(
       break;
     case 'usage':
       if (se.usage) session.patchUsageNote(se.usage);
+      break;
+    case 'permission_denied': {
+      // A denied tool call is a real signal (the agent wanted to do something
+      // it wasn't allowed to) — render it in red so it stands out from the
+      // grey routine-event stream instead of being buried as plain text.
+      const pd = se.permissionDenied;
+      const toolName = pd?.toolName || se.toolName || '';
+      const reason = pd?.reason || pd?.message || se.summary || '';
+      const toolPart = toolName ? ` \`${toolName}\`` : '';
+      const reasonPart = reason
+        ? ` <font color='grey'>${reason.slice(0, 80)}</font>`
+        : '';
+      session.pushRecentEvent(
+        `🚫 <text_tag color='red'>权限拒绝</text_tag>${toolPart}${reasonPart}`,
+      );
+      break;
+    }
+    case 'memory_recall':
+    case 'compact_boundary':
+    case 'notification':
+    case 'prompt_suggestion':
+      if (se.summary || se.title) {
+        // memory_recall / compact_boundary carry the matched memory or the
+        // pre-compaction summary in `detail`; surface it (clamped) after the
+        // headline so the runtime trace shows *what* was recalled/compacted,
+        // not just that it happened.
+        const detail = se.detail ? ` <font color='grey'>${se.detail.slice(0, 120)}</font>` : '';
+        session.pushRecentEvent(
+          `${se.title || se.eventType}: ${(se.summary || '').slice(0, 80)}${detail}`,
+        );
+      }
+      if (se.eventType === 'compact_boundary') {
+        session.setSystemStatus(se.summary || '上下文已压缩');
+      }
+      break;
+    case 'context_audit':
+      if (se.contextAudit?.warnings?.length) {
+        session.pushRecentEvent(`Agent Context: ${se.contextAudit.warnings[0].slice(0, 80)}`);
+      }
+      break;
+    case 'raw_sdk_event':
+      if (se.displayLevel === 'primary') {
+        session.pushRecentEvent(`${se.title || se.rawType || 'SDK'}: ${(se.summary || '').slice(0, 80)}`);
+      }
       break;
     case 'init':
       // Internal signal, no card display needed
@@ -487,11 +646,46 @@ function setCursors(jid: string, cursor: MessageCursor): void {
   saveState();
 }
 
-/** Advance cursors to `candidate`, never regressing behind existing position. */
+/**
+ * Advance only the next-pull cursor (lastAgentTimestamp) so the next poll
+ * skips this message; lastCommittedCursor stays put so recovery still
+ * detects unprocessed earlier messages on crash.
+ *
+ * Use for plugin-expander system replies that are delivered out-of-band
+ * (no agent involvement) when the same batch still has earlier user
+ * messages destined for the agent. Without this, a crash between the
+ * reply commit and the agent finishing processing of the earlier
+ * messages would lose them (#18 P2-bug-2).
+ *
+ * Comparison uses lexicographic (timestamp, id) via `isCursorAfter` —
+ * `getMessagesSince` sorts by `(timestamp, id)` so two messages with the
+ * same timestamp must be ordered by id. Comparing on timestamp alone
+ * could regress the cursor to an earlier id when the later id has
+ * already been processed (#20 P2-3, #24 round-16 P2-2).
+ */
+function advanceNextPullCursorOnly(
+  jid: string,
+  candidate: MessageCursor,
+): void {
+  const current = lastAgentTimestamp[jid];
+  const target = current && isCursorAfter(current, candidate) ? current : candidate;
+  lastAgentTimestamp[jid] = target;
+  saveState();
+}
+
+/**
+ * Advance cursors to `candidate`, never regressing behind existing position.
+ *
+ * Comparison uses lexicographic (timestamp, id) via `isCursorAfter` so
+ * mixed batches with same-timestamp ids cannot regress the cursor (#24
+ * round-16 P2-2). Pre-fix, only timestamps were compared, so a `/cmd`
+ * reply that ran `setCursors` to (T,m2) followed by the agent processing
+ * a plain m1 with the same timestamp T would call `advanceCursors(T,m1)`
+ * → cursor regressed to m1 → next poll re-read m2 and reply re-fired.
+ */
 function advanceCursors(jid: string, candidate: MessageCursor): void {
   const current = lastAgentTimestamp[jid];
-  const target =
-    current && current.timestamp > candidate.timestamp ? current : candidate;
+  const target = current && isCursorAfter(current, candidate) ? current : candidate;
   lastAgentTimestamp[jid] = target;
   lastCommittedCursor[jid] = target;
   saveState();
@@ -706,6 +900,41 @@ const activeRouteUpdaters = new Map<string, ReplyRouteUpdater>();
 // outputs to the correct IM channel (the running session holds the truth).
 const activeImReplyRoutes = new Map<string, string | null>();
 
+// ── IPC send_message 跨重试去重 ──
+// 错误退避重试会把整个 prompt 从头重跑，agent 在失败前已执行的 send_message
+// 会被原样再执行一遍，经 IPC watcher 即时送达用户（重复刷消息）。
+//
+// 关键：抑制必须严格限定在「重试重放」窗口，否则会误杀合法的重复内容
+// （周期定时任务每次报告相同文案、用户明确要求重发同一句话）。因此始终记录
+// 每条 send 的指纹，但仅当该源 group 当前正处于失败重试轮次（retryCount>0）
+// 时，命中已记录的指纹才抑制——正常首轮永不抑制。
+const IPC_SEND_DEDUP_TTL_MS = 10 * 60_000;
+const IPC_SEND_DEDUP_MAX = 500;
+const recentIpcSends = new Map<string, number>(); // key → expireAt
+function isRetryDuplicateIpcSend(
+  sourceGroup: string,
+  chatJid: string,
+  text: string,
+): boolean {
+  const key = `${sourceGroup}|${chatJid}|${crypto
+    .createHash('md5')
+    .update(text)
+    .digest('hex')}`;
+  const now = Date.now();
+  const exp = recentIpcSends.get(key);
+  // 仅在该 group 处于重试重放时，已见过的指纹才视为重复并抑制。
+  const inRetry = queue.getRetryCount(`web:${sourceGroup}`) > 0
+    || queue.getRetryCount(sourceGroup) > 0;
+  const isDup = !!(exp && exp > now) && inRetry;
+  recentIpcSends.set(key, now + IPC_SEND_DEDUP_TTL_MS);
+  // 容量控制：Map 迭代为插入序，先进先出淘汰
+  for (const k of recentIpcSends.keys()) {
+    if (recentIpcSends.size <= IPC_SEND_DEDUP_MAX) break;
+    recentIpcSends.delete(k);
+  }
+  return isDup;
+}
+
 // Track consecutive IM send failures per JID for auto-unbind
 const imSendFailCounts = new Map<string, number>();
 const IM_SEND_FAIL_THRESHOLD = 3;
@@ -748,11 +977,7 @@ function resolveImRoute(opts: {
 }): string | null {
   const { ipcAgentId, isHome, chatJid, sourceGroup } = opts;
   if (ipcAgentId) {
-    return (
-      activeImReplyRoutes.get(`${chatJid}#agent:${ipcAgentId}`) ??
-      activeImReplyRoutes.get(sourceGroup) ??
-      null
-    );
+    return activeImReplyRoutes.get(`${chatJid}#agent:${ipcAgentId}`) ?? null;
   }
   const imFromJid = getChannelType(chatJid) !== null ? chatJid : null;
   const imFromGroup = activeImReplyRoutes.get(sourceGroup) ?? null;
@@ -776,6 +1001,31 @@ function unbindImGroup(jid: string, reason: string): void {
   imSendFailCounts.delete(jid);
   imHealthCheckFailCounts.delete(jid);
   logger.info({ jid, agentId, targetMainJid }, reason);
+}
+
+/**
+ * Remove an IM group entirely (jid record + chat history + pinned refs + send/health counters).
+ * Use this when the group is detected as dead — bot kicked, group disbanded,
+ * health-check repeatedly unreachable, or consecutive send failures.
+ *
+ * Differs from unbindImGroup() which only clears target_* fields (used for
+ * user-initiated soft unbind where the IM group itself is still alive).
+ */
+export function removeImGroupRecord(jid: string, reason: string): void {
+  const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
+  if (!group) return;
+  deleteImGroupRecord(jid);
+  delete registeredGroups[jid];
+  imSendFailCounts.delete(jid);
+  imHealthCheckFailCounts.delete(jid);
+  logger.info(
+    {
+      jid,
+      hadTargetAgent: !!group.target_agent_id,
+      hadTargetMain: !!group.target_main_jid,
+    },
+    reason,
+  );
 }
 
 /**
@@ -1143,12 +1393,12 @@ async function sendImWithRetry(
   imSendFailCounts.set(imJid, count);
   if (count >= IM_SEND_FAIL_THRESHOLD) {
     try {
-      unbindImGroup(
+      removeImGroupRecord(
         imJid,
-        'Auto-unbound IM group after consecutive send failures',
+        'Auto-removed IM group after consecutive send failures',
       );
     } catch (unbindErr) {
-      logger.error({ imJid, unbindErr }, 'Failed to auto-unbind IM group');
+      logger.error({ imJid, unbindErr }, 'Failed to auto-remove IM group');
     }
   }
   return false;
@@ -1239,6 +1489,54 @@ function sendBillingDeniedMessage(jid: string, content: string): string {
   return msgId;
 }
 
+/**
+ * Persist + broadcast a plugin-expander system reply (e.g. command conflict,
+ * docker container offline). Mirrors `sendBillingDeniedMessage` but uses the
+ * `__plugin__` synthetic sender so audits can distinguish the two paths.
+ *
+ * When `imRouteJid` is a connected IM channel, also fan the reply out to that
+ * channel so users on Feishu / Telegram / QQ / DingTalk see the response —
+ * without this, plugin-expander system replies (conflict / offline-runner /
+ * etc.) would silently drop on IM and the slash command appears to no-op
+ * (#20 P1-1).
+ */
+function sendPluginExpanderReply(
+  jid: string,
+  content: string,
+  imRouteJid?: string | null,
+): string {
+  const msgId = `sys_plugin_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+  const timestamp = new Date().toISOString();
+  ensureChatExists(jid);
+  storeMessageDirect(
+    msgId,
+    jid,
+    '__plugin__',
+    ASSISTANT_NAME,
+    content,
+    timestamp,
+    true,
+  );
+  broadcastNewMessage(jid, {
+    id: msgId,
+    chat_jid: jid,
+    sender: '__plugin__',
+    sender_name: ASSISTANT_NAME,
+    content,
+    timestamp,
+    is_from_me: true,
+  });
+  if (imRouteJid && getChannelType(imRouteJid)) {
+    imManager.sendMessage(imRouteJid, content).catch((err) => {
+      logger.warn(
+        { err, jid: imRouteJid },
+        'Failed to send plugin-expander reply to IM',
+      );
+    });
+  }
+  return msgId;
+}
+
 function getSessionClaudeDir(folder: string, agentId?: string): string {
   return agentId
     ? path.join(DATA_DIR, 'sessions', folder, 'agents', agentId, '.claude')
@@ -1304,6 +1602,39 @@ async function handleCommand(
   const cmd = parts[0].toLowerCase();
   const rawArgs = command.slice(parts[0].length).trim();
 
+  // Owner gate for destructive IM commands. See OWNER_REQUIRED_IM_COMMANDS
+  // doc in im-command-utils.ts for the exclusion rationale (notably
+  // /owner_mention stays open as the bootstrap path for unowned groups).
+  let group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+
+  // DM auto-claim: in a 1:1 IM chat the sender is unambiguously the owner, so
+  // claim them on the first owner-required command instead of forcing a
+  // separate /owner_mention (pure friction for a single-person DM). Group
+  // chats never auto-claim — isDirectMessageJid returns false for them, so the
+  // first commander can't silently grab ownership. Feishu already auto-sets
+  // owner_im_id via its DM owner-learn path, so this only kicks in for the
+  // non-Feishu channels that buildOnNewChat leaves unowned.
+  if (
+    OWNER_REQUIRED_IM_COMMANDS.has(cmd) &&
+    group &&
+    !group.owner_im_id &&
+    senderImId &&
+    isDirectMessageJid(chatJid)
+  ) {
+    const claimed = claimOwner(group, senderImId);
+    persistGroupUpdate(chatJid, claimed, registeredGroups);
+    group = claimed;
+    logger.info(
+      { chatJid, senderImId },
+      'Auto-claimed DM owner on first owner-required command',
+    );
+  }
+
+  const ownerCheck = checkImOwnerCommand(cmd, group, senderImId);
+  if (!ownerCheck.ok) {
+    return `⚠️ ${ownerCheck.reason}`;
+  }
+
   switch (cmd) {
     case 'clear':
       return handleClearCommand(chatJid);
@@ -1327,6 +1658,8 @@ async function handleCommand(
       return handleRequireMentionCommand(chatJid, rawArgs, senderImId);
     case 'owner_mention':
       return handleOwnerMentionCommand(chatJid, senderImId);
+    case 'release_owner':
+      return handleReleaseOwnerCommand(chatJid);
     case 'sw':
     case 'spawn':
       return handleSpawnCommand(chatJid, rawArgs, chatJid);
@@ -1878,41 +2211,42 @@ function handleRequireMentionCommand(chatJid: string, rawArgs: string, senderImI
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
   if (!group) return '未找到当前会话';
 
-  // owner_mentioned 模式下，只有 owner 可以修改激活模式
-  if (group.activation_mode === 'owner_mentioned' && group.owner_im_id) {
+  // owner_im_id 已存在时，无论 activation_mode 是什么，非 owner 都不能改 activation_mode：
+  // 否则任意成员可以 /require_mention false 把群从 auto/when_mentioned/owner_mentioned 翻成
+  // always，相当于聊天提权。owner_im_id 未设置时仍放行（bootstrap path）。
+  if (group.owner_im_id) {
     if (!senderImId || senderImId !== group.owner_im_id) {
-      return '当前为「仅 owner 响应」模式，只有 owner 可以修改此设置';
+      return '⚠️ 只有工作区 owner 才能修改此设置';
     }
   }
 
   const action = rawArgs.trim().toLowerCase();
   if (action === 'true') {
-    // 如果当前是 owner_mentioned 模式，切换为 when_mentioned 并清除 owner
+    // 如果当前是 owner_mentioned 模式，切换为 when_mentioned 但保留 owner
+    // 注意：不清空 owner_im_id —— owner 是工作区认领标识，非 owner 通过
+    // 切换 activation_mode 不应该获得清掉 owner、再 /owner_mention 自我夺权的能力。
     if (group.activation_mode === 'owner_mentioned') {
       const updated: RegisteredGroup = {
         ...group,
         require_mention: true,
         activation_mode: 'when_mentioned',
-        owner_im_id: undefined,
       };
-      setRegisteredGroup(chatJid, updated);
-      registeredGroups[chatJid] = updated;
+      persistGroupUpdate(chatJid, updated, registeredGroups);
       return '已从「仅 owner 响应」切换为「需要 @机器人」模式，所有人 @机器人 均可触发';
     }
     const updated: RegisteredGroup = { ...group, require_mention: true };
-    setRegisteredGroup(chatJid, updated);
-    registeredGroups[chatJid] = updated;
+    persistGroupUpdate(chatJid, updated, registeredGroups);
     return '已开启：群聊中需要 @机器人 才会响应';
   } else if (action === 'false') {
+    // 关闭 require_mention 时退出 owner_mentioned 模式，但保留 owner_im_id：
+    // owner 身份是工作区的安全锚点（owner-required 命令依据它鉴权），不能因为
+    // 切换激活策略就被任意人通过 /require_mention false 重置。
     const updated: RegisteredGroup = {
       ...group,
       require_mention: false,
-      // 同时清除 owner_mentioned 模式，恢复为全量响应
       activation_mode: 'always',
-      owner_im_id: undefined,
     };
-    setRegisteredGroup(chatJid, updated);
-    registeredGroups[chatJid] = updated;
+    persistGroupUpdate(chatJid, updated, registeredGroups);
     return '已关闭：群聊中所有消息都会响应，无需 @机器人';
   } else if (!action) {
     const current = group.require_mention === true;
@@ -1922,9 +2256,11 @@ function handleRequireMentionCommand(chatJid: string, rawArgs: string, senderImI
 }
 
 /**
- * /owner_mention 命令：将当前发送者设为群组 owner（用于 owner_mentioned 模式）。
- * 执行后该群组只响应此发送者的 @mention，其他人的 @mention 被静默忽略。
- * 如果已有 owner，只有当前 owner 可以重新设置。
+ * /owner_mention 命令：将当前发送者认领为群组 owner（owner-only 命令的鉴权锚点）。
+ * 仅写入 owner_im_id，不修改 activation_mode —— 群组的激活策略（auto / always /
+ * when_mentioned / owner_mentioned）保持不变。
+ * 已有 owner 时（任意 activation_mode），只有当前 owner 本人可幂等地重发，
+ * 其他人会被拒绝以防夺权。
  */
 function handleOwnerMentionCommand(chatJid: string, senderImId?: string): string {
   const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
@@ -1934,27 +2270,42 @@ function handleOwnerMentionCommand(chatJid: string, senderImId?: string): string
     return '无法识别发送者身份，请在飞书或钉钉群聊中使用此命令';
   }
 
-  // 已有 owner 时，只有 owner 本人可以重新设置
-  if (group.activation_mode === 'owner_mentioned' && group.owner_im_id && group.owner_im_id !== senderImId) {
-    return '当前群组已有 owner，只有 owner 本人可以重新设置';
+  // 已有 owner 时，任意 activation_mode 下都拒绝非 owner 的认领，避免任意人通过
+  // /owner_mention 覆盖已存在的 owner_im_id（哪怕群组当前是 'auto' / 'always' /
+  // 'when_mentioned' 模式，owner_im_id 也可能由 /allow 回填或别处设置过）。
+  // 当前 sender 就是 owner 本人时允许，保持幂等。
+  if (group.owner_im_id && group.owner_im_id !== senderImId) {
+    return '⚠️ 该群组已有 owner，无法重新认领';
   }
 
-  const updated: RegisteredGroup = {
-    ...group,
-    activation_mode: 'owner_mentioned',
-    owner_im_id: senderImId,
-  };
-  setRegisteredGroup(chatJid, updated);
-  registeredGroups[chatJid] = updated;
+  // 仅认领 owner，不强制切换 activation_mode：用户当前的群组激活策略（auto /
+  // always / when_mentioned）保持不变，避免 bootstrap 时被意外改成「仅 owner 响应」。
+  const updated = claimOwner(group, senderImId);
+  persistGroupUpdate(chatJid, updated, registeredGroups);
 
   logger.info(
-    { chatJid, senderImId },
-    'Owner mention mode enabled via /owner_mention command',
+    { chatJid, senderImId, activationMode: updated.activation_mode },
+    'Owner claimed via /owner_mention command',
   );
 
-  return `已开启「仅我响应」模式\n\n你的 IM 标识: ${senderImId}\n只有你 @机器人 时才会响应，其他人的 @mention 将被静默忽略。\n\n发送 /require_mention false 可恢复为全量响应。`;
+  return `已认领工作区 owner\n\n你的 IM 标识: ${senderImId}\n后续 /clear、/bind、/spawn 等 owner-only 命令将以你为准。\n群组激活策略保持不变（当前: ${updated.activation_mode ?? 'auto'}）。`;
 }
 
+/**
+ * /release_owner 命令：当前 owner 主动释放 owner 身份（reclaim path）。
+ * `checkImOwnerCommand` 已在 handleCommand 顶部确保 sender === owner_im_id。
+ * 同时清空 sender_allowlist（避免新 owner 被旧 owner 的白名单锁死、/allow 也
+ * 无法自救），并把 owner_mentioned 模式降级为 when_mentioned（否则清掉 owner
+ * 后 isGroupOwnerMessage 永远返回 false，bot 会在群里全员沉默）。
+ */
+function handleReleaseOwnerCommand(chatJid: string): string {
+  const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
+  if (!group) return '未找到当前工作区';
+  const updated = releaseOwner(group);
+  persistGroupUpdate(chatJid, updated, registeredGroups);
+  logger.info({ chatJid }, 'Owner released via /release_owner');
+  return '✅ 已释放 owner 身份。白名单已清空，激活策略已调整为 when_mentioned（如原本是 owner-only）。下一位用户可发送 /owner_mention 重新认领。';
+}
 
 /**
  * /allow @成员 命令：将 @提及的成员加入发言者白名单（仅 owner 可操作）。
@@ -1974,9 +2325,8 @@ function handleAllowCommand(
   if (!group.owner_im_id && group.created_by) {
     const userOwnerOpenId = getUserFeishuConfig(group.created_by)?.ownerOpenId;
     if (userOwnerOpenId && userOwnerOpenId === senderImId) {
-      const updated: RegisteredGroup = { ...group, owner_im_id: senderImId };
-      setRegisteredGroup(chatJid, updated);
-      registeredGroups[chatJid] = updated;
+      const updated = claimOwner(group, senderImId);
+      persistGroupUpdate(chatJid, updated, registeredGroups);
       group = updated;
       logger.info(
         { chatJid, senderImId },
@@ -2000,21 +2350,14 @@ function handleAllowCommand(
     return '请 @提及 要加入白名单的群成员：/allow @成员';
   }
 
-  const current = group.sender_allowlist ?? [senderImId];
-  const newIds = toAdd.filter((id) => !current.includes(id));
-  if (newIds.length === 0) {
+  const { group: updated, added } = addToAllowlist(group, senderImId, toAdd);
+  if (added.length === 0) {
     return '这些成员已在白名单中';
   }
+  persistGroupUpdate(chatJid, updated, registeredGroups);
+  logger.info({ chatJid, senderImId, added }, 'Members added to sender allowlist');
 
-  const updated: RegisteredGroup = {
-    ...group,
-    sender_allowlist: [...current, ...newIds],
-  };
-  setRegisteredGroup(chatJid, updated);
-  registeredGroups[chatJid] = updated;
-  logger.info({ chatJid, senderImId, added: newIds }, 'Members added to sender allowlist');
-
-  return `已将 ${newIds.length} 名成员加入白名单（当前共 ${updated.sender_allowlist!.length} 人）`;
+  return `已将 ${added.length} 名成员加入白名单（当前共 ${updated.sender_allowlist!.length} 人）`;
 }
 
 /**
@@ -2048,14 +2391,16 @@ function handleDisallowCommand(
     return 'Owner 不能将自己移出白名单';
   }
 
-  const updated_list = group.sender_allowlist.filter((id) => !toRemove.includes(id));
-  const updated: RegisteredGroup = { ...group, sender_allowlist: updated_list };
-  setRegisteredGroup(chatJid, updated);
-  registeredGroups[chatJid] = updated;
+  const { group: updated, removed } = removeFromAllowlist(group, toRemove);
+  if (removed === 0) {
+    // Nothing matched — skip the no-op persist (mirrors handleAllowCommand's
+    // early return when added.length === 0; avoids a redundant full-row write).
+    return `这些成员不在白名单中（当前共 ${group.sender_allowlist!.length} 人）`;
+  }
+  persistGroupUpdate(chatJid, updated, registeredGroups);
   logger.info({ chatJid, senderImId, removed: toRemove }, 'Members removed from sender allowlist');
 
-  const removedCount = group.sender_allowlist.length - updated_list.length;
-  return `已将 ${removedCount} 名成员从白名单移除（当前共 ${updated_list.length} 人）`;
+  return `已将 ${removed} 名成员从白名单移除（当前共 ${updated.sender_allowlist!.length} 人）`;
 }
 
 /**
@@ -2777,6 +3122,13 @@ function saveState(): void {
 }
 
 function registerGroup(jid: string, group: RegisteredGroup): void {
+  // 严格校验 folder 名：注册路径来自 IPC（agent register_group 工具）和直接调用，
+  // folder 会直接拼到 path.join(GROUPS_DIR, ...) 上。任何含 `..`、绝对路径或
+  // 路径分隔符的 folder 都会让 mkdir/写入跑出 GROUPS_DIR 之外（agent
+  // bypass-permissions 模式下完全可达）。规则与典型 unix 目录命名一致。
+  if (!group.folder || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(group.folder)) {
+    throw new Error(`registerGroup: invalid folder name: ${group.folder}`);
+  }
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
 
@@ -2843,6 +3195,34 @@ export function escapeXml(s: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
+}
+
+/**
+ * Build an ExpandContext for plugin slash-command expansion. Resolves the
+ * runtime owner / cwd / executionMode / active container name.
+ *
+ * Returns null when the group has no resolvable owner — in that case callers
+ * skip expansion and fall through to the raw message. Plugin commands require
+ * a per-user runtime so an ownerless group simply has no plugins to expand.
+ *
+ * `ownerOverride` lets callers pin a specific owner (e.g. message sender for
+ * the admin-shared web:main workspace where `group.created_by` is just the
+ * first admin who ever materialised the group, #18 P2-bug-5).
+ */
+function buildExpandContext(
+  chatJid: string,
+  group: RegisteredGroup,
+  ownerOverride?: string | null,
+): ExpandContext | null {
+  return makeExpandContext({
+    chatJid,
+    groupFolder: group.folder,
+    ownerId: ownerOverride ?? group.created_by,
+    executionMode: group.executionMode,
+    customCwd: group.customCwd,
+    groupsDir: GROUPS_DIR,
+    containerName: queue.getActiveContainerName(chatJid),
+  });
 }
 
 export function formatMessages(
@@ -2941,7 +3321,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Get all messages since last agent interaction
   const sinceCursor = lastAgentTimestamp[chatJid] || EMPTY_CURSOR;
-  const missedMessages = getMessagesSince(chatJid, sinceCursor);
+  let missedMessages = getMessagesSince(chatJid, sinceCursor);
 
   if (missedMessages.length === 0) return true;
 
@@ -2988,6 +3368,81 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // send_message outputs to the correct IM channel.
   activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
 
+  // Plugin command expander (DMI commands): replace `/foo` slash-commands
+  // contributed by enabled plugins with their fully-rendered prompt body
+  // before the agent ever sees them. Conflicts / offline-container errors
+  // become in-band system replies that advance the cursor without spawning
+  // a runner.
+  {
+    // Admin-shared web:main: plugin runtime is per-sender, so resolve it
+    // per-message rather than pinning one owner for the whole batch
+    // (#23 round-15 P2-2). Pre-fix logic walked missedMessages once,
+    // picked the latest admin sender, and expanded every message under
+    // that one runtime — mixed-admin batches expanded admin-A's slash
+    // commands under admin-B's plugins.
+    //
+    // We still need a non-null sentinel ExpandContext to gate the block
+    // (some workspaces have no resolvable owner at all → skip expansion).
+    // Build one with the batch fallback to decide whether to enter the
+    // expansion path; the per-message resolver wins inside the loop.
+    const fallbackExpandCtx = buildExpandContext(
+      chatJid,
+      effectiveGroup,
+      effectiveGroup.created_by,
+    );
+    if (fallbackExpandCtx) {
+      const resolveCtxForMsg = (msg: typeof missedMessages[number]) => {
+        const owner = resolvePerMessageRuntimeOwner({
+          chatJid,
+          isHome: !!effectiveGroup.is_home,
+          fallbackOwner: effectiveGroup.created_by,
+          message: msg,
+          getUserById,
+        });
+        return buildExpandContext(chatJid, effectiveGroup, owner);
+      };
+      const { toSend, replies } = await expandMessagesIfNeeded(
+        missedMessages,
+        resolveCtxForMsg,
+        undefined,
+        persistPluginExpansion,
+      );
+      // When toSend still has unprocessed messages, only the next-pull cursor
+      // advances for replies — committing the recovery cursor past a reply
+      // could lose earlier toSend messages on crash before the agent runs
+      // (#18 P2-bug-2). When toSend is empty we fully commit.
+      const advanceReplyCursor =
+        toSend.length === 0 ? setCursors : advanceNextPullCursorOnly;
+      for (const r of replies) {
+        // Per-reply IM target: prefer the originating message's source_jid
+        // (so individual replies route back to whoever sent the slash command,
+        // even in mixed batches), falling back to the batch's IM source
+        // computed earlier.
+        const perMsgImJid =
+          r.originalMsg.source_jid && getChannelType(r.originalMsg.source_jid)
+            ? r.originalMsg.source_jid
+            : replySourceImJid;
+        sendPluginExpanderReply(chatJid, r.text, perMsgImJid);
+        // Advance cursor to the original user message timestamp so the next
+        // poll skips it. setCursors (not advance) bypasses any stale future
+        // cursor when the reply is the only output of this batch.
+        advanceReplyCursor(chatJid, {
+          timestamp: r.originalMsg.timestamp,
+          id: r.originalMsg.id,
+        });
+      }
+      if (toSend.length === 0) {
+        // Reply-only batch never spawns a runner — the normal completion
+        // path's finally block (line ~3532) is skipped, so clear the IM
+        // route here. Otherwise a stale entry leaks across batches and the
+        // next IPC send_message/send_file mirrors to the wrong IM chat.
+        activeImReplyRoutes.delete(effectiveGroup.folder);
+        return true;
+      }
+      missedMessages = toSend;
+    }
+  }
+
   const shared = isGroupShared(group.folder);
   let prompt = formatMessages(missedMessages, shared);
 
@@ -2995,42 +3450,42 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // recent conversation history to give the fresh session context.
   const isRecovery = recoveryGroups.delete(chatJid);
   if (isRecovery) {
-    const RECOVERY_HISTORY_LIMIT = 20;
-    const recentHistory = getMessagesPage(
+    const historyContext = buildRecentConversationHistoryContext(
       chatJid,
-      undefined,
-      RECOVERY_HISTORY_LIMIT,
+      new Set(missedMessages.map((m) => m.id)),
+      {
+        limit: 20,
+        maxMessageLength: 500,
+        intro:
+          '检测到上次有未完成消息，当前使用新会话恢复处理。以下是恢复前的最近对话记录，供你了解上下文。',
+      },
     );
-    // getMessagesPage returns DESC order; reverse to chronological, exclude
-    // the pending messages themselves (already in prompt).
-    const pendingIds = new Set(missedMessages.map((m) => m.id));
-    const historyMsgs = recentHistory
-      .reverse()
-      .filter((m) => !pendingIds.has(m.id));
-    if (historyMsgs.length > 0) {
-      const historyLines = historyMsgs.map((m) => {
-        const role = m.is_from_me ? 'assistant' : m.sender_name;
-        const truncated =
-          m.content.length > 500 ? m.content.slice(0, 500) + '…' : m.content;
-        // Strip lone (unpaired) surrogates while preserving valid surrogate pairs
-        // such as emoji. Must stay byte-for-byte aligned with the matching regex
-        // in container/agent-runner/src/index.ts:extractSessionHistory — both
-        // sides feed the same Anthropic API and must produce identical strings.
-        const cleaned = truncated.replace(
-          /(?:[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF])/g,
-          '',
-        );
-        return `[${role}] ${cleaned}`;
-      });
-      prompt =
-        '<system_context>\n' +
-        '服务刚重启，当前为新会话。以下是重启前的最近对话记录，供你了解上下文：\n\n' +
-        historyLines.join('\n') +
-        '\n</system_context>\n\n' +
-        prompt;
+    if (historyContext) {
+      prompt = historyContext.context + prompt;
       logger.info(
-        { group: group.name, historyCount: historyMsgs.length },
+        { group: group.name, historyCount: historyContext.count },
         'Recovery: injected recent conversation history into prompt',
+      );
+    }
+  } else if (willClearSessionOnProviderSwitch(effectiveGroup.folder)) {
+    // Proactive provider switch (sticky binding unhealthy/disabled) will clear
+    // the SDK session inside the runner. Inject history so the new provider's
+    // first turn keeps context, matching the recovery + reactive-failure paths.
+    const historyContext = buildRecentConversationHistoryContext(
+      chatJid,
+      new Set(missedMessages.map((m) => m.id)),
+      {
+        limit: 30,
+        maxMessageLength: 700,
+        intro:
+          '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
+      },
+    );
+    if (historyContext) {
+      prompt = historyContext.context + prompt;
+      logger.info(
+        { group: group.name, historyCount: historyContext.count },
+        'Provider switch: injected recent conversation history into prompt',
       );
     }
   }
@@ -3185,10 +3640,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let streamingSessionJid = replySourceImJid ?? chatJid;
   const makeOnCardCreated = (jid: string) => (messageId: string) =>
     registerMessageIdMapping(messageId, jid);
-  let streamingSession = await imManager.createStreamingSession(
-    streamingSessionJid,
-    makeOnCardCreated(streamingSessionJid),
-  );
+  // 重试轮（指数退避后的重跑）静默执行，不新建流式卡片：否则一条持续失败的
+  // 消息每轮都会在飞书发一张「生成中→处理出错」卡，最多刷 6 张（消息洪流）。
+  // 重试成功时最终回复仍经静态 sendMessage 送达。
+  const retryAttempt = queue.getRetryCount(chatJid);
+  let streamingSession =
+    retryAttempt > 0
+      ? undefined
+      : await imManager.createStreamingSession(
+          streamingSessionJid,
+          makeOnCardCreated(streamingSessionJid),
+        );
   let streamingAccumulatedText = '';
   let streamingAccumulatedThinking = '';
   let streamInterrupted = false;
@@ -3197,6 +3659,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // and the session rebuild) can still patchUsageNote() onto the right card.
   // Cleared when the next complete() cycle is about to begin.
   let lastCompletedStreamingSession: StreamingSession | null = null;
+  // 本 run 是否已进入 finally 收尾。outputChain 的迟到回调可能在 run resolve
+  // 之后才执行（waitForOutputChain 30s 兜底只放行不取消）；此时绝不能再重建
+  // 流式卡片——重建出的卡片永远无人 complete，成为僵尸「生成中」卡。
+  let runEnded = false;
   logger.info(
     { chatJid, streamingSessionJid, hasSession: !!streamingSession },
     'Streaming session creation result',
@@ -3218,7 +3684,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // in the streaming session rebuild (which also fires on SDK Task
     // completion and would cause multi-result IM spam).
     sentReply = false;
-    if (newImJid === replySourceImJid) return; // no change
+    if (newImJid === replySourceImJid) {
+      // 同一路由下，若上一轮卡片因连续更新失败进入 error 态被冻结（防同轮刷屏，
+      // 见下方 stream 事件处理的 sessionErrored 分支），在新用户消息开启新一轮时
+      // 重建一张干净卡片，恢复流式展示能力。
+      if (
+        streamingSession &&
+        (streamingSession as { currentState?: string }).currentState === 'error'
+      ) {
+        unregisterStreamingSession(streamingSessionJid);
+        streamingAccumulatedText = '';
+        streamingAccumulatedThinking = '';
+        streamInterrupted = false;
+        try {
+          streamingSession = await imManager.createStreamingSession(
+            streamingSessionJid,
+            makeOnCardCreated(streamingSessionJid),
+          );
+        } catch (err: any) {
+          logger.warn(
+            { err: err?.message, streamingSessionJid },
+            'Failed to rebuild streaming session after card error',
+          );
+          streamingSession = undefined;
+        }
+        if (streamingSession) {
+          registerStreamingSession(streamingSessionJid, streamingSession);
+        }
+      }
+      return; // no route change
+    }
     logger.debug(
       { chatJid, oldRoute: replySourceImJid, newRoute: newImJid },
       'Reply route updated via IPC injection',
@@ -3302,6 +3797,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (effectiveGroup.created_by) {
     const owner = getUserById(effectiveGroup.created_by);
+    // Defense-in-depth: drop messages whose owner is no longer active
+    // (disabled or deleted). See `src/owner-gate.ts` for rationale.
+    const ownerGate = checkOwnerActive(owner);
+    if (!ownerGate.allowed) {
+      commitCursor();
+      await setTyping(chatJid, false);
+      logger.info(
+        {
+          chatJid,
+          userId: effectiveGroup.created_by,
+          ownerStatus: ownerGate.status,
+        },
+        'Dropping message: group owner is not active',
+      );
+      return true;
+    }
     if (owner && owner.role !== 'admin') {
       const accessResult = checkBillingAccessFresh(
         effectiveGroup.created_by,
@@ -3329,6 +3840,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let output:
     | { status: 'success' | 'error' | 'closed'; error?: string }
     | undefined;
+  // activeSessionId 已在上方（runtimeResolution 机器）声明（~3535），此处不再重复 let，
+  // 由 onRuntimePrepared 回调通过 getNativeSessionIdForResolution() 赋值（H6 去重）。
+  // currentSourceJid: tells the agent-runner which IM chat the latest user
+  // message came from, so per-channel MCP tools (discord_*, etc.) can detect
+  // it correctly even when the home container was originally started by a
+  // different chat (e.g. web message before the Discord one arrived).
+  const currentSourceJid =
+    missedMessages[missedMessages.length - 1]?.source_jid || chatJid;
   try {
     output = await runAgent(
       effectiveGroup,
@@ -3345,8 +3864,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             broadcastStreamEvent(chatJid, result.streamEvent);
 
             // ── 累积 text_delta / thinking_delta 文本（中断时用于保存已输出内容）──
-            // Sub-agent text (parentToolUseId set) is skipped — only main-agent
-            // output is the user-facing reply worth persisting on interrupt.
+            // 仅累积主 Agent 文本（无 parentToolUseId）。子 Agent（SDK Task）的
+            // 中间文本带 parentToolUseId，混入会污染飞书主卡片正文与 interrupt_partial。
+            // 与 Web 端 chat.ts 对带 parentToolUseId 的 text_delta 隔离到 Task 块的逻辑对齐。
             if (
               result.streamEvent.eventType === 'text_delta' &&
               result.streamEvent.text &&
@@ -3365,7 +3885,21 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // ── Feed stream events into Feishu streaming card ──
             // IPC 注入的新 query 开始时，旧卡片已 complete()/abort()，
             // 需要为新 query 重建流式卡片并重置会话级状态。
-            if (streamingSession && !streamingSession.isActive()) {
+            // 例外：卡片因连续更新失败进入 error 态时绝不在本轮重建——每次重建
+            // 都会向群里再发一张新卡片（失败持续时演变成每隔几秒一条的刷屏），
+            // 且清空 streamingAccumulatedText 会丢失已生成的内容。error 态保持
+            // 冻结，让最终 result 走静态 sendMessage 兜底；下一条用户消息到达时
+            // 由 route updater 重建干净卡片。
+            const sessionErrored =
+              streamingSession &&
+              (streamingSession as { currentState?: string }).currentState ===
+                'error';
+            if (
+              streamingSession &&
+              !streamingSession.isActive() &&
+              !sessionErrored &&
+              !runEnded
+            ) {
               unregisterStreamingSession(streamingSessionJid);
               streamingAccumulatedText = '';
               streamingAccumulatedThinking = '';
@@ -3404,6 +3938,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 targetSession,
                 result.streamEvent,
                 streamingAccumulatedText,
+                buildWebTraceUrl(effectiveGroup.folder, result.streamEvent.turnId || lastProcessed.id),
               );
               // After usage is consumed, release the completed session so it
               // can be GC'd and so a later turn doesn't leak data into it.
@@ -3645,6 +4180,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             // Reset idle timer on stream events so long-running tool calls
             // (e.g. MCP batch writes) don't get killed while the agent is
             // actively working. Previously only final results triggered a reset.
+            resetIdleTimer();
+            return;
+          }
+
+          // Provider quota/limit notice surfaced as a "successful" result.
+          // The switch is silent to the user (decided in #549): never deliver
+          // the English limit text to IM/web — only log for admin/monitoring.
+          // The runner already stops the container and re-routes to another
+          // provider on the next turn.
+          if (result.providerFailure) {
+            logger.warn(
+              {
+                group: group.name,
+                result:
+                  typeof result.result === 'string'
+                    ? result.result.slice(0, 200)
+                    : result.result,
+              },
+              'Provider failure result suppressed from user (silent switch)',
+            );
             resetIdleTimer();
             return;
           }
@@ -3909,8 +4464,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           activeSessionId = getNativeSessionIdForResolution(resolution);
         },
       },
+      currentSourceJid,
     );
   } finally {
+    runEnded = true;
     await setTyping(chatJid, false);
     // Always clear ack reaction in finally — covers error/interrupt/abort paths
     // where the normal sendMessage (which clears it) is never called.
@@ -3928,11 +4485,40 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // ── Streaming card cleanup ──
     if (streamingSession) {
       if (streamingSession.isActive()) {
+        // isActive() 仍为 true ⟹ 卡片从未被 complete()（result.result 非空路径会
+        // 在 3594 complete 后令 isActive 转 false）。这里覆盖所有"卡片建了但没收口"的
+        // 收尾场景，避免卡片永久停在「生成中」（僵尸卡片）。
         if (hadError || !output || output.status === 'error') {
           await streamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
           await streamingSession.abort('已中断').catch(() => {});
+        } else if (output.status === 'closed') {
+          // closed：容器 drain/_close 中断了 in-flight query（agent-runner 发
+          // status:'closed' 而非 interrupt 流事件，streamInterrupted 仍为 false）。
+          // 该消息会重试（3904 保留 cursor），此处仅收口卡片避免僵尸卡 + 重试叠卡。
+          // 文案区别于"已中断"：closed 是系统侧打断并自动重试，非用户主动中断。
+          await streamingSession.abort('连接已切换，正在重试').catch(() => {});
+        } else if (!sentReply) {
+          // 真 silent-success：本轮从未发过可见回复（agent 仅用 send_message 旁路
+          // 回复、最终 result 为空，3546 if(result.result) 门控跳过了 complete()）。
+          // complete() 把卡片从 streaming 收口到 completed（空正文由 buildStructuredFinalCard
+          // 兜底为 "..."，并保留 thinking/工具统计），而非裸 dispose() 留下「生成中」僵尸卡。
+          try {
+            await streamingSession.complete(streamingAccumulatedText);
+          } catch (err) {
+            logger.warn(
+              { err, chatJid },
+              'Streaming card silent-success finalize failed, aborting card',
+            );
+            // dispose() 只清定时器不碰卡面，会留下永久「生成中」僵尸卡；
+            // abort() 内部自带 catch，会尽力把卡面切到「已中断」终态。
+            await streamingSession.abort('').catch(() => {});
+            streamingSession.dispose();
+          }
         } else {
+          // sentReply 已为 true：卡片是正常回复 complete 后由 3651 为"下一条消息"预建的
+          // 空白 active 卡，本轮无后续 result。dispose() 丢弃，不可 complete()（否则会
+          // 凭空渲染一张正文为 "..." 的完成卡）。
           streamingSession.dispose();
         }
       }
@@ -4152,7 +4738,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // which is ambiguous for host processes (could be user stop, process tree
     // kill, or actual OOM).  exitLabel is either `code N` or `signal X` —
     // never both — so this only triggers on Docker container OOM exits.
-    const isOom = OOM_EXIT_RE.test(errorDetail);
+    //
+    // Additional guard: stopGroup → SIGTERM → grace timeout → docker kill 也会
+    // 让容器以 137 退出。如果用户刚点过 stop（GroupQueue.isRecentlyStopped），
+    // 不要把这次退出计入 OOM 计数 —— 否则连续两次手动 stop 就会触发会话重置
+    // 并显示『内存溢出』提示，混淆运维。
+    const isUserStopped = queue.isRecentlyStopped(effectiveGroup.folder);
+    const isOom = !isUserStopped && OOM_EXIT_RE.test(errorDetail);
     if (isOom) {
       const folder = effectiveGroup.folder;
       consecutiveOomExits[folder] = (consecutiveOomExits[folder] || 0) + 1;
@@ -4209,11 +4801,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
     }
 
-    sendSystemMessage(chatJid, 'agent_error', errorDetail);
-    logger.warn(
-      { group: group.name, error: errorDetail },
-      'Agent error (no reply sent), keeping cursor at previous position for retry',
-    );
+    // 还会重试的中间轮次不向用户广播 agent_error：每轮一条错误消息叠加每轮
+    // 一张中断卡就是「消息洪流」。最终失败由 onMaxRetriesExceeded 的
+    // agent_max_retries 系统消息统一告知。
+    if (queue.willRetryAfterFailure(chatJid)) {
+      logger.warn(
+        { group: group.name, error: errorDetail, retry: queue.getRetryCount(chatJid) },
+        'Agent error (no reply sent), will retry silently with backoff',
+      );
+      // agent_error 同时承担清除 Web 端 waiting/streaming 的职责；抑制它后
+      // 必须补一个 status:idle 终态事件，否则重试退避期间 Web 一直转圈。
+      broadcastStreamEvent(chatJid, {
+        eventType: 'status',
+        statusText: 'idle',
+        turnId: lastProcessed.id,
+        sessionId: activeSessionId,
+      });
+    } else {
+      sendSystemMessage(chatJid, 'agent_error', errorDetail);
+      logger.warn(
+        { group: group.name, error: errorDetail },
+        'Agent error (no reply sent), keeping cursor at previous position for retry',
+      );
+    }
     return false;
   }
 
@@ -4226,6 +4836,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Silent success: the runtime exited cleanly but produced no visible reply.
   // This happens for tool-only turns such as image generation when the asset is
   // saved by the runtime but no text/path is returned through the SDK stream.
+  // 决策9：只走本地 fallback 单发（发一条兜底回复 + 收口卡片），不再额外广播 idle
+  // status 事件——后者会让 Web 端在已经收到 fallback new_message 的情况下二次收尾，
+  // 造成「双发」观感。本地 fallback 已经清掉前端「正在思考」并落库，足够收口。
   if (!sentReply) {
     const fallbackText = buildSilentSuccessFallbackReply();
     logger.warn(
@@ -4388,6 +5001,7 @@ async function runAgent(
       context: RuntimeContextBuildResult,
     ) => void;
   },
+  currentSourceJid?: string,
 ): Promise<{ status: 'success' | 'error' | 'closed'; error?: string }> {
   const isHome = !!group.is_home;
   // For the agent-runner: isMain means this is an admin home container (full privileges)
@@ -4501,8 +5115,14 @@ async function runAgent(
           queue.markRunnerQueryIdle(chatJid);
         }
         // 仅从成功的输出中更新 session ID；
-        // error 输出可能携带 stale ID，会覆盖流式传递的有效 session
-        if (output.newSessionId && output.status !== 'error') {
+        // error 输出可能携带 stale ID，会覆盖流式传递的有效 session。
+        // providerFailure（撞限额/换号）时绝不持久化 newSessionId，否则会把失败池的
+        // session 绑回 resolution，导致换号后续杯失败（H12/H14 守卫）。
+        if (
+          output.newSessionId &&
+          output.status !== 'error' &&
+          !output.providerFailure
+        ) {
           persistNativeSessionForResolution(
             runtimeResolution,
             output.newSessionId,
@@ -4557,6 +5177,7 @@ async function runAgent(
           turnId,
           groupFolder: group.folder,
           chatJid,
+          currentSourceJid,
           isMain: isAdminHome,
           isHome,
           isAdminHome,
@@ -4598,6 +5219,7 @@ async function runAgent(
           turnId,
           groupFolder: group.folder,
           chatJid,
+          currentSourceJid,
           isMain: isAdminHome,
           isHome,
           isAdminHome,
@@ -4633,8 +5255,13 @@ async function runAgent(
     }
 
     // 仅从成功的最终输出中更新 session ID；
-    // error 状态的输出可能携带 stale ID，覆盖流式阶段已写入的有效 session
-    if (output.newSessionId && output.status !== 'error') {
+    // error 状态的输出可能携带 stale ID，覆盖流式阶段已写入的有效 session。
+    // providerFailure（换号）时不持久化，避免把失败池 session 绑回 resolution（H13/H14 守卫）。
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
       persistNativeSessionForResolution(runtimeResolution, output.newSessionId, {
         runtimeContext: runtimeContextForOutput(runtimeContext, output),
       });
@@ -4973,29 +5600,23 @@ function stopStreamingBuffer(): void {
   }
 }
 
-/**
- * Check if a source group is authorized to send IPC messages to a target group.
- * - Admin home can send to any group.
- * - Non-home groups can only send to groups sharing the same folder.
- * - Member home groups can send to groups created by the same user.
- */
-export function canSendCrossGroupMessage(
+// Thin production wrapper around the pure helper in ./cross-group-acl.ts so
+// the helper can be unit-tested without booting all of index.ts.
+function canSendCrossGroupMessage(
   isAdminHome: boolean,
   isHome: boolean,
   sourceFolder: string,
   sourceGroupEntry: RegisteredGroup | undefined,
   targetGroup: RegisteredGroup | undefined,
 ): boolean {
-  if (isAdminHome) return true;
-  if (targetGroup && targetGroup.folder === sourceFolder) return true;
-  if (
-    isHome &&
-    targetGroup &&
-    sourceGroupEntry?.created_by != null &&
-    targetGroup.created_by === sourceGroupEntry.created_by
-  )
-    return true;
-  return false;
+  return canSendCrossGroupMessagePure(
+    isAdminHome,
+    isHome,
+    sourceFolder,
+    sourceGroupEntry,
+    targetGroup,
+    (jid) => registeredGroups[jid] ?? getRegisteredGroup(jid),
+  );
 }
 
 // Thin production wrapper around the pure helper in ./task-routing.ts so the
@@ -5139,7 +5760,12 @@ function startIpcWatcher(): void {
             const data = JSON.parse(raw);
             if (data.type === 'message' && data.chatJid && data.text) {
               const targetGroup = registeredGroups[data.chatJid];
-              if (
+              if (isRetryDuplicateIpcSend(sourceGroup, data.chatJid, data.text)) {
+                logger.info(
+                  { sourceGroup, chatJid: data.chatJid },
+                  'Duplicate IPC send_message suppressed (retry replay window)',
+                );
+              } else if (
                 canSendCrossGroupMessage(
                   isAdminHome,
                   isHome,
@@ -5453,13 +6079,22 @@ function startIpcWatcher(): void {
         });
 
         // 清理孤儿结果文件（容器崩溃或超时后残留，超过 10 分钟自动删除）
+        const RESULT_FILE_PREFIXES = [
+          'install_skill_result_',
+          'uninstall_skill_result_',
+          'list_tasks_result_',
+          'discord_get_history_result_',
+          'discord_get_channel_info_result_',
+          'discord_get_server_info_result_',
+        ];
+        const isResultFile = (name: string) =>
+          RESULT_FILE_PREFIXES.some((p) => name.startsWith(p));
+
         for (const entry of allEntries) {
           if (
             entry.isFile() &&
             entry.name.endsWith('.json') &&
-            (entry.name.startsWith('install_skill_result_') ||
-              entry.name.startsWith('uninstall_skill_result_') ||
-              entry.name.startsWith('list_tasks_result_'))
+            isResultFile(entry.name)
           ) {
             try {
               const filePath = path.join(tasksDir, entry.name);
@@ -5468,7 +6103,7 @@ function startIpcWatcher(): void {
                 await fsp.unlink(filePath);
                 logger.debug(
                   { sourceGroup, file: entry.name },
-                  'Cleaned up stale skill result file',
+                  'Cleaned up stale result file',
                 );
               }
             } catch {
@@ -5482,9 +6117,7 @@ function startIpcWatcher(): void {
             (entry) =>
               entry.isFile() &&
               entry.name.endsWith('.json') &&
-              !entry.name.startsWith('install_skill_result_') &&
-              !entry.name.startsWith('uninstall_skill_result_') &&
-              !entry.name.startsWith('list_tasks_result_'),
+              !isResultFile(entry.name),
           )
           .map((entry) => entry.name);
         for (const file of taskFiles) {
@@ -5601,6 +6234,9 @@ async function processTaskIpc(
     fileName?: string;
     // For list_tasks
     isAdminHome?: boolean;
+    // For discord_get_history
+    limit?: number;
+    before?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
@@ -5868,6 +6504,17 @@ async function processTaskIpc(
       }
       break;
 
+    case 'discord_get_history':
+    case 'discord_get_channel_info':
+    case 'discord_get_server_info':
+      await handleDiscordIpcRequest(
+        data,
+        sourceGroup,
+        sourceGroupEntry,
+        isAdminHome,
+      );
+      break;
+
     case 'refresh_groups':
       // Only admin home group can request a refresh
       if (isAdminHome) {
@@ -5910,14 +6557,23 @@ async function processTaskIpc(
           data.executionMode === 'host' || data.executionMode === 'container'
             ? data.executionMode
             : undefined;
-        registerGroup(data.jid, {
-          name: data.name,
-          folder: data.folder,
-          added_at: new Date().toISOString(),
-          containerConfig: data.containerConfig,
-          created_by: sourceEntry?.created_by,
-          executionMode: execMode,
-        });
+        try {
+          registerGroup(data.jid, {
+            name: data.name,
+            folder: data.folder,
+            added_at: new Date().toISOString(),
+            containerConfig: data.containerConfig,
+            created_by: sourceEntry?.created_by,
+            executionMode: execMode,
+          });
+        } catch (err) {
+          // registerGroup 校验 folder 名时会抛错。IPC 来源不可信（agent 进程
+          // 可能被 prompt 注入），不要把异常冒泡到主消息循环。
+          logger.warn(
+            { jid: data.jid, folder: data.folder, err },
+            'register_group rejected by validation',
+          );
+        }
       } else {
         logger.warn(
           { data },
@@ -6124,12 +6780,12 @@ async function processTaskIpc(
               const warnMsg = `⚠️ 文件 "${data.fileName}" 未找到（路径 "${data.filePath}" 不存在）。请引导用户确认正确的文件路径，或使用 'send_file' 时提供正确的相对路径。`;
               broadcastToWebClients(sourceGroup, warnMsg);
               // Also notify via DingTalk for conversation agents bound to IM
-              const imRoute =
-                (ipcAgentId && data.chatJid
-                  ? activeImReplyRoutes.get(
-                      `${data.chatJid}#agent:${ipcAgentId}`,
-                    )
-                  : null) ?? activeImReplyRoutes.get(sourceGroup);
+              const imRoute = resolveImRoute({
+                ipcAgentId,
+                isHome,
+                chatJid: data.chatJid,
+                sourceGroup,
+              });
               if (imRoute) {
                 try {
                   await imManager.sendMessage(imRoute, warnMsg);
@@ -6201,6 +6857,112 @@ async function processTaskIpc(
 }
 
 /**
+ * Handle Discord-specific IPC requests (history, channel info, server info).
+ * Writes a result file `{type}_result_{requestId}.json` back to the source group's tasks dir.
+ * Authorization: target chatJid must be owned by sourceGroup's user (or admin home for cross-group).
+ */
+async function handleDiscordIpcRequest(
+  data: {
+    type: string;
+    chatJid?: string;
+    requestId?: string;
+    limit?: number;
+    before?: string;
+  },
+  sourceGroup: string,
+  sourceGroupEntry: RegisteredGroup | undefined,
+  isAdminHome: boolean,
+): Promise<void> {
+  const requestId = data.requestId;
+  if (!requestId || !SAFE_REQUEST_ID_RE.test(requestId)) {
+    logger.warn(
+      { sourceGroup, type: data.type, requestId },
+      'Rejected Discord IPC request with invalid requestId',
+    );
+    return;
+  }
+
+  const tasksDir = path.join(DATA_DIR, 'ipc', sourceGroup, 'tasks');
+  const tasksDirResolved = path.resolve(tasksDir);
+  const resultFileName = `${data.type}_result_${requestId}.json`;
+  const resultFilePath = path.resolve(tasksDir, resultFileName);
+  if (!resultFilePath.startsWith(`${tasksDirResolved}${path.sep}`)) {
+    logger.warn(
+      { sourceGroup, type: data.type, resultFilePath },
+      'Rejected Discord IPC request with unsafe result file path',
+    );
+    return;
+  }
+  fs.mkdirSync(path.dirname(resultFilePath), { recursive: true });
+
+  const writeResult = (payload: object): void => {
+    const tmpPath = `${resultFilePath}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(payload));
+    fs.renameSync(tmpPath, resultFilePath);
+  };
+
+  try {
+    const chatJid = data.chatJid;
+    if (!chatJid || !chatJid.startsWith('discord:')) {
+      writeResult({
+        success: false,
+        error: 'chatJid must be a Discord JID (discord:*)',
+      });
+      return;
+    }
+
+    // Authorization: read-only Discord queries — admin home, same folder, or
+    // same owner is enough. We don't require sourceGroup to be `is_home` like
+    // cross-group sends do, because querying channel/history info doesn't
+    // write into another workspace.
+    const targetGroup = registeredGroups[chatJid];
+    const ownerOk =
+      isAdminHome ||
+      (targetGroup && targetGroup.folder === sourceGroup) ||
+      (targetGroup &&
+        sourceGroupEntry?.created_by != null &&
+        targetGroup.created_by === sourceGroupEntry.created_by);
+    if (!targetGroup || !ownerOk) {
+      writeResult({
+        success: false,
+        error: `Not authorized to access Discord chat ${chatJid}`,
+      });
+      return;
+    }
+
+    if (data.type === 'discord_get_history') {
+      const messages = await imManager.getDiscordHistory(chatJid, {
+        limit: data.limit,
+        before: data.before,
+      });
+      // Strip authorId (Discord user Snowflake) before sending to agent.
+      // authorId + authorName uniquely identifies a user even after rename;
+      // letting it reach the agent risks cross-channel forwarding into 3rd-
+      // party LLM logs. Formatted output already only shows authorName.
+      const sanitized = messages.map(({ authorId: _id, ...rest }) => rest);
+      writeResult({ success: true, messages: sanitized });
+    } else if (data.type === 'discord_get_channel_info') {
+      const channel = await imManager.getDiscordChannelInfo(chatJid);
+      writeResult({ success: true, channel });
+    } else if (data.type === 'discord_get_server_info') {
+      const guild = await imManager.getDiscordGuildInfo(chatJid);
+      writeResult({ success: true, guild });
+    } else {
+      writeResult({ success: false, error: `Unknown type: ${data.type}` });
+    }
+  } catch (err) {
+    logger.error(
+      { sourceGroup, type: data.type, err },
+      'Discord IPC request failed',
+    );
+    writeResult({
+      success: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * Process messages for a user-created conversation agent.
  * Similar to processGroupMessages but uses agent-specific session/IPC and virtual JID.
  * The agent process stays alive for idleTimeout, cycling idle→running.
@@ -6232,7 +6994,36 @@ async function processAgentConversation(
 
   // Get pending messages
   const sinceCursor = lastAgentTimestamp[virtualChatJid] || EMPTY_CURSOR;
-  const missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
+  let missedMessages = getMessagesSince(virtualChatJid, sinceCursor);
+
+  // Owner gate (single chokepoint for all 5 call sites: normal dispatch,
+  // IM-restart recovery, unconsumed-IPC recovery, /spawn). The main message
+  // loop's owner gate is bypassed for target_agent_id groups (they `continue`
+  // before it), so conversation-agent traffic only reaches this gate. When the
+  // owner is disabled/deleted, advance the cursor past the pending messages so
+  // they aren't replayed, then drop. See `src/owner-gate.ts` for rationale.
+  if (effectiveGroup.created_by) {
+    const ownerGate = checkOwnerActive(getUserById(effectiveGroup.created_by));
+    if (!ownerGate.allowed) {
+      const lastMsg = missedMessages[missedMessages.length - 1];
+      if (lastMsg) {
+        setCursors(virtualChatJid, {
+          timestamp: lastMsg.timestamp,
+          id: lastMsg.id,
+        });
+      }
+      logger.info(
+        {
+          chatJid,
+          agentId,
+          userId: effectiveGroup.created_by,
+          ownerStatus: ownerGate.status,
+        },
+        'Dropping agent conversation: owner is not active',
+      );
+      return;
+    }
+  }
   if (missedMessages.length === 0) {
     // Spawn agents are fire-and-forget: if no messages are found (race condition
     // or cursor already advanced), mark as error so they don't stay idle forever.
@@ -6257,10 +7048,96 @@ async function processAgentConversation(
   const isHome = !!effectiveGroup.is_home;
   const isAdminHome = isHome && effectiveGroup.folder === MAIN_GROUP_FOLDER;
 
+  // Plugin command expander (DMI commands) — agent conversation cold start.
+  // Replies go to virtualChatJid so the agent UI tab routes them correctly;
+  // cursor advancement also uses the virtual JID since that's the read key.
+  {
+    // Admin-shared web:main: plugin runtime is per-sender (each admin's
+    // own plugins). Resolve the runtime per-message instead of pinning one
+    // owner for the whole batch (#23 round-15 P2-2). The per-message
+    // resolver strips the `#agent:` suffix from the virtual JID before
+    // the `web:main` gate so virtual JIDs still get the per-sender
+    // semantics (matches the legacy virtual-JID base resolver).
+    const fallbackExpandCtx = buildExpandContext(
+      virtualChatJid,
+      effectiveGroup,
+      effectiveGroup.created_by,
+    );
+    if (fallbackExpandCtx) {
+      const resolveCtxForMsg = (msg: typeof missedMessages[number]) => {
+        const owner = resolvePerMessageRuntimeOwner({
+          chatJid: virtualChatJid,
+          isHome: !!effectiveGroup.is_home,
+          fallbackOwner: effectiveGroup.created_by,
+          message: msg,
+          getUserById,
+        });
+        return buildExpandContext(virtualChatJid, effectiveGroup, owner);
+      };
+      const { toSend, replies } = await expandMessagesIfNeeded(
+        missedMessages,
+        resolveCtxForMsg,
+        undefined,
+        persistPluginExpansion,
+      );
+      // Same crash-safe split as processGroupMessages (#18 P2-bug-2):
+      // hold the recovery cursor when toSend still has work pending.
+      const advanceReplyCursor =
+        toSend.length === 0 ? setCursors : advanceNextPullCursorOnly;
+      // Resolve IM target so plugin replies fan out to the originating IM
+      // channel (#20 P1-1). Per-reply: prefer that message's source_jid;
+      // otherwise fall back to the agent's last_im_jid, but only if its
+      // channel is currently connected (stale jids would just retry-fail).
+      const persistedAgentImJid = (() => {
+        const agentRow = getAgent(agentId);
+        const candidate = agentRow?.last_im_jid;
+        if (
+          candidate &&
+          getChannelType(candidate) &&
+          imManager.isChannelAvailableForJid(candidate)
+        ) {
+          return candidate;
+        }
+        return null;
+      })();
+      for (const r of replies) {
+        const perMsgImJid =
+          r.originalMsg.source_jid && getChannelType(r.originalMsg.source_jid)
+            ? r.originalMsg.source_jid
+            : persistedAgentImJid;
+        sendPluginExpanderReply(virtualChatJid, r.text, perMsgImJid);
+        advanceReplyCursor(virtualChatJid, {
+          timestamp: r.originalMsg.timestamp,
+          id: r.originalMsg.id,
+        });
+      }
+      if (toSend.length === 0) {
+        // Spawn agents are fire-and-forget: if expansion consumed all
+        // messages with replies, mark as completed so the agent slot is freed.
+        if (agent.kind === 'spawn' && agent.status === 'idle') {
+          updateAgentStatus(agentId, 'completed');
+          broadcastAgentStatus(
+            chatJid,
+            agentId,
+            'completed',
+            agent.name,
+            agent.prompt,
+          );
+        }
+        return;
+      }
+      missedMessages = toSend;
+    }
+  }
+
   // Update agent status → running
   updateAgentStatus(agentId, 'running');
   broadcastAgentStatus(chatJid, agentId, 'running', agent.name, agent.prompt);
 
+  // agent 会话的「换号/新 session 注入历史」由下方 runtimeResolution 机器统一处理：
+  // buildRuntimePrompt() 通过 recentMessages + forceSoftInjectionReason 在 session
+  // 新建 / 换号 / 恢复失败时注入上下文（见 ~7384）。此处只构造基础 prompt，避免与
+  // 该机器重复注入历史（H14 主路换号注入历史已在 processGroupMessages 主路接入）。
   let prompt = formatMessages(missedMessages, false);
   const images = collectMessageImages(virtualChatJid, missedMessages);
   const imagesForAgent = images.length > 0 ? images : undefined;
@@ -6302,8 +7179,9 @@ async function processAgentConversation(
   // Persist the IM routing target so it survives service restarts.
   if (replySourceImJid) {
     updateAgentLastImJid(agentId, replySourceImJid);
-    // Also publish to activeImReplyRoutes so send_file/send_image IPC can route to IM.
-    activeImReplyRoutes.set(effectiveGroup.folder, replySourceImJid);
+    // Publish to activeImReplyRoutes so send_file/send_image IPC can route to IM.
+    // Only use virtualChatJid key (per-agent) — folder-level key would collide
+    // when multiple auto_im agents share the same workspace folder.
     activeImReplyRoutes.set(virtualChatJid, replySourceImJid);
   }
 
@@ -6328,6 +7206,10 @@ async function processAgentConversation(
     : undefined;
   let agentStreamingAccText = '';
   let agentStreamInterrupted = false;
+  // Mirrors the main session's `output.status === 'closed'` handling: set when
+  // the container drained mid-query so the finally block finalizes the card as
+  // "reconnecting" instead of leaving a zombie 生成中 card.
+  let agentClosed = false;
   if (agentStreamingSession && streamingSessionJid) {
     registerStreamingSession(streamingSessionJid, agentStreamingSession);
     logger.debug(
@@ -6517,6 +7399,18 @@ async function processAgentConversation(
   );
 
   const wrappedOnOutput = async (output: ContainerOutput) => {
+    // #547: warm-lifecycle bookkeeping — mark activity, and flag query-idle on
+    // a substantive result / interruption so the runner can be kept warm.
+    queue.markRunnerActivity(virtualJid);
+    if (
+      (output.status === 'success' && output.result !== null) ||
+      (output.status === 'stream' &&
+        output.streamEvent?.eventType === 'status' &&
+        output.streamEvent.statusText === 'interrupted')
+    ) {
+      queue.markRunnerQueryIdle(virtualJid);
+    }
+
     if (output.streamEvent) {
       output = {
         ...output,
@@ -6527,8 +7421,33 @@ async function processAgentConversation(
         },
       };
     }
-    // Track session
-    if (output.newSessionId && output.status !== 'error') {
+
+    // #549: a provider switch surfaced as a failure clears the agent session so
+    // the next turn starts fresh on the newly-selected provider.
+    if (output.providerFailure) {
+      try {
+        deleteSession(effectiveGroup.folder, agentId);
+        currentAgentSessionId = undefined;
+      } catch (err) {
+        logger.warn(
+          { err, chatJid, agentId, folder: effectiveGroup.folder },
+          'Failed to clear agent session after provider failure',
+        );
+      }
+    }
+
+    // Container drained/_closed the in-flight query — remember it so the finally
+    // block finalizes the card (the message will be retried) instead of leaving
+    // a zombie 生成中 card.
+    if (output.status === 'closed') agentClosed = true;
+
+    // Track session：providerFailure（换号）时不持久化（H15/#549 守卫），其余成功输出
+    // 仍走本地 runtimeResolution 机器持久化 native session。
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
       persistNativeSessionForResolution(runtimeResolution, output.newSessionId, {
         runtimeContext: runtimeContextForOutput(runtimeContext, output),
       });
@@ -6540,7 +7459,9 @@ async function processAgentConversation(
       broadcastStreamEvent(chatJid, output.streamEvent, agentId);
 
       // ── 累积 text_delta 文本（中断时用于保存已输出内容）──
-      // Sub-agent text (parentToolUseId set) is skipped.
+      // 仅累积主 Agent 文本（无 parentToolUseId）：子 Agent（SDK Task）的中间
+      // 文本混入会污染飞书 agent 卡正文与 interrupt_partial 落库内容。
+      // 与主会话路径（processGroupMessages）的同名过滤保持一致。
       if (
         output.streamEvent.eventType === 'text_delta' &&
         output.streamEvent.text &&
@@ -6552,10 +7473,11 @@ async function processAgentConversation(
       // ── Feed stream events into Feishu streaming card ──
       if (agentStreamingSession) {
         feedStreamEventToCard(
-          agentStreamingSession,
-          output.streamEvent,
-          agentStreamingAccText,
-        );
+            agentStreamingSession,
+            output.streamEvent,
+            agentStreamingAccText,
+            buildWebTraceUrl(effectiveGroup.folder, output.streamEvent.turnId || lastProcessed.id),
+          );
       }
 
       // ── 中断时立即保存已输出内容 ──
@@ -6612,6 +7534,7 @@ async function processAgentConversation(
               agentId,
             );
             commitCursor();
+            clearStreamingSnapshot(virtualChatJid);
           } catch (err) {
             logger.warn(
               { err, chatJid, agentId },
@@ -6650,6 +7573,25 @@ async function processAgentConversation(
 
       // Reset idle timer on stream events so long-running tool calls
       // don't get killed while the agent is actively working.
+      resetIdleTimer();
+      return;
+    }
+
+    // Provider quota/limit notice surfaced as a "successful" result — silent
+    // switch (#549): suppress the English limit text from the user, log only.
+    // Session was already cleared at the top of this callback.
+    if (output.providerFailure) {
+      logger.warn(
+        {
+          chatJid,
+          agentId,
+          result:
+            typeof output.result === 'string'
+              ? output.result.slice(0, 200)
+              : output.result,
+        },
+        'Provider failure result suppressed from user (silent switch)',
+      );
       resetIdleTimer();
       return;
     }
@@ -6763,6 +7705,9 @@ async function processAgentConversation(
             await agentStreamingSession.complete(text);
             completedAgentStreamingSessionForUsage = agentStreamingSession;
             streamingCardHandledIM = true;
+            if (replySourceImJid) {
+              imManager.clearAckReaction(replySourceImJid);
+            }
           } catch (err) {
             logger.warn(
               { err, chatJid, agentId },
@@ -6811,6 +7756,7 @@ async function processAgentConversation(
             localImagePaths,
           );
           if (imSent) {
+            imManager.clearAckReaction(replySourceImJid);
             logger.info(
               {
                 chatJid,
@@ -6851,7 +7797,23 @@ async function processAgentConversation(
         commitCursor();
         resetIdleTimer();
 
+        // Per-turn snapshot cleanup — mirror of the main path (clearStreamingSnapshot
+        // after each substantive reply). Conversation agents stay warm for
+        // IDLE_TIMEOUT; without this, refreshing the page during the warm window
+        // restores a zombie「生成中」spinner from the stale agent snapshot. Skip
+        // partials (intermediate compression outputs, not the final reply).
+        if (
+          output.sourceKind !== 'overflow_partial' &&
+          output.sourceKind !== 'compact_partial'
+        ) {
+          clearStreamingSnapshot(virtualChatJid);
+        }
+
         // Spawn agents are fire-and-forget: close after first reply to free process slot.
+        // Conversation agents stay warm and are reclaimed by IDLE_TIMEOUT — closing them
+        // after every reply would cold-start the runner each turn (seconds in container mode).
+        // A post-reply tool call that hangs is handled runner-side by the post-result
+        // interrupt fallback, not by tearing down a warm conversation runner here.
         // Skip for overflow_partial/compact_partial — those are intermediate context
         // compression outputs, not the final result; closing now would kill the agent
         // before it finishes the actual task.
@@ -6975,8 +7937,12 @@ async function processAgentConversation(
       );
     }
 
-    // Finalize session
-    if (output.newSessionId && output.status !== 'error') {
+    // Finalize session：providerFailure（换号）时不持久化（H17/#549 守卫）。
+    if (
+      output.newSessionId &&
+      output.status !== 'error' &&
+      !output.providerFailure
+    ) {
       persistNativeSessionForResolution(runtimeResolution, output.newSessionId, {
         runtimeContext: runtimeContextForOutput(runtimeContext, output),
       });
@@ -7032,10 +7998,31 @@ async function processAgentConversation(
     // ── Streaming card cleanup ──
     if (agentStreamingSession) {
       if (agentStreamingSession.isActive()) {
+        // Symmetric with the main session's five-way finalize (index.ts ~3804):
+        // every "card built but never completed" path must finalize so the card
+        // can't get stuck at 生成中 (zombie card).
         if (hadError) {
           await agentStreamingSession.abort('处理出错').catch(() => {});
         } else if (wasInterrupted) {
           await agentStreamingSession.abort('已中断').catch(() => {});
+        } else if (agentClosed) {
+          // Container drained/_closed the in-flight query; the message will be
+          // retried, so just finalize the card (区别于"已中断"：系统侧打断重试).
+          await agentStreamingSession.abort('连接已切换，正在重试').catch(() => {});
+        } else if (!cursorCommitted) {
+          // Silent-success: the agent replied only via the send_message
+          // side-channel or produced an empty result, so the card was never
+          // completed. complete() 收口 (空正文由 buildStructuredFinalCard 兜底)
+          // 而非裸 dispose 留下「生成中」僵尸卡。
+          try {
+            await agentStreamingSession.complete(agentStreamingAccText);
+          } catch (err) {
+            logger.warn(
+              { err, chatJid, agentId },
+              'Agent streaming card silent-success finalize failed, disposing',
+            );
+            agentStreamingSession.dispose();
+          }
         } else {
           agentStreamingSession.dispose();
         }
@@ -7161,6 +8148,9 @@ async function processAgentConversation(
             partialReply,
             localImagePaths,
           );
+          if (imSent) {
+            imManager.clearAckReaction(replySourceImJid);
+          }
           logger.info({ replySourceImJid, imSent }, 'agent IM reply sent');
         } else {
           logger.warn(
@@ -7298,9 +8288,31 @@ async function startMessageLoop(): Promise<void> {
           // to conversation agents at IM ingestion time (feishu.ts/telegram.ts)
           if (group.target_agent_id) continue;
 
-          // Billing quota check before processing
+          // Owner gate + billing share a single owner lookup. Owner status
+          // check first: drop messages from groups whose owner is
+          // disabled/deleted (see `src/owner-gate.ts`); billing quota check
+          // second.
           if (group.created_by) {
             const owner = getUserById(group.created_by);
+            const ownerGate = checkOwnerActive(owner);
+            if (!ownerGate.allowed) {
+              const lastMsg = groupMessages[groupMessages.length - 1];
+              setCursors(chatJid, {
+                timestamp: lastMsg.timestamp,
+                id: lastMsg.id,
+              });
+              logger.info(
+                {
+                  chatJid,
+                  userId: group.created_by,
+                  ownerStatus: ownerGate.status,
+                },
+                'Dropping message: group owner is not active',
+              );
+              continue;
+            }
+
+            // Billing quota check before processing
             if (owner && owner.role !== 'admin') {
               const accessResult = checkBillingAccessFresh(
                 group.created_by,
@@ -7351,8 +8363,83 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             lastAgentTimestamp[chatJid] || EMPTY_CURSOR,
           );
-          const messagesToSend =
+          let messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
+
+          // Plugin command expander (DMI commands) — same as cold-start path.
+          // Active-runner IPC injection: replies advance the cursor without
+          // touching the running agent; full-reply batches skip sendMessage().
+          //
+          // Resolve effectiveGroup so sibling-JID groups (home main + non-home
+          // child sharing a folder) inherit executionMode / customCwd /
+          // created_by from the home sibling — without this, plugin expansion
+          // returns null on the non-home sibling and DMI commands stop working
+          // once a runner is up (#18 P2-bug-3).
+          {
+            const { effectiveGroup: activeEffectiveGroup } =
+              resolveEffectiveGroup(group);
+            // Admin-shared web:main: plugin runtime is per-sender. Resolve
+            // per-message so each admin's slash command expands under their
+            // own enabled plugins, not whichever admin happened to be the
+            // latest sender for the active-IPC batch (#23 round-15 P2-2).
+            const fallbackExpandCtx = buildExpandContext(
+              chatJid,
+              activeEffectiveGroup,
+              activeEffectiveGroup.created_by,
+            );
+            if (fallbackExpandCtx) {
+              const resolveCtxForMsg = (
+                msg: typeof messagesToSend[number],
+              ) => {
+                const owner = resolvePerMessageRuntimeOwner({
+                  chatJid,
+                  isHome: !!activeEffectiveGroup.is_home,
+                  fallbackOwner: activeEffectiveGroup.created_by,
+                  message: msg,
+                  getUserById,
+                });
+                return buildExpandContext(
+                  chatJid,
+                  activeEffectiveGroup,
+                  owner,
+                );
+              };
+              const { toSend, replies } = await expandMessagesIfNeeded(
+                messagesToSend,
+                resolveCtxForMsg,
+                undefined,
+                persistPluginExpansion,
+              );
+              // Hold the recovery cursor while toSend still has work pending
+              // (#18 P2-bug-2 also applies on the active path).
+              const advanceReplyCursor =
+                toSend.length === 0 ? setCursors : advanceNextPullCursorOnly;
+              // IM fan-out (#20 P1-1): if chatJid itself is an IM channel
+              // we route to itself; otherwise prefer the originating message's
+              // source_jid (mixed batches retain individual user routing).
+              const directImReply = getChannelType(chatJid) !== null;
+              for (const r of replies) {
+                let imRouteJid: string | null = null;
+                if (directImReply) {
+                  imRouteJid = chatJid;
+                } else if (
+                  r.originalMsg.source_jid &&
+                  getChannelType(r.originalMsg.source_jid)
+                ) {
+                  imRouteJid = r.originalMsg.source_jid;
+                }
+                sendPluginExpanderReply(chatJid, r.text, imRouteJid);
+                advanceReplyCursor(chatJid, {
+                  timestamp: r.originalMsg.timestamp,
+                  id: r.originalMsg.id,
+                });
+              }
+              if (toSend.length === 0) {
+                continue;
+              }
+              messagesToSend = toSend;
+            }
+          }
 
           // Home and non-home groups now share the same IPC injection path.
           // Reply routing is dynamically updated via activeRouteUpdaters when
@@ -7369,6 +8456,14 @@ async function startMessageLoop(): Promise<void> {
           const lastSourceJidForRoute =
             messagesToSend[messagesToSend.length - 1]?.source_jid || chatJid;
 
+          // Propagate scheduled-task identity into the running agent. Group-mode
+          // tasks inject their prompt as a normal message; when a runner is
+          // already active this IPC path (not the cold-start runContainerAgent
+          // path) handles delivery, so it must carry task_id too — otherwise the
+          // task's send_message output loses task attribution and the host skips
+          // the notify_channels broadcast (riba2534/happyclaw#559).
+          const injectionTaskId = extractLastTaskId(messagesToSend);
+
           const sendResult = queue.sendMessage(
             chatJid,
             formatted,
@@ -7377,6 +8472,8 @@ async function startMessageLoop(): Promise<void> {
               // IPC write succeeded — update reply route for the running agent
               activeRouteUpdaters.get(group.folder)?.(lastSourceJidForRoute);
             },
+            lastSourceJidForRoute,
+            injectionTaskId,
           );
           if (sendResult === 'sent') {
             logger.debug(
@@ -7388,11 +8485,14 @@ async function startMessageLoop(): Promise<void> {
               'Piped messages to active container',
             );
             const lastProcessed = messagesToSend[messagesToSend.length - 1];
-            lastAgentTimestamp[chatJid] = {
+            // advanceNextPullCursorOnly (not direct assignment) so an earlier
+            // reply already pushed past lastProcessed isn't regressed back
+            // to a plain-text timestamp, which would cause the reply to be
+            // re-pulled and replayed on the next poll (#18 P1-bug-1).
+            advanceNextPullCursorOnly(chatJid, {
               timestamp: lastProcessed.timestamp,
               id: lastProcessed.id,
-            };
-            saveState();
+            });
           } else {
             // no_active — enqueue for a new one
             queue.enqueueMessageCheck(chatJid);
@@ -7747,6 +8847,27 @@ function buildOnNewChat(
           setRegisteredGroup(chatJid, existing);
           registeredGroups[chatJid] = existing;
           logger.debug({ chatJid, chatName: trimmed }, 'Updated IM group name (buildOnNewChat)');
+          if (existing.target_agent_id) {
+            const agent = getAgent(existing.target_agent_id);
+            if (agent?.source_kind === 'auto_im') {
+              updateAgentContextInfo(existing.target_agent_id, { name: trimmed });
+              updateChatName(`${agent.chat_jid}#agent:${existing.target_agent_id}`, trimmed);
+            }
+          }
+        }
+        const channelType = getChannelType(chatJid);
+        const isolationConfig = getUserContextIsolationConfig(
+          userId,
+          channelType,
+          { getUserFeishuConfig },
+        );
+        if (isolationConfig.enabled) {
+          ensureAutoImConversationBinding(
+            chatJid,
+            existing,
+            userId,
+            trimmed || existing.name || chatJid,
+          );
         }
         return;
       }
@@ -7849,6 +8970,10 @@ function buildOnNewChat(
       return;
     }
     const ownerOpenId = getOwnerOpenId?.();
+    const ownerUser = getUserById(userId);
+    const groupDefaults = resolveImGroupDefaults({
+      ownerDefaultRequireMention: ownerUser?.default_require_mention,
+    });
     registerGroup(chatJid, {
       name: chatName,
       folder: homeFolder,
@@ -7860,12 +8985,166 @@ function buildOnNewChat(
       sender_allowlist: getOwnerOpenId
         ? (ownerOpenId ? [ownerOpenId] : [])
         : undefined,
+      require_mention: groupDefaults.requireMention,
     });
     logger.info(
-      { chatJid, chatName, userId, homeFolder },
+      {
+        chatJid,
+        chatName,
+        userId,
+        homeFolder,
+        requireMention: groupDefaults.requireMention,
+      },
       'Auto-registered IM chat',
     );
+
+    const channelType = getChannelType(chatJid);
+    const isolationConfig = getUserContextIsolationConfig(userId, channelType, {
+      getUserFeishuConfig,
+    });
+    if (isolationConfig.enabled) {
+      const registered = registeredGroups[chatJid]!;
+      ensureAutoImConversationBinding(chatJid, registered, userId, chatName);
+    }
   };
+}
+
+function resolveAutoImWorkspace(folder: string): { jid: string; folder: string } | null {
+  const jids = getJidsByFolder(folder);
+  for (const jid of jids) {
+    if (!jid.startsWith('web:')) continue;
+    const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
+    if (group) return { jid, folder: group.folder };
+  }
+  return null;
+}
+
+function createAutoImConversationAgent(input: {
+  userId: string;
+  sourceJid: string;
+  groupFolder: string;
+  name: string;
+}): { agentId: string; workspaceJid: string; workspaceFolder: string } | null {
+  const workspace = resolveAutoImWorkspace(input.groupFolder);
+  if (!workspace) {
+    logger.warn(
+      { userId: input.userId, sourceJid: input.sourceJid, groupFolder: input.groupFolder },
+      'Cannot create auto IM conversation agent: workspace not found',
+    );
+    return null;
+  }
+
+  const agentId = crypto.randomUUID();
+  const now = new Date().toISOString();
+  const agentName = input.name || input.sourceJid;
+  createAgent({
+    id: agentId,
+    group_folder: workspace.folder,
+    chat_jid: workspace.jid,
+    name: agentName,
+    prompt: '',
+    status: 'idle',
+    kind: 'conversation',
+    created_by: input.userId,
+    created_at: now,
+    completed_at: null,
+    result_summary: null,
+    last_im_jid: input.sourceJid,
+    spawned_from_jid: null,
+    source_kind: 'auto_im',
+    last_active_at: now,
+  });
+  ensureAgentDirectories(workspace.folder, agentId);
+  const virtualChatJid = `${workspace.jid}#agent:${agentId}`;
+  ensureChatExists(virtualChatJid);
+  updateChatName(virtualChatJid, agentName);
+  updateAgentLastImJid(agentId, input.sourceJid);
+  broadcastAgentStatus(workspace.jid, agentId, 'idle', agentName, '', undefined, 'conversation');
+
+  logger.info(
+    { sourceJid: input.sourceJid, agentId, userId: input.userId },
+    'Auto-created isolated conversation agent for Feishu IM chat',
+  );
+  return { agentId, workspaceJid: workspace.jid, workspaceFolder: workspace.folder };
+}
+
+function ensureAutoImConversationBinding(
+  jid: string,
+  group: RegisteredGroup,
+  userId: string,
+  name: string,
+): boolean {
+  if (group.target_main_jid) return false;
+  if (group.target_agent_id) {
+    const existingAgent = getAgent(group.target_agent_id);
+    if (existingAgent?.source_kind === 'auto_im') {
+      ensureAgentDirectories(existingAgent.group_folder, existingAgent.id);
+      updateAgentLastImJid(existingAgent.id, jid);
+      return false;
+    }
+    return false;
+  }
+
+  const created = createAutoImConversationAgent({
+    userId,
+    sourceJid: jid,
+    groupFolder: group.folder,
+    name: name || group.name || jid,
+  });
+  if (!created) return false;
+
+  group.target_agent_id = created.agentId;
+  setRegisteredGroup(jid, group);
+  registeredGroups[jid] = group;
+  return true;
+}
+
+/**
+ * Batch-apply autoIsolateContext toggle for a user's existing Feishu IM chats.
+ * enable=true:  create conversation agents for unbound Feishu chats
+ * enable=false: remove auto_im agent bindings (manual bindings untouched)
+ */
+function applyAutoIsolateContext(userId: string, enable: boolean): number {
+  return applyAutoIsolateContextForGroups(userId, enable, {
+    groups: getAllRegisteredGroups(),
+    channelType: 'feishu',
+    getChannelType,
+    getAgent,
+    ensureBinding: ensureAutoImConversationBinding,
+    setGroup: (jid, group) => {
+      setRegisteredGroup(jid, group);
+      registeredGroups[jid] = group;
+    },
+    deleteAgent,
+    broadcastAgentRemoved,
+  });
+}
+
+/**
+ * Record the Feishu owner's open_id (auto-detected from a P2P DM) and
+ * unstick any of this user's groups whose `sender_allowlist=[]` —
+ * the "owner-locked trap" that buildOnNewChat creates when a group is
+ * registered before the owner has DM'd the bot.
+ */
+function learnFeishuOwner(
+  userId: string,
+  senderOpenId: string,
+  ownerRef: { value: string | undefined },
+): void {
+  const ownerOpenId = ownerRef.value ?? senderOpenId;
+  if (!ownerRef.value) {
+    ownerRef.value = senderOpenId;
+    saveFeishuOwnerOpenId(userId, senderOpenId);
+  }
+  const backfilled = backfillEmptyAllowlistsForUser(userId, ownerOpenId);
+  for (const jid of backfilled) {
+    const fresh = getRegisteredGroup(jid);
+    if (fresh) registeredGroups[jid] = fresh;
+  }
+  logger.info(
+    { userId, senderOpenId, ownerOpenId, backfilledCount: backfilled.length },
+    'Feishu owner open_id auto-detected from P2P message',
+  );
 }
 
 /**
@@ -7875,9 +9154,9 @@ function buildOnNewChat(
  */
 function buildOnBotRemovedFromGroup(): (chatJid: string) => void {
   return (chatJid: string) => {
-    unbindImGroup(
+    removeImGroupRecord(
       chatJid,
-      'Auto-unbound IM group: bot removed or group disbanded',
+      'Auto-removed IM group: bot removed or group disbanded',
     );
   };
 }
@@ -7925,20 +9204,34 @@ function buildFeishuBotAddedHandler(
     const isNew = !registeredGroups[chatJid] && !getRegisteredGroup(chatJid);
     onNewChat(chatJid, chatName);
     if (isNew) {
-      const ownerKnown = !!getOwnerOpenId?.();
-      const welcome =
-        `已加入「${chatName}」。\n\n` +
-        `当前群聊已启用发言者白名单，仅 bot owner 可触发我。\n` +
-        (ownerKnown
-          ? `Owner 已自动从私聊中识别。\n`
-          : `请先向机器人发一条私信，系统将自动识别您的 owner 身份。\n`) +
-        `\n/allow @成员 — 将群成员加入白名单\n` +
-        `/disallow @成员 — 从白名单移除成员\n` +
-        `/allowlist — 查看白名单`;
+      // 文案分支:仅在飞书路径(传入 getOwnerOpenId,DM 可学到 ownerOpenId 并启用 allowlist)
+      // 才提示「已启用发言者白名单」+「私信识别 owner」。通用路径(dingtalk/discord/whatsapp
+      // 不传 getOwnerOpenId)实际未启用白名单,DM 也没有 learnFeishuOwner 通道,引导用
+      // /owner_mention 在群内自我认领。
+      let welcome: string;
+      if (getOwnerOpenId) {
+        const ownerKnown = !!getOwnerOpenId();
+        welcome =
+          `已加入「${chatName}」。\n\n` +
+          `当前群聊已启用发言者白名单,仅 bot owner 可触发我。\n` +
+          (ownerKnown
+            ? `Owner 已自动从私聊中识别。\n`
+            : `请先向机器人发一条私信,系统将自动识别您的 owner 身份。\n`) +
+          `\n/allow @成员 — 将群成员加入白名单\n` +
+          `/disallow @成员 — 从白名单移除成员\n` +
+          `/allowlist — 查看白名单`;
+      } else {
+        welcome =
+          `已加入「${chatName}」。\n\n` +
+          `机器人已加入群组。请由 owner 在群内发送 /owner_mention 自我认领,命令将永久绑定该身份。\n\n` +
+          `/owner_mention — 认领工作区 owner\n` +
+          `/list — 查看所有工作区\n` +
+          `/new <名称> — 新建工作区并绑定此群`;
+      }
       imManager
         .sendMessage(chatJid, welcome)
         .catch((err) =>
-          logger.warn({ chatJid, err }, 'Failed to send Feishu group welcome message'),
+          logger.warn({ chatJid, err }, 'Failed to send group welcome message'),
         );
     }
   };
@@ -8015,7 +9308,7 @@ function resolveOrCreateThreadAgent(
   workspace: RegisteredGroup,
   group: RegisteredGroup,
   messageMeta: FeishuMessageMeta & { threadId: string },
-): { effectiveJid: string; agentId: string } {
+): { effectiveJid: string; agentId: string; sourceJid: string } {
   const now = new Date().toISOString();
   const threadId = messageMeta.threadId;
   const rootMessageId = messageMeta.rootId || threadId;
@@ -8105,6 +9398,7 @@ function resolveOrCreateThreadAgent(
   return {
     effectiveJid: `${workspaceJid}#agent:${binding.agent_id}`,
     agentId: binding.agent_id,
+    sourceJid: routeJid,
   };
 }
 
@@ -8117,15 +9411,21 @@ function resolveOrCreateThreadAgent(
 function buildResolveEffectiveChatJid(): (
   chatJid: string,
   messageMeta?: FeishuMessageMeta,
-) => { effectiveJid: string; agentId: string | null } | null {
+) => { effectiveJid: string; agentId: string | null; sourceJid?: string } | null {
   return (chatJid: string, messageMeta) => {
     const group = registeredGroups[chatJid] ?? getRegisteredGroup(chatJid);
-    if (!group) return null;
+    if (!group) {
+      logger.debug({ chatJid }, 'resolveEffectiveChatJid: group not found');
+      return null;
+    }
 
     // Agent binding takes priority
     if (group.target_agent_id) {
       const agent = getAgent(group.target_agent_id);
-      if (!agent) return null;
+      if (!agent) {
+        logger.warn({ chatJid, targetAgentId: group.target_agent_id }, 'resolveEffectiveChatJid: agent not found for target_agent_id');
+        return null;
+      }
       // Use the agent's actual chat_jid (the workspace's registered JID) as the
       // base for the virtual JID.  Previously we constructed web:${folder} which
       // doesn't match any registered group for non-main workspaces (folder ≠ JID).
@@ -8137,8 +9437,12 @@ function buildResolveEffectiveChatJid(): (
       group.binding_mode === 'thread_map' &&
       group.target_main_jid &&
       getChannelType(chatJid) === 'feishu' &&
-      messageMeta?.threadId
+      messageMeta &&
+      (messageMeta?.threadId || messageMeta?.rootId || messageMeta?.messageId)
     ) {
+      const threadContextId =
+        messageMeta.threadId || messageMeta.rootId || messageMeta.messageId;
+      if (!threadContextId) return null;
       const workspaceJid = resolveWorkspaceJid(group.target_main_jid);
       if (!workspaceJid) {
         logger.warn(
@@ -8156,7 +9460,7 @@ function buildResolveEffectiveChatJid(): (
         workspaceJid,
         workspace,
         group,
-        { ...messageMeta, threadId: messageMeta.threadId },
+        { ...messageMeta, threadId: threadContextId },
       );
     }
 
@@ -8173,6 +9477,10 @@ function buildResolveEffectiveChatJid(): (
       return { effectiveJid, agentId: null };
     }
 
+    logger.debug(
+      { chatJid, targetAgentId: group.target_agent_id, targetMainJid: group.target_main_jid },
+      'resolveEffectiveChatJid: no binding found',
+    );
     return null;
   };
 }
@@ -8251,12 +9559,15 @@ function buildOnAgentMessage(): (baseChatJid: string, agentId: string) => void {
       const images = collectMessageImages(virtualChatJid, missedMessages);
       const imagesForAgent = images.length > 0 ? images : undefined;
 
+      const lastAgentSourceJid =
+        missedMessages[missedMessages.length - 1]?.source_jid || virtualChatJid;
       const sendResult = formatted
         ? queue.sendMessage(
             virtualChatJid,
             formatted,
             imagesForAgent,
             undefined,
+            lastAgentSourceJid,
           )
         : 'no_active';
       if (sendResult === 'no_active') {
@@ -8367,6 +9678,7 @@ async function connectUserIMChannels(
   wechatConfig?: WeChatConnectConfig | null,
   dingtalkConfig?: DingTalkConnectConfig | null,
   discordConfig?: DiscordConnectConfig | null,
+  whatsappConfig?: WhatsAppConnectConfig | null,
   ignoreMessagesBefore?: number,
 ): Promise<{
   feishu: boolean;
@@ -8375,25 +9687,31 @@ async function connectUserIMChannels(
   wechat: boolean;
   dingtalk: boolean;
   discord: boolean;
+  whatsapp: boolean;
 }> {
   // Per-user mutable ref for Feishu owner open_id auto-detection via P2P messages
   const feishuOwnerRef = { value: feishuConfig ? (getUserFeishuConfig(userId)?.ownerOpenId ?? undefined) : undefined };
   const getFeishuOwnerOpenId = () => feishuOwnerRef.value;
-  const onFeishuP2pSender = (senderOpenId: string) => {
-    if (!feishuOwnerRef.value) {
-      feishuOwnerRef.value = senderOpenId;
-      saveFeishuOwnerOpenId(userId, senderOpenId);
-      logger.info({ userId, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
-    }
-  };
+  const onFeishuP2pSender = (senderOpenId: string) =>
+    learnFeishuOwner(userId, senderOpenId, feishuOwnerRef);
 
-  const onNewChat = buildOnNewChat(userId, homeFolder, getFeishuOwnerOpenId);
+  // Feishu-specific closure: writes the Feishu open_id into owner_im_id when
+  // registering new chats. The non-Feishu variant omits getOwnerOpenId so that
+  // telegram / qq / wechat / dingtalk / discord / whatsapp groups don't get
+  // contaminated with a Feishu open_id that will never match their senders.
+  const feishuOnNewChat = buildOnNewChat(userId, homeFolder, getFeishuOwnerOpenId);
+  const onNewChat = buildOnNewChat(userId, homeFolder);
   const resolveGroupFolder = (chatJid: string): string | undefined => {
     return resolveEffectiveFolder(chatJid);
   };
   const resolveEffectiveChatJid = buildResolveEffectiveChatJid();
   const onAgentMessage = buildOnAgentMessage();
-  const onBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder, getFeishuOwnerOpenId);
+  // Feishu-specific: writes Feishu open_id as owner_im_id + locks allowlist.
+  // Non-Feishu variant omits getOwnerOpenId so dingtalk/discord/whatsapp groups
+  // don't get a Feishu open_id baked in as their owner (which would never match
+  // their own senderImId namespaces).
+  const feishuOnBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder, getFeishuOwnerOpenId);
+  const onBotAddedToGroup = buildFeishuBotAddedHandler(userId, homeFolder);
   const onBotRemovedFromGroup = buildOnBotRemovedFromGroup();
 
   // 各渠道互相独立，并发连接避免启动时延 N×M 累加
@@ -8402,13 +9720,13 @@ async function connectUserIMChannels(
     feishuConfig.enabled !== false &&
     feishuConfig.appId &&
     feishuConfig.appSecret
-      ? imManager.connectUserFeishu(userId, feishuConfig, onNewChat, {
+      ? imManager.connectUserFeishu(userId, feishuConfig, feishuOnNewChat, {
           ignoreMessagesBefore,
           onCommand: handleCommand,
           resolveGroupFolder,
           resolveEffectiveChatJid,
           onAgentMessage,
-          onBotAddedToGroup,
+          onBotAddedToGroup: feishuOnBotAddedToGroup,
           onBotRemovedFromGroup,
           shouldProcessGroupMessage,
           isGroupOwnerMessage,
@@ -8510,16 +9828,36 @@ async function connectUserIMChannels(
         })
       : Promise.resolve(false);
 
-  const [feishu, telegram, qq, wechat, dingtalk, discord] = await Promise.all([
-    feishuTask,
-    telegramTask,
-    qqTask,
-    wechatTask,
-    dingtalkTask,
-    discordTask,
-  ]);
+  const whatsappTask =
+    whatsappConfig && whatsappConfig.enabled !== false
+      ? imManager.connectUserWhatsApp(userId, whatsappConfig, onNewChat, {
+          ignoreMessagesBefore,
+          onCommand: handleCommand,
+          resolveGroupFolder,
+          resolveEffectiveChatJid,
+          onAgentMessage,
+          onBotAddedToGroup,
+          onBotRemovedFromGroup,
+          shouldProcessGroupMessage,
+          isGroupOwnerMessage,
+          onConnectionUpdate: (uid, state) => {
+            broadcastWhatsAppStatus(uid, state);
+          },
+        })
+      : Promise.resolve(false);
 
-  return { feishu, telegram, qq, wechat, dingtalk, discord };
+  const [feishu, telegram, qq, wechat, dingtalk, discord, whatsapp] =
+    await Promise.all([
+      feishuTask,
+      telegramTask,
+      qqTask,
+      wechatTask,
+      dingtalkTask,
+      discordTask,
+      whatsappTask,
+    ]);
+
+  return { feishu, telegram, qq, wechat, dingtalk, discord, whatsapp };
 }
 
 function movePathWithFallback(src: string, dst: string): void {
@@ -8729,6 +10067,33 @@ async function main(): Promise<void> {
 
   loadState();
 
+  // Plugin catalog scan: one shot 5s after startup + every 1h thereafter.
+  // Disabled when SystemSettings.pluginAutoScan = false; admin can still
+  // trigger via POST /api/plugins/catalog/scan. scanHostMarketplaces has
+  // an in-flight Promise mutex, so UI button / startup / periodic timer
+  // can overlap safely.
+  // NOTE: this runs once at startup; runtime toggle requires restart.
+  let startupPluginScanTimer: ReturnType<typeof setTimeout> | null = null;
+  let periodicPluginScanInterval: ReturnType<typeof setInterval> | null = null;
+  if (getSystemSettings().pluginAutoScan) {
+    startupPluginScanTimer = setTimeout(() => {
+      scanHostMarketplaces().catch((err) =>
+        logger.warn({ err }, 'startup plugin catalog scan failed'),
+      );
+    }, 5000);
+
+    periodicPluginScanInterval = setInterval(
+      () => {
+        scanHostMarketplaces().catch((err) =>
+          logger.warn({ err }, 'periodic plugin catalog scan failed'),
+        );
+      },
+      60 * 60 * 1000,
+    );
+  } else {
+    logger.info('Plugin catalog auto-scan disabled by SystemSettings.pluginAutoScan');
+  }
+
   // --- Channel reload helpers (hot-reload on config save) ---
 
   let feishuSyncInterval: ReturnType<typeof setInterval> | null = null;
@@ -8758,6 +10123,9 @@ async function main(): Promise<void> {
       clearInterval(feishuSyncInterval);
       feishuSyncInterval = null;
     }
+
+    if (startupPluginScanTimer) clearTimeout(startupPluginScanTimer);
+    if (periodicPluginScanInterval) clearInterval(periodicPluginScanInterval);
 
     try {
       ipcWatcherManager?.closeAll();
@@ -8844,13 +10212,8 @@ async function main(): Promise<void> {
       const homeFolder = homeGroup?.folder || MAIN_GROUP_FOLDER;
       const adminOwnerRef = { value: getUserFeishuConfig(adminUser.id)?.ownerOpenId ?? undefined };
       const getAdminOwnerOpenId = () => adminOwnerRef.value;
-      const onAdminP2pSender = (senderOpenId: string) => {
-        if (!adminOwnerRef.value) {
-          adminOwnerRef.value = senderOpenId;
-          saveFeishuOwnerOpenId(adminUser.id, senderOpenId);
-          logger.info({ userId: adminUser.id, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
-        }
-      };
+      const onAdminP2pSender = (senderOpenId: string) =>
+        learnFeishuOwner(adminUser.id, senderOpenId, adminOwnerRef);
       const onNewChat = buildOnNewChat(adminUser.id, homeFolder, getAdminOwnerOpenId);
       const connected = await imManager.connectUserFeishu(
         adminUser.id,
@@ -8859,6 +10222,10 @@ async function main(): Promise<void> {
         {
           ignoreMessagesBefore: Date.now(),
           onCommand: handleCommand,
+          resolveGroupFolder: (chatJid: string) =>
+            resolveEffectiveFolder(chatJid),
+          resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+          onAgentMessage: buildOnAgentMessage(),
           onBotAddedToGroup: buildFeishuBotAddedHandler(adminUser.id, homeFolder, getAdminOwnerOpenId),
           onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
           shouldProcessGroupMessage,
@@ -8936,7 +10303,14 @@ async function main(): Promise<void> {
   // Reload a per-user IM channel (hot-reload on user-im config save)
   const reloadUserIMConfig = async (
     userId: string,
-    channel: 'feishu' | 'telegram' | 'qq' | 'wechat' | 'dingtalk' | 'discord',
+    channel:
+      | 'feishu'
+      | 'telegram'
+      | 'qq'
+      | 'wechat'
+      | 'dingtalk'
+      | 'discord'
+      | 'whatsapp',
   ): Promise<boolean> => {
     const homeGroup = getUserHomeGroup(userId);
     if (!homeGroup) {
@@ -8961,13 +10335,8 @@ async function main(): Promise<void> {
       ) {
         const reloadOwnerRef = { value: config.ownerOpenId ?? undefined };
         const getReloadOwnerOpenId = () => reloadOwnerRef.value;
-        const onReloadP2pSender = (senderOpenId: string) => {
-          if (!reloadOwnerRef.value) {
-            reloadOwnerRef.value = senderOpenId;
-            saveFeishuOwnerOpenId(userId, senderOpenId);
-            logger.info({ userId, senderOpenId }, 'Feishu owner open_id auto-detected from P2P message');
-          }
-        };
+        const onReloadP2pSender = (senderOpenId: string) =>
+          learnFeishuOwner(userId, senderOpenId, reloadOwnerRef);
         const onNewChat = buildOnNewChat(userId, homeFolder, getReloadOwnerOpenId);
         const connected = await imManager.connectUserFeishu(
           userId,
@@ -8976,6 +10345,10 @@ async function main(): Promise<void> {
           {
             ignoreMessagesBefore,
             onCommand: handleCommand,
+            resolveGroupFolder: (chatJid: string) =>
+              resolveEffectiveFolder(chatJid),
+            resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+            onAgentMessage: buildOnAgentMessage(),
             onBotAddedToGroup: buildFeishuBotAddedHandler(userId, homeFolder, getReloadOwnerOpenId),
             onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
             shouldProcessGroupMessage,
@@ -9118,8 +10491,7 @@ async function main(): Promise<void> {
       }
       logger.info({ userId }, 'User Discord channel disabled via hot-reload');
       return false;
-    } else {
-      // WeChat
+    } else if (channel === 'wechat') {
       await imManager.disconnectUserWeChat(userId);
       const config = getUserWeChatConfig(userId);
       if (
@@ -9155,7 +10527,71 @@ async function main(): Promise<void> {
       }
       logger.info({ userId }, 'User WeChat channel disabled via hot-reload');
       return false;
+    } else {
+      // WhatsApp (Baileys)
+      await imManager.disconnectUserWhatsApp(userId);
+      const config = getUserWhatsAppConfig(userId);
+      if (config && config.enabled !== false) {
+        const connected = await imManager.connectUserWhatsApp(
+          userId,
+          {
+            accountId: config.accountId,
+            phoneNumber: config.phoneNumber,
+            enabled: config.enabled,
+          },
+          onNewChat,
+          {
+            ignoreMessagesBefore: Date.now(),
+            onCommand: handleCommand,
+            resolveGroupFolder: (chatJid: string) =>
+              resolveEffectiveFolder(chatJid),
+            resolveEffectiveChatJid: buildResolveEffectiveChatJid(),
+            onAgentMessage: buildOnAgentMessage(),
+            onBotAddedToGroup: buildOnNewChat(userId, homeFolder),
+            onBotRemovedFromGroup: buildOnBotRemovedFromGroup(),
+            shouldProcessGroupMessage,
+            isGroupOwnerMessage,
+            onConnectionUpdate: (uid, state) => {
+              broadcastWhatsAppStatus(uid, state);
+            },
+          },
+        );
+        logger.info(
+          { userId, connected },
+          'User WhatsApp connection hot-reloaded',
+        );
+        return connected;
+      }
+      logger.info(
+        { userId },
+        'User WhatsApp channel disabled via hot-reload',
+      );
+      return false;
     }
+  };
+
+  // Reconnect all of a user's IM channels from persisted config — symmetric
+  // counterpart to disconnectAllUserChannels (called on admin re-enable/
+  // restore). Reuses reloadUserIMConfig per channel: it reads each channel's
+  // saved config and only connects the enabled ones, so disabled channels stay
+  // down without extra branching here.
+  const reconnectUserIMChannels = async (userId: string): Promise<void> => {
+    // 解封：disconnectAllUserChannels 把 user 标 sealed 后，所有 connectChannel
+    // 都被拒。re-enable / restore 用户时必须先解封否则 reload 全部失败。
+    imManager.markUserReconnectable(userId);
+    const channels: Array<
+      | 'feishu'
+      | 'telegram'
+      | 'qq'
+      | 'wechat'
+      | 'dingtalk'
+      | 'discord'
+      | 'whatsapp'
+    > = ['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord', 'whatsapp'];
+    await Promise.allSettled(
+      channels.map((channel) => reloadUserIMConfig(userId, channel)),
+    );
+    logger.info({ userId }, 'Reconnected user IM channels after re-enable');
   };
 
   // Start Web server early so frontend auth/API isn't blocked by Feishu readiness.
@@ -9167,15 +10603,33 @@ async function main(): Promise<void> {
     formatMessages,
     getLastAgentTimestamp: () => lastAgentTimestamp,
     setLastAgentTimestamp: setCursors,
+    advanceCursors,
+    advanceNextPullCursorOnly,
     advanceGlobalCursor: (cursor: MessageCursor) => {
       if (isCursorAfter(cursor, globalMessageCursor)) {
         globalMessageCursor = cursor;
         saveState();
       }
     },
+    hasEarlierPendingMessages: (jid, candidate) => {
+      // Compare against lastCommittedCursor (recovery anchor) so the
+      // semantic is "would a recovery pass surface anything earlier than
+      // this candidate?". Lexicographic (timestamp, id) — same ordering
+      // used by getMessagesSince's ORDER BY.
+      const sinceCursor = lastCommittedCursor[jid] || EMPTY_CURSOR;
+      const pending = getMessagesSince(jid, sinceCursor);
+      for (const m of pending) {
+        if (m.timestamp < candidate.timestamp) return true;
+        if (m.timestamp === candidate.timestamp && m.id < candidate.id) {
+          return true;
+        }
+      }
+      return false;
+    },
     reloadFeishuConnection,
     reloadTelegramConnection,
     reloadUserIMConfig,
+    reconnectUserIMChannels,
     isFeishuConnected: () => imManager.isAnyFeishuConnected(),
     isTelegramConnected: () => imManager.isAnyTelegramConnected(),
     isUserFeishuConnected: (userId: string) =>
@@ -9189,16 +10643,31 @@ async function main(): Promise<void> {
       imManager.isDingTalkConnected(userId),
     isUserDiscordConnected: (userId: string) =>
       imManager.isDiscordConnected(userId),
+    isUserWhatsAppConnected: (userId: string) =>
+      imManager.isWhatsAppConnected(userId),
+    getUserWhatsAppState: (userId: string) =>
+      imManager.getUserWhatsAppState(userId),
+    logoutUserWhatsApp: (userId: string, accountId?: string) =>
+      imManager.logoutUserWhatsApp(userId, accountId),
     processAgentConversation,
     getFeishuChatInfo: (userId: string, chatId: string) =>
       imManager.getFeishuChatInfo(userId, chatId),
     clearImFailCounts: (jid: string) => {
       imHealthCheckFailCounts.delete(jid);
     },
+    removeImGroupRecord,
     updateReplyRoute: (folder: string, sourceJid: string | null) => {
       activeRouteUpdaters.get(folder)?.(sourceJid);
     },
     handleSpawnCommand,
+    applyAutoIsolateContext: (userId: string, enable: boolean) =>
+      applyAutoIsolateContext(userId, enable),
+    resolveEffectiveGroup,
+    getUserById: (id: string) => {
+      const user = getUserById(id);
+      if (!user) return null;
+      return { id: user.id, status: user.status, role: user.role };
+    },
   });
 
   // Clean expired sessions every hour
@@ -9451,10 +10920,19 @@ async function main(): Promise<void> {
         const broadcastFolder = options.workspaceFolder ?? ownerHome?.folder;
         if (broadcastFolder) {
           const localImages = extractLocalImImagePaths(text, broadcastFolder);
+          // chatJid 指向任务关联的源 workspace。当它本身是 IM channel（如 feishu:），
+          // 说明源群已通过上游 `sendMessage(chatJid, ...)` 直发收到本消息（见
+          // runScriptTask 在 task-scheduler.ts:~671 的 step 1）。把它加入 alreadySentJids
+          // 让 broadcast 跳过同 channel 的 fallback 群，避免同一条消息被重复推到 owner
+          // 注册的另一个飞书/Telegram 群。isolated agent 任务的 workspace.jid 是
+          // ephemeral `web:task-xxx`，getChannelType 返回 null，自然不会加入此集合，
+          // 行为与修复前保持一致。
+          const alreadySent = new Set<string>();
+          if (getChannelType(chatJid)) alreadySent.add(chatJid);
           broadcastToOwnerIMChannels(
             options.ownerId,
             broadcastFolder,
-            new Set<string>(),
+            alreadySent,
             (jid) => sendImWithFailTracking(jid, text, localImages),
             options.notifyChannels,
           );
@@ -9462,10 +10940,6 @@ async function main(): Promise<void> {
       }
     },
     assistantName: ASSISTANT_NAME,
-    dailySummaryDeps: {
-      logger,
-      dataDir: DATA_DIR,
-    },
   };
   startSchedulerLoop(schedulerDeps);
 
@@ -9511,9 +10985,14 @@ async function main(): Promise<void> {
 
   let anyFeishuConnected = false;
 
-  for (const user of allActiveUsers) {
+  // Connect each user's IM channels concurrently — startup latency was
+  // previously O(N_users) because the await was inside the for-loop. The
+  // per-user `connectUserIMChannels` already parallelizes within a user, so
+  // wrapping the outer loop in Promise.allSettled drops total cold-start to
+  // ~max(per-user latency).
+  await Promise.allSettled(allActiveUsers.map(async (user) => {
     const homeGroup = getUserHomeGroup(user.id);
-    if (!homeGroup) continue;
+    if (!homeGroup) return;
 
     // Per-user IM config takes precedence; fall back to global config for admin
     const userFeishu = getUserFeishuConfig(user.id);
@@ -9522,6 +11001,7 @@ async function main(): Promise<void> {
     const userWeChat = getUserWeChatConfig(user.id);
     const userDingTalk = getUserDingTalkConfig(user.id);
     const userDiscord = getUserDiscordConfig(user.id);
+    const userWhatsApp = getUserWhatsAppConfig(user.id);
 
     // Determine effective Feishu config: per-user > global (admin only)
     let effectiveFeishu: FeishuConnectConfig | null = null;
@@ -9603,15 +11083,26 @@ async function main(): Promise<void> {
       };
     }
 
+    // Determine effective WhatsApp config: per-user only, skeleton always disabled by default
+    let effectiveWhatsApp: WhatsAppConnectConfig | null = null;
+    if (userWhatsApp && userWhatsApp.enabled) {
+      effectiveWhatsApp = {
+        accountId: userWhatsApp.accountId,
+        phoneNumber: userWhatsApp.phoneNumber,
+        enabled: userWhatsApp.enabled,
+      };
+    }
+
     if (
       !effectiveFeishu &&
       !effectiveTelegram &&
       !effectiveQQ &&
       !effectiveWeChat &&
       !effectiveDingTalk &&
-      !effectiveDiscord
+      !effectiveDiscord &&
+      !effectiveWhatsApp
     )
-      continue;
+      return;
 
     try {
       const result = await connectUserIMChannels(
@@ -9623,6 +11114,7 @@ async function main(): Promise<void> {
         effectiveWeChat,
         effectiveDingTalk,
         effectiveDiscord,
+        effectiveWhatsApp,
         Date.now(),
       );
       if (result.feishu) anyFeishuConnected = true;
@@ -9635,6 +11127,7 @@ async function main(): Promise<void> {
           wechat: result.wechat,
           dingtalk: result.dingtalk,
           discord: result.discord,
+          whatsapp: result.whatsapp,
         },
         'User IM channels connected',
       );
@@ -9644,7 +11137,7 @@ async function main(): Promise<void> {
         'Failed to connect user IM channels',
       );
     }
-  }
+  }));
 
   // Start Feishu group sync if any connection is active
   if (anyFeishuConnected) {
@@ -9666,7 +11159,30 @@ async function main(): Promise<void> {
   }
 
   // Run health check once on startup to clean up orphaned bindings, then periodically
-  void checkImBindingsHealth();
+  void checkImBindingsHealth().then(() => {
+    // After health check, ensure auto_im agents exist for users with autoIsolateContext enabled
+    const groups = getAllRegisteredGroups();
+    const userIds = new Set<string>();
+    for (const [jid, group] of Object.entries(groups)) {
+      if (getChannelType(jid) === 'feishu' && group.created_by) {
+        userIds.add(group.created_by);
+      }
+    }
+    for (const uid of userIds) {
+      const isolationConfig = getUserContextIsolationConfig(uid, 'feishu', {
+        getUserFeishuConfig,
+      });
+      if (isolationConfig.enabled) {
+        const migrated = applyAutoIsolateContext(uid, true);
+        if (migrated > 0) {
+          logger.info(
+            { userId: uid, migrated },
+            'Startup: restored auto_im agents for user with autoIsolateContext enabled',
+          );
+        }
+      }
+    }
+  });
   const IM_BINDING_HEALTH_CHECK_INTERVAL = 30 * 60 * 1000; // 30 min
   setInterval(() => {
     void checkImBindingsHealth();
@@ -9706,6 +11222,24 @@ async function checkImBindingsHealth(): Promise<void> {
     if (group.target_agent_id) {
       const agent = getAgent(group.target_agent_id);
       if (!agent) {
+        // For auto_im agents, re-create instead of unbinding if toggle is still on
+        const userId = group.created_by;
+        const channelType = getChannelType(jid);
+        if (userId && channelType) {
+          const isolationConfig = getUserContextIsolationConfig(userId, channelType, {
+            getUserFeishuConfig,
+          });
+          if (isolationConfig.enabled) {
+            const unbound: RegisteredGroup = { ...group, target_agent_id: undefined };
+            if (ensureAutoImConversationBinding(jid, unbound, userId, group.name || jid)) {
+              logger.info(
+                { jid, userId },
+                'Health check: re-created auto_im agent (previous agent lost)',
+              );
+              continue;
+            }
+          }
+        }
         unbindImGroup(
           jid,
           `Orphaned agent binding: agent ${group.target_agent_id} no longer exists`,
@@ -9725,9 +11259,9 @@ async function checkImBindingsHealth(): Promise<void> {
         const count = (imHealthCheckFailCounts.get(jid) ?? 0) + 1;
         imHealthCheckFailCounts.set(jid, count);
         if (count >= IM_HEALTH_CHECK_FAIL_THRESHOLD) {
-          unbindImGroup(
+          removeImGroupRecord(
             jid,
-            'IM group not reachable after multiple checks, auto-unbinding',
+            'IM group not reachable after multiple checks, auto-removing',
           );
         } else {
           logger.debug(

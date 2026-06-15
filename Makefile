@@ -6,20 +6,15 @@
        _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale \
        _start-pm2 _start-direct
 
-# ─── Runtime Detection ──────────────────────────────────────
-# 优先使用 bun（跳过编译、启动更快），fallback 到 npm + tsx + node
-HAS_BUN := $(shell command -v bun >/dev/null 2>&1 && echo 1 || echo 0)
+# ─── Runtime ────────────────────────────────────────────────
+# 本项目只用原生 Node 工具链运行（npm / npx / tsx / node），不使用 bun。
+# 原因：主服务的 WebSocket 走 `ws` 包 + @hono/node-server 的 `server.on('upgrade')`
+# 握手，该模式在 bun 的 HTTP server 下不触发，会导致 WS 全部握手失败（HTTP/接口正常，
+# 但前端实时流式卡片/通知全失效，飞书等 stdout 通道不受影响）。
 PORT    ?= $(or $(WEB_PORT),3000)
-
-ifeq ($(HAS_BUN),1)
-  PKG     := bun
-  RUN     := bun
-  RUNNER  := bun src/index.ts
-else
-  PKG     := npm
-  RUN     := npx
-  RUNNER  := npx tsx src/index.ts
-endif
+PKG     := npm
+RUN     := npx
+RUNNER  := npx tsx src/index.ts
 
 # ─── Development ─────────────────────────────────────────────
 
@@ -41,7 +36,7 @@ dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）；自
 	echo "🚀 使用 $(PKG) 启动..."; \
 	$(PKG) run dev:all
 
-dev-backend: ## 仅启动后端（bun 直接跑 TS，node 用 tsx）；自动暂停 pm2，退出后恢复
+dev-backend: ## 仅启动后端（tsx 直跑 TS）；自动暂停 pm2，退出后恢复
 	@$(PM2_GUARD); $(RUNNER)
 
 dev-web: ## 仅启动前端
@@ -87,17 +82,11 @@ _start-direct: ## (内部) 裸跑模式（无 pm2 或未注册）
 	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-docker-image
 	@$(MAKE) _check-sync
-ifeq ($(HAS_BUN),1)
-	@$(MAKE) _build-web-if-stale
-	@$(MAKE) _build-ar-if-stale
-	@echo "⚡ Bun 模式：直接运行 TypeScript，跳过后端编译"
-	bun src/index.ts
-else
 	@$(MAKE) _build-backend-if-stale
 	@$(MAKE) _build-web-if-stale
 	@$(MAKE) _build-ar-if-stale
+	@echo "🟢 Node 模式：运行编译后的 dist/index.js（本项目不使用 bun，WebSocket 需要 node）"
 	node dist/index.js
-endif
 
 # ─── Internal build checks ────────────────────────────────────
 
@@ -180,6 +169,7 @@ status: ## 查看服务运行状态
 
 typecheck: sync-types typecheck-backend typecheck-web typecheck-agent-runner ## 全量类型检查
 	@./scripts/check-stream-event-sync.sh
+	@./scripts/check-agent-runner-prompts.sh
 
 typecheck-backend:
 	$(RUN) tsc --noEmit
@@ -191,11 +181,7 @@ typecheck-agent-runner:
 	cd container/agent-runner && $(RUN) tsc --noEmit
 
 test: ## 运行单元测试
-ifeq ($(HAS_BUN),1)
-	bun vitest run
-else
 	$(RUN) vitest run
-endif
 
 format: ## 格式化代码
 	$(PKG) run format
@@ -205,8 +191,9 @@ format-check: ## 检查代码格式
 
 # ─── Docker Image ─────────────────────────────────────────────
 
-# Docker 镜像源文件：Dockerfile、entrypoint.sh、agent-runner 源码
-DOCKER_SRC := container/Dockerfile container/entrypoint.sh container/agent-runner/package.json $(wildcard container/agent-runner/src/*.ts) $(wildcard container/agent-runner/prompts/*)
+# Docker 镜像源文件：Dockerfile、entrypoint.sh、agent-runner 源码和运行时 prompts
+# prompts 用 find -type f 递归收集（含 channels/*.md），否则子目录文件改动不触发重建
+DOCKER_SRC := container/Dockerfile container/entrypoint.sh container/agent-runner/package.json $(wildcard container/agent-runner/src/*.ts) $(shell find container/agent-runner/prompts -type f 2>/dev/null)
 
 _ensure-docker-image: ## (内部) 检测 Docker 镜像是否需要构建/重建
 	@if command -v docker >/dev/null 2>&1; then \
@@ -237,10 +224,12 @@ sync-types: ## 同步 shared/ 下的类型定义到各子项目
 
 # ─── SDK ─────────────────────────────────────────────────────
 
-update-sdk: ## 更新 agent-runner 的 Claude Agent SDK 到最新版本
+update-sdk: ## 更新 agent-runner + 主服务的 Claude Agent SDK 到最新版本
 	cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build
-	@# npm/bun update 会将 "*" 回写为具体版本，还原它
+	$(PKG) update @anthropic-ai/claude-agent-sdk
+	@# npm update 会将 "*" 回写为具体版本，还原它（agent-runner + 主服务）
 	@sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json
+	@sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' package.json
 	@echo "SDK updated. Run 'make typecheck' to verify."
 
 update-codex-sdk: ## 更新宿主服务与 agent-runner 的 Codex SDK 到最新版本
@@ -251,16 +240,25 @@ update-codex-sdk: ## 更新宿主服务与 agent-runner 的 Codex SDK 到最新�
 	@sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' container/agent-runner/package.json
 	@echo "Codex SDK updated. Run 'make typecheck' to verify."
 
-ensure-latest-sdk: ## 启动前自动检测并更新 SDK（有新版才更新）
+ensure-latest-sdk: ## 启动前自动检测并更新 SDK（agent-runner + 主服务，有新版才更新）
 	@LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
+	ROOT_LOCAL=$$(node -p "require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
 	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
-		echo "🔄 Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
+		echo "🔄 [agent-runner] Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
 		(cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build); \
 		sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json; \
-		echo "✅ SDK 更新完成（内置 Claude Code 版本随之更新）"; \
+		echo "✅ [agent-runner] SDK 更新完成（内置 Claude Code 版本随之更新）"; \
 	else \
-		echo "✅ Claude Agent SDK 已是最新 ($$LOCAL)"; \
+		echo "✅ [agent-runner] Claude Agent SDK 已是最新 ($$LOCAL)"; \
+	fi; \
+	if [ "$$ROOT_LOCAL" != "$$LATEST" ]; then \
+		echo "🔄 [主服务] Claude Agent SDK 有新版本: $$ROOT_LOCAL → $$LATEST，正在更新..."; \
+		$(PKG) update @anthropic-ai/claude-agent-sdk; \
+		sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' package.json; \
+		echo "✅ [主服务] SDK 更新完成"; \
+	else \
+		echo "✅ [主服务] Claude Agent SDK 已是最新 ($$ROOT_LOCAL)"; \
 	fi
 
 ensure-latest-codex-sdk: ## 启动前自动检测并更新 Codex SDK（有新版才更新）
@@ -427,7 +425,7 @@ launchd-log: ## 查看 launchd 守护日志（最近 50 行）
 # ─── Help ────────────────────────────────────────────────────
 
 help: ## 显示帮助
-	@echo "检测到运行时: $(if $(filter 1,$(HAS_BUN)),⚡ Bun,🟢 Node.js)"
+	@echo "运行时: 🟢 Node.js（本项目不使用 bun）"
 	@echo ""
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 		awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'

@@ -31,9 +31,11 @@ export const CARD_ELEMENT_IDS = {
 
   // Rich streaming slots (Phase C)
   STATUS_BANNER: 'status_banner',
-  PROGRESS_PANEL: 'progress_panel',
-  PROGRESS_CONTENT: 'progress_md',
-  TOOLS_PANEL: 'tools_live',
+    PROGRESS_PANEL: 'progress_panel',
+    PROGRESS_CONTENT: 'progress_md',
+    TASK_PANEL: 'task_live',
+    TASK_CONTENT: 'task_live_md',
+    TOOLS_PANEL: 'tools_live',
   TOOLS_CONTENT: 'tools_live_md',
   THINKING_PANEL: 'thinking_live',
   THINKING_CONTENT: 'thinking_live_md',
@@ -63,6 +65,22 @@ const PANEL_PADDING = '6px 10px 6px 10px';
 const PANEL_ICON = {
   tag: 'standard_icon',
   token: 'down-small-ccm_outlined',
+} as const;
+
+/**
+ * Per-panel header tints. collapsible_panel header.background_color must be an
+ * ENUM colour token — the API rejects rgba()/rgb()/hex here with
+ * `code=11310 collapsible panel header background color is invalid`, which
+ * silently fails card.create and forces the whole streaming card to degrade
+ * from the L0 typewriter path down to L1 CardKit full-update on every reply.
+ * Use the light `-50` gradient tokens: near-white fills that keep the dark
+ * title legible while still differentiating the panels, and that the API
+ * actually accepts.
+ */
+const PANEL_TINT = {
+  thinking: 'blue-50', // light blue
+  tools: 'wathet-50', // light cyan/sky
+  ask: 'orange-50', // light amber
 } as const;
 
 type El = Record<string, unknown>;
@@ -114,21 +132,41 @@ export function extractTitle(text: string): TitleExtractResult {
       const title = raw.length > 40 ? raw.slice(0, 37) + '...' : raw;
       return { title, bodyStartIndex: i + 1 };
     }
-    break;
+    const firstLine = lines[i].replace(/[*_`#\[\]]/g, '').trim();
+    const title =
+      firstLine.length > 40
+        ? firstLine.slice(0, 37) + '...'
+        : firstLine || 'Reply';
+    return { title, bodyStartIndex: i + 1 };
   }
   // No explicit heading — use a fixed default title and keep the body intact.
   return { title: 'Agent 回复', bodyStartIndex: 0 };
 }
 
-export function stripTitleFromBody(text: string, bodyStartIndex: number): string {
-  if (bodyStartIndex <= 0) return text.trim();
-  return text.split('\n').slice(bodyStartIndex).join('\n').trim();
+/**
+ * Minimal status word shown as the header title when no explicit title is
+ * provided. Never derive the title from the body's first line — that was the
+ * root cause of the header/first-line duplication (issue #488). For terminal
+ * states we want a short, unambiguous status word instead.
+ */
+export function statusHeadline(status: AgentCardInput['status']): string {
+  switch (status) {
+    case 'running':
+      return '生成中';
+    case 'warning':
+      return '已中断';
+    case 'error':
+      return '出错';
+    case 'done':
+    default:
+      return '已完成';
+  }
 }
 
 export function buildHeader(input: AgentCardInput): El {
   const theme = resolveStatusTheme(input.status);
-  const { title: autoTitle } = extractTitle(input.text);
-  const baseTitle = input.title ?? autoTitle;
+  const explicitTitle = input.title?.trim();
+  const baseTitle = explicitTitle || statusHeadline(input.status);
   const displayTitle = input.titlePrefix
     ? `${input.titlePrefix}${baseTitle}`
     : baseTitle;
@@ -234,6 +272,7 @@ export function buildThinkingPanel(thinking: string | undefined): El[] {
       title: '**💭 思考过程**',
       expanded: false,
       elementId: CARD_ELEMENT_IDS.THINKING_PANEL_FINAL,
+      backgroundColor: PANEL_TINT.thinking,
       elements: [
         {
           tag: 'markdown',
@@ -366,6 +405,7 @@ export function buildToolsPanel(toolCalls: ToolCallStat[] | undefined): El[] {
       title: `**🛠 工具调用** ${totalBadge}`,
       expanded: false,
       elementId: CARD_ELEMENT_IDS.TOOLS_PANEL_FINAL,
+      backgroundColor: PANEL_TINT.tools,
       elements: [{ tag: 'markdown', content: lines.join('\n') }],
     }),
   ];
@@ -675,6 +715,7 @@ function truncate(text: string, limit: number): string {
 export interface StreamingPanelsInit {
   /** Initial markdown content for each slot — empty strings get placeholder text. */
   progressContent?: string;
+  taskContent?: string;
   toolsContent?: string;
   thinkingContent?: string;
   askContent?: string;
@@ -692,7 +733,7 @@ export interface StreamingPanelsInit {
  * Build the full runtime panel column for the streaming skeleton (ordered).
  *
  * Panel order aligns with the web StreamingDisplay component:
- *   ask (if any) → progress → tools → thinking → timeline
+ *   ask (if any) → progress → tasks → tools → thinking → timeline
  * Each panel's inner markdown has its own element_id so the controller can
  * patch it via cardElement.content() without touching the panel structure.
  * The live status/heartbeat line is rendered in FOOTER_NOTE instead of a top
@@ -731,6 +772,7 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       contentElementId: CARD_ELEMENT_IDS.ASK_CONTENT,
       title: askTitle,
       expanded: init.expandAsk ?? profile === 'claude',
+      backgroundColor: PANEL_TINT.ask,
       content:
         init.askContent ?? "<font color='grey'>暂无提问</font>",
     }),
@@ -742,10 +784,18 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       content: init.progressContent ?? progressPlaceholder,
     }),
     buildRuntimePanel({
+      elementId: CARD_ELEMENT_IDS.TASK_PANEL,
+      contentElementId: CARD_ELEMENT_IDS.TASK_CONTENT,
+      title: '**🤖 子 Agent / Task**',
+      expanded: init.expandProgress ?? false,
+      content: init.taskContent ?? '<font color=\'grey\'>暂无子任务…</font>',
+    }),
+    buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.TOOLS_PANEL,
       contentElementId: CARD_ELEMENT_IDS.TOOLS_CONTENT,
       title: toolsTitle,
       expanded: init.expandTools ?? false,
+      backgroundColor: PANEL_TINT.tools,
       content: init.toolsContent ?? toolsPlaceholder,
     }),
     buildRuntimePanel({
@@ -753,6 +803,7 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       contentElementId: CARD_ELEMENT_IDS.THINKING_CONTENT,
       title: thinkingTitle,
       expanded: init.expandThinking ?? false,
+      backgroundColor: PANEL_TINT.thinking,
       content: init.thinkingContent ?? thinkingPlaceholder,
     }),
     buildRuntimePanel({
@@ -772,11 +823,13 @@ export function buildRuntimePanel(opts: {
   title: string;
   expanded: boolean;
   content: string;
+  backgroundColor?: string;
 }): El {
   return collapsiblePanel({
     title: opts.title,
     expanded: opts.expanded,
     elementId: opts.elementId,
+    backgroundColor: opts.backgroundColor,
     elements: [
       {
         tag: 'markdown',
@@ -792,6 +845,15 @@ interface CollapsibleOpts {
   expanded: boolean;
   elements: El[];
   elementId?: string;
+  /**
+   * Header tint. Defaults to neutral grey. Semantic panels get a restrained
+   * accent (thinking→wathet, tools→turquoise, ask→orange) so the eye can tell
+   * them apart at a glance without the card turning into a colour soup — keep
+   * the palette to ≤3 accents plus grey.
+   */
+  backgroundColor?: string;
+  /** Header leading icon. Defaults to the shared fold chevron. */
+  icon?: El;
 }
 
 function collapsiblePanel(opts: CollapsibleOpts): El {
@@ -800,9 +862,9 @@ function collapsiblePanel(opts: CollapsibleOpts): El {
     expanded: opts.expanded,
     header: {
       title: { tag: 'markdown', content: opts.title },
-      background_color: 'grey',
+      background_color: opts.backgroundColor ?? 'grey',
       padding: PANEL_PADDING,
-      icon: PANEL_ICON,
+      icon: opts.icon ?? PANEL_ICON,
     },
     elements: opts.elements,
   };

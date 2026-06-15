@@ -298,6 +298,10 @@ describe('Codex provider config routes', () => {
       failedCount: 0,
     });
     expect(mocks.stopGroup).toHaveBeenCalledWith('web:test');
-    expect(mocks.deleteAllSessionsForFolder).toHaveBeenCalledWith('flow-test');
+    // Toggling enabled state must NOT wipe sessions: it does not change any
+    // protocol-level provider field, so sticky session→provider bindings stay
+    // intact (narrowed cleanup via deleteSessionsByProviderId, only triggered
+    // when those fields actually change — see issue #476).
+    expect(mocks.deleteAllSessionsForFolder).not.toHaveBeenCalled();
   });
 });
