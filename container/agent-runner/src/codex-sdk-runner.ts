@@ -20,6 +20,7 @@ import {
   buildCodexConfigObject,
   buildPrompt,
   CodexEventNormalizer,
+  resolveWorkspaceIpc,
   writeMcpContext,
   writeTempImages,
 } from './codex-cli-runner.js';
@@ -32,10 +33,7 @@ function isResumeFailure(error: unknown): boolean {
   );
 }
 
-function buildCodexInput(
-  prompt: string,
-  imageFiles: string[],
-): CodexInput {
+function buildCodexInput(prompt: string, imageFiles: string[]): CodexInput {
   if (imageFiles.length === 0) return prompt;
   return [
     { type: 'text', text: prompt },
@@ -83,176 +81,181 @@ export function createCodexSdkAdapter(
       input: RuntimeRunInput,
       emit: RuntimeEmit,
     ): Promise<RuntimeRunResult> {
-    const startedAt = Date.now();
-    const workspaceIpc = process.env.HAPPYCLAW_WORKSPACE_IPC || '/tmp';
-    const imageFiles = writeTempImages(input.images, workspaceIpc);
-    const mcpContextPath = writeMcpContext(input);
-    const model = input.model || input.input.selectedModel || undefined;
-    const prompt = buildPrompt(input);
-    const env: Record<string, string> = {};
-    for (const [key, value] of Object.entries(process.env)) {
-      if (typeof value === 'string') env[key] = value;
-    }
+      const startedAt = Date.now();
+      const workspaceIpc = resolveWorkspaceIpc();
+      const imageFiles = writeTempImages(input.images, workspaceIpc);
+      const mcpContextPath = writeMcpContext(input);
+      const model = input.model || input.input.selectedModel || undefined;
+      const prompt = buildPrompt(input);
+      const env: Record<string, string> = {};
+      for (const [key, value] of Object.entries(process.env)) {
+        if (typeof value === 'string') env[key] = value;
+      }
 
-    const codexPathOverride = configuredCodexPathOverride();
-    const permissionOptions = resolveCodexPermissionOptions({
-      privacyMode: !!input.input.privacyMode,
-    });
-    const codex = new CodexClient({
-      ...(codexPathOverride ? { codexPathOverride } : {}),
-      env,
-      config: buildCodexConfigObject(
-        mcpContextPath,
-        input.cwd,
-      ) as CodexOptions['config'],
-    });
-    const threadOptions = {
-      workingDirectory: input.cwd,
-      ...(input.additionalDirectories?.length
-        ? { additionalDirectories: input.additionalDirectories }
-        : {}),
-      skipGitRepoCheck: true,
-      sandboxMode: permissionOptions.sandboxMode,
-      approvalPolicy: permissionOptions.approvalPolicy,
-      modelReasoningEffort: 'xhigh',
-      ...(model ? { model } : {}),
-    };
-    const thread = input.sessionId
-      ? codex.resumeThread(input.sessionId, threadOptions)
-      : codex.startThread(threadOptions);
+      const codexPathOverride = configuredCodexPathOverride();
+      const permissionOptions = resolveCodexPermissionOptions({
+        privacyMode: !!input.input.privacyMode,
+      });
+      const codex = new CodexClient({
+        ...(codexPathOverride ? { codexPathOverride } : {}),
+        env,
+        config: buildCodexConfigObject(
+          mcpContextPath,
+          input.cwd,
+        ) as CodexOptions['config'],
+      });
+      const threadOptions = {
+        workingDirectory: input.cwd,
+        ...(input.additionalDirectories?.length
+          ? { additionalDirectories: input.additionalDirectories }
+          : {}),
+        skipGitRepoCheck: true,
+        sandboxMode: permissionOptions.sandboxMode,
+        approvalPolicy: permissionOptions.approvalPolicy,
+        modelReasoningEffort: 'xhigh',
+        ...(model ? { model } : {}),
+      };
+      const thread = input.sessionId
+        ? codex.resumeThread(input.sessionId, threadOptions)
+        : codex.startThread(threadOptions);
 
-    emit({
-      status: 'stream',
-      result: null,
-      streamEvent: {
-        eventType: 'status',
-        statusText: 'Codex SDK 正在处理...',
-      },
-    });
+      emit({
+        status: 'stream',
+        result: null,
+        streamEvent: {
+          eventType: 'status',
+          statusText: 'Codex SDK 正在处理...',
+        },
+      });
 
-    let newSessionId: string | undefined = input.sessionId;
-    let emittedAgentMessageText = false;
-    let emittedUsage = false;
-    let lastAgentMessageText = '';
-    let turnFailureMessage: string | null = null;
-    const normalizer = new CodexEventNormalizer(emit, startedAt);
+      let newSessionId: string | undefined = input.sessionId;
+      let emittedAgentMessageText = false;
+      let emittedUsage = false;
+      let lastAgentMessageText = '';
+      let turnFailureMessage: string | null = null;
+      const normalizer = new CodexEventNormalizer(emit, startedAt);
 
-    try {
-      const { events } = await thread.runStreamed(
-        buildCodexInput(prompt, imageFiles),
-        { signal: input.signal },
-      );
-      for await (const event of events) {
-        const eventRecord = event as Record<string, unknown>;
-        if (eventRecord.type === 'thread.started') {
-          const threadId = eventRecord.thread_id;
-          if (typeof threadId === 'string' && threadId.trim()) {
-            newSessionId = threadId;
+      try {
+        const { events } = await thread.runStreamed(
+          buildCodexInput(prompt, imageFiles),
+          { signal: input.signal },
+        );
+        for await (const event of events) {
+          const eventRecord = event as Record<string, unknown>;
+          if (eventRecord.type === 'thread.started') {
+            const threadId = eventRecord.thread_id;
+            if (typeof threadId === 'string' && threadId.trim()) {
+              newSessionId = threadId;
+            }
+          } else if (thread.id) {
+            newSessionId = thread.id;
           }
-        } else if (thread.id) {
-          newSessionId = thread.id;
+          const normalized = normalizer.handle(eventRecord);
+          if (
+            eventRecord.type === 'turn.failed' ||
+            eventRecord.type === 'error'
+          ) {
+            const error = eventRecord.error as
+              | Record<string, unknown>
+              | undefined;
+            turnFailureMessage = String(
+              error?.message || eventRecord.message || 'Codex turn failed',
+            );
+          }
+          if (normalized.agentText) {
+            emittedAgentMessageText = true;
+            lastAgentMessageText = normalized.agentText;
+          }
+          if (normalized.usage) emittedUsage = true;
         }
-        const normalized = normalizer.handle(eventRecord);
-        if (eventRecord.type === 'turn.failed' || eventRecord.type === 'error') {
-          const error = eventRecord.error as Record<string, unknown> | undefined;
-          turnFailureMessage = String(
-            error?.message || eventRecord.message || 'Codex turn failed',
-          );
-        }
-        if (normalized.agentText) {
-          emittedAgentMessageText = true;
-          lastAgentMessageText = normalized.agentText;
-        }
-        if (normalized.usage) emittedUsage = true;
-      }
 
-      const result = lastAgentMessageText;
-      if (result && !emittedAgentMessageText) {
-        emit({
-          status: 'stream',
-          result: null,
-          streamEvent: {
-            eventType: 'text_delta',
-            text: result,
-          },
-        });
-      }
-      if (!emittedUsage) {
-        emit({
-          status: 'stream',
-          result: null,
-          streamEvent: {
-            eventType: 'usage',
-            usage: {
-              inputTokens: 0,
-              outputTokens: 0,
-              cacheReadInputTokens: 0,
-              cacheCreationInputTokens: 0,
-              costUSD: 0,
-              durationMs: Date.now() - startedAt,
-              numTurns: 1,
+        const result = lastAgentMessageText;
+        if (result && !emittedAgentMessageText) {
+          emit({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'text_delta',
+              text: result,
             },
-          },
-        });
-      }
-      if (turnFailureMessage) {
+          });
+        }
+        if (!emittedUsage) {
+          emit({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'usage',
+              usage: {
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheReadInputTokens: 0,
+                cacheCreationInputTokens: 0,
+                costUSD: 0,
+                durationMs: Date.now() - startedAt,
+                numTurns: 1,
+              },
+            },
+          });
+        }
+        if (turnFailureMessage) {
+          return {
+            status: 'error',
+            result: null,
+            error: `Codex SDK 执行失败：${turnFailureMessage}`,
+            errorClass: classifyRuntimeError(turnFailureMessage),
+            newSessionId: newSessionId || thread.id || undefined,
+          };
+        }
+
+        return {
+          status: 'success',
+          result,
+          newSessionId: newSessionId || thread.id || undefined,
+        };
+      } catch (error) {
+        if (input.sessionId && isResumeFailure(error)) {
+          emit({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'status',
+              statusText: 'Codex SDK resume 失败，正在用新会话重试...',
+            },
+          });
+          const retryInput = buildResumeFailureRetryInput(
+            input,
+            'codex_sdk_resume_failed',
+          );
+          const retryResult = await adapter.run(retryInput, emit);
+          return {
+            ...retryResult,
+            runtimeContext:
+              retryResult.runtimeContext ||
+              runtimeContextMetaFromRunInput(retryInput),
+          };
+        }
+
+        const errorClass = classifyRuntimeError(error);
+        if (errorClass === 'cancelled') {
+          return {
+            status: 'closed',
+            result: null,
+            error: runtimeErrorMessage(error),
+            errorClass,
+            newSessionId: newSessionId || thread.id || undefined,
+          };
+        }
+        const message = runtimeErrorMessage(error);
         return {
           status: 'error',
           result: null,
-          error: `Codex SDK 执行失败：${turnFailureMessage}`,
-          errorClass: classifyRuntimeError(turnFailureMessage),
-          newSessionId: newSessionId || thread.id || undefined,
-        };
-      }
-
-      return {
-        status: 'success',
-        result,
-        newSessionId: newSessionId || thread.id || undefined,
-      };
-    } catch (error) {
-      if (input.sessionId && isResumeFailure(error)) {
-        emit({
-          status: 'stream',
-          result: null,
-          streamEvent: {
-            eventType: 'status',
-            statusText: 'Codex SDK resume 失败，正在用新会话重试...',
-          },
-        });
-        const retryInput = buildResumeFailureRetryInput(
-          input,
-          'codex_sdk_resume_failed',
-        );
-        const retryResult = await adapter.run(retryInput, emit);
-        return {
-          ...retryResult,
-          runtimeContext:
-            retryResult.runtimeContext ||
-            runtimeContextMetaFromRunInput(retryInput),
-        };
-      }
-
-      const errorClass = classifyRuntimeError(error);
-      if (errorClass === 'cancelled') {
-        return {
-          status: 'closed',
-          result: null,
-          error: runtimeErrorMessage(error),
+          error: `Codex SDK 执行失败：${message}`,
           errorClass,
           newSessionId: newSessionId || thread.id || undefined,
         };
       }
-      const message = runtimeErrorMessage(error);
-      return {
-        status: 'error',
-        result: null,
-        error: `Codex SDK 执行失败：${message}`,
-        errorClass,
-        newSessionId: newSessionId || thread.id || undefined,
-      };
-    }
-  },
+    },
   };
   return adapter;
 }

@@ -181,6 +181,8 @@ import {
   AgentStatus,
   FeishuMessageMeta,
   MessageCursor,
+  MessageFinalizationReason,
+  MessageSourceKind,
   NewMessage,
   RegisteredGroup,
   StreamEvent,
@@ -507,6 +509,7 @@ class IpcWatcherManager {
   >();
   private debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private processingFolders = new Set<string>();
+  private processingPromises = new Map<string, Promise<void>>();
   private pendingReprocess = new Set<string>();
   private fallbackTimer: ReturnType<typeof setInterval> | null = null;
   private processGroupFn: ((folder: string) => Promise<void>) | null = null;
@@ -589,12 +592,14 @@ class IpcWatcherManager {
           return;
         }
         this.processingFolders.add(folder);
-        this.processGroupFn?.(folder)
-          .catch((err) => {
+        const promise = (async () => {
+          try {
+            await this.processGroupFn?.(folder);
+          } catch (err) {
             logger.error({ err, folder }, 'Error processing IPC for group');
-          })
-          .finally(() => {
+          } finally {
             this.processingFolders.delete(folder);
+            this.processingPromises.delete(folder);
             // Files may have arrived during processing — run once more
             if (
               this.pendingReprocess.delete(folder) &&
@@ -602,7 +607,9 @@ class IpcWatcherManager {
             ) {
               this.debouncedProcess(folder);
             }
-          });
+          }
+        })();
+        this.processingPromises.set(folder, promise);
       }, 100),
     );
   }
@@ -610,6 +617,34 @@ class IpcWatcherManager {
   /** Trigger processing for a folder through the concurrency guard. */
   triggerProcess(folder: string): void {
     this.debouncedProcess(folder);
+  }
+
+  /** Process a folder immediately, used before unwatching to flush final IPC writes. */
+  async processNow(folder: string): Promise<void> {
+    while (true) {
+      const timer = this.debounceTimers.get(folder);
+      if (timer) {
+        clearTimeout(timer);
+        this.debounceTimers.delete(folder);
+      }
+      const current = this.processingPromises.get(folder);
+      if (!current) break;
+      this.pendingReprocess.add(folder);
+      await current.catch(() => {});
+    }
+
+    this.processingFolders.add(folder);
+    const promise = this.processGroupFn?.(folder) ?? Promise.resolve();
+    this.processingPromises.set(folder, promise);
+    try {
+      await promise;
+    } finally {
+      this.processingFolders.delete(folder);
+      this.processingPromises.delete(folder);
+      if (this.pendingReprocess.delete(folder)) {
+        await this.processNow(folder);
+      }
+    }
   }
 
   /** Start fallback polling (every 5s) as safety net for inotify failures. */
@@ -2446,8 +2481,8 @@ interface SendMessageOptions {
     turnId?: string;
     sessionId?: string;
     sdkMessageUuid?: string;
-    sourceKind?: ContainerOutput['sourceKind'];
-    finalizationReason?: ContainerOutput['finalizationReason'];
+    sourceKind?: Exclude<MessageSourceKind, 'user_command'>;
+    finalizationReason?: MessageFinalizationReason;
   };
 }
 
@@ -4188,7 +4223,49 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     deleteRouterState(`oom_exits:${effectiveGroup.folder}`);
   }
 
-  // Final fallback for silent-success paths (no visible reply).
+  // Silent success: the runtime exited cleanly but produced no visible reply.
+  // This happens for tool-only turns such as image generation when the asset is
+  // saved by the runtime but no text/path is returned through the SDK stream.
+  if (!sentReply) {
+    const fallbackText = buildSilentSuccessFallbackReply();
+    logger.warn(
+      { group: group.name, chatJid, status: output.status },
+      'Agent completed without visible reply; sending fallback message',
+    );
+
+    const fallbackMsgId = await sendMessage(chatJid, fallbackText, {
+      sendToIM: directImReply && replySourceImJid === chatJid,
+      messageMeta: {
+        turnId: lastProcessed.id,
+        sessionId: activeSessionId,
+        sourceKind: 'silent_success_fallback',
+        finalizationReason: 'no_visible_reply',
+      },
+    });
+
+    if (replySourceImJid && replySourceImJid !== chatJid) {
+      const imSent = await sendImWithRetry(replySourceImJid, fallbackText, []);
+      logger.info(
+        { chatJid, replySourceImJid, imSent },
+        'Silent-success fallback IM delivery completed',
+      );
+    }
+
+    if (!fallbackMsgId) {
+      logger.warn(
+        { group: group.name, chatJid },
+        'Failed to persist silent-success fallback, keeping cursor for retry',
+      );
+      return false;
+    }
+
+    sentReply = true;
+    lastReplyMsgId = fallbackMsgId;
+    await flushPendingUsageForReply(lastReplyMsgId);
+    commitCursor();
+    return true;
+  }
+
   commitCursor();
 
   return true;
@@ -4590,6 +4667,14 @@ async function runAgent(
     logger.error({ group: group.name, err }, 'Agent error');
     return { status: 'error', error: errorMsg };
   } finally {
+    try {
+      await ipcWatcherManager?.processNow(group.folder);
+    } catch (err) {
+      logger.warn(
+        { folder: group.folder, err },
+        'Failed to flush IPC before unwatching group',
+      );
+    }
     ipcWatcherManager?.unwatchGroup(group.folder);
   }
 }
@@ -4686,6 +4771,13 @@ export function buildOverflowPartialReply(partialText: string): string {
   return trimmed
     ? `${trimmed}\n\n---\n*⚠️ 上下文压缩中，稍后自动继续*`
     : '*⚠️ 上下文压缩中，稍后自动继续*';
+}
+
+export function buildSilentSuccessFallbackReply(): string {
+  return [
+    '这次执行已经结束，但没有产生可发送的回复。',
+    '如果刚才是在生成图片或文件，结果可能已经保存到运行环境里，但没有被自动返回到当前会话。请重新发送需求，或稍后再试一次。',
+  ].join('\n');
 }
 
 /**
@@ -5179,8 +5271,9 @@ function startIpcWatcher(): void {
                     chatJid: data.chatJid,
                     sourceGroup,
                   });
+                  let imDelivered: boolean | null = null;
                   if (imgImRoute) {
-                    const sent = await retryImOperation(
+                    imDelivered = await retryImOperation(
                       'send_image',
                       imgImRoute,
                       () =>
@@ -5192,7 +5285,7 @@ function startIpcWatcher(): void {
                           fileName,
                         ),
                     );
-                    if (!sent) {
+                    if (!imDelivered) {
                       const failMsg = `⚠️ 图片 "${fileName || caption || 'image'}" 发送失败（IM 通道发送失败），请稍后重试。`;
                       broadcastToWebClients(sourceGroup, failMsg);
                     }
@@ -5288,16 +5381,23 @@ function startIpcWatcher(): void {
                     );
                   }
 
-                  logger.info(
-                    {
-                      chatJid: imgChatJid,
-                      sourceGroup,
-                      mimeType,
-                      size: imageBuffer.length,
-                      agentId: ipcAgentId,
-                    },
-                    'IPC image sent',
-                  );
+                  const imageLogContext = {
+                    chatJid: imgChatJid,
+                    sourceGroup,
+                    mimeType,
+                    size: imageBuffer.length,
+                    agentId: ipcAgentId,
+                    imRoute: imgImRoute,
+                    imDelivered,
+                  };
+                  if (imDelivered === false) {
+                    logger.warn(
+                      imageLogContext,
+                      'IPC image processed but IM delivery failed',
+                    );
+                  } else {
+                    logger.info(imageLogContext, 'IPC image sent');
+                  }
                 } catch (err) {
                   logger.error(
                     { chatJid: data.chatJid, sourceGroup, err },
@@ -7139,6 +7239,14 @@ async function processAgentConversation(
     );
 
     activeImReplyRoutes.delete(virtualChatJid);
+    try {
+      await ipcWatcherManager?.processNow(effectiveGroup.folder);
+    } catch (err) {
+      logger.warn(
+        { folder: effectiveGroup.folder, agentId, err },
+        'Failed to flush agent IPC before unwatching group',
+      );
+    }
     ipcWatcherManager?.unwatchGroup(effectiveGroup.folder);
   }
 }

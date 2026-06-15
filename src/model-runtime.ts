@@ -88,6 +88,17 @@ function activeBindingFromState(state: ConversationRuntimeState): ModelBinding {
   };
 }
 
+// claude-opus-4-* 和 claude-sonnet-4-* 全系列支持 1M extended context，
+// 需要 [1m] 后缀让 Claude Code CLI 启用 extended-context beta。
+const SUPPORTS_1M_CONTEXT = /^claude-(opus|sonnet)-4-/;
+
+function ensureExtendedContext(model: string): string {
+  if (/\[\d+m\]/i.test(model)) return model; // 已有后缀
+  const normalized = model.replace(/\[\d+m\]/gi, '');
+  if (SUPPORTS_1M_CONTEXT.test(normalized)) return model + '[1m]';
+  return model;
+}
+
 function modelOverrideForRunner(binding: ModelBinding): string | null {
   if (
     binding.model_kind === 'provider_default' ||
@@ -95,7 +106,9 @@ function modelOverrideForRunner(binding: ModelBinding): string | null {
   ) {
     return null;
   }
-  return binding.resolved_model || binding.selected_model || null;
+  const model = binding.resolved_model || binding.selected_model || null;
+  if (!model) return null;
+  return ensureExtendedContext(model);
 }
 
 function validateAvailability(

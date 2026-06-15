@@ -19,6 +19,7 @@ import { resolveCodexPermissionOptions } from './runtime-permissions.js';
 
 const CODEX_APP_CLI = '/Applications/Codex.app/Contents/Resources/codex';
 const DIST_DIR = path.dirname(fileURLToPath(import.meta.url));
+const CONTAINER_WORKSPACE_IPC = '/workspace/ipc';
 
 export function findCodexCli(): string {
   const configured =
@@ -26,6 +27,16 @@ export function findCodexCli(): string {
   if (configured) return configured;
   if (fs.existsSync(CODEX_APP_CLI)) return CODEX_APP_CLI;
   return 'codex';
+}
+
+export function resolveWorkspaceIpc(
+  configured = process.env.HAPPYCLAW_WORKSPACE_IPC,
+  exists: (filePath: string) => boolean = fs.existsSync,
+): string {
+  const trimmed = configured?.trim();
+  if (trimmed) return trimmed;
+  if (exists(CONTAINER_WORKSPACE_IPC)) return CONTAINER_WORKSPACE_IPC;
+  return '/tmp';
 }
 
 export function writeTempImages(
@@ -36,22 +47,28 @@ export function writeTempImages(
   const dir = path.join(workspaceIpc, 'codex-images');
   fs.mkdirSync(dir, { recursive: true });
   return images.map((img, idx) => {
-    const ext =
-      img.mimeType?.includes('png')
-        ? 'png'
-        : img.mimeType?.includes('webp')
-          ? 'webp'
-          : img.mimeType?.includes('gif')
-            ? 'gif'
-            : 'jpg';
+    const ext = img.mimeType?.includes('png')
+      ? 'png'
+      : img.mimeType?.includes('webp')
+        ? 'webp'
+        : img.mimeType?.includes('gif')
+          ? 'gif'
+          : 'jpg';
     const filePath = path.join(dir, `${Date.now()}-${idx}.${ext}`);
     fs.writeFileSync(filePath, Buffer.from(img.data, 'base64'));
     return filePath;
   });
 }
 
-function parseSessionIdFromEvent(event: Record<string, unknown>): string | null {
-  for (const key of ['session_id', 'sessionId', 'conversation_id', 'thread_id']) {
+function parseSessionIdFromEvent(
+  event: Record<string, unknown>,
+): string | null {
+  for (const key of [
+    'session_id',
+    'sessionId',
+    'conversation_id',
+    'thread_id',
+  ]) {
     const value = event[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
@@ -75,7 +92,7 @@ export function buildPrompt(input: RuntimeRunInput): string {
 }
 
 export function writeMcpContext(input: RuntimeRunInput): string {
-  const workspaceIpc = process.env.HAPPYCLAW_WORKSPACE_IPC || '/tmp';
+  const workspaceIpc = resolveWorkspaceIpc();
   const filePath = path.join(
     workspaceIpc,
     `happyclaw-mcp-context-${Date.now()}-${Math.random()
@@ -92,8 +109,10 @@ export function writeMcpContext(input: RuntimeRunInput): string {
     privacyMode: !!input.input.privacyMode,
     workspaceIpc,
     workspaceGroup: process.env.HAPPYCLAW_WORKSPACE_GROUP || input.cwd,
-    workspaceGlobal: process.env.HAPPYCLAW_WORKSPACE_GLOBAL || '/workspace/global',
-    workspaceMemory: process.env.HAPPYCLAW_WORKSPACE_MEMORY || '/workspace/memory',
+    workspaceGlobal:
+      process.env.HAPPYCLAW_WORKSPACE_GLOBAL || '/workspace/global',
+    workspaceMemory:
+      process.env.HAPPYCLAW_WORKSPACE_MEMORY || '/workspace/memory',
     disableMemoryLayer: process.env.HAPPYCLAW_DISABLE_MEMORY_LAYER === 'true',
     resumeMode: input.resumeMode ?? null,
     inputContextHash: input.inputContextHash ?? null,
@@ -322,7 +341,8 @@ function emitCodexItemEvent(
   state?: CodexEventNormalizerState,
 ): string | null {
   const itemType = String(item.type || '');
-  const id = typeof item.id === 'string' ? item.id : `${itemType}-${Date.now()}`;
+  const id =
+    typeof item.id === 'string' ? item.id : `${itemType}-${Date.now()}`;
 
   if (itemType === 'agent_message') {
     if (lifecycle !== 'completed' && lifecycle !== 'updated') return null;
@@ -486,7 +506,10 @@ export class CodexEventNormalizer {
     private readonly startedAt: number,
   ) {}
 
-  handle(event: Record<string, unknown>): { agentText?: string; usage?: boolean } {
+  handle(event: Record<string, unknown>): {
+    agentText?: string;
+    usage?: boolean;
+  } {
     return emitCodexEvent(event, this.emit, this.startedAt, this.state);
   }
 }
@@ -526,7 +549,9 @@ export function emitCodexEvent(
       result: null,
       streamEvent: {
         eventType: 'status',
-        statusText: String(error?.message || event.message || 'Codex 返回错误事件'),
+        statusText: String(
+          error?.message || event.message || 'Codex 返回错误事件',
+        ),
       },
     });
     return {};
@@ -558,16 +583,17 @@ export const codexCliAdapter: AgentRuntimeAdapter = {
     return !!sessionId?.trim();
   },
   classifyError: classifyRuntimeError,
-  async run(input: RuntimeRunInput, emit: RuntimeEmit): Promise<RuntimeRunResult> {
+  async run(
+    input: RuntimeRunInput,
+    emit: RuntimeEmit,
+  ): Promise<RuntimeRunResult> {
     const cli = findCodexCli();
+    const workspaceIpc = resolveWorkspaceIpc();
     const outputFile = path.join(
-      process.env.HAPPYCLAW_WORKSPACE_IPC || '/tmp',
+      workspaceIpc,
       `codex-last-message-${Date.now()}.md`,
     );
-    const imageFiles = writeTempImages(
-      input.images,
-      process.env.HAPPYCLAW_WORKSPACE_IPC || '/tmp',
-    );
+    const imageFiles = writeTempImages(input.images, workspaceIpc);
     const mcpContextPath = writeMcpContext(input);
     const model = input.model || input.input.selectedModel || undefined;
     const permissionOptions = resolveCodexPermissionOptions({
@@ -741,7 +767,8 @@ export const codexCliAdapter: AgentRuntimeAdapter = {
             });
             return;
           }
-          const errorText = stderr || rawStdout.join('').trim() || 'Codex CLI failed';
+          const errorText =
+            stderr || rawStdout.join('').trim() || 'Codex CLI failed';
           resolveOnce({
             status: 'error',
             result: errorText,

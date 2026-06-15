@@ -201,6 +201,13 @@ const CHANNEL_GUIDELINES: Record<string, string> = {
     '用户同时可以在 Web 端查看你的回复，Web 端支持完整 Markdown + Mermaid 图表渲染，因此**不要因为来源是 Telegram 就限制输出格式**。',
     '可使用 `send_image` 和 `send_file` 工具直接发送文件到 Telegram。',
   ].join('\n'),
+  wechat: [
+    '## 微信消息格式',
+    '',
+    '当前消息来自微信。Markdown 会转换为纯文本，长消息自动分片。',
+    '用户同时可以在 Web 端查看你的回复，Web 端支持完整 Markdown + Mermaid 图表渲染，因此**不要因为来源是微信就限制输出格式**。',
+    '可使用 `send_image` 和 `send_file` 工具直接发送文件到微信。用户要求“直接发图片”时，应优先使用 `send_image`，不要只发送 Markdown 图片链接。',
+  ].join('\n'),
   qq: [
     '## QQ 消息格式',
     '',
@@ -2406,11 +2413,11 @@ async function main(): Promise<void> {
         if (consecutiveCompactions <= MAX_CONSECUTIVE_COMPACTIONS) {
           log(`Auto-continuing after compaction (${consecutiveCompactions}/${MAX_CONSECUTIVE_COMPACTIONS})`);
           const autoContinuePrompt = [
-            '继续。',
-            '注意：刚刚发生了上下文压缩，系统已自动执行了记忆刷新和 CLAUDE.md 更新（这些是内部维护操作）。',
-            '请**只关注与用户的实际对话**，从压缩前的最后一个对话话题自然衔接。',
-            '如果压缩前你正在进行方案设计、讨论或等待用户确认，请简要回顾当前状态和待确认事项。',
-            '如果压缩前已经在执行中，则继续执行。',
+            '[系统] 上下文已压缩，系统已自动执行记忆刷新和 CLAUDE.md 更新（内部维护操作）。',
+            '请只关注与用户的实际对话，从压缩前的最后一个对话话题自然衔接。',
+            '如果压缩前你在等待用户回应（提问、提议、方案待确认），**不要替用户回答，不要自行决定执行**，简要回顾当前状态和待确认事项即可。',
+            '如果压缩前你正在执行工具调用或代码生成等具体操作，继续完成该操作。',
+            '如果压缩前你正在进行方案设计或讨论，简要回顾当前进度。',
             '**重要**：不要提及、确认或重复任何系统维护相关的内容（如 "OK"、"已更新 CLAUDE.md"、"记忆已刷新" 等），',
             '这些内部状态对用户不可见。如果你的回复中确实包含此类内容，请用 <internal>...</internal> 标签包裹。',
           ].join('');

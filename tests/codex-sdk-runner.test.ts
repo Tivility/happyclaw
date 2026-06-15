@@ -14,6 +14,7 @@ const sdkMock = {
 };
 
 import { createCodexSdkAdapter } from '../container/agent-runner/src/codex-sdk-runner.js';
+import { resolveWorkspaceIpc } from '../container/agent-runner/src/codex-cli-runner.js';
 import type { ContainerOutput } from '../container/agent-runner/src/types.js';
 
 class MockThread {
@@ -130,15 +131,26 @@ afterEach(() => {
   else process.env.HAPPYCLAW_CODEX_CLI_PATH = previousCli;
   if (previousGroup === undefined) delete process.env.HAPPYCLAW_WORKSPACE_GROUP;
   else process.env.HAPPYCLAW_WORKSPACE_GROUP = previousGroup;
-  if (previousGlobal === undefined) delete process.env.HAPPYCLAW_WORKSPACE_GLOBAL;
+  if (previousGlobal === undefined)
+    delete process.env.HAPPYCLAW_WORKSPACE_GLOBAL;
   else process.env.HAPPYCLAW_WORKSPACE_GLOBAL = previousGlobal;
-  if (previousMemory === undefined) delete process.env.HAPPYCLAW_WORKSPACE_MEMORY;
+  if (previousMemory === undefined)
+    delete process.env.HAPPYCLAW_WORKSPACE_MEMORY;
   else process.env.HAPPYCLAW_WORKSPACE_MEMORY = previousMemory;
-  if (previousUserMcp === undefined) delete process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON;
+  if (previousUserMcp === undefined)
+    delete process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON;
   else process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON = previousUserMcp;
 });
 
 describe('Codex SDK runner', () => {
+  it('resolves the Docker IPC mount for Codex MCP context when env is absent', () => {
+    expect(
+      resolveWorkspaceIpc('', (filePath) => filePath === '/workspace/ipc'),
+    ).toBe('/workspace/ipc');
+    expect(resolveWorkspaceIpc('', () => false)).toBe('/tmp');
+    expect(resolveWorkspaceIpc('/custom/ipc', () => true)).toBe('/custom/ipc');
+  });
+
   it('runs through @openai/codex-sdk with project docs and MCP config', async () => {
     const codexSdkAdapter = createCodexSdkAdapter(MockCodex);
     const outputs: ContainerOutput[] = [];
@@ -182,12 +194,12 @@ describe('Codex SDK runner', () => {
         },
       },
     });
-    expect(outputs.some((output) => output.streamEvent?.eventType === 'text_delta')).toBe(
-      true,
-    );
-    expect(outputs.some((output) => output.streamEvent?.eventType === 'usage')).toBe(
-      true,
-    );
+    expect(
+      outputs.some((output) => output.streamEvent?.eventType === 'text_delta'),
+    ).toBe(true);
+    expect(
+      outputs.some((output) => output.streamEvent?.eventType === 'usage'),
+    ).toBe(true);
   });
 
   it('falls back to a fresh SDK thread when SDK resume fails', async () => {
@@ -204,9 +216,10 @@ describe('Codex SDK runner', () => {
     expect(sdkMock.resumed[0].id).toBe('old-thread');
     expect(sdkMock.started).toHaveLength(1);
     expect(
-      outputs.some((output) =>
-        output.streamEvent?.eventType === 'status' &&
-        output.streamEvent.statusText?.includes('resume 失败'),
+      outputs.some(
+        (output) =>
+          output.streamEvent?.eventType === 'status' &&
+          output.streamEvent.statusText?.includes('resume 失败'),
       ),
     ).toBe(true);
   });
@@ -234,9 +247,15 @@ describe('Codex SDK runner', () => {
       softInjectionReason: 'native_resume_failed',
     });
     expect(sdkMock.inputs).toHaveLength(2);
-    expect(String(sdkMock.inputs[0])).toContain('resume prompt without recent history');
-    expect(String(sdkMock.inputs[1])).toContain('<recent-messages>old context</recent-messages>');
-    expect(String(sdkMock.inputs[1])).not.toContain('resume prompt without recent history');
+    expect(String(sdkMock.inputs[0])).toContain(
+      'resume prompt without recent history',
+    );
+    expect(String(sdkMock.inputs[1])).toContain(
+      '<recent-messages>old context</recent-messages>',
+    );
+    expect(String(sdkMock.inputs[1])).not.toContain(
+      'resume prompt without recent history',
+    );
   });
 
   it('preserves the host-mode Codex context contract', async () => {
@@ -309,8 +328,7 @@ describe('Codex SDK runner', () => {
       command: 'node',
       args: ['workspace-tool.js'],
     });
-    const happyclawArgs =
-      constructed.config.mcp_servers?.happyclaw?.args ?? [];
+    const happyclawArgs = constructed.config.mcp_servers?.happyclaw?.args ?? [];
     const contextPath = happyclawArgs[happyclawArgs.length - 1];
     expect(contextPath).toBeTruthy();
     const context = JSON.parse(fs.readFileSync(contextPath, 'utf-8'));

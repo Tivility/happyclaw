@@ -250,6 +250,7 @@ export type MessageSourceKind =
   | 'compact_partial'
   | 'user_command'
   | 'scheduled_task_prompt'
+  | 'silent_success_fallback'
   | 'legacy'
   | 'auto_continue';
 
@@ -257,6 +258,7 @@ export type MessageFinalizationReason =
   | 'completed'
   | 'interrupted'
   | 'error'
+  | 'no_visible_reply'
   | 'shutdown'
   | 'crash_recovery';
 
