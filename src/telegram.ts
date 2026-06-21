@@ -1021,6 +1021,7 @@ export function createTelegramConnection(
           telegramApiAgent.destroy();
         }
       }
+      processingLock.dispose();
     },
 
     async sendMessage(

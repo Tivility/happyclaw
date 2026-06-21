@@ -122,11 +122,18 @@ function readRecentLogs(folder: string, maxLines = 50): string {
   }
 }
 
-/** Mask environment variable values in log text */
-function sanitizeLogs(text: string): string {
+/**
+ * Mask environment variable values, credentials, and absolute paths in log text
+ * before it is embedded in a bug report. Exported for unit testing — this is a
+ * security boundary and must keep a regression safety net.
+ */
+export function sanitizeLogs(text: string): string {
   let result = text;
 
-  // Replace absolute paths to project root and home directory with placeholders
+  // Replace absolute paths to project root and home directory with placeholders.
+  // Done BEFORE the per-line truncation below: replaceAll is a linear literal
+  // match (no ReDoS risk on long input), and running it first ensures a path
+  // straddling the truncation point isn't sliced mid-string and left unredacted.
   const projectRoot = path.resolve(process.cwd());
   const homeDir = os.homedir();
   // Replace longer path first to avoid partial replacement
@@ -138,9 +145,61 @@ function sanitizeLogs(text: string): string {
     result = result.replaceAll(projectRoot, '<project>');
   }
 
-  // Generic pattern matching any env var name containing sensitive keywords
+  // Cap per-line length BEFORE the keyword regex runs. The credential pattern's
+  // prefix `\b\w*(?:keyword)\w*` backtracks O(n²) on a long separator-less,
+  // keyword-dense line (e.g. a member-influenced agent stdout dump written
+  // untruncated on a failing run); a ~100KB line stalls the single-threaded
+  // event loop for ~1-2s. Bug reports never need multi-KB single lines, so a
+  // per-line cap keeps masking linear. Splitting per line also stops an
+  // unterminated quote in one line from over-masking the lines that follow it.
+  const MAX_LINE = 2000;
+  result = result
+    .split('\n')
+    .map((line) =>
+      line.length > MAX_LINE ? line.slice(0, MAX_LINE) + '…[truncated]' : line,
+    )
+    .join('\n');
+
+  // Mask known credential FORMATS and Authorization schemes BEFORE the generic
+  // keyword pattern below. The generic pattern's keyword list includes
+  // "authorization", so on the standard `Authorization: Bearer <token>` header
+  // it would match `Authorization: Bearer` (its value part `[^\s"',]+` stops at
+  // the space, consuming only the scheme word) and rewrite it to
+  // `Authorization=***`, leaving the real token after the space exposed. Running
+  // the format-specific passes first guarantees the token itself is redacted
+  // regardless of the keyword that precedes it.
+
+  // Authorization scheme values: `Bearer <token>` / `Basic <creds>`.
+  result = result.replace(
+    /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+/gi,
+    '$1 ***',
+  );
+
+  // Known credential formats with no surrounding keyword (raw tokens dumped in
+  // logs): Anthropic/OpenAI keys, GitHub tokens, JWTs, AWS access key ids.
+  result = result
+    .replace(/\bsk-[A-Za-z0-9_-]{8,}/g, 'sk-***')
+    .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}/g, 'gh_***')
+    .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/g, 'eyJ***')
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA***');
+
+  // Generic pattern matching any env var name containing sensitive keywords.
+  // Allow optional quotes and whitespace around the separator so JSON
+  // ("apiKey": "v") and shell (APIKEY=v) forms are both covered. Runs AFTER the
+  // format passes above, so a `Authorization: Bearer <token>` already has its
+  // token masked and this only collapses the leftover `Authorization:` prefix.
+  // The value part matches, in order: a double/single-quoted string with an
+  // OPTIONAL closing quote (`"[^"\n]*"?`) — so a mid-line-truncated log such as
+  // `"app_secret": "cli_abc` (readRecentLogs slices the buffer and routinely
+  // cuts inside a quoted value) is still masked whole, and JSON values
+  // containing commas are masked without leaking neighbours; OR an unquoted run
+  // `[^\s"']+` that keeps comma-joined segments (`cookie=a,b,c` → `cookie=***`,
+  // including a leading comma) but stops at whitespace so a space-separated
+  // neighbour like `apikey=v, region=us` keeps `region=us`. The quoted classes
+  // exclude `\n` so an unterminated quote over-masks only the rest of its OWN
+  // line, never swallowing following log lines.
   const sensitivePattern =
-    /(\b\w*(?:token|password|passwd|secret|api[_-]?key|auth[_-]?token|authorization|cookie|credential|private[_-]?key|access[_-]?key|app[_-]?secret)\w*)[=:]\s*\S+/gi;
+    /(\b\w*(?:token|password|passwd|secret|api[_-]?key|auth[_-]?token|authorization|cookie|credential|private[_-]?key|access[_-]?key|app[_-]?secret)\w*)["']?\s*[=:]\s*(?:"[^"\n]*"?|'[^'\n]*'?|[^\s"']+)/gi;
   result = result.replace(sensitivePattern, '$1=***');
 
   return result;

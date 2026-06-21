@@ -93,6 +93,14 @@ export function MessageInput({
     // Load draft for new group
     const draft = groupJid ? drafts[groupJid] || '' : '';
     setContent(draft);
+    // Drop pending attachments staged for the previous group — they must not
+    // leak into the newly-selected conversation (会话隔离). Release image
+    // preview object URLs to avoid a memory leak.
+    setPendingImages((prev) => {
+      prev.forEach((img) => URL.revokeObjectURL(img.preview));
+      return [];
+    });
+    setPendingFiles([]);
     // Clear any pending debounce timer
     if (draftTimerRef.current) {
       clearTimeout(draftTimerRef.current);

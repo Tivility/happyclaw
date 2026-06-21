@@ -443,13 +443,16 @@ export function createDiscordConnection(
             return;
           }
         }
-        // Gate 2: owner_mentioned mode — only process if sender is owner or bot was @mentioned
-        if (opts.isGroupOwnerMessage) {
+        // Gate 2: owner_mentioned mode — when the bot IS @mentioned, only the
+        // group owner may trigger it. Mirrors whatsapp.ts: a non-owner who
+        // @mentions the bot must be dropped (the old `!isOwner && !isBotMentioned`
+        // AND-guard let any member trigger the bot simply by @mentioning it).
+        if (opts.isGroupOwnerMessage && isBotMentioned) {
           const isOwner = opts.isGroupOwnerMessage(jid, senderImId);
-          if (!isOwner && !isBotMentioned) {
+          if (!isOwner) {
             logger.debug(
               { jid, senderImId },
-              'Discord group message dropped (owner_mentioned mode)',
+              'Discord group message dropped (owner_mentioned mode, sender is not group owner)',
             );
             return;
           }
@@ -844,6 +847,7 @@ export function createDiscordConnection(
       dedup.clear();
       lastMessageIds.clear();
       ackReactionByChat.clear();
+      processingLock.dispose();
       logger.info('Discord bot disconnected');
     },
 

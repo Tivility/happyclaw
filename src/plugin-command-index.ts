@@ -166,6 +166,12 @@ function asBool(v: unknown): boolean {
 /** Module-level per-user cache. Cleared by invalidateUserCommandIndex. */
 const cache = new Map<string, CommandIndex>();
 
+// Per-user invalidation epoch. buildCommandIndex records the epoch before its
+// async build and only writes the result if the epoch is unchanged — otherwise
+// an invalidate() that lands during the await would be lost and the cache would
+// serve a stale index forever (lost-invalidation race).
+const cacheEpoch = new Map<string, number>();
+
 /**
  * List `*.md` files in a commands directory, returning basenames (without
  * `.md`). Filters out names that would fail the path-segment whitelist.
@@ -313,8 +319,12 @@ export async function buildCommandIndex(
 ): Promise<CommandIndex> {
   const hit = cache.get(userId);
   if (hit) return hit;
+  const epochAtStart = cacheEpoch.get(userId) ?? 0;
   const fresh = await buildCommandIndexUncached(userId);
-  cache.set(userId, fresh);
+  // Only commit if no invalidate() bumped the epoch while we were building.
+  if ((cacheEpoch.get(userId) ?? 0) === epochAtStart) {
+    cache.set(userId, fresh);
+  }
   return fresh;
 }
 
@@ -324,11 +334,13 @@ export async function buildCommandIndex(
  */
 export function invalidateUserCommandIndex(userId: string): void {
   cache.delete(userId);
+  cacheEpoch.set(userId, (cacheEpoch.get(userId) ?? 0) + 1);
 }
 
 /** Test/debug only: nuke all cached entries. */
 export function _resetCommandIndexCacheForTests(): void {
   cache.clear();
+  cacheEpoch.clear();
 }
 
 // --- Resolution ------------------------------------------------------------

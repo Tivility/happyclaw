@@ -153,13 +153,23 @@ export function listFiles(
     throw new Error('Path is not a directory');
   }
 
-  const entries = fs.readdirSync(absolutePath);
+  const entries = fs.readdirSync(absolutePath, { withFileTypes: true });
   const files: FileEntry[] = [];
 
-  for (const name of entries) {
+  for (const entry of entries) {
+    const name = entry.name;
     const entryPath = path.join(absolutePath, name);
-    const stats = fs.statSync(entryPath);
     const entryRelativePath = path.join(relativePath, name);
+
+    let stats: fs.Stats;
+    try {
+      stats = fs.statSync(entryPath);
+    } catch {
+      // Broken symlink or unreadable entry — skip rather than failing the whole
+      // listing. statSync follows symlinks, so a dangling link throws ENOENT and
+      // would otherwise 500 the entire directory (agent-triggerable DoS).
+      continue;
+    }
 
     files.push({
       name,

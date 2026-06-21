@@ -541,7 +541,10 @@ export function createWhatsAppConnection(
       return;
     }
 
-    const text = extractMessageText(content);
+    // Unwrap ephemeral / view-once envelopes once so text, media, and mention
+    // detection all see the real inner message (they otherwise diverge).
+    const inner = unwrapMessageContent(content);
+    const text = extractMessageText(inner);
     const chatJid = `${CHANNEL_PREFIX}${remoteJid}`;
     const isGroup = remoteJid.endsWith('@g.us');
     const senderRaw = isGroup ? key.participant || remoteJid : remoteJid;
@@ -550,6 +553,14 @@ export function createWhatsAppConnection(
     const senderName = pushName || (isGroup ? '群成员' : remoteJid);
     const chatName = groupNameCache.get(remoteJid) || (isGroup ? remoteJid : senderName);
     const timestampISO = new Date(tsMs > 0 ? tsMs : Date.now()).toISOString();
+
+    // Register the chat BEFORE the group gates so shouldProcessGroupMessage /
+    // isGroupOwnerMessage can resolve it. Without this, a group's first message
+    // hits the mention gate while still unregistered → shouldProcessGroupMessage
+    // returns false → the message is dropped (mirrors Discord's early register).
+    storeChatMetadata(chatJid, timestampISO);
+    updateChatName(chatJid, chatName);
+    opts.onNewChat(chatJid, chatName);
 
     // ── Group gates: sender allowlist → mention required → owner check ──
     if (isGroup) {
@@ -564,7 +575,7 @@ export function createWhatsAppConnection(
         return;
       }
 
-      const isBotMentioned = isMentioningBot(content, sock?.user?.id);
+      const isBotMentioned = isMentioningBot(inner, sock?.user?.id);
       if (
         opts.shouldProcessGroupMessage &&
         !isBotMentioned &&
@@ -595,30 +606,33 @@ export function createWhatsAppConnection(
       }
     }
 
-    // If no text, try to handle media (image/video/audio/document)
+    // Handle media (image/video/audio/document) whenever the message carries
+    // it — NOT only when there's no text. A captioned image/video has non-empty
+    // `text` (extractMessageText reads the caption), so gating on `!finalContent`
+    // would skip the download entirely (media lost + no Vision inlining).
+    // tryHandleMediaMessage already folds the caption into its returned content.
+    // tryHandleMediaMessage returns null only when `inner` carries no supported
+    // media (its first step is detectMedia), so calling it unconditionally folds
+    // the media probe + download into one pass — no second detectMedia, no
+    // duplicated "neither text nor media" branch.
     let finalContent = text;
     let attachmentsJson: string | undefined;
-    if (!finalContent) {
-      const groupFolder = opts.resolveGroupFolder?.(chatJid);
-      const media = await tryHandleMediaMessage(
-        msg,
-        content,
-        groupFolder,
-      );
-      if (!media) {
-        logger.debug(
-          { remoteJid, msgId: key.id, types: Object.keys(content) },
-          'WhatsApp message has neither text nor supported media',
-        );
-        return;
-      }
+    const media = await tryHandleMediaMessage(
+      msg,
+      inner,
+      opts.resolveGroupFolder?.(chatJid),
+    );
+    if (media) {
       finalContent = media.content;
       attachmentsJson = media.attachmentsJson;
     }
-
-    storeChatMetadata(chatJid, timestampISO);
-    updateChatName(chatJid, chatName);
-    opts.onNewChat(chatJid, chatName);
+    if (!finalContent) {
+      logger.debug(
+        { remoteJid, msgId: key.id, types: Object.keys(inner) },
+        'WhatsApp message has neither text nor supported media',
+      );
+      return;
+    }
 
     // Slash command interception (matches Telegram pattern: `/cmd args`)
     const trimmed = finalContent.trim();
@@ -716,6 +730,7 @@ export function createWhatsAppConnection(
         }
         sock = null;
       }
+      processingLock.dispose();
       setState({ status: 'disconnected' });
     },
 
@@ -886,6 +901,36 @@ export function getWhatsAppAuthDir(
   accountId = 'default',
 ): string {
   return path.join(dataDir, 'config', 'user-im', userId, 'whatsapp-auth', accountId);
+}
+
+/**
+ * Strip ephemeral / view-once envelopes so the real inner message is exposed.
+ * extractMessageText recurses through these on its own, but detectMedia and
+ * isMentioningBot only inspect top-level nodes — so a disappearing-message photo
+ * (`ephemeralMessage.message.imageMessage`, increasingly the Meta default) would
+ * never be downloaded and @mentions inside a wrapper would be missed. Unwrap once
+ * up front and feed the inner content to all of them. Bounded to avoid a
+ * pathological/cyclic payload spinning forever.
+ */
+export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
+  let inner = content;
+  for (let i = 0; i < 5; i++) {
+    // Mirror baileys' getFutureProofMessage (Utils/messages.js): a captioned
+    // document arrives as documentWithCaptionMessage; edits/view-once-extension
+    // wrap too. Missing any of these drops the message — e.g. a PDF WITH a
+    // caption (documentWithCaptionMessage) would extract no text and detect no
+    // media, while the same PDF without a caption (bare documentMessage) works.
+    const next =
+      inner.ephemeralMessage?.message ||
+      inner.viewOnceMessage?.message ||
+      inner.viewOnceMessageV2?.message ||
+      inner.viewOnceMessageV2Extension?.message ||
+      inner.documentWithCaptionMessage?.message ||
+      inner.editedMessage?.message;
+    if (!next) break;
+    inner = next;
+  }
+  return inner;
 }
 
 /**

@@ -625,11 +625,14 @@ export function createWeChatConnection(
           await Promise.allSettled(mediaPromises);
         }
 
+        // Merge file/media labels into content independently of images: a
+        // file-only message (no imageAttachments) would otherwise drop its
+        // textPrefixes and hit `if (!content) return` below → silently lost.
+        if (textPrefixes.length > 0) {
+          content = `${textPrefixes.join('\n')}\n${content}`.trim();
+        }
         if (imageAttachments.length > 0) {
           attachmentsJson = JSON.stringify(imageAttachments);
-          if (textPrefixes.length > 0) {
-            content = `${textPrefixes.join('\n')}\n${content}`.trim();
-          }
         }
 
         if (!content && imageAttachments.length > 0) {

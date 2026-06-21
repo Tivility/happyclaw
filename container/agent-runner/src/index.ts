@@ -1234,13 +1234,13 @@ async function runQuery(
   disallowedTools?: string[],
   images?: Array<{ data: string; mimeType?: string }>,
   sourceKindOverride?: ContainerOutput['sourceKind'],
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> }> {
+): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean; contextOverflow?: boolean; unrecoverableTranscriptError?: boolean; interruptedDuringQuery: boolean; sessionResumeFailed?: boolean; pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }> }> {
   const stream = new MessageStream();
   // Track messages piped into this query.  When the query is interrupted,
   // these messages would otherwise be lost (consumed by the aborted query).
   // The main loop uses them as the next prompt so the user's queued intent
   // continues after the cancelled turn (#421, Claude Code-style queuing).
-  const pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }> }> = [];
+  const pipedMessagesDuringQuery: Array<{ text: string; images?: Array<{ data: string; mimeType?: string }>; taskId?: string; sourceJid?: string }> = [];
   let newSessionId: string | undefined;
   let lastAssistantUuid: string | undefined;
   let canonicalAssistantText: string | undefined;
@@ -2103,6 +2103,17 @@ async function main(): Promise<void> {
       const sj = pendingDrain.messages[i].sourceJid;
       if (sj) { mcpToolsConfig.chatJid = sj; break; }
     }
+    // Likewise carry the task identity. A group-mode scheduled task injected
+    // into this cold-start window (process registered, SDK transport not yet
+    // ready) arrives via IPC with a taskId; without propagating it here the
+    // first query's send_message would route as a non-task message and the task
+    // notify would be lost (#559, on the boot-drain path the piped-message
+    // taskId plumbing doesn't cover). Only override when a taskId is present so
+    // a plain message in the batch doesn't wipe the startup messageTaskId.
+    for (let i = pendingDrain.messages.length - 1; i >= 0; i--) {
+      const tid = pendingDrain.messages[i].taskId;
+      if (tid) { mcpToolsConfig.currentTaskId = tid; break; }
+    }
   }
 
   if (containerInput.runtime === 'codex') {
@@ -2454,7 +2465,7 @@ async function main(): Promise<void> {
             const filepath = path.join(IPC_INPUT_DIR, filename);
             const tempPath = `${filepath}.tmp`;
             try {
-              fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: msg.text, images: msg.images }));
+              fs.writeFileSync(tempPath, JSON.stringify({ type: 'message', text: msg.text, images: msg.images, taskId: msg.taskId, sourceJid: msg.sourceJid }));
               fs.renameSync(tempPath, filepath);
             } catch (err) {
               log(`Failed to re-enqueue piped message: ${err}`);

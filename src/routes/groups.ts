@@ -379,37 +379,17 @@ groupRoutes.post('/', authMiddleware, async (c) => {
         return c.json({ error: 'custom_cwd directory does not exist' }, 400);
       }
 
-      // 白名单校验：检查路径是否在允许的根目录下
+      // 白名单校验：检查路径是否在允许的根目录下，并过滤敏感路径
+      // （与 init_source_path 对齐：之前缺少 matchesBlockedPattern，可把
+      // .ssh / .aws / .gnupg 等敏感目录挂进容器）
       const allowlist = loadMountAllowlist();
       if (
         allowlist &&
         allowlist.allowedRoots &&
         allowlist.allowedRoots.length > 0
       ) {
-        let allowed = false;
-        for (const root of allowlist.allowedRoots) {
-          const expandedRoot = root.path.startsWith('~')
-            ? path.join(
-                process.env.HOME || '/Users/user',
-                root.path.slice(root.path.startsWith('~/') ? 2 : 1),
-              )
-            : path.resolve(root.path);
-
-          let realRoot: string;
-          try {
-            realRoot = fs.realpathSync(expandedRoot);
-          } catch {
-            continue; // 允许的根目录不存在，跳过
-          }
-
-          const relative = path.relative(realRoot, realPath);
-          if (!relative.startsWith('..') && !path.isAbsolute(relative)) {
-            allowed = true;
-            break;
-          }
-        }
-
-        if (!allowed) {
+        const allowedRoot = findAllowedRoot(realPath, allowlist.allowedRoots);
+        if (!allowedRoot) {
           const allowedPaths = allowlist.allowedRoots
             .map((r) => r.path)
             .join(', ');
@@ -417,6 +397,17 @@ groupRoutes.post('/', authMiddleware, async (c) => {
             {
               error: `custom_cwd must be under an allowed root. Allowed roots: ${allowedPaths}. Check config/mount-allowlist.json`,
             },
+            403,
+          );
+        }
+
+        const blockedMatch = matchesBlockedPattern(
+          realPath,
+          allowlist.blockedPatterns,
+        );
+        if (blockedMatch) {
+          return c.json(
+            { error: `custom_cwd matches blocked pattern "${blockedMatch}"` },
             403,
           );
         }
@@ -901,12 +892,27 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
     );
   }
 
-  // Wait for container to fully stop before cleaning up its files
+  // Wait for container to fully stop before cleaning up its files.
+  // Must include sibling JIDs (same folder) AND descendant virtual JIDs —
+  // sub-agents (`{jid}#agent:{id}`) and scheduled tasks (`{jid}#task:{id}`) —
+  // mirroring clear-history. Otherwise those runners keep executing with their
+  // cwd/session dirs deleted out from under them (container/process leak + ENOENT).
+  const deleteSiblingJids = getJidsByFolder(existing.folder);
+  const deleteDescendantJids = Array.from(
+    new Set(
+      deleteSiblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
+    ),
+  );
+  const deleteStopJids = Array.from(
+    new Set([jid, ...deleteSiblingJids, ...deleteDescendantJids]),
+  );
   try {
-    await deps.queue.stopGroup(jid);
+    await Promise.all(
+      deleteStopJids.map((j) => deps.queue.stopGroup(j, { force: true })),
+    );
   } catch (err) {
     logger.error(
-      { jid, err },
+      { jid, stopJids: deleteStopJids, err },
       'Failed to stop container before deleting group',
     );
     return c.json(
@@ -1214,7 +1220,7 @@ groupRoutes.post('/:jid/clear-history', authMiddleware, async (c) => {
   //    behavior in container mode).
   const descendantJids = Array.from(
     new Set(
-      siblingJids.flatMap((j) => deps.queue.listActiveDescendantJids(j)),
+      siblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
     ),
   );
   const stopJids = [...siblingJids, ...descendantJids];

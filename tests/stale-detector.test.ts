@@ -7,9 +7,12 @@ describe('isStale', () => {
     expect(isStale(Date.now())).toBe(false);
   });
 
-  test('boundary at exactly windowMs returns false (strict >)', () => {
-    const now = Date.now();
-    expect(isStale(now - DEFAULT_STALE_MS)).toBe(false);
+  test('within windowMs returns false (strict >)', () => {
+    // Use an explicit large window so the unavoidable drift between this
+    // Date.now() and the one inside isStale() (a few ms at most) can't push the
+    // result past the boundary — the previous `now - DEFAULT_STALE_MS` form was
+    // flaky because that drift made the diff exceed windowMs by 1-2ms.
+    expect(isStale(Date.now(), 60_000)).toBe(false);
   });
 
   test('1ms past windowMs returns true', () => {

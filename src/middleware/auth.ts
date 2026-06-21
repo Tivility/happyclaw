@@ -161,6 +161,18 @@ export const requireAnyPermission =
   };
 
 export const systemConfigMiddleware = requirePermission('manage_system_config');
+
+// Stricter than a permission check: requires the admin ROLE. Use for routes
+// that write host-global files (e.g. ~/.claude/agents) which affect every
+// host-mode agent — a member with manage_system_config (ops_manager template)
+// must not be able to mutate them.
+export const adminRoleMiddleware = async (c: any, next: any) => {
+  const user = c.get('user') as AuthUser;
+  if (!user || user.role !== 'admin') {
+    return c.json({ error: 'Forbidden: admin role required' }, 403);
+  }
+  await next();
+};
 export const groupEnvMiddleware = requireAnyPermission([
   'manage_group_env',
   'manage_system_config',

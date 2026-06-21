@@ -61,7 +61,7 @@ import {
   resolveTemplate,
   hasPermission,
 } from '../permissions.js';
-import { getClientIp } from '../utils.js';
+import { getClientIp, escapeCsvField } from '../utils.js';
 import { DATA_DIR } from '../config.js';
 import { logger } from '../logger.js';
 
@@ -883,14 +883,6 @@ adminRoutes.get(
       to: to || undefined,
     });
 
-    const escapeCsv = (value: unknown): string => {
-      const text = value === null || value === undefined ? '' : String(value);
-      if (text.includes(',') || text.includes('"') || text.includes('\n')) {
-        return `"${text.replace(/"/g, '""')}"`;
-      }
-      return text;
-    };
-
     const rows = [
       [
         'id',
@@ -913,7 +905,7 @@ adminRoutes.get(
           log.created_at,
           JSON.stringify(log.details ?? {}),
         ]
-          .map(escapeCsv)
+          .map(escapeCsvField)
           .join(','),
       ),
     ];

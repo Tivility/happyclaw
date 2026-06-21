@@ -1019,125 +1019,10 @@ export function createFeishuConnection(
       onP2pSender(senderOpenId);
     }
 
+    // NOTE: image/file download moved BELOW the group gates (allowlist +
+    // mention gate). Declaring attachmentsJson here keeps it in scope for the
+    // store/broadcast block; the actual download runs only after authorization.
     let attachmentsJson: string | undefined;
-
-    if (extracted.imageKeys && extracted.imageKeys.length > 0) {
-      // 图片消息：下载后双轨处理
-      // 1. Vision 通道：base64 附件供模型看图
-      // 2. 存盘通道：写入工作区文件，agent 可直接操作（压缩、发送等）
-      const attachments = [];
-      const groupFolder = resolveGroupFolder?.(chatJid);
-      const savedPaths: string[] = [];
-
-      for (const imageKey of extracted.imageKeys) {
-        const imageData = await downloadFeishuImage(messageId, imageKey);
-        if (!imageData) continue;
-
-        // Vision 附件
-        attachments.push({
-          type: 'image',
-          data: imageData.base64,
-          mimeType: imageData.mimeType,
-        });
-
-        // 存盘：扩展名从 mimeType 推断，对齐文件消息处理逻辑
-        if (groupFolder) {
-          const extMap: Record<string, string> = {
-            'image/jpeg': '.jpg',
-            'image/png': '.png',
-            'image/gif': '.gif',
-            'image/webp': '.webp',
-            'image/bmp': '.bmp',
-            'image/tiff': '.tiff',
-          };
-          const ext = extMap[imageData.mimeType] ?? '.jpg';
-          const fileName = `feishu_img_${imageKey.slice(-8)}${ext}`;
-          try {
-            const relPath = await saveDownloadedFile(
-              groupFolder,
-              'feishu',
-              fileName,
-              Buffer.from(imageData.base64, 'base64'),
-            );
-            if (relPath) savedPaths.push(relPath);
-          } catch (err) {
-            logger.warn(
-              { err, imageKey },
-              'Failed to save Feishu image to disk',
-            );
-          }
-        }
-      }
-
-      // 拼接图片标记：成功下载的用路径，失败的用占位符，确保 text 不为空。
-      // 否则长图/超大图片下载失败时会落入 agent 的空消息分支，回复"消息是空的"。
-      const failedCount = extracted.imageKeys.length - attachments.length;
-      const markers: string[] = [];
-      if (attachments.length > 0) {
-        attachmentsJson = JSON.stringify(attachments);
-        if (savedPaths.length > 0) {
-          markers.push(...savedPaths.map((p) => `[图片: ${p}]`));
-        } else {
-          markers.push('[图片]');
-        }
-      }
-      if (failedCount > 0) {
-        markers.push(
-          `[图片下载失败: ${failedCount} 张，可能超过飞书接口限制或网络异常]`,
-        );
-        logger.warn(
-          { chatJid, messageId, failedCount, totalKeys: extracted.imageKeys.length },
-          'Feishu image download failed for some or all images',
-        );
-      }
-      const imgMarker = markers.join('\n');
-      if (imgMarker) {
-        text = text ? `${imgMarker}\n${text}` : imgMarker;
-      }
-    } else if (extracted.fileInfos && extracted.fileInfos.length > 0) {
-      // 文件消息：下载到磁盘，路径内联替换
-      logger.info(
-        {
-          chatJid,
-          messageId,
-          messageType,
-          fileCount: extracted.fileInfos.length,
-        },
-        'Processing Feishu file download',
-      );
-      const groupFolder = resolveGroupFolder?.(chatJid);
-      if (!groupFolder) {
-        logger.warn(
-          { chatJid },
-          'Cannot resolve group folder for file download',
-        );
-        for (const fi of extracted.fileInfos) {
-          const safeFilename = sanitizeImFilename(fi.filename || fi.fileKey);
-          const placeholder = `[文件: ${safeFilename}]`;
-          text = text.replace(
-            placeholder,
-            `[文件下载失败: ${safeFilename}]`,
-          );
-        }
-      } else {
-        for (const fi of extracted.fileInfos) {
-          const safeFilename = sanitizeImFilename(fi.filename || fi.fileKey);
-          const relPath = await downloadFeishuFileToDisk(
-            messageId,
-            fi.fileKey,
-            fi.filename,
-            groupFolder,
-          );
-          const placeholder = `[文件: ${safeFilename}]`;
-          text = text.replace(
-            placeholder,
-            relPath
-              ? `[文件: ${relPath}]`
-              : `[文件下载失败: ${safeFilename}]`,
-          );
-        }
-      }
-    }
 
     lastMessageIdByChat.set(chatId, messageId);
 
@@ -1272,6 +1157,127 @@ export function createFeishuConnection(
           );
         }
         return;
+      }
+    }
+
+    // ── 附件下载（已通过白名单 + mention 门控后才执行）──
+    // 安全：未授权发送者 / 未 @bot 的群消息已在上面 return，绝不会触发图片/
+    // 文件下载落盘或对飞书 API 的拉取（防止未授权资源消耗 / SSRF 式拉取）。
+    if (extracted.imageKeys && extracted.imageKeys.length > 0) {
+      // 图片消息：下载后双轨处理
+      // 1. Vision 通道：base64 附件供模型看图
+      // 2. 存盘通道：写入工作区文件，agent 可直接操作（压缩、发送等）
+      const attachments = [];
+      const groupFolder = resolveGroupFolder?.(chatJid);
+      const savedPaths: string[] = [];
+
+      for (const imageKey of extracted.imageKeys) {
+        const imageData = await downloadFeishuImage(messageId, imageKey);
+        if (!imageData) continue;
+
+        // Vision 附件
+        attachments.push({
+          type: 'image',
+          data: imageData.base64,
+          mimeType: imageData.mimeType,
+        });
+
+        // 存盘：扩展名从 mimeType 推断，对齐文件消息处理逻辑
+        if (groupFolder) {
+          const extMap: Record<string, string> = {
+            'image/jpeg': '.jpg',
+            'image/png': '.png',
+            'image/gif': '.gif',
+            'image/webp': '.webp',
+            'image/bmp': '.bmp',
+            'image/tiff': '.tiff',
+          };
+          const ext = extMap[imageData.mimeType] ?? '.jpg';
+          const fileName = `feishu_img_${imageKey.slice(-8)}${ext}`;
+          try {
+            const relPath = await saveDownloadedFile(
+              groupFolder,
+              'feishu',
+              fileName,
+              Buffer.from(imageData.base64, 'base64'),
+            );
+            if (relPath) savedPaths.push(relPath);
+          } catch (err) {
+            logger.warn(
+              { err, imageKey },
+              'Failed to save Feishu image to disk',
+            );
+          }
+        }
+      }
+
+      // 拼接图片标记：成功下载的用路径，失败的用占位符，确保 text 不为空。
+      // 否则长图/超大图片下载失败时会落入 agent 的空消息分支，回复"消息是空的"。
+      const failedCount = extracted.imageKeys.length - attachments.length;
+      const markers: string[] = [];
+      if (attachments.length > 0) {
+        attachmentsJson = JSON.stringify(attachments);
+        if (savedPaths.length > 0) {
+          markers.push(...savedPaths.map((p) => `[图片: ${p}]`));
+        } else {
+          markers.push('[图片]');
+        }
+      }
+      if (failedCount > 0) {
+        markers.push(
+          `[图片下载失败: ${failedCount} 张，可能超过飞书接口限制或网络异常]`,
+        );
+        logger.warn(
+          { chatJid, messageId, failedCount, totalKeys: extracted.imageKeys.length },
+          'Feishu image download failed for some or all images',
+        );
+      }
+      const imgMarker = markers.join('\n');
+      if (imgMarker) {
+        text = text ? `${imgMarker}\n${text}` : imgMarker;
+      }
+    } else if (extracted.fileInfos && extracted.fileInfos.length > 0) {
+      // 文件消息：下载到磁盘，路径内联替换
+      logger.info(
+        {
+          chatJid,
+          messageId,
+          messageType,
+          fileCount: extracted.fileInfos.length,
+        },
+        'Processing Feishu file download',
+      );
+      const groupFolder = resolveGroupFolder?.(chatJid);
+      if (!groupFolder) {
+        logger.warn(
+          { chatJid },
+          'Cannot resolve group folder for file download',
+        );
+        for (const fi of extracted.fileInfos) {
+          const safeFilename = sanitizeImFilename(fi.filename || fi.fileKey);
+          const placeholder = `[文件: ${safeFilename}]`;
+          text = text.replace(
+            placeholder,
+            `[文件下载失败: ${safeFilename}]`,
+          );
+        }
+      } else {
+        for (const fi of extracted.fileInfos) {
+          const safeFilename = sanitizeImFilename(fi.filename || fi.fileKey);
+          const relPath = await downloadFeishuFileToDisk(
+            messageId,
+            fi.fileKey,
+            fi.filename,
+            groupFolder,
+          );
+          const placeholder = `[文件: ${safeFilename}]`;
+          text = text.replace(
+            placeholder,
+            relPath
+              ? `[文件: ${relPath}]`
+              : `[文件下载失败: ${safeFilename}]`,
+          );
+        }
       }
     }
 
@@ -1759,6 +1765,7 @@ export function createFeishuConnection(
       }
       client = null;
       lastWsStateConnected = false;
+      processingLock.dispose();
     },
 
     async sendMessage(

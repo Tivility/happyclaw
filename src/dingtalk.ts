@@ -2003,6 +2003,7 @@ export function createDingTalkConnection(
       lastSenderIds.clear();
       lastSenderStaffIds.clear();
       groupNameCache.clear();
+      processingLock.dispose();
       logger.info('DingTalk bot disconnected');
     },
 

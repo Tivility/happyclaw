@@ -157,6 +157,9 @@ export const useTasksStore = create<TasksState>((set, get) => ({
       await get().loadTasks();
     } catch (err) {
       set({ error: extractErrorMessage(err) });
+      // Re-throw so callers (TaskDetail.handleSave) can distinguish failure from
+      // success — otherwise a failed save still shows "保存成功".
+      throw err;
     }
   },
 

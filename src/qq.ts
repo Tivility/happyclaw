@@ -1877,6 +1877,7 @@ export function createQQConnection(config: QQConnectionConfig): QQConnection {
       dedup.clear();
       msgSeqCounters.clear();
       rejectTimestamps.clear();
+      processingLock.dispose();
       logger.info('QQ bot disconnected');
     },
 

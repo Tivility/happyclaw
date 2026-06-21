@@ -1705,6 +1705,9 @@ export async function runHostAgent(
 
   try {
     // 配置层环境变量
+    // Bearer 透传(上游): 第三方 provider 显式注入 ANTHROPIC_AUTH_TOKEN 时保留继承 token；
+    // hoist 到函数作用域,供下方第三方 base-url 分支判断。codex 路径不注入,恒 false。
+    let injectsAnthropicAuthToken = false;
     if (isCodexRuntime) {
       const authMaterial = writeCodexProviderAuthMaterial(codexProvider!);
       Object.assign(hostEnv, authMaterial.env);
@@ -1719,6 +1722,9 @@ export async function runHostAgent(
         containerOverride,
         hostPoolResult?.resolved.customEnv,
       );
+      injectsAnthropicAuthToken = envLines.some((line) =>
+        line.startsWith('ANTHROPIC_AUTH_TOKEN='),
+      );
       for (const line of envLines) {
         const eqIdx = line.indexOf('=');
         if (eqIdx > 0) {
@@ -1730,12 +1736,13 @@ export async function runHostAgent(
       }
     }
 
-    // Third-party provider: ANTHROPIC_AUTH_TOKEN inherited from the host
-    // (~/.claude/settings.json) forces the SDK down the OAuth code path,
-    // which skips the standard Bearer header and causes 404 on non-Anthropic
-    // endpoints. Unset it so the injected ANTHROPIC_API_KEY takes effect.
+    // Third-party provider: unless this provider explicitly injects
+    // ANTHROPIC_AUTH_TOKEN (Bearer proxy mode), remove any inherited host token
+    // so API-key mode can take effect.
     if (hostEnv['ANTHROPIC_BASE_URL']) {
-      delete hostEnv['ANTHROPIC_AUTH_TOKEN'];
+      if (!injectsAnthropicAuthToken) {
+        delete hostEnv['ANTHROPIC_AUTH_TOKEN'];
+      }
 
       // Also strip oauthAccount from session .claude.json: the SDK detects
       // OAuth credentials in .claude.json and takes the OAuth code path even

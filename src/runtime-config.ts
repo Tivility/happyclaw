@@ -446,10 +446,16 @@ function normalizeSecret(input: unknown, fieldName: string): string {
   if (typeof input !== 'string') {
     throw new Error(`Invalid field: ${fieldName}`);
   }
-  // Strip ALL whitespace and non-ASCII characters — API keys/tokens are always ASCII;
-  // users often paste with accidental spaces, line breaks, or smart quotes (e.g. U+2019).
   // eslint-disable-next-line no-control-regex
-  const value = input.replace(/\s+/g, '').replace(/[^\x00-\x7F]/g, '');
+  const ascii = input.replace(/[^\x00-\x7F]/g, '').trim();
+  // An ANTHROPIC_AUTH_TOKEN may intentionally be an Authorization header value
+  // ("Bearer <token>"); collapse internal whitespace to a single space so the
+  // prefix survives. Every other secret — API keys, OAuth tokens, and bare
+  // auth tokens — stays compact so an accidental pasted space can't break auth.
+  const value =
+    fieldName === 'anthropicAuthToken' && /^Bearer\s/i.test(ascii)
+      ? ascii.replace(/\s+/g, ' ')
+      : ascii.replace(/\s+/g, '');
   if (value.length > MAX_FIELD_LENGTH) {
     throw new Error(`Field too long: ${fieldName}`);
   }
@@ -570,7 +576,8 @@ function sanitizeCustomEnvMap(
     if (options?.skipReservedClaudeKeys && RESERVED_CLAUDE_ENV_KEYS.has(key)) {
       continue;
     }
-    out[key] = sanitizeEnvValue(
+    out[key] = sanitizeCustomEnvValue(
+      key,
       typeof rawValue === 'string' ? rawValue : String(rawValue),
     );
   }
@@ -2643,6 +2650,13 @@ function sanitizeEnvValue(value: string): string {
   return value.replace(/[\r\n\0]/g, '');
 }
 
+function sanitizeCustomEnvValue(key: string, value: string): string {
+  if (key === 'ANTHROPIC_CUSTOM_HEADERS') {
+    return value.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\0/g, '');
+  }
+  return sanitizeEnvValue(value);
+}
+
 /** Convert KEY=value lines to shell-safe format by single-quoting values.
  *  Used when writing env files that are `source`d by bash. */
 export function shellQuoteEnvLines(lines: string[]): string[] {
@@ -2679,18 +2693,21 @@ export function buildClaudeEnvLines(
     );
   }
   if (config.anthropicAuthToken) {
-    if (config.anthropicBaseUrl) {
-      // Third-party provider: the SDK treats ANTHROPIC_AUTH_TOKEN as an OAuth
-      // legacy token and skips the standard Bearer header, causing 404 on
-      // non-Anthropic endpoints. Use ANTHROPIC_API_KEY instead so the SDK
-      // sends the correct Authorization header.
+    const bearerMatch = /^Bearer\s+(.+)$/i.exec(config.anthropicAuthToken);
+    if (config.anthropicBaseUrl && !bearerMatch) {
+      // Most third-party Anthropic-compatible endpoints expect API-key style
+      // auth (the SDK sends a bare token as `X-Api-Key`). A plain token maps to
+      // ANTHROPIC_API_KEY so non-Anthropic endpoints don't 404 on the OAuth path.
       lines.push(
         `ANTHROPIC_API_KEY=${sanitizeEnvValue(config.anthropicAuthToken)}`,
       );
     } else {
-      lines.push(
-        `ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(config.anthropicAuthToken)}`,
-      );
+      // An explicit `Bearer <token>` (or first-party usage) goes to
+      // ANTHROPIC_AUTH_TOKEN so the SDK emits `Authorization: Bearer <token>`.
+      // The SDK adds the `Bearer ` prefix itself, so strip the user-supplied
+      // one to avoid a doubled `Authorization: Bearer Bearer <token>`.
+      const token = bearerMatch ? bearerMatch[1] : config.anthropicAuthToken;
+      lines.push(`ANTHROPIC_AUTH_TOKEN=${sanitizeEnvValue(token)}`);
     }
   }
   if (config.anthropicModel) {
@@ -2701,7 +2718,7 @@ export function buildClaudeEnvLines(
   const customEnv = profileCustomEnv ?? getActiveProfileCustomEnv();
   for (const [key, value] of Object.entries(customEnv)) {
     if (RESERVED_CLAUDE_ENV_KEYS.has(key)) continue;
-    lines.push(`${key}=${sanitizeEnvValue(value)}`);
+    lines.push(`${key}=${sanitizeCustomEnvValue(key, value)}`);
   }
 
   return lines;
@@ -3123,7 +3140,7 @@ export function buildContainerEnvLines(
         continue;
       }
       // Strip control characters to prevent env injection
-      const sanitized = value.replace(/[\r\n\0]/g, '');
+      const sanitized = sanitizeCustomEnvValue(key, value);
       lines.push(`${key}=${sanitized}`);
     }
   }
@@ -3999,6 +4016,14 @@ export interface SystemSettings {
   taskBackfillGraceMs: number;
 }
 
+// Upper bound for the login lockout window. auth.ts reclaims login-attempt
+// records on a fixed 24h TTL (its authoritative window check assumes the
+// configured lockout never exceeds this); a larger value would let the cleanup
+// timer drop a record mid-lockout, resetting the per-ip counter and letting an
+// attacker resume brute-forcing by pausing ~24h. Every read path clamps to it,
+// not just saveSystemSettings, so the env/file fallbacks can't bypass the cap.
+const MAX_LOGIN_LOCKOUT_MINUTES = 1440;
+
 const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   containerTimeout: 1800000,
   idleTimeout: 1800000,
@@ -4084,7 +4109,7 @@ function readSystemSettingsFromFile(): SystemSettings | null {
         : DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
     loginLockoutMinutes:
       typeof raw.loginLockoutMinutes === 'number' && raw.loginLockoutMinutes > 0
-        ? raw.loginLockoutMinutes
+        ? Math.min(raw.loginLockoutMinutes, MAX_LOGIN_LOCKOUT_MINUTES)
         : DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
     maxConcurrentScripts:
       typeof raw.maxConcurrentScripts === 'number' &&
@@ -4164,9 +4189,12 @@ function buildEnvFallbackSettings(): SystemSettings {
       process.env.MAX_LOGIN_ATTEMPTS,
       DEFAULT_SYSTEM_SETTINGS.maxLoginAttempts,
     ),
-    loginLockoutMinutes: parseIntEnv(
-      process.env.LOGIN_LOCKOUT_MINUTES,
-      DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+    loginLockoutMinutes: Math.min(
+      parseIntEnv(
+        process.env.LOGIN_LOCKOUT_MINUTES,
+        DEFAULT_SYSTEM_SETTINGS.loginLockoutMinutes,
+      ),
+      MAX_LOGIN_LOCKOUT_MINUTES,
     ),
     maxConcurrentScripts: parseIntEnv(
       process.env.MAX_CONCURRENT_SCRIPTS,
@@ -4281,7 +4309,8 @@ export function saveSystemSettings(
   if (merged.maxLoginAttempts < 1) merged.maxLoginAttempts = 1;
   if (merged.maxLoginAttempts > 100) merged.maxLoginAttempts = 100;
   if (merged.loginLockoutMinutes < 1) merged.loginLockoutMinutes = 1;
-  if (merged.loginLockoutMinutes > 1440) merged.loginLockoutMinutes = 1440; // max 24 hours
+  if (merged.loginLockoutMinutes > MAX_LOGIN_LOCKOUT_MINUTES)
+    merged.loginLockoutMinutes = MAX_LOGIN_LOCKOUT_MINUTES; // max 24 hours, see auth.ts reclaim TTL
   if (merged.maxConcurrentScripts < 1) merged.maxConcurrentScripts = 1;
   if (merged.maxConcurrentScripts > 50) merged.maxConcurrentScripts = 50;
   if (merged.scriptTimeout < 5000) merged.scriptTimeout = 5000; // min 5s

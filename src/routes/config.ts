@@ -2056,6 +2056,10 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
     enabled: current?.enabled ?? true,
     updatedAt: current?.updatedAt || null,
     autoIsolateContext: current?.autoIsolateContext ?? false,
+    // Preserve the auto-learned owner open_id — saveUserFeishuConfig does a full
+    // rewrite, so omitting it here would wipe the owner_mentioned activation and
+    // sender_allowlist seed on every settings save.
+    ownerOpenId: current?.ownerOpenId,
   };
   if (typeof validation.data.appId === 'string') {
     const appId = validation.data.appId.trim();
@@ -2083,6 +2087,7 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       appSecret: next.appSecret as string,
       enabled: next.enabled as boolean | undefined,
       autoIsolateContext: next.autoIsolateContext as boolean | undefined,
+      ownerOpenId: next.ownerOpenId as string | undefined,
     });
     appendImConfigAudit(user.username, 'feishu', 'update', Object.keys(validation.data), {
       userId: user.id,

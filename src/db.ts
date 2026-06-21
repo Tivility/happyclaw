@@ -2892,6 +2892,22 @@ export function advanceSkippedTask(id: string, nextRun: string | null): void {
   ).run(nextRun, nextRun, id);
 }
 
+// Pause a recurring task that just ran but whose schedule produces no next_run
+// (corrupted schedule_value, cron parse failure). Unlike updateTaskAfterRun(null)
+// it does NOT flip status to 'completed' (which would silently disable it);
+// it records THIS run's last_run/last_result so the task detail view is accurate
+// and clears next_run so the owner can fix the schedule and re-activate.
+export function pauseTaskAfterRun(id: string, lastResult: string): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `
+    UPDATE scheduled_tasks
+    SET next_run = NULL, last_run = ?, last_result = ?, status = 'paused'
+    WHERE id = ?
+  `,
+  ).run(now, lastResult, id);
+}
+
 export function logTaskRun(log: TaskRunLog): void {
   db.prepare(
     `

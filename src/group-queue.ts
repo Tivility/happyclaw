@@ -367,23 +367,35 @@ export class GroupQueue {
   }
 
   /**
-   * List all active virtual-JID runners that belong to the same folder family
-   * as `baseJid` (i.e. sub-agents `{...}#agent:{id}` and scheduled tasks
-   * `{...}#task:{id}`), excluding the base JID itself. Used by workspace-level
-   * operations (e.g. clear-history) that need to stop every descendant process
-   * before wiping the folder's filesystem.
+   * List every virtual-JID runner that belongs to the same folder family as
+   * `baseJid` (i.e. sub-agents `{...}#agent:{id}` and scheduled tasks
+   * `{...}#task:{id}`), excluding the base JID itself — whether it is actively
+   * running OR merely QUEUED (capacity-blocked: in pendingTasks / waitingGroups,
+   * not yet active). Used by workspace-level operations (delete / clear-history)
+   * that stop every descendant before wiping the folder's filesystem.
+   *
+   * Including queued descendants is essential: a capacity-blocked sub-agent left
+   * out of the stop set would be picked up by drainWaiting after a slot frees and
+   * launch against a folder/session dir that was already deleted (container/
+   * process leak + ENOENT). stopGroup() on a queued descendant clears its
+   * pendingTasks and removes it from waitingGroups, so it never launches.
    *
    * Matching is done via serializationKey (folder-based), so descendants
    * launched from any sibling JID sharing the same folder are all returned.
    */
-  listActiveDescendantJids(baseJid: string): string[] {
+  listDescendantJids(baseJid: string): string[] {
     const baseKey = this.getSerializationKey(baseJid);
     const prefix = baseKey + '#';
     const result: string[] = [];
     for (const [jid, state] of this.groups.entries()) {
-      if (!state.active) continue;
-      const key = this.getSerializationKey(jid);
-      if (key.startsWith(prefix)) result.push(jid);
+      if (!this.getSerializationKey(jid).startsWith(prefix)) continue;
+      if (
+        state.active ||
+        state.pendingTasks.length > 0 ||
+        this.waitingGroups.has(jid)
+      ) {
+        result.push(jid);
+      }
     }
     return result;
   }
@@ -1158,6 +1170,16 @@ export class GroupQueue {
     reason: 'messages' | 'drain',
   ): Promise<void> {
     const state = this.getGroup(groupJid);
+    // Defensive re-entrancy guard: never start a second runner on a GroupState
+    // that is already active. Pending work is picked up by the active runner's
+    // finally → drainGroup, so returning here loses nothing.
+    if (state.active) {
+      logger.warn(
+        { groupJid, reason },
+        'runForGroup called on already-active group, ignoring re-entry',
+      );
+      return;
+    }
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
     state.activeRunnerIsTask = false;
@@ -1288,6 +1310,18 @@ export class GroupQueue {
 
   private async runTask(groupJid: string, task: QueuedTask): Promise<void> {
     const state = this.getGroup(groupJid);
+    // Defensive re-entrancy guard (see runForGroup): a task must never start on
+    // an already-active GroupState, or it would overwrite the live process
+    // handle and double-count the concurrency slot.
+    if (state.active) {
+      logger.warn(
+        { groupJid, taskId: task.id },
+        'runTask called on already-active group, re-queuing task',
+      );
+      state.pendingTasks.unshift(task);
+      this.waitingGroups.add(groupJid);
+      return;
+    }
     const isHostMode = this.isHostMode(groupJid);
     state.active = true;
     state.activeRunnerIsTask = true;
@@ -1458,8 +1492,36 @@ export class GroupQueue {
 
     this.waitingGroups.delete(groupJid);
 
+    // GC one-shot virtual JIDs (#task:/#agent:) once fully idle. Each task run
+    // uses a unique taskRunId → a unique JID, so without this the groups Map
+    // grows without bound. Only virtual JIDs are collected; real chat JIDs are
+    // bounded by the number of registered groups and keep useful state. We only
+    // reach here when there are no pending tasks and no runnable messages.
+    if (this.isVirtualJid(groupJid)) {
+      const s = this.groups.get(groupJid);
+      if (
+        s &&
+        !s.active &&
+        !s.queryInFlight &&
+        !s.pendingMessages &&
+        s.pendingTasks.length === 0 &&
+        !s.retryTimer &&
+        !s.restarting &&
+        !this.waitingGroups.has(groupJid)
+      ) {
+        this.groups.delete(groupJid);
+        this.contextOverflowGroups.delete(groupJid);
+        // fall through to drainWaiting so other waiting groups still get a slot
+      }
+    }
+
     // Nothing pending for this group; check if other groups are waiting for a slot
     this.drainWaiting();
+  }
+
+  /** Virtual JIDs are one-shot per run (`{jid}#task:{id}` / `{jid}#agent:{id}`). */
+  private isVirtualJid(jid: string): boolean {
+    return jid.includes('#task:') || jid.includes('#agent:');
   }
 
   private drainWaiting(): void {
@@ -1470,7 +1532,14 @@ export class GroupQueue {
 
     for (const jid of candidates) {
       const activeRunner = this.findActiveRunnerFor(jid);
-      if (activeRunner && activeRunner !== jid) continue;
+      // Any active runner sharing this serialization key — including jid's OWN
+      // runner — means no new runner may start. enqueueMessageCheck adds a jid
+      // to waitingGroups even while its own runner is active (state.active), so
+      // without checking self-active we would start a SECOND concurrent runner
+      // on the same GroupState (duplicate replies, orphaned containers, broken
+      // counters). Pending work is drained by the active runner's
+      // finally → drainGroup, so skipping here is safe (no starvation).
+      if (activeRunner) continue;
       if (!this.hasCapacityFor(jid)) continue;
 
       this.waitingGroups.delete(jid);

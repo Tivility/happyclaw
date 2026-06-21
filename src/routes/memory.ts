@@ -15,6 +15,7 @@ import {
 import { getAllRegisteredGroups, getUserById } from '../db.js';
 import { logger } from '../logger.js';
 import { GROUPS_DIR, DATA_DIR } from '../config.js';
+import { isRealpathInside } from '../utils.js';
 import type { AuthUser } from '../types.js';
 
 const memoryRoutes = new Hono<{ Variables: Variables }>();
@@ -80,6 +81,12 @@ function resolveMemoryPath(
   const writable = inGroups || inMemoryData;
 
   if (!writable) {
+    throw new Error('Memory path out of allowed scope');
+  }
+
+  // Symlink-escape defense: a symlink inside an allowed root could otherwise
+  // redirect reads/writes outside it. Re-verify the resolved real path.
+  if (!isRealpathInside(absolute, [GROUPS_DIR, MEMORY_DATA_DIR])) {
     throw new Error('Memory path out of allowed scope');
   }
 

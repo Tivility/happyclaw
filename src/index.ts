@@ -211,6 +211,7 @@ import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
 import { checkOwnerActive } from './owner-gate.js';
 import {
   ensureAgentDirectories,
+  isRealpathInside,
   isSystemMaintenanceNoise,
   stripAgentInternalTags,
   stripVirtualJidSuffix,
@@ -923,8 +924,20 @@ function isRetryDuplicateIpcSend(
   const now = Date.now();
   const exp = recentIpcSends.get(key);
   // 仅在该 group 处于重试重放时，已见过的指纹才视为重复并抑制。
-  const inRetry = queue.getRetryCount(`web:${sourceGroup}`) > 0
-    || queue.getRetryCount(sourceGroup) > 0;
+  // retryCount 挂在「入队时的原始 chatJid」上——对直连 IM 群组是带前缀的
+  // IM jid（如 feishu:oc_xxx），仅查 web:{folder}/{folder} 会漏掉它们导致
+  // 去重对所有 IM 来源失效。故用 folder 反查其全部注册 jid 逐一检查。
+  let inRetry =
+    queue.getRetryCount(`web:${sourceGroup}`) > 0 ||
+    queue.getRetryCount(sourceGroup) > 0;
+  if (!inRetry) {
+    for (const jid of getJidsByFolder(sourceGroup)) {
+      if (queue.getRetryCount(jid) > 0) {
+        inRetry = true;
+        break;
+      }
+    }
+  }
   const isDup = !!(exp && exp > now) && inRetry;
   recentIpcSends.set(key, now + IPC_SEND_DEDUP_TTL_MS);
   // 容量控制：Map 迭代为插入序，先进先出淘汰
@@ -1327,6 +1340,10 @@ function extractLocalImImagePaths(
       !resolved.startsWith(workspaceRoot + path.sep)
     )
       continue;
+    // Symlink-escape protection: reject paths whose realpath leaves the
+    // workspace (a symlink with an in-workspace lexical path could otherwise
+    // exfiltrate arbitrary host/other-user files via IM).
+    if (!isRealpathInside(resolved, workspaceRoot)) continue;
     if (seen.has(resolved)) continue;
     try {
       if (!fs.statSync(resolved).isFile()) continue;
@@ -6808,6 +6825,18 @@ async function processTaskIpc(
             sourceGroup,
           });
           if (fileImRoute) {
+            // Symlink-escape protection: the lexical startsWith check above does
+            // not stop a symlink (inside the workspace) pointing at host/other-user
+            // files. Re-verify the final path (original OR downloads fallback)
+            // resolves inside the workspace before reading it for delivery.
+            const sendRoot = path.resolve(GROUPS_DIR, sourceGroup);
+            if (!isRealpathInside(resolvedPath, sendRoot)) {
+              logger.warn(
+                { sourceGroup, filePath: data.filePath, resolvedPath },
+                'Symlink traversal attempt blocked in send_file IPC',
+              );
+              break;
+            }
             const imFileName = data.fileName || path.basename(resolvedPath);
             const sent = await retryImOperation('send_file', fileImRoute, () =>
               imManager.sendFile(fileImRoute, resolvedPath, imFileName),

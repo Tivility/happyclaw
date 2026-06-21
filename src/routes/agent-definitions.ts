@@ -6,7 +6,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import type { Variables } from '../web-context.js';
-import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
+import { authMiddleware, systemConfigMiddleware, adminRoleMiddleware } from '../middleware/auth.js';
 import { logger } from '../logger.js';
 
 const agentDefinitionsRoutes = new Hono<{ Variables: Variables }>();
@@ -192,7 +192,7 @@ agentDefinitionsRoutes.get('/:id', authMiddleware, (c) => {
 });
 
 // Update agent content
-agentDefinitionsRoutes.put('/:id', authMiddleware, systemConfigMiddleware, async (c) => {
+agentDefinitionsRoutes.put('/:id', authMiddleware, systemConfigMiddleware, adminRoleMiddleware, async (c) => {
   const id = c.req.param('id');
   if (!validateAgentId(id)) {
     return c.json({ error: 'Invalid agent ID' }, 400);
@@ -218,7 +218,7 @@ agentDefinitionsRoutes.put('/:id', authMiddleware, systemConfigMiddleware, async
 });
 
 // Create new agent
-agentDefinitionsRoutes.post('/', authMiddleware, systemConfigMiddleware, async (c) => {
+agentDefinitionsRoutes.post('/', authMiddleware, systemConfigMiddleware, adminRoleMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const { name, content } = body as { name: string; content: string };
 
@@ -251,7 +251,7 @@ agentDefinitionsRoutes.post('/', authMiddleware, systemConfigMiddleware, async (
 });
 
 // Delete agent
-agentDefinitionsRoutes.delete('/:id', authMiddleware, systemConfigMiddleware, (c) => {
+agentDefinitionsRoutes.delete('/:id', authMiddleware, systemConfigMiddleware, adminRoleMiddleware, (c) => {
   const id = c.req.param('id');
   if (!validateAgentId(id)) {
     return c.json({ error: 'Invalid agent ID' }, 400);

@@ -58,9 +58,26 @@ import {
 import { getSystemSettings } from '../runtime-config.js';
 import type { Variables } from '../web-context.js';
 import type { AuthUser, BillingPlan, RedeemCode } from '../types.js';
+import { escapeCsvField } from '../utils.js';
 
 const billingRoutes = new Hono<{ Variables: Variables }>();
 const billingManageMiddleware = requirePermission('manage_billing');
+
+/**
+ * Parse a pagination/range query param into a clamped integer. Non-numeric
+ * input (e.g. ?limit=abc → NaN) would otherwise reach SQLite as NaN and cause
+ * a datatype-mismatch 500.
+ */
+function parseClampedInt(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const n = parseInt(raw ?? '', 10);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, min), max);
+}
 
 // ==================== User-facing endpoints ====================
 
@@ -117,8 +134,8 @@ billingRoutes.get('/my/usage', authMiddleware, async (c) => {
 // GET /my/transactions — balance change history (paginated)
 billingRoutes.get('/my/transactions', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
-  const limit = Math.min(parseInt(c.req.query('limit') || '50'), 100);
-  const offset = parseInt(c.req.query('offset') || '0');
+  const limit = parseClampedInt(c.req.query('limit'), 50, 1, 100);
+  const offset = parseClampedInt(c.req.query('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
   const result = getBalanceTransactions(user.id, limit, offset);
   return c.json(result);
 });
@@ -392,8 +409,8 @@ billingRoutes.get(
   billingManageMiddleware,
   async (c) => {
     const userId = c.req.param('id');
-    const limit = Math.min(parseInt(c.req.query('limit') || '20'), 100);
-    const offset = parseInt(c.req.query('offset') || '0');
+    const limit = parseClampedInt(c.req.query('limit'), 20, 1, 100);
+    const offset = parseClampedInt(c.req.query('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
     const result = getBalanceTransactions(userId, limit, offset);
     return c.json(result);
   },
@@ -556,8 +573,8 @@ billingRoutes.get(
   authMiddleware,
   billingManageMiddleware,
   async (c) => {
-    const limit = Math.min(parseInt(c.req.query('limit') || '50'), 200);
-    const offset = parseInt(c.req.query('offset') || '0');
+    const limit = parseClampedInt(c.req.query('limit'), 50, 1, 200);
+    const offset = parseClampedInt(c.req.query('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
     const userId = c.req.query('user_id');
     const eventType = c.req.query('event_type');
     const result = getBillingAuditLog(limit, offset, userId || undefined, eventType || undefined);
@@ -656,26 +673,19 @@ billingRoutes.get(
   async (c) => {
     const codes = getAllRedeemCodes();
     const header = 'code,type,value_usd,plan_id,duration_days,max_uses,used_count,expires_at,notes,batch_id,created_at\n';
-    const csvEscape = (val: unknown): string => {
-      const s = String(val ?? '');
-      if (s.includes(',') || s.includes('"') || s.includes('\n')) {
-        return `"${s.replace(/"/g, '""')}"`;
-      }
-      return s;
-    };
     const rows = codes.map((rc) =>
       [
-        csvEscape(rc.code),
-        csvEscape(rc.type),
-        csvEscape(rc.value_usd ?? ''),
-        csvEscape(rc.plan_id ?? ''),
-        csvEscape(rc.duration_days ?? ''),
-        csvEscape(rc.max_uses),
-        csvEscape(rc.used_count),
-        csvEscape(rc.expires_at ?? ''),
-        csvEscape(rc.notes ?? ''),
-        csvEscape(rc.batch_id ?? ''),
-        csvEscape(rc.created_at ?? ''),
+        escapeCsvField(rc.code),
+        escapeCsvField(rc.type),
+        escapeCsvField(rc.value_usd ?? ''),
+        escapeCsvField(rc.plan_id ?? ''),
+        escapeCsvField(rc.duration_days ?? ''),
+        escapeCsvField(rc.max_uses),
+        escapeCsvField(rc.used_count),
+        escapeCsvField(rc.expires_at ?? ''),
+        escapeCsvField(rc.notes ?? ''),
+        escapeCsvField(rc.batch_id ?? ''),
+        escapeCsvField(rc.created_at ?? ''),
       ].join(','),
     );
     const csv = '\uFEFF' + header + rows.join('\n');
@@ -717,7 +727,7 @@ billingRoutes.get(
   authMiddleware,
   billingManageMiddleware,
   async (c) => {
-    const months = Math.min(parseInt(c.req.query('months') || '6'), 24);
+    const months = parseClampedInt(c.req.query('months'), 6, 1, 24);
     const trend = getRevenueTrend(months);
     return c.json({ trend });
   },
@@ -726,7 +736,7 @@ billingRoutes.get(
 // GET /my/usage/daily — daily usage history for charts
 billingRoutes.get('/my/usage/daily', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
-  const days = Math.min(parseInt(c.req.query('days') || '14'), 90);
+  const days = parseClampedInt(c.req.query('days'), 14, 1, 90);
   const history = getUserDailyUsageHistory(user.id, days);
   return c.json({ history });
 });

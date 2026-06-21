@@ -1,9 +1,13 @@
 import { describe, expect, test } from 'vitest';
+import { PassThrough } from 'node:stream';
 
 import {
   isApiError,
   isProviderFailureResult,
+  createStdoutParserState,
+  attachStdoutHandler,
 } from '../src/agent-output-parser.js';
+import type { ContainerOutput } from '../src/container-runner.js';
 
 describe('isProviderFailureResult — positive (genuine Claude limit notices)', () => {
   test('detects Claude extra-usage exhaustion returned as final text', () => {
@@ -137,5 +141,177 @@ describe('isApiError — stderr classification still detects provider issues', (
 
   test('returns false for empty stderr', () => {
     expect(isApiError('')).toBe(false);
+  });
+});
+
+describe('attachStdoutHandler — framed output parsing (marker collision)', () => {
+  // Helper: feed chunks through the parser and collect emitted outputs.
+  async function runParser(
+    chunks: string[],
+  ): Promise<ContainerOutput[]> {
+    const stream = new PassThrough();
+    const state = createStdoutParserState();
+    const collected: ContainerOutput[] = [];
+    attachStdoutHandler(stream, state, {
+      groupName: 'test',
+      label: 'Test',
+      resetTimeout: () => {},
+      onOutput: async (o) => {
+        collected.push(o);
+      },
+    });
+    for (const c of chunks) stream.write(c);
+    stream.end();
+    // Let the stream 'data' handlers and the outputChain promise settle.
+    await new Promise((r) => setTimeout(r, 10));
+    await state.outputChain;
+    return collected;
+  }
+
+  const S = '---HAPPYCLAW_OUTPUT_START---';
+  const E = '---HAPPYCLAW_OUTPUT_END---';
+
+  test('parses a normal framed result', async () => {
+    const out = await runParser([
+      `${S}${JSON.stringify({ status: 'success', result: 'hi' })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe('hi');
+  });
+
+  test('does NOT drop a result whose payload contains the literal END marker', async () => {
+    // The agent's reply text mentions the END marker string. The naive
+    // indexOf(END) would truncate the JSON and silently drop the message.
+    const result = `Here is the marker: ${E} — note it.`;
+    const out = await runParser([
+      `${S}${JSON.stringify({ status: 'success', result })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe(result);
+  });
+
+  test('waits for more data on an incomplete pair instead of dropping it', async () => {
+    const payload = JSON.stringify({ status: 'success', result: 'split' });
+    const full = `${S}${payload}${E}`;
+    const mid = Math.floor(full.length / 2);
+    // Deliver in two chunks; the first is an incomplete frame.
+    const out = await runParser([full.slice(0, mid), full.slice(mid)]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe('split');
+  });
+
+  test('parses two back-to-back framed results', async () => {
+    const out = await runParser([
+      `${S}${JSON.stringify({ status: 'stream', result: null })}${E}` +
+        `${S}${JSON.stringify({ status: 'success', result: 'done' })}${E}`,
+    ]);
+    expect(out).toHaveLength(2);
+    expect(out[1].result).toBe('done');
+  });
+
+  test('resyncs past a non-object frame and still emits a following valid frame', async () => {
+    // A broken (non-`{`) payload that is fully delimited, followed by a valid
+    // frame. The parser must skip the broken frame (not stall until the size
+    // cap) and emit the trailing valid one. Guards the resyncPastBrokenFrame
+    // non-object branch — a regression (reverting `continue` to `break`) would
+    // drop the valid frame.
+    const out = await runParser([
+      `${S}42${E}${S}${JSON.stringify({ status: 'success', result: 'ok' })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe('ok');
+  });
+
+  test('skips a fully-delimited non-object frame with nothing following (no stall)', async () => {
+    // START + a bare string + END, no later START. Must resync past this frame's
+    // END (it is fully delimited) rather than waiting for a non-existent next
+    // START. Asserting it returns (no hang) and emits nothing.
+    const out = await runParser([`${S}"just a string"${E}`]);
+    expect(out).toHaveLength(0);
+  });
+
+  test('resyncs past balanced-but-invalid JSON and emits the next valid frame', async () => {
+    // Balanced braces but not parseable JSON → parse-failure branch resyncs by
+    // the already-located END index (knownEnd), not by scanning for a later
+    // START. The following valid frame must still be emitted.
+    const out = await runParser([
+      `${S}{not valid json}${E}${S}${JSON.stringify({ status: 'success', result: 'after' })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe('after');
+  });
+
+  test('parses a complete frame whose payload contains the literal START marker', async () => {
+    // Symmetric to the embedded-END case: the reply text mentions the START
+    // marker. The real terminator is present, so it must parse normally.
+    const result = `Talking about the ${S} marker here.`;
+    const out = await runParser([
+      `${S}${JSON.stringify({ status: 'success', result })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe(result);
+  });
+
+  test('does NOT drop a still-incomplete frame whose payload contains the literal START marker', async () => {
+    // Regression: the old resync logic, on an incomplete frame, searched for a
+    // later START marker and — finding the one embedded in the payload —
+    // discarded the genuine frame. Deliver the frame split BEFORE the END
+    // marker arrives, with a START marker embedded in the still-partial payload.
+    // The parser must wait and then emit the frame intact.
+    const result = `embedded ${S} inside`;
+    const full = `${S}${JSON.stringify({ status: 'success', result })}${E}`;
+    // Split right after the embedded START marker so the first chunk is an
+    // incomplete frame that already contains a second START marker.
+    const splitAt = full.indexOf(S, S.length) + S.length;
+    const out = await runParser([full.slice(0, splitAt), full.slice(splitAt)]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe(result);
+  });
+
+  test('emits a frame even when its payload embeds both START and END markers', async () => {
+    // The hardest collision: the payload quotes both markers and arrives in one
+    // piece. The scanner must skip the embedded END (JSON parse fails on the
+    // truncated slice) and not be fooled by the embedded START.
+    const result = `both ${S} and ${E} quoted`;
+    const out = await runParser([
+      `${S}${JSON.stringify({ status: 'success', result })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe(result);
+  });
+
+  test('recovers a complete frame whose payload embeds 300+ literal END markers', async () => {
+    // The payload quotes 300+ literal END markers inside a string value. The
+    // brace matcher finds the object's true end regardless, so the frame (and
+    // its session id) is recovered, never dropped.
+    const result = `${E} `.repeat(300);
+    const out = await runParser([
+      `${S}${JSON.stringify({ status: 'success', result, newSessionId: 'sid-1' })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0].result).toBe(result);
+    expect(out[0].newSessionId).toBe('sid-1');
+  });
+
+  test('emits BOTH frames when the first packs many END markers and a second frame trails', async () => {
+    // Regression (back-to-back delivery): agent-runner flushes a buffered
+    // text_delta then the final result via consecutive console.logs, which the
+    // OS pipe routinely coalesces into one chunk. A terminator-scanning parser
+    // would mis-bind frame1 to frame2's END and drop frame1; the brace matcher
+    // binds each frame to its own JSON object, so both survive.
+    const f1 = JSON.stringify({
+      status: 'stream',
+      result: `${E} `.repeat(300),
+    });
+    const f2 = JSON.stringify({
+      status: 'success',
+      result: 'final',
+      newSessionId: 'sid-xyz',
+    });
+    const out = await runParser([`${S}${f1}${E}${S}${f2}${E}`]);
+    expect(out).toHaveLength(2);
+    expect(out[0].status).toBe('stream');
+    expect(out[1].result).toBe('final');
+    expect(out[1].newSessionId).toBe('sid-xyz');
   });
 });

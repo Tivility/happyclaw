@@ -138,19 +138,31 @@ const loginAttempts = new Map<string, AttemptRecord>();
 const GLOBAL_USERNAME_MULTIPLIER = 4;
 const GLOBAL_USERNAME_WINDOW_MS = 60 * 60 * 1000; // 1 hour
 
-// Sliding window: clean old entries every 10 minutes
-setInterval(
+// Memory reclamation only. The authoritative expiry check is in
+// checkAttemptRecord (based on firstAttempt + the relevant window). This TTL
+// must therefore be >= every possible rate-limit window, or records would be
+// reclaimed early and an attacker could reset the global limit by pausing.
+// lockoutMinutes is runtime-configurable, so use a generous upper bound and
+// key the reclamation on firstAttempt (not lastAttempt) to match the window
+// semantics used by checkAttemptRecord.
+const ATTEMPT_RECORD_RECLAIM_MS = Math.max(
+  24 * 60 * 60 * 1000, // 24h safety upper bound
+  GLOBAL_USERNAME_WINDOW_MS,
+);
+const loginAttemptsCleanupTimer = setInterval(
   () => {
     const now = Date.now();
     for (const [key, record] of loginAttempts) {
-      // Remove entries older than lockout period * 2
-      if (now - record.lastAttempt > 30 * 60 * 1000) {
+      if (now - record.firstAttempt > ATTEMPT_RECORD_RECLAIM_MS) {
         loginAttempts.delete(key);
       }
     }
   },
   10 * 60 * 1000,
 );
+// Don't keep short-lived CLI scripts (e.g. reset-admin) alive just for this
+// housekeeping timer.
+loginAttemptsCleanupTimer.unref?.();
 
 function checkAttemptRecord(
   key: string,

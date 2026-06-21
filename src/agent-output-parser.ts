@@ -14,6 +14,54 @@ import type { ContainerOutput } from './container-runner.js';
 export const OUTPUT_START_MARKER = '---HAPPYCLAW_OUTPUT_START---';
 export const OUTPUT_END_MARKER = '---HAPPYCLAW_OUTPUT_END---';
 
+/**
+ * Parse a framed payload slice, accepting it only if it yields a JSON *object*
+ * (a real ContainerOutput). Returns null on any parse error or a non-object.
+ */
+function tryParseContainerOutput(jsonStr: string): ContainerOutput | null {
+  let v: unknown;
+  try {
+    v = JSON.parse(jsonStr.trim());
+  } catch {
+    return null;
+  }
+  return typeof v === 'object' && v !== null ? (v as ContainerOutput) : null;
+}
+
+function isJsonWhitespace(ch: string): boolean {
+  return ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+}
+
+/**
+ * Find the end of the JSON object that starts at buf[start] (which must be '{').
+ * Returns the index just AFTER the matching closing '}', or -1 if the object is
+ * not yet complete in buf. String-aware: braces (and the literal START/END
+ * marker strings the payload may quote) inside JSON string values do not affect
+ * the brace depth, so this is never fooled by an embedded marker — even when a
+ * second frame trails in the same buffer. O(buf length), single pass.
+ */
+function findJsonObjectEnd(buf: string, start: number): number {
+  let depth = 0;
+  let inStr = false;
+  let escaped = false;
+  for (let i = start; i < buf.length; i++) {
+    const ch = buf[i];
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inStr = false;
+    } else if (ch === '"') {
+      inStr = true;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
 // ─── Stdout Stream Parser ────────────────────────────────────────────
 
 export interface StdoutParserState {
@@ -97,56 +145,130 @@ export function attachStdoutHandler(
       while (
         (startIdx = state.parseBuffer.indexOf(OUTPUT_START_MARKER)) !== -1
       ) {
-        const endIdx = state.parseBuffer.indexOf(OUTPUT_END_MARKER, startIdx);
-        if (endIdx === -1) break; // Incomplete pair, wait for more data
+        const contentStart = startIdx + OUTPUT_START_MARKER.length;
+        // Locate the framed JSON object by brace matching rather than by
+        // scanning for END markers. The agent's reply text can contain literal
+        // START/END marker strings inside the JSON payload; deriving the
+        // object's true end from the JSON structure is both correct (never
+        // fooled by an embedded marker — even when a second frame trails in the
+        // same buffer) and O(payload): no repeated slice+parse per candidate
+        // terminator, which would stall the shared main-process event loop. The
+        // ContainerOutput payload is always a JSON object.
+        let objStart = contentStart;
+        while (
+          objStart < state.parseBuffer.length &&
+          isJsonWhitespace(state.parseBuffer[objStart])
+        ) {
+          objStart++;
+        }
+        if (objStart >= state.parseBuffer.length) break; // only whitespace yet
 
-        const jsonStr = state.parseBuffer
-          .slice(startIdx + OUTPUT_START_MARKER.length, endIdx)
-          .trim();
+        // Resync past a broken/unparseable frame so the buffer never stalls
+        // until the size cap (the pre-refactor parser always advanced past a
+        // malformed frame). `knownEnd`, when given, is this frame's already
+        // located END index — used by the parse-failure path, whose object may
+        // legitimately contain literal END marker strings, so we must NOT
+        // re-scan for END from contentStart. Without it (non-object payload),
+        // skip past whichever boundary arrives first: this frame's END (frame
+        // fully delimited but malformed) or a later START. Returns false only
+        // when neither boundary exists yet, so the caller waits for more data.
+        const resyncPastBrokenFrame = (
+          reason: string,
+          knownEnd?: number,
+        ): boolean => {
+          let resyncTo = -1;
+          if (knownEnd !== undefined) {
+            resyncTo = knownEnd + OUTPUT_END_MARKER.length;
+          } else {
+            const nextStart = state.parseBuffer.indexOf(
+              OUTPUT_START_MARKER,
+              contentStart,
+            );
+            const endIdx = state.parseBuffer.indexOf(
+              OUTPUT_END_MARKER,
+              contentStart,
+            );
+            if (endIdx !== -1 && (nextStart === -1 || endIdx < nextStart)) {
+              resyncTo = endIdx + OUTPUT_END_MARKER.length;
+            } else if (nextStart !== -1) {
+              resyncTo = nextStart;
+            }
+          }
+          if (resyncTo === -1) return false;
+          logger.warn({ group: opts.groupName }, reason);
+          state.parseBuffer = state.parseBuffer.slice(resyncTo);
+          return true;
+        };
+
+        if (state.parseBuffer[objStart] !== '{') {
+          // Payload isn't a JSON object — framing is broken.
+          if (
+            resyncPastBrokenFrame(
+              'Framed payload is not a JSON object, resyncing past broken frame',
+            )
+          ) {
+            continue;
+          }
+          break;
+        }
+
+        const objEnd = findJsonObjectEnd(state.parseBuffer, objStart);
+        if (objEnd === -1) break; // object still streaming in — wait
+        const endIdx = state.parseBuffer.indexOf(OUTPUT_END_MARKER, objEnd);
+        if (endIdx === -1) break; // object complete, END marker not here yet
+
+        const parsed = tryParseContainerOutput(
+          state.parseBuffer.slice(objStart, objEnd),
+        );
+        if (!parsed) {
+          // Balanced braces but not a valid ContainerOutput object (should not
+          // happen for well-formed output). The frame is fully delimited (END
+          // already located at endIdx), so drop it and continue rather than
+          // stalling until the buffer cap — no later START is required.
+          resyncPastBrokenFrame(
+            'Framed JSON object failed to parse, skipping frame',
+            endIdx,
+          );
+          continue;
+        }
+
         state.parseBuffer = state.parseBuffer.slice(
           endIdx + OUTPUT_END_MARKER.length,
         );
 
-        try {
-          const parsed: ContainerOutput = JSON.parse(jsonStr);
-          if (parsed.newSessionId) {
-            state.newSessionId = parsed.newSessionId;
-          }
-          if (parsed.status === 'success') {
-            state.hasSuccessOutput = true;
-            if (isProviderFailureResult(parsed.result)) {
-              state.hasProviderFailureOutput = true;
-              parsed.providerFailure = true;
-            }
-          }
-          if (parsed.status === 'closed') {
-            state.hasClosedOutput = true;
-          }
-          if (
-            parsed.status === 'stream' &&
-            parsed.streamEvent?.statusText === 'interrupted'
-          ) {
-            state.hasInterruptedOutput = true;
-          }
-          // Activity detected — reset the hard timeout
-          opts.resetTimeout();
-          // Call onOutput for all markers (including null results)
-          // so idle timers start even for "silent" query completions.
-          const onOutputFn = opts.onOutput;
-          state.outputChain = state.outputChain
-            .then(() => onOutputFn(parsed))
-            .catch((err) => {
-              logger.error(
-                { group: opts.groupName, err },
-                'onOutput callback error',
-              );
-            });
-        } catch (err) {
-          logger.warn(
-            { group: opts.groupName, error: err },
-            'Failed to parse streamed output chunk',
-          );
+        if (parsed.newSessionId) {
+          state.newSessionId = parsed.newSessionId;
         }
+        if (parsed.status === 'success') {
+          state.hasSuccessOutput = true;
+          if (isProviderFailureResult(parsed.result)) {
+            state.hasProviderFailureOutput = true;
+            parsed.providerFailure = true;
+          }
+        }
+        if (parsed.status === 'closed') {
+          state.hasClosedOutput = true;
+        }
+        if (
+          parsed.status === 'stream' &&
+          parsed.streamEvent?.statusText === 'interrupted'
+        ) {
+          state.hasInterruptedOutput = true;
+        }
+        // Activity detected — reset the hard timeout
+        opts.resetTimeout();
+        // Call onOutput for all markers (including null results) so idle timers
+        // start even for "silent" query completions.
+        const onOutputFn = opts.onOutput;
+        const parsedForCallback = parsed;
+        state.outputChain = state.outputChain
+          .then(() => onOutputFn(parsedForCallback))
+          .catch((err) => {
+            logger.error(
+              { group: opts.groupName, err },
+              'onOutput callback error',
+            );
+          });
       }
     }
   });
