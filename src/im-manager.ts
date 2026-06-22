@@ -42,7 +42,7 @@ import type { StreamingSession } from './im-channel.js';
 import { getRegisteredGroup, getJidsByFolder } from './db.js';
 import { getUserDingTalkConfig } from './runtime-config.js';
 import { logger } from './logger.js';
-import type { FeishuMessageMeta } from './types.js';
+import type { ChatProbe, FeishuMessageMeta } from './types.js';
 
 export interface UserIMConnection {
   userId: string;
@@ -1100,7 +1100,14 @@ class IMConnectionManager {
     return this.connections.get(userId)?.channels.get('qq');
   }
 
-  /** Get chat info from the Feishu API for a specific user's connection */
+  /**
+   * Get chat info from the Feishu API for a specific user's connection.
+   *
+   * 这是供 web 路由（thread-capability 检测等）使用的便利方法，保持旧的
+   * nullable 对象契约：成功 → info 对象；其他（未连接 / 不可达 / 我方故障）→ null。
+   * 注意：此方法**不**用于破坏性健康检查决策——那条路径用下方返回 ChatProbe 的
+   * getChatInfo()，能区分 'gone' 与 'unknown'。
+   */
   async getFeishuChatInfo(
     userId: string,
     chatId: string,
@@ -1110,42 +1117,36 @@ class IMConnectionManager {
     user_count?: string;
     chat_type?: string;
     chat_mode?: string;
+    group_message_type?: string;
   } | null> {
     const channel = this.getFeishuConnection(userId);
     if (!channel?.getChatInfo) return null;
-    return channel.getChatInfo(chatId);
+    const probe = await channel.getChatInfo(chatId);
+    return probe.status === 'ok' ? probe.info : null;
   }
 
   /**
    * Get chat info for an IM group by JID, auto-routing to the correct connection.
    * Used for health checks to detect disbanded groups.
    *
-   * Returns:
-   * - object: chat info (reachable)
-   * - null: channel supports getChatInfo but chat is not reachable
-   * - undefined: channel does not support getChatInfo (e.g. Telegram, QQ)
+   * Returns a ChatProbe. 关键语义：'unknown'（我方/传输故障）携带零信息量，调用方
+   * 绝不能据此做破坏性决策；只有 'gone'（针对该群的确定性否定）才允许进入解绑/删除
+   * 计数。内部错误（无法解析 channel type）也归 unknown，而非 gone。
    */
-  async getChatInfo(jid: string): Promise<
-    | {
-        avatar?: string;
-        name?: string;
-        user_count?: string;
-        chat_type?: string;
-        chat_mode?: string;
-      }
-    | null
-    | undefined
-  > {
+  async getChatInfo(jid: string): Promise<ChatProbe> {
     const channelType = getChannelType(jid);
-    if (!channelType) return null;
+    // 无法解析 channel type 是内部错误，零信息量 → unknown（绝不当作群失效）
+    if (!channelType) {
+      return { status: 'unknown', reason: 'unresolved channel type' };
+    }
 
     const chatId = extractChatId(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.getChatInfo) {
       return channel.getChatInfo(chatId);
     }
-    // Channel doesn't implement getChatInfo — not a reachability failure
-    return undefined;
+    // Channel doesn't implement getChatInfo — not a reachability signal
+    return { status: 'unsupported' };
   }
 
   /** Get all user IDs with active connections */

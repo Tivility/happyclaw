@@ -196,6 +196,7 @@ import {
 } from './billing.js';
 import {
   AgentStatus,
+  ChatProbe,
   FeishuMessageMeta,
   MessageCursor,
   MessageFinalizationReason,
@@ -206,6 +207,7 @@ import {
   SubAgent,
 } from './types.js';
 import { logger } from './logger.js';
+import { decideHealthAction } from './im-safety/index.js';
 import { resolveTaskOwner } from './task-utils.js';
 import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
 import { checkOwnerActive } from './owner-gate.js';
@@ -1009,6 +1011,17 @@ function unbindImGroup(jid: string, reason: string): void {
     target_main_jid: undefined,
     reply_policy: 'source_only' as const,
   };
+  // 审计：记下清空前的指针值，便于将来复盘"是谁/为何把绑定清空了"
+  logger.warn(
+    {
+      jid,
+      action: 'unbindImGroup',
+      reason,
+      oldTargetMainJid: targetMainJid,
+      oldTargetAgentId: agentId,
+    },
+    'binding change',
+  );
   setRegisteredGroup(jid, updated);
   registeredGroups[jid] = updated;
   imSendFailCounts.delete(jid);
@@ -1027,6 +1040,17 @@ function unbindImGroup(jid: string, reason: string): void {
 export function removeImGroupRecord(jid: string, reason: string): void {
   const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
   if (!group) return;
+  // 审计：记下清空前的指针值，便于将来复盘
+  logger.warn(
+    {
+      jid,
+      action: 'removeImGroupRecord',
+      reason,
+      oldTargetMainJid: group.target_main_jid,
+      oldTargetAgentId: group.target_agent_id,
+    },
+    'binding change',
+  );
   deleteImGroupRecord(jid);
   delete registeredGroups[jid];
   imSendFailCounts.delete(jid);
@@ -1039,6 +1063,39 @@ export function removeImGroupRecord(jid: string, reason: string): void {
     },
     reason,
   );
+}
+
+/**
+ * 健康检查确认某 IM 群"针对该群的确定性否定"已达阈值后的善后。
+ *
+ * 默认**不毁数据**：autoRemoveDeadImGroup !== true 时只打一条 warn 旗标，等待人工
+ * 复核（避免任何自动化误删——本次串台事故的教训）。仅当显式开启自动移除时，才用
+ * 可恢复的 unbindImGroup（清空 target_* 指针）而非 removeImGroupRecord（删整行）。
+ */
+function onConfirmedGone(jid: string, reason: string): void {
+  // 先写审计日志（unbindImGroup 内部也会写一条；这里多记一条 confirmed-gone 上下文）
+  const group = registeredGroups[jid] ?? getRegisteredGroup(jid);
+  logger.warn(
+    {
+      jid,
+      action: 'confirmedGone',
+      reason,
+      oldTargetMainJid: group?.target_main_jid,
+      oldTargetAgentId: group?.target_agent_id,
+    },
+    'binding change',
+  );
+
+  if (getSystemSettings().autoRemoveDeadImGroup !== true) {
+    logger.warn(
+      { jid, reason },
+      'IM group confirmed gone — flagged, NOT auto-removed',
+    );
+    return;
+  }
+
+  // 可恢复的解绑（清空指针），而非删整行
+  unbindImGroup(jid, 'confirmed gone: ' + reason);
 }
 
 /**
@@ -11278,36 +11335,45 @@ async function checkImBindingsHealth(): Promise<void> {
     }
 
     try {
-      const info = await imManager.getChatInfo(jid);
-      if (info === undefined) {
-        // Channel doesn't support getChatInfo (e.g. Telegram, QQ) — skip reachability check
-        continue;
-      }
-      if (info === null) {
-        // Chat not reachable — could be temporary (connection down, API permission issue)
-        const count = (imHealthCheckFailCounts.get(jid) ?? 0) + 1;
-        imHealthCheckFailCounts.set(jid, count);
-        if (count >= IM_HEALTH_CHECK_FAIL_THRESHOLD) {
-          removeImGroupRecord(
-            jid,
-            'IM group not reachable after multiple checks, auto-removing',
-          );
-        } else {
+      const probe: ChatProbe = await imManager.getChatInfo(jid);
+      const action = decideHealthAction(
+        probe,
+        imHealthCheckFailCounts.get(jid) ?? 0,
+        IM_HEALTH_CHECK_FAIL_THRESHOLD,
+      );
+      switch (action.kind) {
+        case 'skip':
+          // 'unknown'（我方/传输故障）或 'unsupported'（渠道不支持）——
+          // 零信息量，绝不累加 imHealthCheckFailCounts、绝不动绑定（根治点）
+          if (probe.status === 'unknown') {
+            logger.debug(
+              { jid, reason: probe.reason },
+              'IM health check inconclusive (our-side/transport) — ignored',
+            );
+          }
+          continue;
+        case 'reset':
+          // Chat is reachable — reset failure counter
+          imHealthCheckFailCounts.delete(jid);
+          break;
+        case 'wait':
+          imHealthCheckFailCounts.set(jid, action.nextCount);
           logger.debug(
             {
               jid,
-              failCount: count,
+              failCount: action.nextCount,
               threshold: IM_HEALTH_CHECK_FAIL_THRESHOLD,
             },
-            'IM health check failed, will retry before unbinding',
+            'IM health check confirmed-gone, will retry before acting',
           );
-        }
-      } else {
-        // Chat is reachable — reset failure counter
-        imHealthCheckFailCounts.delete(jid);
+          break;
+        case 'confirmed_gone':
+          imHealthCheckFailCounts.set(jid, IM_HEALTH_CHECK_FAIL_THRESHOLD);
+          onConfirmedGone(jid, action.reason);
+          break;
       }
     } catch (err) {
-      // API error — could be temporary, don't unbind on single failure
+      // 异常也当 inconclusive（零信息量）——绝不动绑定
       logger.debug({ jid, err }, 'IM binding health check failed for group');
     }
   }

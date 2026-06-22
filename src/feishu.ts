@@ -31,7 +31,7 @@ import {
   type MentionGateMention,
 } from './feishu-mention-gate.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
-import type { FeishuMessageMeta } from './types.js';
+import type { ChatProbe, FeishuMessageMeta } from './types.js';
 
 // ─── FeishuConnection Interface ────────────────────────────────
 
@@ -115,7 +115,7 @@ export interface FeishuConnection {
   clearAckReaction(chatId: string): void;
   isConnected(): boolean;
   syncGroups(): Promise<void>;
-  getChatInfo(chatId: string): Promise<FeishuChatInfo | null>;
+  getChatInfo(chatId: string): Promise<ChatProbe>;
   /** Get the underlying Lark SDK client (for streaming cards) */
   getLarkClient(): lark.Client | null;
   /** Get the last received message ID for a chat (for reply threading) */
@@ -123,6 +123,107 @@ export interface FeishuConnection {
 }
 
 // ─── Shared Helpers (pure functions, no instance state) ────────
+
+/**
+ * 飞书业务错误码 → "该群确定性否定" 的映射集合。
+ *
+ * 根治原则：破坏性自动化只能基于"针对该群自身的确定性否定证据"。这里只放
+ * 我们能确信代表"群已不存在 / bot 已被移出"的飞书业务码。**初始留空**，因为
+ * 当前没有经实测确认的码值——宁可漏判不删（一切归 unknown），也不可凭猜测的码
+ * 误判错删。待按飞书 OAPI 实际返回的错误码逐个精化后再填入。
+ *
+ * 注意：HTTP 404 / 403 已在 classifyFeishuError 中按 HTTP 状态码直接归为 gone，
+ * 这里的集合仅用于 HTTP 200 但携带业务错误码的场景。
+ */
+const FEISHU_CHAT_NOT_FOUND_CODES = new Set<number>([
+  // 待按飞书实际错误码精化（如群解散 / chat_id 不存在）
+]);
+const FEISHU_BOT_NOT_IN_CHAT_CODES = new Set<number>([
+  // 待按飞书实际错误码精化（如 bot 已被移出该群）
+]);
+
+/** 明确代表"我方/传输故障"的网络错误码——零信息量，一律归 unknown。 */
+const TRANSPORT_ERROR_CODES = new Set<string>([
+  'EADDRNOTAVAIL',
+  'ECONNREFUSED',
+  'ETIMEDOUT',
+  'ENOTFOUND',
+  'ECONNRESET',
+]);
+
+/**
+ * 把 getChatInfo 抛出的异常分类为 ChatProbe。
+ *
+ * 默认归 'unknown'（我方/传输故障，零信息量）。只有能**明确匹配**"针对该群的
+ * 确定性否定"才归 'gone'：HTTP 404（chat 不存在）/ HTTP 403（bot 无权限/被踢），
+ * 或 HTTP 200 携带的 FEISHU_CHAT_NOT_FOUND_CODES / FEISHU_BOT_NOT_IN_CHAT_CODES。
+ *
+ * 网络码（EADDRNOTAVAIL 等）、token 接口故障、HTTP 429 / 5xx、以及任何无法确定
+ * 含义的飞书业务码，一律 unknown——宁可漏判不删，不可误判错删。
+ */
+export function classifyFeishuError(err: unknown): ChatProbe {
+  const e = (err ?? {}) as {
+    code?: unknown;
+    message?: unknown;
+    cause?: { code?: unknown };
+    response?: { status?: unknown; data?: { code?: unknown } };
+  };
+
+  // 1) 网络/传输码 → unknown（我方故障）
+  const rawCode =
+    typeof e.code === 'string'
+      ? e.code
+      : typeof e.cause?.code === 'string'
+        ? e.cause.code
+        : undefined;
+  if (rawCode && TRANSPORT_ERROR_CODES.has(rawCode)) {
+    return { status: 'unknown', reason: `transport error: ${rawCode}` };
+  }
+
+  // 2) token 接口故障 / 解构失败 → unknown（我方故障）
+  const message = typeof e.message === 'string' ? e.message : '';
+  if (
+    message.includes('tenant_access_token') ||
+    message.includes('Cannot destructure')
+  ) {
+    return { status: 'unknown', reason: 'token/auth pipeline error' };
+  }
+
+  // 3) HTTP 状态码
+  const httpStatus =
+    typeof e.response?.status === 'number' ? e.response.status : undefined;
+  if (httpStatus !== undefined) {
+    if (httpStatus === 429 || httpStatus >= 500) {
+      // 限流 / 服务端故障 → 我方视角不可断言群失效
+      return { status: 'unknown', reason: `http ${httpStatus}` };
+    }
+    if (httpStatus === 404) {
+      return { status: 'gone', reason: 'http 404 not found' };
+    }
+    if (httpStatus === 403) {
+      return { status: 'gone', reason: 'http 403 forbidden' };
+    }
+  }
+
+  // 4) 飞书业务码（HTTP 200 携带 code）
+  const feishuCode =
+    typeof e.response?.data?.code === 'number'
+      ? e.response.data.code
+      : undefined;
+  if (feishuCode !== undefined) {
+    if (FEISHU_CHAT_NOT_FOUND_CODES.has(feishuCode)) {
+      return { status: 'gone', reason: `feishu code ${feishuCode}: chat not found` };
+    }
+    if (FEISHU_BOT_NOT_IN_CHAT_CODES.has(feishuCode)) {
+      return { status: 'gone', reason: `feishu code ${feishuCode}: bot not in chat` };
+    }
+    // 无法确定含义的业务码 → unknown（宁可漏判不删）
+    return { status: 'unknown', reason: `feishu code ${feishuCode}` };
+  }
+
+  // 5) 兜底：无法确定 → unknown
+  return { status: 'unknown', reason: 'unclassified error' };
+}
 
 // Feishu card allows at most 5 markdown tables; beyond this, skip card and use post+md directly
 const CARD_TABLE_LIMIT = 5;
@@ -2014,25 +2115,31 @@ export function createFeishuConnection(
       return wsClient != null;
     },
 
-    async getChatInfo(chatId: string): Promise<FeishuChatInfo | null> {
-      if (!client) return null;
+    async getChatInfo(chatId: string): Promise<ChatProbe> {
+      // client 未就绪是我方状态，零信息量 → unknown（绝不当作群失效）
+      if (!client) return { status: 'unknown', reason: 'client not ready' };
       try {
         const target = parseFeishuRouteTarget(chatId);
         const res = await client.im.v1.chat.get({
           path: { chat_id: target.chatId },
         });
-        if (!res.data) return null;
+        // 空响应是我方/传输异常，无法断言群失效 → unknown
+        if (!res.data) return { status: 'unknown', reason: 'empty response' };
         return {
-          avatar: res.data.avatar,
-          name: res.data.name,
-          user_count: res.data.user_count,
-          chat_type: res.data.chat_type,
-          chat_mode: res.data.chat_mode,
-          group_message_type: (res.data as { group_message_type?: string }).group_message_type,
+          status: 'ok',
+          info: {
+            avatar: res.data.avatar,
+            name: res.data.name,
+            user_count: res.data.user_count,
+            chat_type: res.data.chat_type,
+            chat_mode: res.data.chat_mode,
+            group_message_type: (res.data as { group_message_type?: string })
+              .group_message_type,
+          },
         };
       } catch (err) {
         logger.warn({ err, chatId }, 'Failed to get Feishu chat info');
-        return null;
+        return classifyFeishuError(err);
       }
     },
 

@@ -4014,6 +4014,10 @@ export interface SystemSettings {
   // 跨天积压任务集体在重启那一秒并发 fire 刷屏。
   // 0 = 关闭（保留旧行为：无视逾期时长全部 backfill）。默认 300000 (5 分钟)。
   taskBackfillGraceMs: number;
+  // 健康检查确认某 IM 群"针对该群的确定性否定"达阈值后，是否自动解绑该群。
+  // 默认 false：只打 warn 旗标、等待人工复核，绝不自动毁数据（避免误判错删）。
+  // true：用可恢复的 unbindImGroup（清空 target_* 指针）自动解绑。
+  autoRemoveDeadImGroup?: boolean;
 }
 
 // Upper bound for the login lockout window. auth.ts reclaims login-attempt
@@ -4045,6 +4049,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   disableMemoryLayerForAdminHost: false,
   pluginAutoScan: true,
   taskBackfillGraceMs: 300000,
+  autoRemoveDeadImGroup: false,
 };
 
 function parseIntEnv(envVar: string | undefined, fallback: number): number {
@@ -4160,6 +4165,10 @@ function readSystemSettingsFromFile(): SystemSettings | null {
       raw.taskBackfillGraceMs >= 0
         ? raw.taskBackfillGraceMs
         : DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
+    autoRemoveDeadImGroup:
+      typeof raw.autoRemoveDeadImGroup === 'boolean'
+        ? raw.autoRemoveDeadImGroup
+        : DEFAULT_SYSTEM_SETTINGS.autoRemoveDeadImGroup,
   };
 }
 
@@ -4236,6 +4245,9 @@ function buildEnvFallbackSettings(): SystemSettings {
       process.env.TASK_BACKFILL_GRACE_MS,
       DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
     ),
+    autoRemoveDeadImGroup:
+      process.env.AUTO_REMOVE_DEAD_IM_GROUP === 'true' ||
+      DEFAULT_SYSTEM_SETTINGS.autoRemoveDeadImGroup,
   };
 }
 

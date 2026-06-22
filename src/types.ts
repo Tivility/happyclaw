@@ -180,6 +180,29 @@ export interface RuntimeNativeSession extends RuntimeSessionKey {
   updated_at: string;
 }
 
+/**
+ * IM 群组探测结果（getChatInfo 的统一返回类型）。
+ *
+ * 设计动机：破坏性自动化决策（解绑/删除 IM 群记录）只能基于"针对该群自身的
+ * 确定性否定证据"。我方/传输故障（token 接口抖动、网络错误、超时、限流、5xx）
+ * 携带零信息量，必须显式标记为 'unknown' 并被健康检查决策忽略，避免一次飞书
+ * token 接口抖动导致所有 bound 群批量返回 null → 跨阈值 → 全部串台的事故。
+ */
+export interface ChatInfo {
+  avatar?: string;
+  name?: string;
+  user_count?: string;
+  chat_type?: string;
+  chat_mode?: string; // 'p2p' | 'group' | 'topic'
+  group_message_type?: string; // 'chat' | 'thread'
+}
+
+export type ChatProbe =
+  | { status: 'ok'; info: ChatInfo }
+  | { status: 'gone'; reason: string } // 针对该群的确定性否定：404 not-found / 403 bot 被踢
+  | { status: 'unknown'; reason: string } // 我方/传输故障：token/网络/超时/429/5xx/client 未就绪
+  | { status: 'unsupported' }; // 渠道不支持（替代旧 undefined）
+
 /** 飞书消息的话题/线程元数据，用于 thread_map 路由 */
 export interface FeishuMessageMeta {
   threadId?: string;

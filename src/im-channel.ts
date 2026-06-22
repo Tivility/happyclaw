@@ -46,7 +46,7 @@ import {
   type WhatsAppConnectionState,
 } from './whatsapp.js';
 import { logger } from './logger.js';
-import type { FeishuMessageMeta } from './types.js';
+import type { ChatProbe, FeishuMessageMeta } from './types.js';
 import {
   StreamingCardController,
   type StreamingCardOptions,
@@ -140,14 +140,7 @@ export interface IMChannel {
     chatId: string,
     onCardCreated?: (messageId: string) => void,
   ): Promise<StreamingSession | undefined>;
-  getChatInfo?(chatId: string): Promise<{
-    avatar?: string;
-    name?: string;
-    user_count?: string;
-    chat_type?: string;
-    chat_mode?: string;
-    group_message_type?: string;
-  } | null>;
+  getChatInfo?(chatId: string): Promise<ChatProbe>;
 }
 
 // ─── Channel Registry ───────────────────────────────────────────
@@ -287,8 +280,9 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       await inner.sendFile(chatId, filePath, fileName);
     },
 
-    async getChatInfo(chatId: string) {
-      if (!inner) return null;
+    async getChatInfo(chatId: string): Promise<ChatProbe> {
+      // 飞书未连接是我方状态，零信息量 → unknown（绝不当作群失效）
+      if (!inner) return { status: 'unknown', reason: 'feishu not connected' };
       return inner.getChatInfo(chatId);
     },
 
