@@ -568,6 +568,38 @@ WebSocket：`/ws`（协议详见 §3.6）。
 
 **风险提示**：Baileys 是社区逆向工程的 WhatsApp Web 协议库，Meta 在 2025-2026 收紧识别（握手时序、加密时序），封号率显著上升。同 OpenClaw / Wechaty puppet 等同类逆向方案共享相同风险。商用场景应使用 Meta 官方 Cloud API（需要 Facebook Business 验证、按模板消息计费）。
 
+### 8.14 Grok 运行时（ACP / `grok agent stdio`）
+
+HappyClaw 支持除 Claude / Codex 之外的第三条 Agent 运行时：xAI 自家 CLI（`grok`）。通过 **ACP（Agent Client Protocol，JSON-RPC over stdio）** 驱动，模块结构镜像 codex 运行时（`grok-cli-runner.ts` ≈ `codex-cli-runner.ts`）。family / pool / runtime 全仓单一字符串 **`grok`**（禁用 `xai`）。
+
+**Auth（GROK_HOME seed，CLI 自刷新）**：
+- 用户 `grok login`（或 device-auth）得到 `auth.json`（含 access_token + 30 天 refresh_token），由 admin 粘贴到 provider 配置，AES-256-GCM 加密存 `StoredProviderV4.secrets.grokAuthJson`
+- spawn 前 `writeGrokProviderAuthMaterial(provider)`（`runtime-config.ts`，对标 `writeCodexProviderAuthMaterial`）把 auth.json **整体 seed** 到 `CLAUDE_CONFIG_DIR/grok/{providerId}/auth.json`（0600），设 `GROK_HOME` 指该目录。**不自研 OIDC**——让 grok CLI 用内置 refresh 链自刷新
+- 复用 codex seed-metadata 三件套（`authHash` + `authProfileGeneration` + mtime）去重，**只在凭据真变了才写**，避免覆盖 CLI 刚刷新的 token
+- GROK_HOME 目录 **RW 挂载**（host 直接读写 / docker `/workspace/grok-home` readonly:false），CLI 在容器内自刷新并回写持久化——长会话不会因 access_token 过期掉线
+- `deleteProvider` 时 `fs.rmSync(grokHomeDir, {recursive,force})` GC 残留凭据
+
+**会话模型（单 turn re-spawn，对标 codex）**：
+- `grokCliAdapter`（`runtime:'grok'`、`supportsNativeResume:true`、`supportsLiveInput:false`）：**一次 `run()` = 一个 ACP turn**，绝不在 run() 内等下一条 IPC（否则与 host drain 抢消息死锁）
+- 流程：spawn `grok agent --model grok-build --always-approve --no-auto-update stdio` → `initialize`（`clientCapabilities.fs/terminal=false`，故无反向 fs/terminal 回调）→ `session/new`（或 `session/load` resume）→ **一次** `session/prompt` → 消费 `session/update` 通知 → prompt response（`stopReason` + `_meta`）→ 关进程
+- 多 turn 交给 host：`newSessionId` → `setSession` → 下条消息 group-queue drain + re-spawn 带 `input.sessionId` → `session/load`
+- systemPrompt 走 `session/new` 的 `_meta.rules`（**追加**，保留 grok 原生工具/sandbox/subagent 提示），不用 `systemPromptOverride`（整体替换会顶掉 grok 自身能力）
+- ACP 事件归一化在 `grok-event-normalizer.ts`（`GrokEventNormalizer`，21 测）：`agent_message_chunk`→text_delta、`agent_thought_chunk`→thinking_delta、`tool_call`/`tool_call_update`→tool_use_*、`plan`→todo_update。grok 把 MCP/间接工具包成 `use_tool`，真实工具名在 `rawInput.tool_name`，normalizer 自动解包
+
+**MCP（复用 happyclaw-mcp-server，经 ACP session 挂）**：
+- **不新建** grok MCP server，复用 `container/agent-runner/src/happyclaw-mcp-server.js`（codex 已复用）
+- ACP `session/new` params 传 `mcpServers:[{name,command,args,env}]` 数组（零落盘、零 cwd 污染、agent 无法篡改）：`happyclaw`（first-class，经 context 文件传 IPC 路径）+ merge 用户/工作区自配 stdio MCP server，`name==='happyclaw'` 去重
+- IPC 路径不靠 env：沿用 codex context-file（`writeMcpContext` 把 `workspaceIpc` 绝对路径写进 context JSON，server 从 argv 读）
+- admin-only 跨组工具（`register_group` 等）的权限门控由 happyclaw-mcp-server handler 内 `ctx.isAdminHome` 继承，**grok 侧不重做权限**
+
+**Subagent / 隔离 / 用量**：
+- Subagent 用 grok **内置**体系（general-purpose/explore/plan + `spawn_subagent`），不映射 `PREDEFINED_AGENTS`；`spawn_subagent` 的 tool_call 当**普通 top-level 工具**显示（不强求嵌套面板）
+- 多账号隔离**完全照 codex / claude（路 0）**：admin 配置全员共享，零特殊隔离代码；provider 选择走 `selectGrokProviderForInput`（`container-runner.ts`，sticky `acquireSession` + reset 重绑），按 `provider_pool_id='grok'` round-robin
+- 用量管线**复用 codex**：normalizer 在 session/prompt 响应 `result._meta` 取 `inputTokens`（全量，**含 cachedRead**，OpenAI 口径）/ `outputTokens`（已含 reasoning，不另加）/ `cachedReadTokens`；emit `usage` StreamEvent 时 `inputTokens` 全量 + `cacheReadInputTokens` 单列，入库 `db.ts` **分列 SUM 不相减**。订阅制 `costUSD:0`（与 codex 同），前端 `MessageBubble` 仅在 `cost>0` 才显示美元，$0 自动隐藏，不误导
+- `classifyRuntimeError`（`runtime-adapter.ts`）按 grok/x.ai 措辞补 quota（out of credits/monthly limit/402）/ rate_limit（per minute/RPM/TPM）专有词
+
+**双路对称**：host（`container-runner.ts` host 注入分支）/ docker（同分支 + grok-home RW 挂载）两条 spawn 路径必须对称；派生新 input（`{...input, sessionId:undefined}`）而非原地 mutate。Dockerfile 装 `@xai-official/grok` + `@agentclientprotocol/sdk`，entrypoint chown/chmod grok-home。
+
 ## 9. 环境变量
 
 | 变量 | 默认值 | 说明 |
