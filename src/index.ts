@@ -328,7 +328,9 @@ export function feedStreamEventToCard(
   if (
     se.runtime &&
     session instanceof StreamingCardController &&
-    (se.runtime === 'claude' || se.runtime === 'codex')
+    (se.runtime === 'claude' ||
+      se.runtime === 'codex' ||
+      se.runtime === 'grok')
   ) {
     session.setRuntimeProfile(se.runtime);
   }

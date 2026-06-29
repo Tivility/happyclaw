@@ -468,7 +468,7 @@ export type StreamingPhase =
   | 'aborted'
   | 'error';
 
-export type StreamingCardRuntimeProfile = 'claude' | 'codex';
+export type StreamingCardRuntimeProfile = 'claude' | 'codex' | 'grok';
 
 function runtimeLabel(
   profile: StreamingCardRuntimeProfile | undefined,
