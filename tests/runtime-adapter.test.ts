@@ -22,6 +22,29 @@ describe('runtime adapter boundary helpers', () => {
     expect(classifyRuntimeError(new Error('spawn codex ENOENT'))).toBe(
       'runtime_unavailable',
     );
+    expect(classifyRuntimeError(new Error('spawn grok ENOENT'))).toBe(
+      'runtime_unavailable',
+    );
+  });
+
+  it('classifies grok/x.ai-specific quota and rate-limit wording', () => {
+    // x.ai 速率限制措辞
+    expect(
+      classifyRuntimeError(new Error('Rate limit reached for requests per minute')),
+    ).toBe('rate_limit');
+    expect(
+      classifyRuntimeError(new Error('TPM limit hit, please slow down')),
+    ).toBe('rate_limit');
+    // 订阅/配额措辞（区别于 rate limit）
+    expect(classifyRuntimeError(new Error('You are out of credits'))).toBe(
+      'quota',
+    );
+    expect(classifyRuntimeError(new Error('Monthly limit reached'))).toBe(
+      'quota',
+    );
+    expect(classifyRuntimeError(new Error('402 Payment Required'))).toBe(
+      'quota',
+    );
     expect(classifyRuntimeError(new Error('EACCES permission denied'))).toBe(
       'permission',
     );

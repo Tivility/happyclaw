@@ -45,7 +45,7 @@ export type RuntimeErrorClass =
   | 'unknown';
 
 export interface AgentRuntimeAdapter {
-  runtime: 'claude' | 'codex';
+  runtime: 'claude' | 'codex' | 'grok';
   supportsNativeResume?: boolean;
   supportsLiveInput?: boolean;
   supportsPreCompactHook?: boolean;
@@ -127,10 +127,22 @@ export function classifyRuntimeError(error: unknown): RuntimeErrorClass {
   ) {
     return 'unsupported_model';
   }
-  if (/rate.?limit|too many requests|429/.test(haystack)) {
+  // grok/x.ai 速率限制措辞：x.ai API 用 "rate limit reached/exceeded"、
+  // ACP 层偶发 "tokens per minute" / "requests per minute (RPM/TPM)" / "too many"。
+  if (
+    /rate.?limit|too many requests|too many|429|requests per minute|tokens per minute|\brpm\b|\btpm\b|slow down/.test(
+      haystack,
+    )
+  ) {
     return 'rate_limit';
   }
-  if (/quota|billing|insufficient_quota|credit|subscription/.test(haystack)) {
+  // grok/x.ai 配额/订阅措辞：订阅制超额走 "out of credits" / "credit balance" /
+  // "monthly limit" / "spending limit" / "usage limit"（区别于上面的 rate limit）。
+  if (
+    /quota|billing|insufficient_quota|credit|subscription|out of credits|credit balance|monthly limit|spending limit|usage limit|payment required|402/.test(
+      haystack,
+    )
+  ) {
     return 'quota';
   }
   if (

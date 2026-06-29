@@ -34,7 +34,7 @@ export interface ContainerInput {
   images?: Array<{ data: string; mimeType?: string }>;
   agentId?: string;
   agentName?: string;
-  runtime?: 'claude' | 'codex';
+  runtime?: 'claude' | 'codex' | 'grok';
   providerPoolId?: string;
   providerId?: string | null;
   authProfileGeneration?: number;

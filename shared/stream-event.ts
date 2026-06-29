@@ -78,7 +78,7 @@ export interface ClaudeContextAudit {
 export interface StreamEvent {
   eventType: StreamEventType;
   /** Runtime that produced this event. Used for runtime-specific presentation. */
-  runtime?: 'claude' | 'codex';
+  runtime?: 'claude' | 'codex' | 'grok';
   /** Which runtime actor produced the event. */
   agentScope?: StreamAgentScope;
   /** Correlates all stream events for a single user turn. */

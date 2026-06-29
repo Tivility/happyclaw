@@ -34,8 +34,8 @@ export interface ContainerConfig {
 }
 
 export type ExecutionMode = 'container' | 'host';
-export type AgentRuntime = 'claude' | 'codex';
-export type ProviderFamily = 'claude' | 'gpt';
+export type AgentRuntime = 'claude' | 'codex' | 'grok';
+export type ProviderFamily = 'claude' | 'gpt' | 'grok';
 export type ModelSelectionKind =
   | 'provider_default'
   | 'runtime_default'
