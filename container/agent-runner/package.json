@@ -9,6 +9,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "^1.0.0",
     "@anthropic-ai/claude-agent-sdk": "*",
     "@anthropic-ai/claude-code": "*",
     "@modelcontextprotocol/sdk": "^1.29.0",

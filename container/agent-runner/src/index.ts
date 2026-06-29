@@ -44,7 +44,12 @@ import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
 import { codexCliAdapter } from './codex-cli-runner.js';
 import { codexSdkAdapter } from './codex-sdk-runner.js';
-import { buildRuntimeBackgroundTaskGuidelines } from './runtime-guidelines.js';
+import { grokCliAdapter } from './grok-cli-runner.js';
+import type { AgentRuntimeAdapter } from './runtime-adapter.js';
+import {
+  buildHappyClawToolsHint,
+  buildRuntimeBackgroundTaskGuidelines,
+} from './runtime-guidelines.js';
 import {
   CLAUDEMD_UPDATE_ALLOWED_TOOLS,
   CLAUDEMD_UPDATE_DISALLOWED_TOOLS,
@@ -131,7 +136,7 @@ const CODEX_SKILL_FILE_GUIDELINES = [
 ].join('\n');
 
 // guidelines 块按 runtime（claude/codex）感知，background task 指引由 runtime-guidelines 派生。
-function buildGuidelinesBlock(runtime: 'claude' | 'codex'): string {
+function buildGuidelinesBlock(runtime: 'claude' | 'codex' | 'grok'): string {
   return `<guidelines>\n${OUTPUT_GUIDELINES}\n${WEB_FETCH_GUIDELINES}\n${buildRuntimeBackgroundTaskGuidelines(runtime)}\n</guidelines>`;
 }
 
@@ -1988,6 +1993,190 @@ function forceExitWithSafetyNet(code: number): never {
   process.exit(code);
 }
 
+/**
+ * One-turn runtime driver shared by the non-Claude adapters (Codex CLI/SDK,
+ * Grok ACP). These runtimes do NOT run a multi-turn IPC loop inside a single
+ * process: each invocation is exactly one turn that spawns the underlying CLI,
+ * streams events, and exits. Multi-turn is handled by the host (drain +
+ * re-spawn with native resume), so this driver only needs to wrap a single
+ * `adapter.run()` with the three-stage control-sentinel + abort handling that
+ * Codex established (_close → closed, _interrupt → interrupt_partial,
+ * _drain → no-op for one-turn runtimes).
+ *
+ * Returns the resolved sessionId so the caller can keep `latestSessionId` in
+ * sync. All ContainerOutput writes (including finalization) happen inside.
+ */
+async function runOneTurnRuntime(
+  adapter: AgentRuntimeAdapter,
+  opts: {
+    containerInput: ContainerInput;
+    prompt: string;
+    sessionId: string | undefined;
+    systemPromptAppend: string;
+    additionalDirectories?: string[];
+    model?: string | null;
+    images?: Array<{ data: string; mimeType?: string }>;
+  },
+): Promise<{ newSessionId: string | undefined }> {
+  const { containerInput } = opts;
+  let sessionId = opts.sessionId;
+
+  const emit = (output: ContainerOutput): void => {
+    if (output.streamEvent) {
+      output = {
+        ...output,
+        streamEvent: {
+          ...output.streamEvent,
+          runtime: output.streamEvent.runtime || containerInput.runtime,
+          turnId: containerInput.turnId,
+          sessionId,
+        },
+        turnId: containerInput.turnId,
+        sessionId,
+      };
+    } else {
+      output = {
+        ...output,
+        turnId: containerInput.turnId,
+        sessionId,
+      };
+    }
+    writeOutput(output);
+  };
+
+  const abortController = new AbortController();
+  let interrupted = false;
+  let closed = false;
+
+  const checkControlSentinels = () => {
+    if (closed || interrupted) return;
+    if (shouldClose()) {
+      closed = true;
+      log(`Close sentinel detected during ${adapter.runtime} run, aborting turn`);
+      abortController.abort();
+      return;
+    }
+    if (shouldInterrupt()) {
+      interrupted = true;
+      log(`Interrupt sentinel detected during ${adapter.runtime} run, aborting turn`);
+      emit({
+        status: 'stream',
+        result: null,
+        streamEvent: { eventType: 'status', statusText: 'interrupted' },
+        newSessionId: sessionId,
+      });
+      abortController.abort();
+      return;
+    }
+    if (shouldDrain()) {
+      log(`Drain sentinel detected during ${adapter.runtime} run; one-turn runtime will exit after current turn`);
+    }
+  };
+
+  const controlWatcher = createIpcWatcher(checkControlSentinels);
+  checkControlSentinels();
+  if (closed) {
+    controlWatcher.close();
+    writeOutput({
+      status: 'closed',
+      result: null,
+      newSessionId: sessionId,
+      turnId: containerInput.turnId,
+      sessionId,
+    });
+    return { newSessionId: sessionId };
+  }
+  if (interrupted) {
+    controlWatcher.close();
+    writeOutput({
+      status: 'success',
+      result: null,
+      newSessionId: sessionId,
+      turnId: containerInput.turnId,
+      sessionId,
+      sourceKind: 'interrupt_partial',
+      finalizationReason: 'interrupted',
+    });
+    return { newSessionId: sessionId };
+  }
+
+  const result = await adapter
+    .run(
+      {
+        input: containerInput,
+        prompt: opts.prompt,
+        sessionId,
+        signal: abortController.signal,
+        cwd: WORKSPACE_GROUP,
+        systemPromptAppend: opts.systemPromptAppend,
+        additionalDirectories: opts.additionalDirectories,
+        model: opts.model,
+        images: opts.images,
+        resumeMode: containerInput.resumeMode,
+        inputContextHash: containerInput.inputContextHash,
+        workspaceInstructionHash: containerInput.workspaceInstructionHash,
+        softInjectionReason: containerInput.softInjectionReason,
+        resumeFailureFallbackPrompt: containerInput.resumeFailureFallbackPrompt,
+        resumeFailureFallbackInputContextHash:
+          containerInput.resumeFailureFallbackInputContextHash,
+        resumeFailureFallbackWorkspaceInstructionHash:
+          containerInput.resumeFailureFallbackWorkspaceInstructionHash,
+        resumeFailureFallbackSoftInjectionReason:
+          containerInput.resumeFailureFallbackSoftInjectionReason,
+      },
+      emit,
+    )
+    .finally(() => {
+      controlWatcher.close();
+    });
+
+  if (result.newSessionId) {
+    sessionId = result.newSessionId;
+    latestSessionId = sessionId;
+  }
+
+  if (closed || result.status === 'closed') {
+    writeOutput({
+      status: interrupted ? 'success' : 'closed',
+      result: null,
+      error: interrupted ? undefined : result.error,
+      newSessionId: result.newSessionId || sessionId,
+      turnId: containerInput.turnId,
+      sessionId: result.newSessionId || sessionId,
+      sourceKind: interrupted ? 'interrupt_partial' : undefined,
+      finalizationReason: interrupted ? 'interrupted' : undefined,
+      runtimeContext: result.runtimeContext,
+    });
+    return { newSessionId: sessionId };
+  }
+  if (interrupted) {
+    writeOutput({
+      status: 'success',
+      result: null,
+      newSessionId: result.newSessionId || sessionId,
+      turnId: containerInput.turnId,
+      sessionId: result.newSessionId || sessionId,
+      sourceKind: 'interrupt_partial',
+      finalizationReason: 'interrupted',
+      runtimeContext: result.runtimeContext,
+    });
+    return { newSessionId: sessionId };
+  }
+
+  writeOutput({
+    status: result.status === 'success' ? 'success' : 'error',
+    result: result.result,
+    error: result.error,
+    newSessionId: result.newSessionId,
+    turnId: containerInput.turnId,
+    sessionId: result.newSessionId || sessionId,
+    sourceKind: result.status === 'success' ? 'sdk_final' : 'legacy',
+    finalizationReason: result.status === 'success' ? 'completed' : 'error',
+    runtimeContext: result.runtimeContext,
+  });
+  return { newSessionId: sessionId };
+}
+
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
 
@@ -2116,15 +2305,20 @@ async function main(): Promise<void> {
     }
   }
 
-  if (containerInput.runtime === 'codex') {
+  if (containerInput.runtime === 'codex' || containerInput.runtime === 'grok') {
+    const runtime = containerInput.runtime;
     const channel = getChannelFromJid(containerInput.chatJid);
     const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
-    const codexSkillContext = buildCodexSkillContext();
+    const skillContext = buildCodexSkillContext();
     const globalMemoryContext = buildGlobalMemoryContext(disableMemoryLayer);
     const additionalDirectories = buildRuntimeAdditionalDirectories(disableMemoryLayer);
+    const runtimeNote =
+      runtime === 'grok'
+        ? '当前运行时是 Grok。HappyClaw 会把你的最终文本作为本轮回复发送给用户；请直接完成用户当前请求。'
+        : '当前运行时是 Codex。HappyClaw 会把你的最终文本作为本轮回复发送给用户；请直接完成用户当前请求。';
     const systemPromptAppend = [
       `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
-      `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n${CODEX_SKILL_FILE_GUIDELINES}\n\n${codexSkillContext}\n</skill-routing>`,
+      `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n${CODEX_SKILL_FILE_GUIDELINES}\n\n${skillContext}\n</skill-routing>`,
       `<security>\n${SECURITY_RULES}\n</security>`,
       globalMemoryContext,
       memoryRecallPrompt && `<memory-system>\n${memoryRecallPrompt}\n</memory-system>`,
@@ -2135,170 +2329,34 @@ async function main(): Promise<void> {
         globalMemoryFile: globalClaudeMdPath(),
         workspaceClaudeMdPath: path.join(WORKSPACE_GROUP, 'CLAUDE.md'),
       }),
-      buildGuidelinesBlock('codex'),
+      buildGuidelinesBlock(runtime),
+      // grok 经 search_tool 间接发现 MCP 工具：显式把 happyclaw 工具清单写进 rules，
+      // 否则模型不知道工具存在 → scheduled-task 的 send_message 回复契约失效。
+      buildHappyClawToolsHint(runtime) &&
+        `<happyclaw-tools>${buildHappyClawToolsHint(runtime)}\n</happyclaw-tools>`,
       channelGuidelines && `<channel-format>\n${channelGuidelines}\n</channel-format>`,
       containerInput.agentId && CONVERSATION_AGENT_BLOCK,
       '',
       '<runtime-note>',
-      '当前运行时是 Codex。HappyClaw 会把你的最终文本作为本轮回复发送给用户；请直接完成用户当前请求。',
+      runtimeNote,
       '</runtime-note>',
     ].filter(Boolean).join('\n');
 
-    const emit = (output: ContainerOutput): void => {
-      if (output.streamEvent) {
-        output = {
-          ...output,
-          streamEvent: {
-            ...output.streamEvent,
-            runtime: output.streamEvent.runtime || containerInput.runtime,
-            turnId: containerInput.turnId,
-            sessionId,
-          },
-          turnId: containerInput.turnId,
-          sessionId,
-        };
-      } else {
-        output = {
-          ...output,
-          turnId: containerInput.turnId,
-          sessionId,
-        };
-      }
-      writeOutput(output);
-    };
+    const adapter: AgentRuntimeAdapter =
+      runtime === 'grok'
+        ? grokCliAdapter
+        : process.env.HAPPYCLAW_CODEX_RUNNER === 'cli'
+          ? codexCliAdapter
+          : codexSdkAdapter;
 
-    const codexAdapter =
-      process.env.HAPPYCLAW_CODEX_RUNNER === 'cli'
-        ? codexCliAdapter
-        : codexSdkAdapter;
-    const abortController = new AbortController();
-    let codexInterrupted = false;
-    let codexClosed = false;
-
-    const checkCodexControlSentinels = () => {
-      if (codexClosed || codexInterrupted) return;
-      if (shouldClose()) {
-        codexClosed = true;
-        log('Close sentinel detected during Codex run, aborting turn');
-        abortController.abort();
-        return;
-      }
-      if (shouldInterrupt()) {
-        codexInterrupted = true;
-        log('Interrupt sentinel detected during Codex run, aborting turn');
-        emit({
-          status: 'stream',
-          result: null,
-          streamEvent: { eventType: 'status', statusText: 'interrupted' },
-          newSessionId: sessionId,
-        });
-        abortController.abort();
-        return;
-      }
-      if (shouldDrain()) {
-        log('Drain sentinel detected during Codex run; one-turn runtime will exit after current turn');
-      }
-    };
-
-    const codexControlWatcher = createIpcWatcher(checkCodexControlSentinels);
-    checkCodexControlSentinels();
-    if (codexClosed) {
-      codexControlWatcher.close();
-      writeOutput({
-        status: 'closed',
-        result: null,
-        newSessionId: sessionId,
-        turnId: containerInput.turnId,
-        sessionId,
-      });
-      return;
-    }
-    if (codexInterrupted) {
-      codexControlWatcher.close();
-      writeOutput({
-        status: 'success',
-        result: null,
-        newSessionId: sessionId,
-        turnId: containerInput.turnId,
-        sessionId,
-        sourceKind: 'interrupt_partial',
-        finalizationReason: 'interrupted',
-      });
-      return;
-    }
-
-    const result = await codexAdapter.run(
-      {
-        input: containerInput,
-        prompt,
-        sessionId,
-        signal: abortController.signal,
-        cwd: WORKSPACE_GROUP,
-        systemPromptAppend,
-        additionalDirectories,
-        model: containerInput.modelOverride || containerInput.selectedModel,
-        images: promptImages,
-        resumeMode: containerInput.resumeMode,
-        inputContextHash: containerInput.inputContextHash,
-        workspaceInstructionHash: containerInput.workspaceInstructionHash,
-        softInjectionReason: containerInput.softInjectionReason,
-        resumeFailureFallbackPrompt:
-          containerInput.resumeFailureFallbackPrompt,
-        resumeFailureFallbackInputContextHash:
-          containerInput.resumeFailureFallbackInputContextHash,
-        resumeFailureFallbackWorkspaceInstructionHash:
-          containerInput.resumeFailureFallbackWorkspaceInstructionHash,
-        resumeFailureFallbackSoftInjectionReason:
-          containerInput.resumeFailureFallbackSoftInjectionReason,
-      },
-      emit,
-    ).finally(() => {
-      codexControlWatcher.close();
-    });
-
-    if (result.newSessionId) {
-      sessionId = result.newSessionId;
-      latestSessionId = sessionId;
-    }
-
-    if (codexClosed || result.status === 'closed') {
-      writeOutput({
-        status: codexInterrupted ? 'success' : 'closed',
-        result: null,
-        error: codexInterrupted ? undefined : result.error,
-        newSessionId: result.newSessionId || sessionId,
-        turnId: containerInput.turnId,
-        sessionId: result.newSessionId || sessionId,
-        sourceKind: codexInterrupted ? 'interrupt_partial' : undefined,
-        finalizationReason: codexInterrupted ? 'interrupted' : undefined,
-        runtimeContext: result.runtimeContext,
-      });
-      return;
-    }
-    if (codexInterrupted) {
-      writeOutput({
-        status: 'success',
-        result: null,
-        newSessionId: result.newSessionId || sessionId,
-        turnId: containerInput.turnId,
-        sessionId: result.newSessionId || sessionId,
-        sourceKind: 'interrupt_partial',
-        finalizationReason: 'interrupted',
-        runtimeContext: result.runtimeContext,
-      });
-      return;
-    }
-
-    writeOutput({
-      status: result.status === 'success' ? 'success' : 'error',
-      result: result.result,
-      error: result.error,
-      newSessionId: result.newSessionId,
-      turnId: containerInput.turnId,
-      sessionId: result.newSessionId || sessionId,
-      sourceKind: result.status === 'success' ? 'sdk_final' : 'legacy',
-      finalizationReason: result.status === 'success' ? 'completed' : 'error',
-      runtimeContext: result.runtimeContext,
+    await runOneTurnRuntime(adapter, {
+      containerInput,
+      prompt,
+      sessionId,
+      systemPromptAppend,
+      additionalDirectories,
+      model: containerInput.modelOverride || containerInput.selectedModel,
+      images: promptImages,
     });
     return;
   }
