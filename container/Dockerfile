@@ -113,6 +113,11 @@ COPY agent-runner/package.json ./
 # (COPY caches on file content hash, which blocks ARG invalidation propagation)
 ARG CACHEBUST=1
 RUN npm install -g agent-browser
+# Grok CLI (x.ai)：全局安装 pin 住的版本，spawn 时 `grok agent stdio` 走 ACP。
+# pin 0.2.67（P0 真机验证版本）确保 ACP 协议/事件结构与 GrokEventNormalizer 一致；
+# 升级前需重跑 P0 spike 复核。@agentclientprotocol/sdk 由 agent-runner 本地依赖提供。
+RUN npm install -g @xai-official/grok@0.2.67 \
+    && grok --version
 RUN npm install
 
 # Claude Code's package-level bin can resolve to the host-platform wrapper on
