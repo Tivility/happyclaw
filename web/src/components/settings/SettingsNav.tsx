@@ -33,6 +33,7 @@ const systemItems: NavItem[] = [
   { key: 'models', label: '模型', icon: <Cpu className="w-4 h-4" />, group: 'system' },
   { key: 'claude', label: 'Claude 提供商', icon: <ShieldCheck className="w-4 h-4" />, group: 'system' },
   { key: 'gpt', label: 'GPT 提供商', icon: <KeyRound className="w-4 h-4" />, group: 'system' },
+  { key: 'grok', label: 'Grok 提供商', icon: <Bot className="w-4 h-4" />, group: 'system' },
   { key: 'registration', label: '注册管理', icon: <UserPlus className="w-4 h-4" />, group: 'system' },
   { key: 'appearance', label: '全局外观', icon: <Palette className="w-4 h-4" />, group: 'system' },
   { key: 'system', label: '系统参数', icon: <SlidersHorizontal className="w-4 h-4" />, group: 'system' },

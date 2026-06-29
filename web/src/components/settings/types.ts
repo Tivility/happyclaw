@@ -4,10 +4,10 @@ export interface UnifiedProviderPublic {
   id: string;
   name: string;
   type: 'official' | 'third_party';
-  runtime: 'claude' | 'codex';
-  providerFamily: 'claude' | 'gpt';
+  runtime: 'claude' | 'codex' | 'grok';
+  providerFamily: 'claude' | 'gpt' | 'grok';
   providerPoolId: string;
-  authMode: 'api_key' | 'oauth' | 'setup_token' | 'third_party' | 'chatgpt_oauth';
+  authMode: 'api_key' | 'oauth' | 'setup_token' | 'third_party' | 'chatgpt_oauth' | 'grok_oauth';
   authProfileGeneration: number;
   enabled: boolean;
   weight: number;
@@ -25,6 +25,8 @@ export interface UnifiedProviderPublic {
   hasOpenaiApiKey: boolean;
   openaiApiKeyMasked: string | null;
   hasCodexAuthJson: boolean;
+  hasGrokAuthJson: boolean;
+  grokOAuthExpiresAt: number | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -139,8 +141,8 @@ export interface CachedOAuthUsage {
 }
 
 export interface ProviderPoolModelOption {
-  runtime: 'claude' | 'codex';
-  provider_family: 'claude' | 'gpt';
+  runtime: 'claude' | 'codex' | 'grok';
+  provider_family: 'claude' | 'gpt' | 'grok';
   provider_pool_id: string;
   model_id: string;
   model_kind: 'provider_default' | 'runtime_default' | 'alias' | 'explicit_version' | 'custom';
@@ -152,14 +154,14 @@ export interface ProviderPoolModelOption {
 
 export interface ProviderPool {
   provider_pool_id: string;
-  runtime: 'claude' | 'codex';
-  provider_family: 'claude' | 'gpt';
+  runtime: 'claude' | 'codex' | 'grok';
+  provider_family: 'claude' | 'gpt' | 'grok';
   display_name: string;
   enabled: boolean;
 }
 
 export interface ConversationRuntimeState {
-  runtime: 'claude' | 'codex';
+  runtime: 'claude' | 'codex' | 'grok';
   provider_pool_id: string;
   selected_model: string | null;
   model_kind: ProviderPoolModelOption['model_kind'];
@@ -167,7 +169,7 @@ export interface ConversationRuntimeState {
   binding_source: 'system_default' | 'workspace_default' | 'copied_workspace_default' | 'user_pinned';
 }
 
-export type SettingsTab = 'models' | 'claude' | 'gpt' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'plugins' | 'agent-definitions' | 'users' | 'about' | 'bindings' | 'usage' | 'monitor';
+export type SettingsTab = 'models' | 'claude' | 'gpt' | 'grok' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'plugins' | 'agent-definitions' | 'users' | 'about' | 'bindings' | 'usage' | 'monitor';
 
 export function getErrorMessage(err: unknown, fallback: string): string {
   if (typeof err === 'object' && err !== null && 'message' in err) {

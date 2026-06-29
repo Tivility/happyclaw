@@ -361,7 +361,13 @@ export function ModelSettingsSection() {
                 <input
                   value={addModelId}
                   onChange={(event) => setAddModelId(event.target.value)}
-                  placeholder={selectedCatalogPool?.provider_family === 'gpt' ? 'gpt-5.5' : 'claude-opus-4-7'}
+                  placeholder={
+                    selectedCatalogPool?.provider_family === 'gpt'
+                      ? 'gpt-5.5'
+                      : selectedCatalogPool?.provider_family === 'grok'
+                        ? 'grok-build'
+                        : 'claude-opus-4-7'
+                  }
                   className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                 />
               </label>
