@@ -67,7 +67,7 @@ export function handleModelCommandForTarget(input: {
   }
 
   if (subcommand) {
-    return '可用命令：/model、/model list、/model use <claude|gpt> [model]';
+    return '可用命令：/model、/model list、/model use <claude|gpt|grok> [model]';
   }
 
   const state = input.deps.ensureConversationRuntimeState(

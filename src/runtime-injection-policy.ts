@@ -33,6 +33,14 @@ const POLICIES: Record<AgentRuntime, RuntimeInjectionPolicy> = {
     injectRecentHistory: 'when_soft_inject',
     preserveStablePrefix: true,
   },
+  grok: {
+    runtime: 'grok',
+    nativeProjectInstructions: 'allow',
+    injectWorkspaceInstructions: 'never',
+    injectGlobalMemory: 'always',
+    injectRecentHistory: 'when_soft_inject',
+    preserveStablePrefix: true,
+  },
 };
 
 export function getRuntimeInjectionPolicy(

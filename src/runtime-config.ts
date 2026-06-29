@@ -252,6 +252,7 @@ interface SecretPayload {
   claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
   openaiApiKey?: string;
   codexAuthJson?: string;
+  grokAuthJson?: string;
 }
 
 interface EncryptedSecrets {
@@ -356,10 +357,16 @@ interface StoredProviderV4 {
   id: string;
   name: string;
   type: 'official' | 'third_party';
-  runtime?: 'claude' | 'codex';
-  providerFamily?: 'claude' | 'gpt';
+  runtime?: 'claude' | 'codex' | 'grok';
+  providerFamily?: 'claude' | 'gpt' | 'grok';
   providerPoolId?: string;
-  authMode?: 'api_key' | 'oauth' | 'setup_token' | 'third_party' | 'chatgpt_oauth';
+  authMode?:
+    | 'api_key'
+    | 'oauth'
+    | 'setup_token'
+    | 'third_party'
+    | 'chatgpt_oauth'
+    | 'grok_oauth';
   authProfileGeneration?: number;
   enabled: boolean;
   weight: number;
@@ -382,10 +389,16 @@ export interface UnifiedProvider {
   id: string;
   name: string;
   type: 'official' | 'third_party';
-  runtime: 'claude' | 'codex';
-  providerFamily: 'claude' | 'gpt';
+  runtime: 'claude' | 'codex' | 'grok';
+  providerFamily: 'claude' | 'gpt' | 'grok';
   providerPoolId: string;
-  authMode: 'api_key' | 'oauth' | 'setup_token' | 'third_party' | 'chatgpt_oauth';
+  authMode:
+    | 'api_key'
+    | 'oauth'
+    | 'setup_token'
+    | 'third_party'
+    | 'chatgpt_oauth'
+    | 'grok_oauth';
   authProfileGeneration: number;
   enabled: boolean;
   weight: number;
@@ -397,6 +410,7 @@ export interface UnifiedProvider {
   claudeOAuthCredentials: ClaudeOAuthCredentials | null;
   openaiApiKey: string;
   codexAuthJson: string;
+  grokAuthJson: string;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -406,10 +420,16 @@ export interface UnifiedProviderPublic {
   id: string;
   name: string;
   type: 'official' | 'third_party';
-  runtime: 'claude' | 'codex';
-  providerFamily: 'claude' | 'gpt';
+  runtime: 'claude' | 'codex' | 'grok';
+  providerFamily: 'claude' | 'gpt' | 'grok';
   providerPoolId: string;
-  authMode: 'api_key' | 'oauth' | 'setup_token' | 'third_party' | 'chatgpt_oauth';
+  authMode:
+    | 'api_key'
+    | 'oauth'
+    | 'setup_token'
+    | 'third_party'
+    | 'chatgpt_oauth'
+    | 'grok_oauth';
   authProfileGeneration: number;
   enabled: boolean;
   weight: number;
@@ -427,6 +447,8 @@ export interface UnifiedProviderPublic {
   hasOpenaiApiKey: boolean;
   openaiApiKeyMasked: string | null;
   hasCodexAuthJson: boolean;
+  hasGrokAuthJson: boolean;
+  grokOAuthExpiresAt: number | null;
   customEnv: Record<string, string>;
   updatedAt: string;
 }
@@ -679,6 +701,10 @@ function decryptSecrets(secrets: EncryptedSecrets): SecretPayload {
     codexAuthJson:
       typeof parsed.codexAuthJson === 'string'
         ? parsed.codexAuthJson.slice(0, 200_000)
+        : '',
+    grokAuthJson:
+      typeof parsed.grokAuthJson === 'string'
+        ? parsed.grokAuthJson.slice(0, 200_000)
         : '',
   };
   // Restore OAuth credentials if present
@@ -1068,6 +1094,7 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
     claudeOAuthCredentials: provider.claudeOAuthCredentials ?? null,
     openaiApiKey: provider.openaiApiKey || '',
     codexAuthJson: provider.codexAuthJson || '',
+    grokAuthJson: provider.grokAuthJson || '',
   };
   const sanitizedEnv = sanitizeCustomEnvMap(provider.customEnv || {}, {
     skipReservedClaudeKeys: true,
@@ -1096,7 +1123,13 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
 function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
   const secrets = decryptSecrets(stored.secrets);
   const providerFamily = stored.providerFamily ?? 'claude';
-  const runtime = stored.runtime ?? (providerFamily === 'gpt' ? 'codex' : 'claude');
+  const runtime =
+    stored.runtime ??
+    (providerFamily === 'gpt'
+      ? 'codex'
+      : providerFamily === 'grok'
+        ? 'grok'
+        : 'claude');
   return {
     id: stored.id,
     name: stored.name,
@@ -1110,7 +1143,9 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
         ? 'third_party'
         : providerFamily === 'gpt'
           ? 'chatgpt_oauth'
-          : 'oauth'),
+          : providerFamily === 'grok'
+            ? 'grok_oauth'
+            : 'oauth'),
     authProfileGeneration: Math.max(0, stored.authProfileGeneration ?? 0),
     enabled: stored.enabled,
     weight: Math.max(1, Math.min(100, stored.weight || 1)),
@@ -1122,6 +1157,7 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
     claudeOAuthCredentials: secrets.claudeOAuthCredentials ?? null,
     openaiApiKey: secrets.openaiApiKey || '',
     codexAuthJson: secrets.codexAuthJson || '',
+    grokAuthJson: secrets.grokAuthJson || '',
     customEnv: sanitizeCustomEnvMap(stored.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
@@ -1162,6 +1198,7 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       claudeOAuthCredentials: v3.officialSecrets.claudeOAuthCredentials ?? null,
       openaiApiKey: '',
       codexAuthJson: '',
+      grokAuthJson: '',
       customEnv: v3.officialCustomEnv || {},
       updatedAt: v3.officialUpdatedAt || now,
     });
@@ -1189,6 +1226,7 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
       claudeOAuthCredentials: null,
       openaiApiKey: '',
       codexAuthJson: '',
+      grokAuthJson: '',
       customEnv: profile.customEnv || {},
       updatedAt: profile.updatedAt || now,
     });
@@ -1358,10 +1396,16 @@ export function saveBalancingConfig(
 export function createProvider(input: {
   name: string;
   type: 'official' | 'third_party';
-  runtime?: 'claude' | 'codex';
-  providerFamily?: 'claude' | 'gpt';
+  runtime?: 'claude' | 'codex' | 'grok';
+  providerFamily?: 'claude' | 'gpt' | 'grok';
   providerPoolId?: string;
-  authMode?: 'api_key' | 'oauth' | 'setup_token' | 'third_party' | 'chatgpt_oauth';
+  authMode?:
+    | 'api_key'
+    | 'oauth'
+    | 'setup_token'
+    | 'third_party'
+    | 'chatgpt_oauth'
+    | 'grok_oauth';
   anthropicBaseUrl?: string;
   anthropicAuthToken?: string;
   anthropicModel?: string;
@@ -1370,6 +1414,7 @@ export function createProvider(input: {
   claudeOAuthCredentials?: ClaudeOAuthCredentials | null;
   openaiApiKey?: string;
   codexAuthJson?: string;
+  grokAuthJson?: string;
   customEnv?: Record<string, string>;
   weight?: number;
   enabled?: boolean;
@@ -1385,14 +1430,22 @@ export function createProvider(input: {
 
   const now = new Date().toISOString();
   const providerFamily = input.providerFamily ?? 'claude';
-  const runtime = input.runtime ?? (providerFamily === 'gpt' ? 'codex' : 'claude');
+  const runtime =
+    input.runtime ??
+    (providerFamily === 'gpt'
+      ? 'codex'
+      : providerFamily === 'grok'
+        ? 'grok'
+        : 'claude');
   const authMode =
     input.authMode ??
     (input.type === 'third_party'
       ? 'third_party'
       : providerFamily === 'gpt'
         ? 'chatgpt_oauth'
-        : 'oauth');
+        : providerFamily === 'grok'
+          ? 'grok_oauth'
+          : 'oauth');
   const provider: UnifiedProvider = {
     id: crypto.randomBytes(8).toString('hex'),
     name: normalizeProfileName(input.name),
@@ -1428,6 +1481,7 @@ export function createProvider(input: {
       ? normalizeSecret(input.openaiApiKey, 'openaiApiKey')
       : '',
     codexAuthJson: input.codexAuthJson || '',
+    grokAuthJson: input.grokAuthJson || '',
     customEnv: sanitizeCustomEnvMap(input.customEnv || {}, {
       skipReservedClaudeKeys: true,
     }),
@@ -1500,6 +1554,8 @@ export function updateProviderSecrets(
     clearOpenaiApiKey?: boolean;
     codexAuthJson?: string;
     clearCodexAuthJson?: boolean;
+    grokAuthJson?: string;
+    clearGrokAuthJson?: boolean;
     authMode?: UnifiedProvider['authMode'];
   },
 ): UnifiedProvider {
@@ -1579,6 +1635,15 @@ export function updateProviderSecrets(
     credentialsChanged = true;
   }
 
+  if (typeof secrets.grokAuthJson === 'string') {
+    updated.grokAuthJson = secrets.grokAuthJson;
+    updated.authMode = 'grok_oauth';
+    credentialsChanged = true;
+  } else if (secrets.clearGrokAuthJson) {
+    updated.grokAuthJson = '';
+    credentialsChanged = true;
+  }
+
   if (credentialsChanged) {
     updated.authProfileGeneration = (updated.authProfileGeneration || 0) + 1;
   }
@@ -1635,6 +1700,15 @@ export function deleteProvider(id: string): void {
     ).length <= 1
   ) {
     throw new Error('至少需要保留一个供应商');
+  }
+
+  // GC seeded grok auth material so a deleted provider's auth.json /
+  // refresh_token does not linger on disk. codexHomeDir GC is best-effort.
+  if (provider.runtime === 'grok') {
+    fs.rmSync(path.join(CLAUDE_CONFIG_DIR, 'grok', provider.id), {
+      recursive: true,
+      force: true,
+    });
   }
 
   const wasEnabled = state.providers[idx].enabled;
@@ -1812,6 +1886,115 @@ export function writeCodexProviderAuthMaterial(
   };
 }
 
+// ─── Grok providers (pool 'grok', runtime 'grok') ──────────────────
+
+export interface GrokProviderAuthMaterial {
+  providerId: string;
+  authMode: UnifiedProvider['authMode'];
+  authProfileGeneration: number;
+  env: Record<string, string>; // { GROK_HOME }
+  grokHomeDir: string;
+}
+
+export function getGrokProviders(): UnifiedProvider[] {
+  return getProvidersForPool('grok').filter((p) => p.runtime === 'grok');
+}
+
+export function getEnabledGrokProviders(): UnifiedProvider[] {
+  return getEnabledProvidersForPool('grok').filter((p) => p.runtime === 'grok');
+}
+
+/**
+ * Best-effort 解析 grok auth.json 内 access_token JWT 的 exp claim（秒→毫秒）。
+ * 仅用于前端展示「凭据过期时间」，失败返回 null，绝不阻塞流程。
+ */
+function extractGrokOAuthExpiresAt(grokAuthJson: string): number | null {
+  if (!grokAuthJson) return null;
+  try {
+    const parsed = JSON.parse(grokAuthJson) as Record<string, unknown>;
+    const candidates: unknown[] = [
+      (parsed as { access_token?: unknown }).access_token,
+      ((parsed as { tokens?: { access_token?: unknown } }).tokens || {})
+        .access_token,
+    ];
+    for (const token of candidates) {
+      if (typeof token !== 'string') continue;
+      const segments = token.split('.');
+      if (segments.length < 2) continue;
+      try {
+        const payloadRaw = Buffer.from(segments[1], 'base64url').toString(
+          'utf-8',
+        );
+        const payload = JSON.parse(payloadRaw) as { exp?: unknown };
+        if (typeof payload.exp === 'number' && Number.isFinite(payload.exp)) {
+          return payload.exp * 1000;
+        }
+      } catch {
+        // malformed JWT segment — try next candidate
+      }
+    }
+  } catch {
+    // not JSON or unexpected shape — no expiry info
+  }
+  return null;
+}
+
+/**
+ * 把用户 `grok login` 的 auth.json 整体 seed 到 per-provider GROK_HOME，让
+ * grok CLI 用内置 refresh 链自刷新（RW 挂载回写持久化）。复用 codex 的
+ * seed-metadata 三件套（authHash + authProfileGeneration + mtime）去重，避免
+ * 覆盖 CLI 刚刷新的 token。对标 writeCodexProviderAuthMaterial。
+ */
+export function writeGrokProviderAuthMaterial(
+  provider: UnifiedProvider,
+): GrokProviderAuthMaterial {
+  const env: Record<string, string> = {};
+  const grokHomeDir = path.join(CLAUDE_CONFIG_DIR, 'grok', provider.id);
+  fs.mkdirSync(grokHomeDir, { recursive: true, mode: 0o700 });
+
+  if (provider.grokAuthJson) {
+    const authPath = path.join(grokHomeDir, 'auth.json');
+    const authHash = hashCodexAuthJson(provider.grokAuthJson);
+    const metadata = readCodexAuthSeedMetadata(grokHomeDir);
+    const authStat = fs.existsSync(authPath) ? fs.statSync(authPath) : null;
+    const providerUpdatedAt = Date.parse(provider.updatedAt || '');
+    const providerUpdatedAfterAuth =
+      Number.isFinite(providerUpdatedAt) &&
+      authStat !== null &&
+      providerUpdatedAt > authStat.mtimeMs + 1000;
+    const metadataMismatch =
+      metadata !== null &&
+      (metadata.providerId !== provider.id ||
+        metadata.authProfileGeneration !== provider.authProfileGeneration ||
+        metadata.authHash !== authHash);
+    const shouldSeedAuthJson =
+      !authStat || providerUpdatedAfterAuth || metadataMismatch;
+
+    if (shouldSeedAuthJson) {
+      fs.writeFileSync(authPath, provider.grokAuthJson.trim() + '\n', {
+        encoding: 'utf-8',
+        mode: 0o600,
+      });
+    }
+    writeCodexAuthSeedMetadata(grokHomeDir, provider, authHash);
+  } else {
+    fs.rmSync(path.join(grokHomeDir, 'auth.json'), { force: true });
+    fs.rmSync(path.join(grokHomeDir, CODEX_AUTH_SEED_METADATA_FILE), {
+      force: true,
+    });
+  }
+
+  env.GROK_HOME = grokHomeDir;
+
+  return {
+    providerId: provider.id,
+    authMode: provider.authMode,
+    authProfileGeneration: provider.authProfileGeneration,
+    env,
+    grokHomeDir,
+  };
+}
+
 /** Convert UnifiedProvider to public (masked) representation */
 export function toPublicProvider(
   provider: UnifiedProvider,
@@ -1844,6 +2027,8 @@ export function toPublicProvider(
     hasOpenaiApiKey: !!provider.openaiApiKey,
     openaiApiKeyMasked: maskSecret(provider.openaiApiKey),
     hasCodexAuthJson: !!provider.codexAuthJson,
+    hasGrokAuthJson: !!provider.grokAuthJson,
+    grokOAuthExpiresAt: extractGrokOAuthExpiresAt(provider.grokAuthJson),
     customEnv: provider.customEnv || {},
     updatedAt: provider.updatedAt,
   };

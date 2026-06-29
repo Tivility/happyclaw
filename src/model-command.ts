@@ -119,7 +119,7 @@ export function parseModelBindingFromArgs(
   if (args.length === 0) {
     return {
       error:
-        '用法：/model use <claude|gpt> [model]\n例如：/model use claude opus-4.7 或 /model use gpt',
+        '用法：/model use <claude|gpt|grok> [model]\n例如：/model use claude opus-4.7 或 /model use gpt 或 /model use grok',
     };
   }
 
@@ -164,7 +164,8 @@ export function parseModelBindingFromArgs(
     const modelSpec = args.join(' ').trim();
     if (modelSpec.toLowerCase() === 'default') {
       return {
-        error: '请指定模型池：/model use claude default 或 /model use gpt default',
+        error:
+          '请指定模型池：/model use claude default 或 /model use gpt default 或 /model use grok default',
       };
     }
     const matches = visibleOptions.filter(

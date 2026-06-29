@@ -34,6 +34,7 @@ import {
   resolveProviderById,
   shellQuoteEnvLines,
   writeCodexProviderAuthMaterial,
+  writeGrokProviderAuthMaterial,
   writeCredentialsFile,
 } from './runtime-config.js';
 import { providerPool, providerPoolManager } from './provider-pool.js';
@@ -46,6 +47,7 @@ import { isApiError } from './agent-output-parser.js';
 import type {
   ClaudeProviderConfig,
   CodexProviderAuthMaterial,
+  GrokProviderAuthMaterial,
   UnifiedProvider,
 } from './runtime-config.js';
 import { loadUserMcpServers } from './mcp-utils.js';
@@ -596,6 +598,56 @@ function selectCodexProviderForInput(input: ContainerInput): UnifiedProvider | n
 }
 
 /**
+ * Select a Grok provider for a spawn (sticky pin / pool round-robin). Mirrors
+ * selectCodexProviderForInput but filters to runtime/family 'grok'.
+ */
+function selectGrokProviderForInput(
+  input: ContainerInput,
+): UnifiedProvider | null {
+  const providerPoolId = input.providerPoolId || 'grok';
+
+  if (input.providerId) {
+    const explicit = getProviderById(input.providerId);
+    if (
+      explicit &&
+      explicit.enabled &&
+      explicit.runtime === 'grok' &&
+      explicit.providerPoolId === providerPoolId
+    ) {
+      providerPoolManager.acquireSession(providerPoolId, explicit.id);
+      return explicit;
+    }
+    logger.warn(
+      { providerId: input.providerId, providerPoolId },
+      'Pinned Grok provider is unavailable, falling back to provider pool',
+    );
+  }
+
+  const enabledProviders = getEnabledProvidersForPool(providerPoolId).filter(
+    (provider) =>
+      provider.runtime === 'grok' && provider.providerFamily === 'grok',
+  );
+  if (enabledProviders.length === 0) return null;
+
+  if (enabledProviders.length === 1) {
+    providerPoolManager.acquireSession(providerPoolId, enabledProviders[0].id);
+    return enabledProviders[0];
+  }
+
+  providerPoolManager.refreshPoolFromConfig(
+    providerPoolId,
+    enabledProviders,
+    getBalancingConfig(),
+  );
+  const selectedProviderId = providerPoolManager.selectProvider(providerPoolId);
+  const selectedProvider =
+    enabledProviders.find((provider) => provider.id === selectedProviderId) ??
+    enabledProviders[0];
+  providerPoolManager.acquireSession(providerPoolId, selectedProvider.id);
+  return selectedProvider;
+}
+
+/**
  * Best-effort pre-spawn materialize for host-mode plugins. Mirrors the docker
  * path's behaviour in `buildVolumeMounts`: v2 config can exist before the
  * runtime/ tree is built (first enable, or after orphan GC), and
@@ -632,6 +684,7 @@ export function buildVolumeMounts(
   resolvedProvider?: ResolvedProvider,
   modelOverride?: string | null,
   codexAuthMaterial?: CodexProviderAuthMaterial | null,
+  grokAuthMaterial?: GrokProviderAuthMaterial | null,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -857,8 +910,9 @@ export function buildVolumeMounts(
   fs.mkdirSync(envDir, { recursive: true });
   const globalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
   const containerOverride = getContainerEnvConfig(group.folder);
-  const envLines = codexAuthMaterial
-    ? Object.entries(codexAuthMaterial.env).map(([key, value]) => `${key}=${value}`)
+  const nativeCliMaterial = codexAuthMaterial ?? grokAuthMaterial ?? null;
+  const envLines = nativeCliMaterial
+    ? Object.entries(nativeCliMaterial.env).map(([key, value]) => `${key}=${value}`)
     : buildContainerEnvLines(
         globalConfig,
         containerOverride,
@@ -882,7 +936,27 @@ export function buildVolumeMounts(
   if (codexAuthMaterial) {
     envLines.push('HAPPYCLAW_CODEX_CLI_PATH=/app/node_modules/.bin/codex');
   }
-  if (!codexAuthMaterial && modelOverride) {
+  // Grok：GROK_HOME 目录 RW 挂载到容器（与 codex-home 对称）。grok CLI 在容器内
+  // 用 refresh_token 自刷新会回写 auth.json，必须可写，否则长会话过期即 401。
+  if (grokAuthMaterial?.grokHomeDir) {
+    mounts.push({
+      hostPath: grokAuthMaterial.grokHomeDir,
+      containerPath: '/workspace/grok-home',
+      readonly: false,
+    });
+    const grokHomeIndex = envLines.findIndex((line) =>
+      line.startsWith('GROK_HOME='),
+    );
+    if (grokHomeIndex >= 0) {
+      envLines[grokHomeIndex] = 'GROK_HOME=/workspace/grok-home';
+    } else {
+      envLines.push('GROK_HOME=/workspace/grok-home');
+    }
+    // grok CLI 全局安装在镜像内（@xai-official/grok），走 PATH 即可；显式 pin 路径
+    // 与 codex 对称，避免 agent extra 目录里持久化的同名包屏蔽。
+    envLines.push('HAPPYCLAW_GROK_CLI_PATH=/usr/local/bin/grok');
+  }
+  if (!nativeCliMaterial && modelOverride) {
     envLines.push(`ANTHROPIC_MODEL=${modelOverride}`);
   }
   // SystemSettings.autoCompactWindow > 0 时注入到容器，让 agent-runner 通过 query() settings 传给 SDK
@@ -917,7 +991,7 @@ export function buildVolumeMounts(
   }
 
   // Write .credentials.json for OAuth credentials (session dir is already mounted)
-  if (!codexAuthMaterial) {
+  if (!nativeCliMaterial) {
     const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
     if (modelOverride) {
       mergedConfig.anthropicModel = modelOverride;
@@ -1048,8 +1122,13 @@ export async function runContainerAgent(
 
   // ─── Provider Pool selection ───
   const isCodexRuntime = input.runtime === 'codex';
+  const isGrokRuntime = input.runtime === 'grok';
+  // codex/grok both bypass the Claude env/pool path and seed a per-provider
+  // HOME directory instead (CODEX_HOME / GROK_HOME).
+  const isNativeCliRuntime = isCodexRuntime || isGrokRuntime;
   const selectedProviderPoolId =
-    input.providerPoolId || (isCodexRuntime ? 'gpt' : 'claude');
+    input.providerPoolId ||
+    (isCodexRuntime ? 'gpt' : isGrokRuntime ? 'grok' : 'claude');
   const codexProvider = isCodexRuntime ? selectCodexProviderForInput(input) : null;
   if (isCodexRuntime && !codexProvider) {
     return {
@@ -1058,14 +1137,25 @@ export async function runContainerAgent(
       error: 'GPT/Codex 模型池没有启用的官方供应商',
     };
   }
-  const poolResult = isCodexRuntime
+  const grokProvider = isGrokRuntime ? selectGrokProviderForInput(input) : null;
+  if (isGrokRuntime && !grokProvider) {
+    return {
+      status: 'error',
+      result: null,
+      error: 'Grok 模型池没有启用的供应商',
+    };
+  }
+  const poolResult = isNativeCliRuntime
     ? null
     : trySelectPoolProvider(group.folder, input.providerId, input.agentId);
   const selectedProfileId = isCodexRuntime
     ? codexProvider?.id ?? null
-    : poolResult?.profileId ?? null;
+    : isGrokRuntime
+      ? grokProvider?.id ?? null
+      : poolResult?.profileId ?? null;
   const resolvedProvider = poolResult?.resolved;
   let codexAuthMaterial: CodexProviderAuthMaterial | null = null;
+  let grokAuthMaterial: GrokProviderAuthMaterial | null = null;
   let providerFailureReported = false;
   if (poolResult?.resetSession && input.sessionId) {
     logger.info(
@@ -1101,6 +1191,15 @@ export async function runContainerAgent(
           error: 'Codex 供应商缺少 API key 或 OAuth auth.json',
         };
       }
+    } else if (isGrokRuntime) {
+      grokAuthMaterial = writeGrokProviderAuthMaterial(grokProvider!);
+      if (!grokProvider!.grokAuthJson) {
+        return {
+          status: 'error',
+          result: null,
+          error: 'Grok 供应商缺少 auth.json 凭据',
+        };
+      }
     }
 
     // Determine if this is an admin home container (full privileges)
@@ -1117,6 +1216,7 @@ export async function runContainerAgent(
       resolvedProvider,
       input.runtime === 'claude' ? input.modelOverride : null,
       codexAuthMaterial,
+      grokAuthMaterial,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = input.agentId
@@ -1666,6 +1766,10 @@ export async function runHostAgent(
 
   // ─── Provider Pool selection (host mode) ───
   const isCodexRuntime = input.runtime === 'codex';
+  const isGrokRuntime = input.runtime === 'grok';
+  // codex/grok both bypass the Claude env/pool path and seed a per-provider
+  // HOME directory instead.
+  const isNativeCliRuntime = isCodexRuntime || isGrokRuntime;
   const containerOverride = getContainerEnvConfig(group.folder);
   const codexProvider = isCodexRuntime
     ? selectCodexProviderForInput(input)
@@ -1673,14 +1777,21 @@ export async function runHostAgent(
   if (isCodexRuntime && !codexProvider) {
     return hostModeSetupError('GPT/Codex 模型池没有启用的官方供应商');
   }
-  const hostPoolResult = isCodexRuntime
+  const grokProvider = isGrokRuntime ? selectGrokProviderForInput(input) : null;
+  if (isGrokRuntime && !grokProvider) {
+    return hostModeSetupError('Grok 模型池没有启用的供应商');
+  }
+  const hostPoolResult = isNativeCliRuntime
     ? null
     : trySelectPoolProvider(group.folder, input.providerId, input.agentId);
   const hostSelectedProfileId = isCodexRuntime
     ? codexProvider?.id ?? null
-    : hostPoolResult?.profileId ?? null;
+    : isGrokRuntime
+      ? grokProvider?.id ?? null
+      : hostPoolResult?.profileId ?? null;
   const hostProviderPoolId =
-    input.providerPoolId || (isCodexRuntime ? 'gpt' : 'claude');
+    input.providerPoolId ||
+    (isCodexRuntime ? 'gpt' : isGrokRuntime ? 'grok' : 'claude');
   const globalConfig = hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
   if (hostPoolResult?.resetSession && input.sessionId) {
@@ -1715,6 +1826,12 @@ export async function runHostAgent(
         return hostModeSetupError(
           'Codex 供应商缺少 API key 或 OAuth auth.json',
         );
+      }
+    } else if (isGrokRuntime) {
+      const authMaterial = writeGrokProviderAuthMaterial(grokProvider!);
+      Object.assign(hostEnv, authMaterial.env);
+      if (!grokProvider!.grokAuthJson) {
+        return hostModeSetupError('Grok 供应商缺少 auth.json 凭据');
       }
     } else {
       const envLines = buildContainerEnvLines(
@@ -1779,7 +1896,7 @@ export async function runHostAgent(
     }
 
     // Write .credentials.json for OAuth credentials
-    if (!isCodexRuntime) {
+    if (!isNativeCliRuntime) {
       const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
       if (input.runtime === 'claude' && input.modelOverride) {
         mergedConfig.anthropicModel = input.modelOverride;

@@ -689,11 +689,18 @@ export const UnifiedProviderCreateSchema = z
   .object({
     name: z.string().min(1).max(64),
     type: z.enum(['official', 'third_party']),
-    runtime: z.enum(['claude', 'codex']).optional(),
-    providerFamily: z.enum(['claude', 'gpt']).optional(),
+    runtime: z.enum(['claude', 'codex', 'grok']).optional(),
+    providerFamily: z.enum(['claude', 'gpt', 'grok']).optional(),
     providerPoolId: z.string().min(1).max(64).optional(),
     authMode: z
-      .enum(['api_key', 'oauth', 'setup_token', 'third_party', 'chatgpt_oauth'])
+      .enum([
+        'api_key',
+        'oauth',
+        'setup_token',
+        'third_party',
+        'chatgpt_oauth',
+        'grok_oauth',
+      ])
       .optional(),
     anthropicBaseUrl: z.string().max(2000).optional(),
     anthropicAuthToken: z.string().max(2000).optional(),
@@ -703,6 +710,7 @@ export const UnifiedProviderCreateSchema = z
     claudeOAuthCredentials: ClaudeOAuthCredentialsSchema.optional(),
     openaiApiKey: z.string().max(2000).optional(),
     codexAuthJson: z.string().max(200000).optional(),
+    grokAuthJson: z.string().max(200000).optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
     enabled: z.boolean().optional(),
@@ -755,6 +763,8 @@ export const UnifiedProviderSecretsSchema = z
     clearOpenaiApiKey: z.boolean().optional(),
     codexAuthJson: z.string().max(200000).optional(),
     clearCodexAuthJson: z.boolean().optional(),
+    grokAuthJson: z.string().max(200000).optional(),
+    clearGrokAuthJson: z.boolean().optional(),
   })
   .refine(
     (data) => {
@@ -770,7 +780,9 @@ export const UnifiedProviderSecretsSchema = z
         typeof data.openaiApiKey === 'string' ||
         data.clearOpenaiApiKey === true ||
         typeof data.codexAuthJson === 'string' ||
-        data.clearCodexAuthJson === true
+        data.clearCodexAuthJson === true ||
+        typeof data.grokAuthJson === 'string' ||
+        data.clearGrokAuthJson === true
       );
     },
     { message: 'At least one secret field must be provided' },

@@ -1652,6 +1652,7 @@ function initializeModelSwitchingDefaults(): void {
   );
   insertPool.run('claude', 'claude', 'claude', 'Claude', now);
   insertPool.run('gpt', 'codex', 'gpt', 'GPT', now);
+  insertPool.run('grok', 'grok', 'grok', 'Grok', now);
 
   db.prepare(
     `INSERT OR IGNORE INTO system_model_default (
@@ -1832,6 +1833,39 @@ function initializeModelSwitchingDefaults(): void {
       source: 'admin_configured',
       status: 'unverified',
       metadata: { resolved_model: 'gpt-5.2' },
+    },
+    {
+      runtime: 'grok',
+      providerFamily: 'grok',
+      poolId: 'grok',
+      modelId: 'default',
+      modelKind: 'provider_default',
+      displayName: 'Grok default',
+      source: 'runtime_default',
+      status: 'available',
+      metadata: null,
+    },
+    {
+      runtime: 'grok',
+      providerFamily: 'grok',
+      poolId: 'grok',
+      modelId: 'grok-build',
+      modelKind: 'explicit_version',
+      displayName: 'Grok Build',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: { resolved_model: 'grok-build' },
+    },
+    {
+      runtime: 'grok',
+      providerFamily: 'grok',
+      poolId: 'grok',
+      modelId: 'grok-composer-2.5-fast',
+      modelKind: 'explicit_version',
+      displayName: 'Grok Composer 2.5 Fast',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: { resolved_model: 'grok-composer-2.5-fast' },
     },
   ];
 

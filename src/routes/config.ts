@@ -1,7 +1,8 @@
 // Configuration management routes
 
 import { randomBytes, createHash } from 'node:crypto';
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
 import { Agent as HttpsAgent } from 'node:https';
 import { ProxyAgent } from 'proxy-agent';
 import QRCode from 'qrcode';
@@ -47,6 +48,7 @@ import {
   getProviders,
   getEnabledProvidersForPool,
   getCodexProviders,
+  getGrokProviders,
   getBalancingConfig,
   saveBalancingConfig,
   createProvider,
@@ -107,6 +109,8 @@ import {
 import { providerPool } from '../provider-pool.js';
 import fs from 'fs';
 import path from 'path';
+
+const execFileAsync = promisify(execFile);
 
 const configRoutes = new Hono<{ Variables: Variables }>();
 
@@ -251,6 +255,76 @@ const CodexProviderSecretsSchema = z
           code: z.ZodIssueCode.custom,
           path: ['codexAuthJson'],
           message: 'Codex auth.json must be valid JSON',
+        });
+      }
+    }
+  });
+
+const GrokProviderCreateSchema = z
+  .object({
+    name: z.string().min(1).max(64).default('官方 Grok'),
+    authMode: z.enum(['grok_oauth']).default('grok_oauth'),
+    grokAuthJson: z.string().max(200000).optional(),
+    enabled: z.boolean().optional(),
+    weight: z.number().int().min(1).max(100).optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (!data.grokAuthJson?.trim()) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['grokAuthJson'],
+        message: 'Grok auth.json content is required',
+      });
+    } else {
+      try {
+        JSON.parse(data.grokAuthJson);
+      } catch {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['grokAuthJson'],
+          message: 'Grok auth.json must be valid JSON',
+        });
+      }
+    }
+  });
+
+const GrokProviderPatchSchema = z
+  .object({
+    name: z.string().min(1).max(64).optional(),
+    enabled: z.boolean().optional(),
+    weight: z.number().int().min(1).max(100).optional(),
+  })
+  .refine(
+    (data) =>
+      data.name !== undefined ||
+      data.enabled !== undefined ||
+      data.weight !== undefined,
+    { message: 'At least one field must be provided' },
+  );
+
+const GrokProviderSecretsSchema = z
+  .object({
+    grokAuthJson: z.string().max(200000).optional(),
+    clearGrokAuthJson: z.boolean().optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (
+      data.grokAuthJson === undefined &&
+      data.clearGrokAuthJson !== true
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'At least one secret field must be provided',
+      });
+    }
+    if (data.grokAuthJson !== undefined) {
+      try {
+        JSON.parse(data.grokAuthJson);
+      } catch {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['grokAuthJson'],
+          message: 'Grok auth.json must be valid JSON',
         });
       }
     }
@@ -608,6 +682,7 @@ configRoutes.post(
               : 'oauth',
         openaiApiKey: '',
         codexAuthJson: '',
+        grokAuthJson: '',
       });
       appendClaudeConfigAudit(actor, 'create_provider', [
         `id:${provider.id}`,
@@ -1235,6 +1310,469 @@ configRoutes.delete(
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Failed to delete Codex provider';
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+// ─── Grok providers (pool 'grok', runtime 'grok') ─────────────────
+// 隔离决策 D9=路0：admin 配置全员共享，零特殊隔离代码。全部走
+// systemConfigMiddleware（manage_system_config），与 codex 一致。
+
+// ─── Grok device-auth (镜像 codex 的 device-auth spawn+解析) ────────
+const GrokOAuthStartSchema = z.object({
+  targetProviderId: z.string().min(1).max(128).optional(),
+  name: z.string().min(1).max(64).optional(),
+  weight: z.number().int().min(1).max(100).optional(),
+});
+
+const GrokOAuthStateSchema = z.object({
+  state: z.string().min(16).max(128),
+});
+
+interface GrokOAuthFlow {
+  child: ChildProcess;
+  grokHome: string;
+  createdAt: number;
+  expiresAt: number;
+  stdout: string;
+  stderr: string;
+  authorizeUrl: string | null;
+  deviceCode: string | null;
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
+  targetProviderId?: string;
+  name: string;
+  weight: number;
+}
+
+const GROK_OAUTH_FLOW_TTL_MS = 15 * 60 * 1000;
+const GROK_OAUTH_ROOT = path.join(DATA_DIR, 'config', 'grok-oauth');
+const grokOAuthFlows = new Map<string, GrokOAuthFlow>();
+
+// host 端寻找 grok CLI：env 覆盖 > PATH 解析（镜像 findCodexCli 思路）。
+async function findGrokCli(): Promise<string | null> {
+  if (
+    process.env.HAPPYCLAW_GROK_CLI_PATH &&
+    fs.existsSync(process.env.HAPPYCLAW_GROK_CLI_PATH)
+  ) {
+    return process.env.HAPPYCLAW_GROK_CLI_PATH;
+  }
+  try {
+    const { stdout } = await execFileAsync('sh', ['-lc', 'command -v grok'], {
+      timeout: 3000,
+    });
+    const found = stdout.trim().split('\n')[0];
+    return found || null;
+  } catch {
+    return null;
+  }
+}
+
+function parseGrokDeviceLoginOutput(output: string): {
+  authorizeUrl: string | null;
+  deviceCode: string | null;
+} {
+  const plain = stripAnsi(output);
+  const authorizeUrl =
+    plain.match(/https:\/\/(?:auth|accounts)\.x\.ai\/\S+/)?.[0] ??
+    plain.match(/https:\/\/\S+/)?.[0] ??
+    null;
+  const deviceCode = plain.match(/\b[A-Z0-9]{4}-[A-Z0-9]{4,6}\b/)?.[0] ?? null;
+  return { authorizeUrl, deviceCode };
+}
+
+function cleanupGrokOAuthFlow(state: string, flow: GrokOAuthFlow): void {
+  if (flow.exitCode === null && flow.exitSignal === null) {
+    try {
+      flow.child.kill('SIGTERM');
+    } catch {
+      // best effort
+    }
+  }
+  grokOAuthFlows.delete(state);
+  fs.rmSync(flow.grokHome, { recursive: true, force: true });
+}
+
+function findGrokAuthJson(grokHome: string): string | null {
+  const candidates = [
+    path.join(grokHome, 'auth.json'),
+    path.join(grokHome, '.grok', 'auth.json'),
+  ];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+async function waitForGrokDeviceCode(
+  flow: GrokOAuthFlow,
+  timeoutMs = 5000,
+): Promise<void> {
+  if (flow.authorizeUrl && flow.deviceCode) return;
+  if (flow.exitCode !== null || flow.exitSignal !== null) return;
+
+  await new Promise<void>((resolve) => {
+    const started = Date.now();
+    const timer = setInterval(() => {
+      if (
+        (flow.authorizeUrl && flow.deviceCode) ||
+        flow.exitCode !== null ||
+        flow.exitSignal !== null ||
+        Date.now() - started >= timeoutMs
+      ) {
+        clearInterval(timer);
+        resolve();
+      }
+    }, 100);
+  });
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [state, flow] of grokOAuthFlows) {
+    if (flow.expiresAt < now) cleanupGrokOAuthFlow(state, flow);
+  }
+}, 60_000);
+
+configRoutes.post(
+  '/grok/oauth/start',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = GrokOAuthStartSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    if (validation.data.targetProviderId) {
+      const target = getGrokProviders().find(
+        (p) => p.id === validation.data.targetProviderId,
+      );
+      if (!target) return c.json({ error: 'Grok provider not found' }, 404);
+    }
+
+    const cliPath = await findGrokCli();
+    if (!cliPath) {
+      return c.json({ error: 'Grok CLI executable not found' }, 400);
+    }
+
+    const state = randomBytes(24).toString('base64url');
+    const grokHome = path.join(GROK_OAUTH_ROOT, state);
+    fs.mkdirSync(grokHome, { recursive: true, mode: 0o700 });
+
+    const child = spawn(cliPath, ['login', '--device-auth'], {
+      cwd: grokHome,
+      env: {
+        ...process.env,
+        GROK_HOME: grokHome,
+        HOME: grokHome,
+        NO_COLOR: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const now = Date.now();
+    const flow: GrokOAuthFlow = {
+      child,
+      grokHome,
+      createdAt: now,
+      expiresAt: now + GROK_OAUTH_FLOW_TTL_MS,
+      stdout: '',
+      stderr: '',
+      authorizeUrl: null,
+      deviceCode: null,
+      exitCode: null,
+      exitSignal: null,
+      targetProviderId: validation.data.targetProviderId,
+      name: validation.data.name?.trim() || '官方 Grok',
+      weight: validation.data.weight || 1,
+    };
+
+    const handleOutput = (chunk: Buffer) => {
+      flow.stdout += chunk.toString('utf-8');
+      const parsed = parseGrokDeviceLoginOutput(flow.stdout);
+      flow.authorizeUrl = flow.authorizeUrl || parsed.authorizeUrl;
+      flow.deviceCode = flow.deviceCode || parsed.deviceCode;
+    };
+
+    child.stdout.on('data', handleOutput);
+    child.stderr.on('data', (chunk: Buffer) => {
+      flow.stderr += chunk.toString('utf-8');
+      const parsed = parseGrokDeviceLoginOutput(flow.stderr);
+      flow.authorizeUrl = flow.authorizeUrl || parsed.authorizeUrl;
+      flow.deviceCode = flow.deviceCode || parsed.deviceCode;
+    });
+    child.on('close', (code, signal) => {
+      flow.exitCode = code;
+      flow.exitSignal = signal;
+    });
+    child.on('error', (err) => {
+      flow.stderr += err instanceof Error ? err.message : String(err);
+    });
+
+    grokOAuthFlows.set(state, flow);
+    await waitForGrokDeviceCode(flow);
+
+    if (!flow.authorizeUrl) {
+      cleanupGrokOAuthFlow(state, flow);
+      const detail = stripAnsi(flow.stderr || flow.stdout).trim();
+      return c.json(
+        {
+          error:
+            detail || 'Grok login did not produce a device authorization URL',
+        },
+        400,
+      );
+    }
+
+    return c.json({
+      state,
+      authorizeUrl: flow.authorizeUrl,
+      deviceCode: flow.deviceCode || '',
+      expiresAt: flow.expiresAt,
+    });
+  },
+);
+
+configRoutes.post(
+  '/grok/oauth/complete',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = GrokOAuthStateSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    const flow = grokOAuthFlows.get(validation.data.state);
+    if (!flow) return c.json({ error: 'Grok OAuth flow not found or expired' }, 404);
+
+    await waitForGrokDeviceCode(flow, 1500);
+    const authPath = findGrokAuthJson(flow.grokHome);
+    if (!authPath && flow.exitCode === null && flow.exitSignal === null) {
+      return c.json({ error: '授权尚未完成，请在浏览器中完成登录后再确认。' }, 409);
+    }
+
+    if (!authPath) {
+      const detail = stripAnsi(flow.stderr || flow.stdout).trim();
+      cleanupGrokOAuthFlow(validation.data.state, flow);
+      return c.json(
+        { error: detail || 'Grok OAuth login failed before auth.json was created' },
+        400,
+      );
+    }
+
+    const grokAuthJson = fs.readFileSync(authPath, 'utf-8').trim();
+    try {
+      JSON.parse(grokAuthJson);
+    } catch {
+      cleanupGrokOAuthFlow(validation.data.state, flow);
+      return c.json({ error: 'Grok auth.json is not valid JSON' }, 400);
+    }
+
+    const actor = (c.get('user') as AuthUser).username;
+    try {
+      const provider = flow.targetProviderId
+        ? updateProviderSecrets(flow.targetProviderId, {
+            authMode: 'grok_oauth',
+            grokAuthJson,
+          })
+        : createProvider({
+            name: flow.name,
+            type: 'official',
+            runtime: 'grok',
+            providerFamily: 'grok',
+            providerPoolId: 'grok',
+            authMode: 'grok_oauth',
+            grokAuthJson,
+            enabled: true,
+            weight: flow.weight,
+          });
+
+      appendClaudeConfigAudit(actor, 'grok_oauth_complete', [
+        `providerId:${provider.id}`,
+        flow.targetProviderId ? 'mode:update' : 'mode:create',
+      ]);
+
+      cleanupGrokOAuthFlow(validation.data.state, flow);
+      return c.json({ provider: toPublicProvider(provider) });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to save Grok OAuth credentials';
+      logger.warn({ err }, 'Failed to save Grok OAuth credentials');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+configRoutes.post(
+  '/grok/oauth/cancel',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = GrokOAuthStateSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+
+    const flow = grokOAuthFlows.get(validation.data.state);
+    if (flow) cleanupGrokOAuthFlow(validation.data.state, flow);
+    return c.json({ ok: true });
+  },
+);
+
+configRoutes.get(
+  '/grok/providers',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    try {
+      return c.json({
+        providers: getGrokProviders().map(toPublicProvider),
+        dependencies: null,
+      });
+    } catch (err) {
+      logger.error({ err }, 'Failed to list Grok providers');
+      return c.json({ error: 'Failed to list Grok providers' }, 500);
+    }
+  },
+);
+
+configRoutes.post(
+  '/grok/providers',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = GrokProviderCreateSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const actor = (c.get('user') as AuthUser).username;
+    try {
+      const provider = createProvider({
+        name: validation.data.name,
+        type: 'official',
+        runtime: 'grok',
+        providerFamily: 'grok',
+        providerPoolId: 'grok',
+        authMode: 'grok_oauth',
+        grokAuthJson: validation.data.grokAuthJson,
+        enabled: validation.data.enabled,
+        weight: validation.data.weight,
+      });
+      appendClaudeConfigAudit(actor, 'grok_provider_create', [
+        `providerId:${provider.id}`,
+        `authMode:${provider.authMode}`,
+      ]);
+      return c.json({ provider: toPublicProvider(provider) }, 201);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to create Grok provider';
+      logger.warn({ err }, 'Failed to create Grok provider');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+configRoutes.patch(
+  '/grok/providers/:id',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({}));
+    const validation = GrokProviderPatchSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const current = getGrokProviders().find((p) => p.id === id);
+    if (!current) return c.json({ error: 'Grok provider not found' }, 404);
+    try {
+      let provider = updateProvider(id, {
+        name: validation.data.name,
+        weight: validation.data.weight,
+      });
+      if (
+        validation.data.enabled !== undefined &&
+        provider.enabled !== validation.data.enabled
+      ) {
+        provider = toggleProvider(id);
+      }
+      return c.json({ provider: toPublicProvider(provider) });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to update Grok provider';
+      logger.warn({ err, providerId: id }, 'Failed to update Grok provider');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+configRoutes.put(
+  '/grok/providers/:id/secrets',
+  authMiddleware,
+  systemConfigMiddleware,
+  async (c) => {
+    const { id } = c.req.param();
+    const body = await c.req.json().catch(() => ({}));
+    const validation = GrokProviderSecretsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const current = getGrokProviders().find((p) => p.id === id);
+    if (!current) return c.json({ error: 'Grok provider not found' }, 404);
+    try {
+      const provider = updateProviderSecrets(id, {
+        grokAuthJson: validation.data.grokAuthJson,
+        clearGrokAuthJson: validation.data.clearGrokAuthJson,
+      });
+      return c.json({ provider: toPublicProvider(provider) });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to update Grok secrets';
+      logger.warn({ err, providerId: id }, 'Failed to update Grok secrets');
+      return c.json({ error: message }, 400);
+    }
+  },
+);
+
+configRoutes.delete(
+  '/grok/providers/:id',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const { id } = c.req.param();
+    const current = getGrokProviders().find((p) => p.id === id);
+    if (!current) return c.json({ error: 'Grok provider not found' }, 404);
+    try {
+      deleteProvider(id);
+      return c.json({ ok: true });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : 'Failed to delete Grok provider';
       return c.json({ error: message }, 400);
     }
   },

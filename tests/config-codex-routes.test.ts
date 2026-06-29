@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   dataDir: `/tmp/happyclaw-config-codex-routes-${process.pid}`,
   spawn: vi.fn(),
+  execFile: vi.fn(),
   deleteAllSessionsForFolder: vi.fn(),
   stopGroup: vi.fn(),
 }));
@@ -35,6 +36,11 @@ vi.mock('../src/middleware/auth.js', () => ({
 
 vi.mock('node:child_process', () => ({
   spawn: mocks.spawn,
+  // execFile must be a function with a `__promisify__` hook so that
+  // `promisify(execFile)` at config.ts module load doesn't throw.
+  execFile: Object.assign(mocks.execFile, {
+    __promisify__: () => Promise.resolve({ stdout: '', stderr: '' }),
+  }),
 }));
 
 vi.mock('../src/db.js', () => ({

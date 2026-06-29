@@ -41,7 +41,7 @@ function shouldUseNativeSession(
   nativeSession: RuntimeNativeSession | undefined,
 ): boolean {
   if (!nativeSession?.native_session_id) return false;
-  if (binding.runtime !== 'codex') return true;
+  if (binding.runtime !== 'codex' && binding.runtime !== 'grok') return true;
 
   const maxInputTokens = codexNativeResumeMaxInputTokens();
   const usage = getLatestSessionTokenUsage(nativeSession.native_session_id);
@@ -130,7 +130,7 @@ function validateAvailability(
     };
   }
   if (
-    binding.runtime === 'codex' &&
+    (binding.runtime === 'codex' || binding.runtime === 'grok') &&
     getEnabledProvidersForPool(binding.provider_pool_id).length === 0
   ) {
     return {
