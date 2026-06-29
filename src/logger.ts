@@ -10,6 +10,7 @@ export const logger = pino({
       '*.authorization', '*.cookie', '*.sessionId',
       '*.appSecret', '*.app_secret', '*.appId',
       '*.anthropicApiKey', '*.anthropicAuthToken',
+      '*.codexAuthJson', '*.grokAuthJson',
       '*.botToken', '*.bot_token',
     ],
     censor: '[REDACTED]',

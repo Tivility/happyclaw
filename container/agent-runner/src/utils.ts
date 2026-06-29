@@ -94,6 +94,19 @@ export function redactInlineSecrets(value: string): string {
       .replace(/\bsk_(?:live|test)_[A-Za-z0-9]{16,}/g, '[REDACTED]')
       .replace(/\bSG\.[A-Za-z0-9_\-]{16,}\.[A-Za-z0-9_\-]{16,}/g, '[REDACTED]')
       .replace(/\bnpm_[A-Za-z0-9]{30,}/g, '[REDACTED]')
+      // xAI / Grok API key 前缀
+      .replace(/\bxai-[A-Za-z0-9_\-]{16,}/g, '[REDACTED]')
+      // GROK_AUTH_* / XAI_API_KEY 环境变量赋值（key=value / key: value）
+      .replace(
+        /\b(GROK_AUTH[A-Z_]*|XAI_API_KEY)\s*[:=]\s*["']?[^"'\s;,&]+/g,
+        '$1=[REDACTED]',
+      )
+      // 裸 JWT（access/refresh token，三段 base64url）。放在厂商前缀之后，
+      // 兜底未被具名规则命中的 grok auth.json token。
+      .replace(
+        /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+        '[REDACTED JWT]',
+      )
       // private key / pem 头标识，整段一路擦到 END 标记
       .replace(/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g, '[REDACTED PRIVATE KEY]')
   );

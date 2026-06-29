@@ -724,6 +724,8 @@ const API_ERROR_PATTERNS = [
   /\b(502|503|504|529)\b/,
   /ANTHROPIC_API_KEY/,
   /ANTHROPIC_AUTH_TOKEN/,
+  /GROK_AUTH/,
+  /XAI_API_KEY/,
   /\binvalid[_ ]?api\b/i,
   /\bbilling\s+(error|issue|limit)\b/i,
   /\bcredit(s)?\s+(exhausted|insufficient)\b/i,

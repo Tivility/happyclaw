@@ -90,6 +90,39 @@ describe('redactInlineSecrets', () => {
     });
   });
 
+  describe('Grok / xAI tokens', () => {
+    test('redacts xai- API key prefix', () => {
+      const out = redactInlineSecrets('export XAI=xai-abcdefghij0123456789ABCDEF now');
+      expect(out).toContain('[REDACTED]');
+      expect(out).not.toContain('xai-abcdefghij0123456789ABCDEF');
+    });
+
+    test('redacts GROK_AUTH_* env var assignment', () => {
+      expect(redactInlineSecrets('GROK_AUTH_ACCESS_TOKEN=eyJsomethinglong')).toMatch(
+        /GROK_AUTH_ACCESS_TOKEN=\[REDACTED\]/,
+      );
+      expect(redactInlineSecrets('GROK_AUTH_REFRESH: rt_supersecretvalue')).toMatch(
+        /\[REDACTED\]/,
+      );
+    });
+
+    test('redacts XAI_API_KEY env var assignment', () => {
+      const out = redactInlineSecrets('XAI_API_KEY=xai-zzzzzzzzzzzzzzzzzzzz');
+      expect(out).toMatch(/XAI_API_KEY=\[REDACTED\]/);
+      expect(out).not.toContain('xai-zzzzzzzzzzzzzzzzzzzz');
+    });
+
+    test('redacts bare JWT (grok auth.json access/refresh token)', () => {
+      const jwt =
+        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9' +
+        '.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6Ikdyb2sifQ' +
+        '.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+      const out = redactInlineSecrets(`token is ${jwt} ok`);
+      expect(out).toContain('[REDACTED JWT]');
+      expect(out).not.toContain(jwt);
+    });
+  });
+
   describe('PEM private keys (R3 fix)', () => {
     test('redacts entire PEM block', () => {
       const pem = '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...\n-----END RSA PRIVATE KEY-----';
