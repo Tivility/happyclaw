@@ -6,9 +6,9 @@
 
 HappyClaw 是一个自托管的多用户 AI Agent 系统：
 
-- **输入**：飞书 / Telegram / QQ / 钉钉 / WhatsApp（基于 Baileys）/ Web 界面消息（每个用户可独立配置 IM 通道）
-- **执行**：Docker 容器或宿主机进程中运行 Claude Agent（基于 Claude Agent SDK），每个用户拥有独立主容器
-- **输出**：飞书富文本卡片 / Telegram HTML / QQ 纯文本 / Web 实时流式推送
+- **输入**：飞书 / Telegram / QQ / 钉钉 / 微信 / Discord / WhatsApp（基于 Baileys）/ Web 界面消息（每个用户可独立配置 IM 通道；渠道全集以 `shared/channel-prefixes.ts` 为准）
+- **执行**：Docker 容器或宿主机进程中运行 Agent，支持三条运行时：Claude（Agent SDK）/ Codex（CLI/SDK）/ Grok（ACP），每个用户拥有独立主容器
+- **输出**：飞书富文本卡片 / 钉钉 AI Card / QQ・Discord 流式编辑 / Telegram HTML / Web 实时流式推送
 - **记忆**：Agent 自主维护 `CLAUDE.md` 和工作区文件，实现跨会话持久记忆
 
 ## 2. 核心架构
@@ -17,7 +17,7 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 
 | 模块 | 职责 |
 |------|------|
-| `src/index.ts` | 入口：管理员引导、消息轮询（2s）、IPC 监听（1s）、容器生命周期 |
+| `src/index.ts` | 入口：管理员引导、消息轮询（2s）、IPC 监听（fs.watch 事件驱动 + 兜底轮询）、容器生命周期 |
 | `src/web.ts` | Hono 框架：路由挂载、WebSocket 升级、HMAC Cookie 认证、静态文件托管 |
 | `src/routes/auth.ts` | 认证：登录 / 登出 / 注册、`GET /api/auth/me`（含 `setupStatus`）、设置向导、RBAC、邀请码 |
 | `src/routes/groups.ts` | 群组 CRUD、消息分页、会话重置（重建工作区）、群组级容器环境变量 |
@@ -32,6 +32,12 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/routes/agents.ts` | Sub-Agent CRUD（`GET/POST/DELETE /api/groups/:jid/agents`） |
 | `src/routes/mcp-servers.ts` | MCP Servers 管理（CRUD + `POST /api/mcp-servers/sync-host`，per-user） |
 | `src/routes/plugins.ts` | Claude Code Plugins 管理（catalog + per-user enable + versioned runtime）：admin 通过 `POST /api/plugins/catalog/scan` 触发宿主机扫描共享导入 catalog；用户从 catalog enable（`PATCH /api/plugins/enabled/:fullId`，自动 materialize runtime）；`DELETE /api/plugins/marketplaces/:name` 仅清除调用者自己的 enabled refs，不删 catalog |
+| `src/routes/usage.ts` | Token 用量统计查询（日汇总 / 明细） |
+| `src/routes/billing.ts` | 计费 API：套餐 / 订阅 / 余额 / 兑换码 / 计费审计 |
+| `src/routes/model.ts` | 模型与运行时绑定 API（系统默认 / 工作区默认 / 会话级切换） |
+| `src/routes/agent-definitions.ts` | 自定义 SubAgent 定义管理 |
+| `src/routes/workspace-config.ts` | 工作区级配置（`/api/groups/:jid/workspace-config`） |
+| `src/routes/bug-report.ts` | Bug 报告收集 API |
 | `src/plugin-utils.ts` | Plugin 加载工具：`loadUserPlugins(userId, {runtime})` → `SdkPluginConfig[]`；per-user enable refs 在 `data/plugins/users/{userId}/plugins.json`，runtime materialize 到 `data/plugins/runtime/{userId}/snapshots/{snapshotId}/{marketplace}/{plugin}/` |
 | `src/plugin-dependency-check.ts` | Plugin 依赖 best-effort 预检：扫描 plugin 目录下 `commands/*.md` frontmatter 的 `allowed-tools: Bash()` + `hooks/hooks.json` 的 command 第一 token；`config/plugin-deps-override.json` 人工覆盖表优先级最高 |
 | `src/feishu.ts` | 飞书连接工厂（`createFeishuConnection`）：WebSocket 长连接、消息去重（LRU 1000 条 / 30min TTL）、富文本卡片、Reaction；`file` 消息下载到工作区；`post` 图文消息仅提取文字 |
@@ -39,24 +45,38 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/qq.ts` | QQ 连接工厂（`createQQConnection`）：Bot API v2 WebSocket 长连接、OAuth Token 管理、C2C 私聊 + 群聊 @Bot、消息去重（LRU 1000 条 / 30min TTL）、Markdown → 纯文本、长消息分片（5000 字符）、图片下载为 base64 供 Vision |
 | `src/dingtalk.ts` | 钉钉连接工厂（`createDingTalkConnection`）：Stream 协议长连接、消息去重（LRU 1000 条 / 30min TTL）；支持 `text`、`picture`（通过 downloadCode 下载）和 `image`（通过 contentUrl 下载）；图片超过 5MB 不发 base64，仅保存到 `downloads/dingtalk/` |
 | `src/whatsapp.ts` | WhatsApp 连接工厂（`createWhatsAppConnection`）：基于 `@whiskeysockets/baileys` 的 WhatsApp Web 协议；`useMultiFileAuthState` 持久化登录态；QR 经 `qrcode` 渲染 PNG data URL 推前端；自动 3s 重连（logged_out 不重连避免 QR 风暴）；`messages.upsert` 转发文本 + 媒体（image/video/audio/document）下载到 `downloads/whatsapp/{date}/`；小图片附 base64 attachment 供 Vision；`group-participants.update` 触发 onBotAddedToGroup / onBotRemovedFromGroup；群组 `require_mention` 通过 `mentionedJid` 与 `sock.user.id` 比对。详见 §8.13 |
+| `src/wechat.ts` | 微信连接工厂（iLink Bot API：long-polling 收消息、context_token 发送、CDN 图片下载 + AES 解密，配合 `wechat-crypto.ts`） |
+| `src/discord.ts` | Discord 连接工厂（discord.js Gateway），MCP 侧有 3 个 Discord 专用工具（get_history / channel_info / server_info） |
 | `src/dingtalk-streaming-card.ts` | 钉钉 AI Card 流式响应控制器（打字机效果） |
+| `src/feishu-streaming-card.ts` | 飞书流式卡片控制器（增量编辑、节流、runtime profile） |
+| `src/qq-streaming-card.ts` / `src/discord-streaming-edit.ts` | QQ / Discord 的流式编辑控制器 |
+| `src/feishu-cards/` | 飞书卡片构建工具（builder / sections / length / status-theme） |
 | `src/im-downloader.ts` | IM 文件下载工具：`saveDownloadedFile()` 将 Buffer 写入 `downloads/{channel}/{YYYY-MM-DD}/`，支持 `feishu`/`telegram`/`qq`/`dingtalk` 通道，处理路径安全、文件名冲突和 50MB 限制 |
-| `src/im-manager.ts` | IM 连接池管理器（`IMConnectionManager`）：per-user 飞书/Telegram/QQ/钉钉/Discord/WhatsApp 连接管理、热重连、批量断开 |
+| `src/im-manager.ts` | IM 连接池管理器（`IMConnectionManager`）：per-user 全渠道（飞书/Telegram/QQ/钉钉/微信/Discord/WhatsApp）连接管理、热重连、批量断开 |
 | `src/container-runner.ts` | 容器生命周期：Docker run + 宿主机进程模式、卷挂载构建（isAdminHome 区分权限）、环境变量注入 |
 | `src/agent-output-parser.ts` | Agent 输出解析：OUTPUT_MARKER 流式输出解析、stdout/stderr 处理、进程生命周期回调（从 container-runner.ts 提取的共享逻辑） |
 | `src/group-queue.ts` | 并发控制：最大 20 容器 + 最大 5 宿主机进程、会话级队列、任务优先于消息、指数退避重试 |
-| `src/runtime-config.ts` | 配置存储：AES-256-GCM 加密、分层配置（容器级 > 全局 > 环境变量）、变更审计日志 |
+| `src/runtime-config.ts` | 配置存储：AES-256-GCM 加密、分层配置（容器级 > 全局 > 环境变量）、变更审计日志；含 codex/grok 凭据物化（`writeCodexProviderAuthMaterial` / `writeGrokProviderAuthMaterial`） |
+| `src/provider-pool.ts` | 多提供商负载均衡：round-robin / weighted / failover 三策略，健康状态纯内存（连续错误标记不健康），配置由 runtime-config V4 注入 |
+| `src/model-runtime.ts` | 会话级模型/运行时绑定解析（`ModelBinding`、native session、provider sticky 选择） |
+| `src/model-switch-handoff.ts` | 切换模型/运行时时生成对话交接摘要（取最近消息经 `sdk-query` 总结，跨运行时延续上下文） |
+| `src/billing.ts` | 计费核心：套餐 / 订阅 / 余额 / 配额检查 / 兑换码 / 月度聚合 |
+| `src/sdk-query.ts` | 主进程内直接调 Claude Agent SDK 的轻量 query 封装（供 handoff 摘要、/recall 等） |
+| `src/codex-runtime.ts` | Codex CLI/SDK 依赖探测（宿主机 codex 可用性检查） |
 | `src/task-scheduler.ts` | 定时调度：60s 轮询、cron / interval / once 三种模式、group / isolated 上下文 |
 | `src/file-manager.ts` | 文件安全：路径遍历防护、符号链接检测、系统路径保护（`logs/`、`CLAUDE.md`、`.claude/`、`conversations/`） |
 | `src/mount-security.ts` | 挂载安全：白名单校验、黑名单模式匹配（`.ssh`、`.gnupg` 等）、非主会话只读强制 |
-| `src/db.ts` | 数据层：SQLite WAL 模式、Schema 版本校验（v1→v24）、核心表定义 |
+| `src/cross-group-acl.ts` | 跨组 IPC 消息 ACL（admin home 全通 / 同 folder / 同 owner / IM 绑定可达） |
+| `src/im-safety/` | IM 链路自愈：processing-lock（防重复处理）、stale-detector（卡死检测）、health-action |
+| `src/im-context-isolation.ts` | IM 来源消息自动上下文隔离（per-user 开关） |
+| `src/db.ts` | 数据层：SQLite WAL 模式、Schema 版本校验（版本号以 `SCHEMA_VERSION` 常量为准）、核心表定义 |
 | `src/auth.ts` | 密码工具：bcrypt 哈希/验证、Session Token 生成、用户名/密码校验 |
 | `src/permissions.ts` | 权限常量和模板定义（`ALL_PERMISSIONS`、`PERMISSION_TEMPLATES`） |
 | `src/schemas.ts` | Zod v4 校验 schema：API 请求体校验 |
 | `src/utils.ts` | 工具函数：`getClientIp()`（TRUST_PROXY 感知） |
 | `src/web-context.ts` | Web 共享状态：`WebDeps` 依赖注入、群组访问权限检查、WS 客户端管理 |
 | `src/middleware/auth.ts` | 认证中间件：Cookie Session 校验、权限检查中间件工厂 |
-| `src/channel-prefixes.ts` | IM channel type → JID prefix 映射，被多处共享；**新增渠道时必须同步更新此文件** |
+| `src/channel-prefixes.ts` | IM channel type → JID prefix 映射（由 `shared/channel-prefixes.ts` 经 `make sync-types` 同步，**新增渠道时改 shared/ 源文件**） |
 | `src/im-channel.ts` | 统一 IM 通道接口（`IMChannel`）、Feishu/Telegram 适配器工厂 |
 | `src/commands.ts` | Web 端斜杠命令处理器（`/clear` 重置会话） |
 | `src/im-command-utils.ts` | IM 斜杠命令纯函数工具：`formatWorkspaceList()`、`formatContextMessages()` |
@@ -74,7 +94,7 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | 层次 | 技术 |
 |------|------|
 | 框架 | React 19 + TypeScript + Vite 6 |
-| 状态 | Zustand 5（10 个 Store：auth、chat、groups、tasks、monitor、container-env、files、users、skills、mcp-servers） |
+| 状态 | Zustand 5（15 个 Store：auth、chat、groups、tasks、monitor、container-env、files、users、skills、mcp-servers、plugins、billing、usage、agent-definitions、workspace-config；以 `web/src/stores/` 为准） |
 | 样式 | Tailwind CSS 4（teal 主色调，`lg:` 断点响应式，移动端优先） |
 | 路由 | React Router 7（AuthGuard + SetupPage 重定向） |
 | 通信 | 统一 API 客户端（8s 超时，FormData 120s）、WebSocket 实时推送 + 指数退避重连 |
@@ -94,9 +114,13 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `/chat/:groupFolder?` | `ChatPage` — 主聊天界面（懒加载） | 登录后 |
 | `/groups` | 重定向到 `/settings?tab=groups` | 登录后 |
 | `/tasks` | `TasksPage` — 定时任务（懒加载） | 登录后 |
-| `/monitor` | `MonitorPage` — 系统监控（懒加载） | 登录后 |
+| `/monitor` | 重定向到 `/settings?tab=monitor` | 登录后 |
+| `/usage` | 重定向到 `/settings?tab=usage` | 登录后 |
+| `/billing` | `BillingPage` — 计费 / 订阅（懒加载） | 登录后 |
 | `/memory` | `MemoryPage` — 记忆管理 | 登录后 |
 | `/skills` | `SkillsPage` — Skills 管理 | 登录后 |
+| `/plugins` | `PluginsPage` — Claude Code Plugins 管理 | 登录后 |
+| `/agent-definitions` | `AgentDefinitionsPage` — 自定义 SubAgent 管理 | 登录后 |
 | `/settings` | `SettingsPage` — 系统设置（懒加载） | 登录后 |
 | `/mcp-servers` | `McpServersPage` — MCP Servers 管理 | 登录后 |
 | `/users` | `UsersPage` — 用户管理 | `manage_users` / `manage_invites` / `view_audit_log` |
@@ -105,28 +129,36 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 
 Agent Runner（`container/agent-runner/`）在 Docker 容器或宿主机进程中执行：
 
-- **输入协议**：stdin 接收初始 JSON（`ContainerInput`：prompt、sessionId、groupFolder、chatJid、isHome、isAdminHome），IPC 文件接收后续消息
+- **多运行时**：`runtime-adapter.ts` 定义统一的 `AgentRuntimeAdapter` 接口（含 `resumeMode: resume/fresh/soft_inject`、resume 失败 fallback），之下挂三条运行时——Claude（SDK `query()` 循环，常驻 + IPC 注入）、Codex（`codex-cli-runner.ts` / `codex-sdk-runner.ts`，单 turn re-spawn + native resume）、Grok（`grok-cli-runner.ts`，ACP 协议，详见 §8.14）
+- **输入协议**：stdin 接收初始 JSON（`ContainerInput`：prompt、sessionId、groupFolder、chatJid、isHome、isAdminHome、plugins、model 等），IPC 文件接收后续消息
 - **输出协议**：stdout 输出 `OUTPUT_START_MARKER...OUTPUT_END_MARKER` 包裹的 JSON（`ContainerOutput`：status、result、newSessionId、streamEvent）
-- **流式事件**：`text_delta`、`thinking_delta`、`tool_use_start/end`、`tool_progress`、`hook_started/progress/response`、`task_start`、`task_notification`、`status`、`init` —— 通过 WebSocket `stream_event` 消息广播到 Web 端
+- **流式事件**：`text_delta`、`thinking_delta`、`tool_use_start/end`、`tool_progress`、`hook_started/progress/response`、`task_start`、`task_notification`、`usage`、`todo_update`、`status`、`init` 等 —— 全集以 `shared/stream-event.ts` 为准，通过 WebSocket `stream_event` 消息广播到 Web 端
 - **文本缓冲**：`text_delta` 累积到 200 字符后刷新，避免高频小包
-- **会话循环**：`query()` → 等待 IPC 消息 → 再次 `query()` → 直到 `_close` sentinel
-- **MCP Server**：12 个工具（`send_message`、`schedule_task`、`list/pause/resume/cancel_task`、`register_group`、`install_skill`、`uninstall_skill`、`memory_append`、`memory_search`、`memory_get`），通过 SDK `createSdkMcpServer()` 以同进程模式注册
+- **会话循环**（Claude 运行时）：`query()` → 等待 IPC 消息 → 再次 `query()` → 直到 `_close` sentinel；Codex/Grok 为单 turn re-spawn，多 turn 由主进程 drain 驱动
+- **MCP Server**：14 个通用工具（`send_message/send_image/send_file`、`schedule_task`、`list/pause/resume/cancel_task`、`register_group`、`install_skill`、`uninstall_skill`、`memory_append/search/get`）+ 3 个 Discord 渠道专用工具；Claude 经 SDK `createSdkMcpServer()` 同进程注册，Codex/Grok 经独立进程 `happyclaw-mcp-server.js` 复用同一 catalog（`createMcpToolCatalog()`）
 - **Hooks**：PreCompact 钩子在上下文压缩前归档对话到 `conversations/` 目录
 - **敏感数据过滤**：StreamEvent 中的 `toolInputSummary` 会过滤 `ANTHROPIC_API_KEY` 等环境变量名
-- **预定义 SubAgent**：`agent-definitions.ts` 定义 `code-reviewer`（代码审查）和 `web-researcher`（网页研究）两个 SubAgent，通过 SDK `agents` 选项注册到 query() 会话中
+- **预定义 SubAgent**：`agent-definitions.ts` 定义 `code-reviewer`（代码审查）和 `web-researcher`（网页研究）两个 SubAgent，通过 SDK `agents` 选项注册到 query() 会话中（另有用户自定义 SubAgent，经 `/api/agent-definitions` 管理）
 
 **Agent Runner 模块结构**（`container/agent-runner/src/`）：
 
 | 文件 | 职责 |
 |------|------|
-| `index.ts` | 主入口：stdin 读取、会话循环、query() 调用、IPC 轮询 |
+| `index.ts` | 主入口：stdin 读取、会话循环、运行时分发、IPC 轮询 |
 | `types.ts` | 共享类型定义（ContainerInput、ContainerOutput 等），re-export StreamEvent |
 | `utils.ts` | 纯工具函数（字符串截断、敏感数据脱敏、文件名清理等） |
+| `runtime-adapter.ts` | 运行时适配器接口 + 错误分类（`classifyRuntimeError`）、resume 失败重试 input 构建 |
+| `codex-cli-runner.ts` / `codex-sdk-runner.ts` | Codex 运行时（CLI exec / `@openai/codex-sdk` 两条实现） |
+| `grok-cli-runner.ts` / `grok-event-normalizer.ts` | Grok 运行时（ACP stdio）+ ACP 事件归一化 |
+| `happyclaw-mcp-server.js` | 独立进程 MCP server（Codex/Grok 复用，经 context 文件传 IPC 路径） |
+| `runtime-permissions.ts` / `runtime-guidelines.ts` / `runtime-memory.ts` | 各运行时的权限映射 / 系统提示 / 记忆注入 |
+| `session-history.ts` / `history-image-prune.ts` | 会话历史管理与历史图片裁剪 |
 | `stream-processor.ts` | StreamEventProcessor 类：流式事件缓冲、工具状态追踪、SubAgent 消息转换 |
-| `mcp-tools.ts` | MCP 工具定义：12 个工具通过 SDK `tool()` 注册，IPC 文件通信 |
+| `mcp-tools.ts` | MCP 工具 catalog（`createMcpToolCatalog()` 运行时中立定义 + `createMcpTools()` SDK 包装），IPC 文件通信 |
 | `agent-definitions.ts` | 预定义 SubAgent（code-reviewer、web-researcher） |
 | `image-detector.ts` | 图片 MIME 检测（由 `shared/image-detector.ts` 构建时同步生成，勿直接编辑） |
 | `stream-event.types.ts` | StreamEvent 类型（由 `shared/stream-event.ts` 构建时同步生成，勿直接编辑） |
+| `channel-prefixes.ts` | 渠道前缀（由 `shared/channel-prefixes.ts` 同步，勿直接编辑） |
 
 ### 2.4 执行模式
 
@@ -159,14 +191,14 @@ Agent Runner（`container/agent-runner/`）在 Docker 容器或宿主机进程�
 ### 3.1 消息处理
 
 ```
-飞书/Telegram/钉钉/Web 消息 → storeMessageDirect(db) + broadcastNewMessage(ws)
+IM（飞书/Telegram/QQ/钉钉/微信/Discord/WhatsApp）/Web 消息 → storeMessageDirect(db) + broadcastNewMessage(ws)
      → index.ts 轮询 getNewMessages()（2s 间隔）→ 按 chat_jid 分组去重
      → queue.enqueueMessageCheck() 判断容器/进程状态
          ├── 空闲 → runContainerAgent() 启动容器/进程
          ├── 运行中 → queue.sendMessage() 通过 IPC 文件注入
          └── 满载 → waitingGroups 排队等待
      → 流式输出 → onOutput 回调
-         → imManager.sendFeishuMessage()/sendTelegramMessage()/sendDingTalkMessage() + broadcastToWebClients() + db.storeMessageDirect()
+         → imManager.send{Channel}Message() 回对应 IM 渠道 + broadcastToWebClients() + db.storeMessageDirect()
 ```
 
 ### 3.2 流式显示管道
@@ -186,9 +218,7 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 
 修改 StreamEvent 类型时，只需编辑 `shared/stream-event.ts`，然后运行 `make sync-types`（`make build` 会自动触发）。`make typecheck` 会通过 `scripts/check-stream-event-sync.sh` 校验同步状态。
 
-`shared/image-detector.ts` 同样通过 `make sync-types` 同步到两处副本：
-- `src/image-detector.ts`（后端）
-- `container/agent-runner/src/image-detector.ts`（agent-runner）
+`shared/image-detector.ts` 和 `shared/channel-prefixes.ts` 同样通过 `make sync-types` 各同步到两处副本（`src/` + `container/agent-runner/src/`），修改时一律编辑 `shared/` 下的源文件。
 
 ### 3.3 IPC 通信
 
@@ -249,8 +279,17 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 | `terminal_started` | 终端会话已启动 |
 | `terminal_stopped` | 终端会话已停止 |
 | `terminal_error` | 终端错误 |
+| `runner_state` / `task_state` | 容器/进程运行状态、任务执行状态变更 |
+| `group_created` | 新群组注册（前端侧边栏即时刷新） |
+| `model_changed` | 会话模型/运行时绑定变更 |
+| `whatsapp_status` | WhatsApp 连接状态 / QR 码推送（详见 §8.13） |
+| `billing_update` | 计费/配额状态变更 |
+| `stream_snapshot` | 流式状态快照（重连/刷新后恢复进行中的流） |
+| `ws_error` | WebSocket 层错误 |
 | `docker_build_log` | Docker 镜像构建日志 |
 | `docker_build_complete` | Docker 镜像构建完成 |
+
+> 类型全集以 `src/types.ts` 的 `WsMessageOut` / `WsMessageIn` union 为准。
 
 **客户端 → 服务端（`WsMessageIn`）**：
 
@@ -266,8 +305,8 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 
 `IMConnectionManager`（`src/im-manager.ts`）管理 per-user 的 IM 连接：
 
-- 每个用户可独立配置飞书、Telegram、QQ 和钉钉连接（存储在 `data/config/user-im/{userId}/feishu.json`、`telegram.json`、`qq.json`、`dingtalk.json`）
-- `feishu.ts`、`telegram.ts`、`qq.ts`、`dingtalk.ts` 均为工厂模式（`createFeishuConnection()`、`createTelegramConnection()`、`createQQConnection()`、`createDingTalkConnection()`），返回无状态的连接实例
+- 每个用户可独立配置各渠道连接：飞书 / Telegram / QQ / 钉钉 / 微信 / Discord / WhatsApp（存储在 `data/config/user-im/{userId}/{channel}.json`，WhatsApp 登录态另存 `whatsapp-auth/{accountId}/`）
+- 各渠道模块（`feishu.ts`、`telegram.ts`、`qq.ts`、`dingtalk.ts`、`wechat.ts`、`discord.ts`、`whatsapp.ts`）均为工厂模式（`create{Channel}Connection()`），返回无状态的连接实例
 - 系统启动时 `loadState()` 遍历所有用户，加载已保存的 IM 配置并建立连接
 - 首次启动时自动迁移系统级 IM 配置到 admin 的 per-user 配置（`migrateSystemIMToPerUser()`）
 - 系统级 API（`/api/config/feishu`、`/api/config/telegram`）已标记 deprecated，新代码应使用 `/api/config/user-im/*`
@@ -313,7 +352,7 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 |------|-------|--------|
 | 主容器 folder | `main` | `home-{userId}` |
 | 执行模式 | `host`（宿主机） | `container`（Docker） |
-| IM 通道 | 独立的飞书/Telegram/QQ/钉钉连接 | 独立的飞书/Telegram/QQ/钉钉连接 |
+| IM 通道 | 独立的各渠道 IM 连接（飞书/Telegram/QQ/钉钉/微信/Discord/WhatsApp） | 同左 |
 | 全局记忆写入 | 可读写 | 只读 |
 | 项目根目录挂载 | 读写 | 不可访问 |
 | 跨组 MCP 操作 | `register_group`、跨组任务管理 | 仅限自己的群组 |
@@ -324,7 +363,7 @@ StreamEvent 类型以 `shared/stream-event.ts` 为单一真相源，构建时通
 
 ## 5. 数据库表
 
-SQLite WAL 模式，Schema 经历 v1→v24 演进（`db.ts` 中的 `SCHEMA_VERSION`）。
+SQLite WAL 模式，Schema 持续演进（当前版本以 `db.ts` 中的 `SCHEMA_VERSION` 常量为准，勿在文档中硬编码）。
 
 | 表 | 主键 | 用途 |
 |-----|------|------|
@@ -343,9 +382,13 @@ SQLite WAL 模式，Schema 经历 v1→v24 演进（`db.ts` 中的 `SCHEMA_VERSI
 | `agents` | `id` | Sub-Agent（status、kind、prompt、result_summary，属于特定群组） |
 | `usage_records` | `id` | Token 用量明细（per-model 拆行，关联 user_id、group_folder、message_id） |
 | `usage_daily_summary` | `(user_id, model, date)` | 日维度用量预聚合（本地时区日期，增量 UPSERT） |
-| `user_quotas` | `user_id` | 用户配额（预留，暂不写入数据） |
+| `user_quotas` | `user_id` | 用户配额 |
+| `im_context_bindings` | - | IM 渠道 ↔ 工作区上下文绑定（`target_main_jid` 路由） |
+| `user_pinned_groups` | - | 用户置顶的群组 |
+| 计费组：`billing_plans` / `user_subscriptions` / `user_balances` / `balance_transactions` / `monthly_usage` / `daily_usage` / `redeem_codes` / `redeem_code_usage` / `billing_audit_log` | - | 套餐、订阅、余额流水、月/日用量、兑换码、计费审计（`src/billing.ts`） |
+| 模型/运行时组：`provider_pools` / `provider_model_options` / `provider_pool_model_options` / `system_model_default` / `workspace_model_defaults` / `conversation_runtime_state` / `conversation_runtime_sessions` / `conversation_handoff_summaries` | - | Provider 池与模型选项、系统/工作区默认模型、会话级运行时状态、native session、切换交接摘要（`src/model-runtime.ts`） |
 
-**注意**：`registered_groups.folder` 允许重复（多个飞书群组可映射到同一 folder）。`registered_groups.is_home` 标记用户主容器。
+**注意**：`registered_groups.folder` 允许重复（多个飞书群组可映射到同一 folder）。`registered_groups.is_home` 标记用户主容器。表全集以 `db.ts` 的 `CREATE TABLE IF NOT EXISTS` 语句为准。
 
 ## 6. 目录约定
 
@@ -372,10 +415,8 @@ data/
   config/feishu-provider.json              # 飞书配置
   config/claude-custom-env.json            # 自定义环境变量
   config/container-env/{folder}.json       # 群组级环境变量覆盖
-  config/user-im/{userId}/feishu.json      # 用户级飞书 IM 配置（AES-256-GCM 加密）
-  config/user-im/{userId}/telegram.json    # 用户级 Telegram IM 配置（AES-256-GCM 加密）
-  config/user-im/{userId}/qq.json          # 用户级 QQ IM 配置（AES-256-GCM 加密）
-  config/user-im/{userId}/dingtalk.json   # 用户级钉钉 IM 配置（AES-256-GCM 加密）
+  config/user-im/{userId}/{channel}.json   # 用户级 IM 配置（feishu/telegram/qq/dingtalk/wechat/discord/whatsapp，AES-256-GCM 加密）
+  config/user-im/{userId}/whatsapp-auth/{accountId}/  # WhatsApp Baileys 登录态（noise 密钥 / Signal pre-keys）
   config/user-cli/{userId}/feishu-cli/     # 用户级 feishu-cli OAuth 状态（token.json + config.yaml，bind-mount 到容器 /home/node/.feishu-cli）
   config/registration.json                 # 注册设置（开关、邀请码要求）
   config/session-secret.key                # 会话签名密钥（0600 权限）
@@ -398,6 +439,7 @@ container/skills/             # 项目级 Skills（挂载到所有容器）
 shared/                       # 跨项目共享类型定义
   stream-event.ts             # StreamEvent 类型单一真相源（构建时同步到三个子项目）
   image-detector.ts           # 图片 MIME 检测（同步到 src/ 和 agent-runner/src/）
+  channel-prefixes.ts         # IM 渠道前缀单一真相源（同步到 src/ 和 agent-runner/src/）
 
 scripts/                      # 构建辅助脚本
   sync-stream-event.sh        # 将 shared/stream-event.ts 同步到各子项目
@@ -424,6 +466,11 @@ scripts/                      # 构建辅助脚本
 | MCP Servers | `src/routes/mcp-servers.ts` |
 | Claude Code Plugins | `src/routes/plugins.ts` |
 | 用量统计 | `src/routes/usage.ts` |
+| 计费 / 订阅 | `src/routes/billing.ts` |
+| 模型 / 运行时绑定 | `src/routes/model.ts` |
+| 自定义 SubAgent 定义 | `src/routes/agent-definitions.ts` |
+| 工作区配置 | `src/routes/workspace-config.ts` |
+| Bug 报告 | `src/routes/bug-report.ts` |
 | 监控 / 健康检查 | `src/routes/monitor.ts`（`GET /api/health` 无需认证） |
 
 WebSocket：`/ws`（协议详见 §3.6）。
@@ -440,7 +487,7 @@ WebSocket：`/ws`（协议详见 §3.6）。
 
 ### 8.2 IM 自动注册
 
-未注册的飞书/Telegram/QQ/钉钉群组首次发消息时，通过 `onNewChat` 回调自动注册到该用户的主容器（`folder='home-{userId}'`，admin 则为 `folder='main'`）。支持多个 IM 群组映射到同一个 folder。QQ 通道需先通过配对码绑定（`/pair <code>`），钉钉通道无需配对。
+未注册的 IM 群组/私聊首次发消息时，通过 `onNewChat` 回调自动注册到该用户的主容器（`folder='home-{userId}'`，admin 则为 `folder='main'`）。支持多个 IM 群组映射到同一个 folder。QQ 通道需先通过配对码绑定（`/pair <code>`），其余渠道无需配对。
 
 ### 8.3 无触发词
 
@@ -467,7 +514,7 @@ WebSocket：`/ws`（协议详见 §3.6）。
 
 ### 8.6 回复路由
 
-主容器在 Web 与 IM 共用历史（通过 `normalizeHomeJid` 映射飞书/Telegram/QQ/钉钉 JID → `web:{folder}`）。IM 来源的消息回复到对应 IM 渠道，Web 来源的消息仅在 Web 展示。
+主容器在 Web 与 IM 共用历史（通过 `normalizeHomeJid` 映射各渠道 IM JID → `web:{folder}`）。IM 来源的消息回复到对应 IM 渠道，Web 来源的消息仅在 Web 展示。IM 渠道 ↔ 工作区的绑定关系持久化在 `im_context_bindings` 表（`target_main_jid`）。
 
 ### 8.7 并发控制
 
@@ -496,7 +543,7 @@ WebSocket：`/ws`（协议详见 §3.6）。
 
 ### 8.10 IM 通道热管理
 
-通过 `PUT /api/config/user-im/feishu`、`PUT /api/config/user-im/telegram`、`PUT /api/config/user-im/qq`、`PUT /api/config/user-im/dingtalk` 或 `PUT /api/config/user-im/whatsapp` 更新 IM 配置后：
+通过 `PUT /api/config/user-im/{channel}`（feishu / telegram / qq / dingtalk / wechat / discord / whatsapp）更新 IM 配置后：
 - 保存配置到 `data/config/user-im/{userId}/` 目录（AES-256-GCM 加密）
 - 断开该用户的旧连接
 - 如果新配置有效（`enabled=true` 且凭据非空），立即建立新连接
@@ -504,7 +551,7 @@ WebSocket：`/ws`（协议详见 §3.6）。
 
 ### 8.11 IM 斜杠命令
 
-飞书/Telegram/QQ/钉钉 中以 `/` 开头的消息会被拦截为斜杠命令（未知命令继续作为普通消息处理）。命令在主服务进程的 `handleCommand()` 中分发，纯函数逻辑在 `im-command-utils.ts` 中（便于单测）。
+各 IM 渠道中以 `/` 开头的消息会被拦截为斜杠命令（未知命令继续作为普通消息处理）。命令在主服务进程的 `handleCommand()` 中分发，纯函数逻辑在 `im-command-utils.ts` 中（便于单测）。另有 `/model` 命令（`im-model-command.ts`）用于会话内切换模型/运行时。
 
 | 命令 | 缩写 | 用途 |
 |------|------|------|
@@ -627,6 +674,8 @@ HappyClaw 支持除 Claude / Codex 之外的第三条 Agent 运行时：xAI 自�
 
 - **不要重新引入"触发词"架构**
 - **会话隔离是核心原则**，避免跨会话共享运行时目录
+- **本文档的准确性优先于详尽度**：新增模块/表/渠道/WS 事件时同步更新对应小节；易变的枚举（数量、版本号、渠道全集）写"以某文件为准"的指针，不硬编码具体值——过时的文档比没有文档更误导
+
 - 当前阶段允许不兼容重构，优先代码清晰与行为一致
 - 修改容器 / 调度逻辑时，优先保证：不丢消息、不重复回复、失败可重试
 - **Git commit message 使用简体中文**，格式：`类型: 简要描述`（如 `修复: 侧边栏下拉菜单无法点击`）
@@ -820,7 +869,7 @@ make help          # 列出所有可用的 make 命令
 
 ### 新增 MCP 工具
 
-1. 在 `container/agent-runner/src/mcp-tools.ts` 的 `createMcpTools()` 中添加 `tool()` 定义
+1. 在 `container/agent-runner/src/mcp-tools.ts` 的 `createMcpToolCatalog()` 中添加 `defineTool()` 定义（运行时中立，Claude/Codex/Grok 三条运行时自动共享）
 2. 主进程 `src/index.ts` 的 IPC 处理器增加对应 type 分支
 3. 重建容器镜像：`./container/build.sh`
 
@@ -840,7 +889,7 @@ make help          # 列出所有可用的 make 命令
 ### 新增 IM 集成渠道
 
 1. 在 `src/` 目录下创建新的连接工厂模块（参考 `feishu.ts`、`telegram.ts`、`qq.ts` 的接口模式）
-2. **在 `src/channel-prefixes.ts` 的 `CHANNEL_PREFIXES` 中添加新渠道的 prefix 条目**（否则 `sendMessage()` 路由会将其识别为非 IM 通道，回复无法送达）
+2. **在 `shared/channel-prefixes.ts` 的 `CHANNEL_PREFIXES` 中添加新渠道的 prefix 条目并运行 `make sync-types`**（`src/` 和 agent-runner 下的副本是同步生成的，直接改会被覆盖；缺 prefix 时 `sendMessage()` 路由会将其识别为非 IM 通道，回复无法送达）
 3. 在 `src/im-manager.ts` 中添加 `connectUser{Channel}()` / `disconnectUser{Channel}()` 方法
 4. 在 `src/routes/config.ts` 中添加 `/api/config/user-im/{channel}` 路由（GET/PUT）
 5. 在 `src/index.ts` 的 `loadState()` 和 `connectUserIMChannels()` 中加载新渠道
