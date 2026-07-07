@@ -308,7 +308,7 @@ function handleWebModelCommand(input: {
   }
 
   if (subcommand !== 'use') {
-    return '可用命令：/model、/model list、/model use <claude|gpt> [model]';
+    return '可用命令：/model、/model list、/model use opus-4.8-1m 或 /model use <claude|gpt|grok> [model]';
   }
 
   const groupWithJid = { ...input.group, jid: input.baseChatJid };

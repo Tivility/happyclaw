@@ -63,17 +63,105 @@ export function shouldIncludeAllModelOptions(args: string[]): boolean {
   });
 }
 
-function resolvedModelFromOption(option?: ProviderPoolModelOption): string | null {
+function metadataFromOption(
+  option?: ProviderPoolModelOption,
+): Record<string, unknown> | null {
   if (!option?.metadata_json) return null;
   try {
-    const metadata = JSON.parse(option.metadata_json) as Record<string, unknown>;
-    const resolved = metadata.resolved_model ?? metadata.resolvedModel;
-    return typeof resolved === 'string' && resolved.trim()
-      ? resolved.trim()
-      : null;
+    return JSON.parse(option.metadata_json) as Record<string, unknown>;
   } catch {
     return null;
   }
+}
+
+function resolvedModelFromOption(option?: ProviderPoolModelOption): string | null {
+  const metadata = metadataFromOption(option);
+  const resolved = metadata?.resolved_model ?? metadata?.resolvedModel;
+  return typeof resolved === 'string' && resolved.trim()
+    ? resolved.trim()
+    : null;
+}
+
+function metadataAliasesFromOption(option: ProviderPoolModelOption): string[] {
+  const metadata = metadataFromOption(option);
+  const aliases = metadata?.aliases;
+  if (!Array.isArray(aliases)) return [];
+  return aliases
+    .filter((alias): alias is string => typeof alias === 'string')
+    .map((alias) => alias.trim())
+    .filter(Boolean);
+}
+
+function dedupeAliases(values: string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const trimmed = value.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+function shortClaudeModelName(modelId: string): string | null {
+  const stripped = modelId.replace(/^claude-/i, '');
+  const aliasMatch = stripped.match(/^(fable|opus|sonnet|haiku)$/i);
+  if (aliasMatch) return aliasMatch[1].toLowerCase();
+
+  const versionMatch = stripped.match(
+    /^(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i,
+  );
+  if (!versionMatch) return null;
+  const family = versionMatch[1].toLowerCase();
+  const major = versionMatch[2];
+  const minor = versionMatch[3];
+  return minor ? `${family}-${major}.${minor}` : `${family}-${major}`;
+}
+
+function derivedModelAliases(option: ProviderPoolModelOption): string[] {
+  const suffixMatch = option.model_id.match(/\[(\d+)m\]$/i);
+  const baseModelId = option.model_id.replace(/\[\d+m\]$/i, '');
+  const shortName = shortClaudeModelName(baseModelId);
+  if (!shortName) return [];
+
+  const aliases: string[] = [];
+  if (suffixMatch) {
+    aliases.push(`${shortName}-${suffixMatch[1].toLowerCase()}m`);
+    aliases.push(`${shortName}[${suffixMatch[1].toLowerCase()}m]`);
+  } else {
+    aliases.push(shortName);
+  }
+
+  return aliases.flatMap((alias) => {
+    const noDot = alias.replace(/\.(\d+)/, '-$1');
+    return noDot === alias ? [alias] : [alias, noDot];
+  });
+}
+
+function modelSpecAliases(option: ProviderPoolModelOption): string[] {
+  return dedupeAliases([
+    ...metadataAliasesFromOption(option),
+    ...derivedModelAliases(option),
+  ]).filter(
+    (alias) => alias.toLowerCase() !== option.model_id.toLowerCase(),
+  );
+}
+
+function findModelOptionMatches(
+  options: ProviderPoolModelOption[],
+  modelSpec: string,
+): ProviderPoolModelOption[] {
+  const normalized = modelSpec.toLowerCase();
+  const exactMatches = options.filter(
+    (item) => item.model_id.toLowerCase() === normalized,
+  );
+  if (exactMatches.length > 0) return exactMatches;
+  return options.filter((item) =>
+    modelSpecAliases(item).some((alias) => alias.toLowerCase() === normalized),
+  );
 }
 
 function shouldShowInDefaultModelList(option: ProviderPoolModelOption): boolean {
@@ -110,7 +198,10 @@ function formatModelOptionLine(
     formatModelKindLabel(option.model_kind),
     formatModelStatusLabel(option.status),
   ].join(' · ');
-  return `  ${command}\n    ${details}`;
+  const shortAlias = modelSpecAliases(option)[0];
+  return shortAlias
+    ? `  ${command}\n    ${details}\n    短写：/model use ${shortAlias}`
+    : `  ${command}\n    ${details}`;
 }
 
 export function parseModelBindingFromArgs(
@@ -119,7 +210,7 @@ export function parseModelBindingFromArgs(
   if (args.length === 0) {
     return {
       error:
-        '用法：/model use <claude|gpt|grok> [model]\n例如：/model use claude opus-4.7 或 /model use gpt 或 /model use grok',
+        '用法：/model use <claude|gpt|grok> [model]\n例如：/model use opus-4.8-1m 或 /model use claude claude-opus-4-8[1m]',
     };
   }
 
@@ -143,11 +234,10 @@ export function parseModelBindingFromArgs(
     providerPoolId = pool.provider_pool_id;
     const modelSpec = args.slice(1).join(' ').trim();
     if (modelSpec && modelSpec.toLowerCase() !== 'default') {
-      const option = visibleOptions.find(
-        (item) =>
-          item.provider_pool_id === providerPoolId &&
-          item.model_id.toLowerCase() === modelSpec.toLowerCase(),
-      );
+      const option = findModelOptionMatches(
+        visibleOptions.filter((item) => item.provider_pool_id === providerPoolId),
+        modelSpec,
+      )[0];
       if (!option) {
         return {
           error: `模型 ${modelSpec} 未配置在模型池 ${providerPoolId} 中。请先用 /model list 查看可用模型。`,
@@ -168,9 +258,7 @@ export function parseModelBindingFromArgs(
           '请指定模型池：/model use claude default 或 /model use gpt default 或 /model use grok default',
       };
     }
-    const matches = visibleOptions.filter(
-      (item) => item.model_id.toLowerCase() === modelSpec.toLowerCase(),
-    );
+    const matches = findModelOptionMatches(visibleOptions, modelSpec);
     if (matches.length === 0) {
       return {
         error: `未找到模型 ${modelSpec}。请先用 /model list 查看可用模型。`,

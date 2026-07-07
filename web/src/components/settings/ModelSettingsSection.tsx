@@ -366,7 +366,7 @@ export function ModelSettingsSection() {
                       ? 'gpt-5.5'
                       : selectedCatalogPool?.provider_family === 'grok'
                         ? 'grok-build'
-                        : 'claude-opus-4-7'
+                        : 'claude-opus-4-8[1m]'
                   }
                   className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
                 />

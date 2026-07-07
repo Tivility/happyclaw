@@ -24,6 +24,35 @@ const modelOptions = [
     runtime: 'claude',
     provider_family: 'claude',
     provider_pool_id: 'claude',
+    model_id: 'fable',
+    model_kind: 'alias',
+    display_name: 'Fable',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: null,
+    updated_by: 'test',
+    updated_at: '2026-07-06T00:00:00.000Z',
+  },
+  {
+    runtime: 'claude',
+    provider_family: 'claude',
+    provider_pool_id: 'claude',
+    model_id: 'opus[1m]',
+    model_kind: 'alias',
+    display_name: 'Opus 1M',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'opus[1m]',
+      aliases: ['opus-1m'],
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-06T00:00:00.000Z',
+  },
+  {
+    runtime: 'claude',
+    provider_family: 'claude',
+    provider_pool_id: 'claude',
     model_id: 'fast',
     model_kind: 'alias',
     display_name: 'Claude Fast',
@@ -73,6 +102,68 @@ const modelOptions = [
     metadata_json: null,
     updated_by: 'test',
     updated_at: '2026-04-25T00:00:00.000Z',
+  },
+  {
+    runtime: 'claude',
+    provider_family: 'claude',
+    provider_pool_id: 'claude',
+    model_id: 'claude-fable-5',
+    model_kind: 'explicit_version',
+    display_name: 'Claude Fable 5',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'claude-fable-5',
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-06T00:00:00.000Z',
+  },
+  {
+    runtime: 'claude',
+    provider_family: 'claude',
+    provider_pool_id: 'claude',
+    model_id: 'claude-opus-4-8',
+    model_kind: 'explicit_version',
+    display_name: 'Claude Opus 4.8',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'claude-opus-4-8',
+      aliases: ['opus-4.8', 'opus-4-8'],
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-06T00:00:00.000Z',
+  },
+  {
+    runtime: 'claude',
+    provider_family: 'claude',
+    provider_pool_id: 'claude',
+    model_id: 'claude-opus-4-8[1m]',
+    model_kind: 'explicit_version',
+    display_name: 'Claude Opus 4.8 1M',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'claude-opus-4-8[1m]',
+      aliases: ['opus-4.8-1m', 'opus-4-8-1m'],
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-06T00:00:00.000Z',
+  },
+  {
+    runtime: 'claude',
+    provider_family: 'claude',
+    provider_pool_id: 'claude',
+    model_id: 'claude-sonnet-5',
+    model_kind: 'explicit_version',
+    display_name: 'Claude Sonnet 5',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'claude-sonnet-5',
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-06T00:00:00.000Z',
   },
   {
     runtime: 'claude',
@@ -173,6 +264,57 @@ describe('model command parsing', () => {
     });
   });
 
+  it('selects the Claude Fable alias', () => {
+    const result = parseModelBindingFromArgs(['fable']);
+
+    expect(result.error).toBeUndefined();
+    expect(result.binding).toMatchObject({
+      runtime: 'claude',
+      provider_family: 'claude',
+      provider_pool_id: 'claude',
+      selected_model: 'fable',
+      model_kind: 'alias',
+      resolved_model: null,
+    });
+  });
+
+  it.each([
+    'claude-fable-5',
+    'claude-opus-4-8',
+    'claude-opus-4-8[1m]',
+    'claude-sonnet-5',
+  ])('selects new pinned Claude model %s', (modelId) => {
+    const result = parseModelBindingFromArgs([modelId]);
+
+    expect(result.error).toBeUndefined();
+    expect(result.binding).toMatchObject({
+      runtime: 'claude',
+      provider_family: 'claude',
+      provider_pool_id: 'claude',
+      selected_model: modelId,
+      model_kind: 'explicit_version',
+      resolved_model: modelId,
+    });
+  });
+
+  it.each([
+    ['opus-4.8-1m', 'claude-opus-4-8[1m]'],
+    ['opus-4-8-1m', 'claude-opus-4-8[1m]'],
+    ['opus-4.8', 'claude-opus-4-8'],
+    ['fable-5', 'claude-fable-5'],
+    ['sonnet-5', 'claude-sonnet-5'],
+    ['opus-1m', 'opus[1m]'],
+  ])('canonicalizes short model command %s', (input, modelId) => {
+    const result = parseModelBindingFromArgs([input]);
+
+    expect(result.error).toBeUndefined();
+    expect(result.binding).toMatchObject({
+      provider_pool_id: 'claude',
+      selected_model: modelId,
+      resolved_model: modelId,
+    });
+  });
+
   it('uses the provider default for an enabled GPT pool', () => {
     const result = parseModelBindingFromArgs(['gpt']);
 
@@ -208,6 +350,17 @@ describe('model command parsing', () => {
 
     expect(output).toContain('可用模型（直接复制下面的切换命令）');
     expect(output).toContain('Claude (claude)');
+    expect(output).toContain('/model use fable');
+    expect(output).toContain('Fable · 自动跟随 · 可用');
+    expect(output).toContain('/model use claude-fable-5');
+    expect(output).toContain('Claude Fable 5 · 固定版本 · 可用');
+    expect(output).toContain('/model use claude-opus-4-8[1m]');
+    expect(output).toContain('Claude Opus 4.8 1M · 固定版本 · 可用');
+    expect(output).toContain('短写：/model use opus-4.8-1m');
+    expect(output).toContain('/model use claude-opus-4-8');
+    expect(output).toContain('/model use claude-sonnet-5');
+    expect(output).toContain('/model use opus[1m]');
+    expect(output).toContain('短写：/model use opus-1m');
     expect(output).toContain('/model use opus');
     expect(output).toContain('Opus · 自动跟随 · 可用');
     expect(output).toContain('/model use claude fast');

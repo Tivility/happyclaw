@@ -254,6 +254,11 @@ describe('formatters', () => {
   });
 
   test('shortModel', () => {
+    expect(shortModel('claude-fable-5')).toBe('fable-5');
+    expect(shortModel('claude-sonnet-5')).toBe('sonnet-5');
+    expect(shortModel('claude-opus-4-8')).toBe('opus-4.8');
+    expect(shortModel('claude-opus-4-8[1m]')).toBe('opus-4.8-1m');
+    expect(shortModel('opus[1m]')).toBe('opus-1m');
     expect(shortModel('claude-opus-4-7')).toBe('opus-4.7');
     expect(shortModel('claude-sonnet-4-6')).toBe('sonnet-4.6');
     expect(shortModel('claude-haiku-4-5-20251001')).toBe('haiku-4.5');

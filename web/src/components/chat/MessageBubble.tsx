@@ -60,10 +60,21 @@ function ReasoningBlock({ content, durationMs }: { content: string; durationMs?:
   );
 }
 
-// "claude-opus-4-7" → "opus-4.7"; keeps short names untouched, truncates long ones.
+// "claude-opus-4-8[1m]" -> "opus-4.8-1m"; keeps short names untouched.
 function shortModel(model: string): string {
-  const m = model.match(/(opus|sonnet|haiku)-(\d+)-(\d+)/i);
-  if (m) return `${m[1].toLowerCase()}-${m[2]}.${m[3]}`;
+  const suffix = model.match(/\[(\d+)m\]$/i)?.[1];
+  const base = model.replace(/\[\d+m\]$/i, '');
+  const alias = base.match(/^(fable|opus|sonnet|haiku)$/i);
+  const m = base.match(/(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i);
+  let short = '';
+  if (alias) {
+    short = alias[1].toLowerCase();
+  } else if (m && !m[3]) {
+    short = `${m[1].toLowerCase()}-${m[2]}`;
+  } else if (m) {
+    short = `${m[1].toLowerCase()}-${m[2]}.${m[3]}`;
+  }
+  if (short) return suffix ? `${short}-${suffix.toLowerCase()}m` : short;
   return model.length > 20 ? model.slice(0, 17) + '...' : model;
 }
 

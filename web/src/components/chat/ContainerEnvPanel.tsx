@@ -10,7 +10,18 @@ interface ContainerEnvPanelProps {
 }
 
 const MODEL_ENV_KEY = 'ANTHROPIC_MODEL';
-const MODEL_PRESETS = ['opus[1m]', 'opus', 'sonnet[1m]', 'sonnet', 'haiku'] as const;
+const MODEL_PRESETS = [
+  'fable',
+  'claude-fable-5',
+  'claude-opus-4-8[1m]',
+  'claude-opus-4-8',
+  'claude-sonnet-5',
+  'opus[1m]',
+  'opus',
+  'sonnet[1m]',
+  'sonnet',
+  'haiku',
+] as const;
 
 export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps) {
   const { configs, loading, saving, loadConfig, saveConfig } = useContainerEnvStore();
@@ -200,7 +211,7 @@ export function ContainerEnvPanel({ groupJid, onClose }: ContainerEnvPanelProps)
                 type="text"
                 value={model}
                 onChange={(e) => setModel(e.target.value)}
-                placeholder="opus / sonnet / haiku 或完整模型 ID"
+                placeholder="fable / claude-opus-4-8[1m] / opus[1m] / sonnet / haiku"
                 className="px-2.5 py-1.5 text-xs h-auto font-mono"
                 list="anthropic-model-presets"
               />

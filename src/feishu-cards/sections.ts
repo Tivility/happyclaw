@@ -101,9 +101,20 @@ export function formatTokens(n: number | undefined): string {
 }
 
 export function shortModel(model: string): string {
-  // "claude-opus-4-7" → "opus-4.7", "claude-sonnet-4-6" → "sonnet-4.6"
-  const m = model.match(/(opus|sonnet|haiku)-(\d+)-(\d+)/i);
-  if (m) return `${m[1].toLowerCase()}-${m[2]}.${m[3]}`;
+  // "claude-opus-4-8[1m]" -> "opus-4.8-1m", "opus[1m]" -> "opus-1m"
+  const suffix = model.match(/\[(\d+)m\]$/i)?.[1];
+  const base = model.replace(/\[\d+m\]$/i, '');
+  const alias = base.match(/^(fable|opus|sonnet|haiku)$/i);
+  const m = base.match(/(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i);
+  let short = '';
+  if (alias) {
+    short = alias[1].toLowerCase();
+  } else if (m && !m[3]) {
+    short = `${m[1].toLowerCase()}-${m[2]}`;
+  } else if (m) {
+    short = `${m[1].toLowerCase()}-${m[2]}.${m[3]}`;
+  }
+  if (short) return suffix ? `${short}-${suffix.toLowerCase()}m` : short;
   return model.length > 20 ? model.slice(0, 17) + '...' : model;
 }
 

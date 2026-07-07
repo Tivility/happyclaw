@@ -17,6 +17,20 @@ import { getErrorMessage } from './types';
 type ProviderType = 'official' | 'third_party';
 type OfficialAuthTab = 'oauth' | 'setup_token' | 'api_key';
 
+const OFFICIAL_CLAUDE_MODEL_OPTIONS = [
+  { value: '', label: 'default（默认）' },
+  { value: 'fable', label: 'fable' },
+  { value: 'opus[1m]', label: 'opus[1m]' },
+  { value: 'opus', label: 'opus' },
+  { value: 'sonnet[1m]', label: 'sonnet[1m]' },
+  { value: 'sonnet', label: 'sonnet' },
+  { value: 'haiku', label: 'haiku' },
+  { value: 'claude-fable-5', label: 'claude-fable-5' },
+  { value: 'claude-opus-4-8[1m]', label: 'claude-opus-4-8[1m]' },
+  { value: 'claude-opus-4-8', label: 'claude-opus-4-8' },
+  { value: 'claude-sonnet-5', label: 'claude-sonnet-5' },
+] as const;
+
 const RESERVED_ENV_KEYS = new Set([
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_AUTH_TOKEN',
@@ -664,9 +678,11 @@ export function ProviderEditor({
                   disabled={saving}
                   className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-primary/30"
                 >
-                  <option value="">default（默认）</option>
-                  <option value="sonnet">sonnet</option>
-                  <option value="haiku">haiku</option>
+                  {OFFICIAL_CLAUDE_MODEL_OPTIONS.map((option) => (
+                    <option key={option.value || 'default'} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
                 </select>
                 <p className="text-xs text-muted-foreground mt-1">
                   别名自动解析为最新版本，留空使用 default。

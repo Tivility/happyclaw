@@ -1643,6 +1643,26 @@ export function initDatabase(): void {
 
 function initializeModelSwitchingDefaults(): void {
   const now = new Date().toISOString();
+  const claudeAdaptiveModelMetadata = (
+    model: string,
+    options: {
+      aliases?: string[];
+      baseModel?: string;
+      contextVariant?: 'provider_default' | '1m';
+    } = {},
+  ) => ({
+    resolved_model: model,
+    ...(options.baseModel ? { base_model: options.baseModel } : {}),
+    ...(options.aliases?.length ? { aliases: options.aliases } : {}),
+    capabilities: {
+      context_window: 1_000_000,
+      max_output_tokens: 128_000,
+      adaptive_thinking: true,
+      supports_effort: true,
+      context_variant: options.contextVariant ?? 'provider_default',
+      effort_levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+    },
+  });
   const insertPool = db.prepare(
     `INSERT OR IGNORE INTO provider_pools (
       provider_pool_id, runtime, provider_family, display_name,
@@ -1695,12 +1715,48 @@ function initializeModelSwitchingDefaults(): void {
       runtime: 'claude',
       providerFamily: 'claude',
       poolId: 'claude',
+      modelId: 'fable',
+      modelKind: 'alias',
+      displayName: 'Claude Fable',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: null,
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
       modelId: 'opus[1m]',
       modelKind: 'alias',
       displayName: 'Claude Opus 1M',
       source: 'admin_configured',
       status: 'unverified',
-      metadata: null,
+      metadata: {
+        resolved_model: 'opus[1m]',
+        aliases: ['opus-1m'],
+        capabilities: {
+          context_window: 1_000_000,
+          context_variant: '1m',
+        },
+      },
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
+      modelId: 'sonnet[1m]',
+      modelKind: 'alias',
+      displayName: 'Claude Sonnet 1M',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: {
+        resolved_model: 'sonnet[1m]',
+        aliases: ['sonnet-1m'],
+        capabilities: {
+          context_window: 1_000_000,
+          context_variant: '1m',
+        },
+      },
     },
     {
       runtime: 'claude',
@@ -1728,12 +1784,84 @@ function initializeModelSwitchingDefaults(): void {
       runtime: 'claude',
       providerFamily: 'claude',
       poolId: 'claude',
+      modelId: 'claude-fable-5',
+      modelKind: 'explicit_version',
+      displayName: 'Claude Fable 5',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: claudeAdaptiveModelMetadata('claude-fable-5', {
+        aliases: ['fable-5'],
+      }),
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
+      modelId: 'claude-opus-4-8',
+      modelKind: 'explicit_version',
+      displayName: 'Claude Opus 4.8',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: claudeAdaptiveModelMetadata('claude-opus-4-8', {
+        aliases: ['opus-4.8', 'opus-4-8'],
+      }),
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
+      modelId: 'claude-opus-4-8[1m]',
+      modelKind: 'explicit_version',
+      displayName: 'Claude Opus 4.8 1M',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: claudeAdaptiveModelMetadata('claude-opus-4-8[1m]', {
+        aliases: ['opus-4.8-1m', 'opus-4-8-1m'],
+        baseModel: 'claude-opus-4-8',
+        contextVariant: '1m',
+      }),
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
+      modelId: 'claude-sonnet-5',
+      modelKind: 'explicit_version',
+      displayName: 'Claude Sonnet 5',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: claudeAdaptiveModelMetadata('claude-sonnet-5', {
+        aliases: ['sonnet-5'],
+      }),
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
       modelId: 'claude-opus-4-7',
       modelKind: 'explicit_version',
       displayName: 'Claude Opus 4.7',
       source: 'admin_configured',
       status: 'unverified',
-      metadata: { resolved_model: 'claude-opus-4-7' },
+      metadata: {
+        resolved_model: 'claude-opus-4-7',
+        aliases: ['opus-4.7', 'opus-4-7'],
+      },
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
+      modelId: 'claude-opus-4-7[1m]',
+      modelKind: 'explicit_version',
+      displayName: 'Claude Opus 4.7 1M',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: claudeAdaptiveModelMetadata('claude-opus-4-7[1m]', {
+        aliases: ['opus-4.7-1m', 'opus-4-7-1m'],
+        baseModel: 'claude-opus-4-7',
+        contextVariant: '1m',
+      }),
     },
     {
       runtime: 'claude',
@@ -1744,7 +1872,25 @@ function initializeModelSwitchingDefaults(): void {
       displayName: 'Claude Opus 4.6',
       source: 'admin_configured',
       status: 'unverified',
-      metadata: { resolved_model: 'claude-opus-4-6' },
+      metadata: {
+        resolved_model: 'claude-opus-4-6',
+        aliases: ['opus-4.6', 'opus-4-6'],
+      },
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
+      modelId: 'claude-opus-4-6[1m]',
+      modelKind: 'explicit_version',
+      displayName: 'Claude Opus 4.6 1M',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: claudeAdaptiveModelMetadata('claude-opus-4-6[1m]', {
+        aliases: ['opus-4.6-1m', 'opus-4-6-1m'],
+        baseModel: 'claude-opus-4-6',
+        contextVariant: '1m',
+      }),
     },
     {
       runtime: 'claude',
@@ -1755,7 +1901,25 @@ function initializeModelSwitchingDefaults(): void {
       displayName: 'Claude Sonnet 4.6',
       source: 'admin_configured',
       status: 'unverified',
-      metadata: { resolved_model: 'claude-sonnet-4-6' },
+      metadata: {
+        resolved_model: 'claude-sonnet-4-6',
+        aliases: ['sonnet-4.6', 'sonnet-4-6'],
+      },
+    },
+    {
+      runtime: 'claude',
+      providerFamily: 'claude',
+      poolId: 'claude',
+      modelId: 'claude-sonnet-4-6[1m]',
+      modelKind: 'explicit_version',
+      displayName: 'Claude Sonnet 4.6 1M',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: claudeAdaptiveModelMetadata('claude-sonnet-4-6[1m]', {
+        aliases: ['sonnet-4.6-1m', 'sonnet-4-6-1m'],
+        baseModel: 'claude-sonnet-4-6',
+        contextVariant: '1m',
+      }),
     },
     {
       runtime: 'claude',
@@ -1766,7 +1930,10 @@ function initializeModelSwitchingDefaults(): void {
       displayName: 'Claude Haiku 4.5',
       source: 'admin_configured',
       status: 'unverified',
-      metadata: { resolved_model: 'claude-haiku-4-5' },
+      metadata: {
+        resolved_model: 'claude-haiku-4-5',
+        aliases: ['haiku-4.5', 'haiku-4-5'],
+      },
     },
     {
       runtime: 'codex',
