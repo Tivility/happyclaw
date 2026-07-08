@@ -104,6 +104,54 @@ const modelOptions = [
     updated_at: '2026-04-25T00:00:00.000Z',
   },
   {
+    runtime: 'grok',
+    provider_family: 'grok',
+    provider_pool_id: 'grok',
+    model_id: 'grok-4.5',
+    model_kind: 'explicit_version',
+    display_name: 'Grok 4.5',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'grok-4.5',
+      aliases: ['grok-4.5-latest', 'grok-build-latest'],
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-08T00:00:00.000Z',
+  },
+  {
+    runtime: 'grok',
+    provider_family: 'grok',
+    provider_pool_id: 'grok',
+    model_id: 'grok-4.3',
+    model_kind: 'explicit_version',
+    display_name: 'Grok 4.3',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'grok-4.3',
+      aliases: ['grok-4.3-latest', 'grok-latest'],
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-08T00:00:00.000Z',
+  },
+  {
+    runtime: 'grok',
+    provider_family: 'grok',
+    provider_pool_id: 'grok',
+    model_id: 'grok-build-0.1',
+    model_kind: 'explicit_version',
+    display_name: 'Grok Build 0.1',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'grok-build-0.1',
+      aliases: ['grok-code-fast-1', 'grok-code-fast', 'grok-code-fast-1-0825'],
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-08T00:00:00.000Z',
+  },
+  {
     runtime: 'claude',
     provider_family: 'claude',
     provider_pool_id: 'claude',
@@ -196,6 +244,13 @@ vi.mock('../src/db.js', () => ({
       provider_family: 'gpt',
       enabled: true,
     },
+    {
+      provider_pool_id: 'grok',
+      display_name: 'Grok',
+      runtime: 'grok',
+      provider_family: 'grok',
+      enabled: true,
+    },
   ],
   getProviderPool: (providerPoolId: string) =>
     providerPoolId === 'claude'
@@ -214,8 +269,19 @@ vi.mock('../src/db.js', () => ({
             provider_family: 'gpt',
             enabled: true,
           }
-      : null,
-  listProviderPoolModelOptions: (_providerPoolId?: string, includeAll = false) =>
+        : providerPoolId === 'grok'
+          ? {
+              provider_pool_id: 'grok',
+              display_name: 'Grok',
+              runtime: 'grok',
+              provider_family: 'grok',
+              enabled: true,
+            }
+          : null,
+  listProviderPoolModelOptions: (
+    _providerPoolId?: string,
+    includeAll = false,
+  ) =>
     includeAll
       ? modelOptions
       : modelOptions.filter((option) => option.status !== 'hidden'),
@@ -236,6 +302,7 @@ describe('model command parsing', () => {
     mocks.enabledProvidersByPool.clear();
     mocks.enabledProvidersByPool.set('claude', [{ id: 'claude-provider' }]);
     mocks.enabledProvidersByPool.set('gpt', [{ id: 'gpt-provider' }]);
+    mocks.enabledProvidersByPool.set('grok', [{ id: 'grok-provider' }]);
   });
 
   it('carries resolved model metadata into the binding key material', () => {
@@ -315,6 +382,40 @@ describe('model command parsing', () => {
     });
   });
 
+  it.each(['grok-4.5', 'grok-4.3', 'grok-build-0.1'])(
+    'selects new pinned Grok model %s',
+    (modelId) => {
+      const result = parseModelBindingFromArgs([modelId]);
+
+      expect(result.error).toBeUndefined();
+      expect(result.binding).toMatchObject({
+        runtime: 'grok',
+        provider_family: 'grok',
+        provider_pool_id: 'grok',
+        selected_model: modelId,
+        model_kind: 'explicit_version',
+        resolved_model: modelId,
+      });
+    },
+  );
+
+  it.each([
+    ['grok-4.5-latest', 'grok-4.5'],
+    ['grok-build-latest', 'grok-4.5'],
+    ['grok-latest', 'grok-4.3'],
+    ['grok-code-fast-1', 'grok-build-0.1'],
+  ])('canonicalizes Grok model alias %s', (input, modelId) => {
+    const result = parseModelBindingFromArgs([input]);
+
+    expect(result.error).toBeUndefined();
+    expect(result.binding).toMatchObject({
+      runtime: 'grok',
+      provider_pool_id: 'grok',
+      selected_model: modelId,
+      resolved_model: modelId,
+    });
+  });
+
   it('uses the provider default for an enabled GPT pool', () => {
     const result = parseModelBindingFromArgs(['gpt']);
 
@@ -368,6 +469,13 @@ describe('model command parsing', () => {
     expect(output).toContain('GPT (gpt)');
     expect(output).toContain('/model use gpt-5.5');
     expect(output).toContain('GPT-5.5 · 固定版本 · 可用');
+    expect(output).toContain('Grok (grok)');
+    expect(output).toContain('/model use grok-4.5');
+    expect(output).toContain('Grok 4.5 · 固定版本 · 可用');
+    expect(output).toContain('短写：/model use grok-4.5-latest');
+    expect(output).toContain('/model use grok-4.3');
+    expect(output).toContain('/model use grok-build-0.1');
+    expect(output).toContain('短写：/model use grok-code-fast-1');
     expect(output).not.toContain('Claude Retired');
     expect(output).not.toContain('GPT Legacy Hidden');
   });

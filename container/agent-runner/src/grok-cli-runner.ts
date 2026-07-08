@@ -168,7 +168,7 @@ export const grokCliAdapter: AgentRuntimeAdapter = {
     const cli = findGrokCli();
     const contextPath = writeMcpContext(input);
     const mcpServers = buildAcpMcpServers(contextPath, input.cwd);
-    const model = input.model || input.input.selectedModel || 'grok-build';
+    const model = input.model || input.input.selectedModel || 'grok-4.5';
     const startedAt = Date.now();
     const normalizer = new GrokEventNormalizer(emit, startedAt);
 
