@@ -66,6 +66,52 @@ const modelOptions = [
     runtime: 'codex',
     provider_family: 'gpt',
     provider_pool_id: 'gpt',
+    model_id: 'gpt-5.6-sol',
+    model_kind: 'explicit_version',
+    display_name: 'GPT-5.6 Sol',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'gpt-5.6-sol',
+      aliases: ['gpt-5.6'],
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-15T00:00:00.000Z',
+  },
+  {
+    runtime: 'codex',
+    provider_family: 'gpt',
+    provider_pool_id: 'gpt',
+    model_id: 'gpt-5.6-terra',
+    model_kind: 'explicit_version',
+    display_name: 'GPT-5.6 Terra',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'gpt-5.6-terra',
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-15T00:00:00.000Z',
+  },
+  {
+    runtime: 'codex',
+    provider_family: 'gpt',
+    provider_pool_id: 'gpt',
+    model_id: 'gpt-5.6-luna',
+    model_kind: 'explicit_version',
+    display_name: 'GPT-5.6 Luna',
+    source: 'admin_configured',
+    status: 'available',
+    metadata_json: JSON.stringify({
+      resolved_model: 'gpt-5.6-luna',
+    }),
+    updated_by: 'test',
+    updated_at: '2026-07-15T00:00:00.000Z',
+  },
+  {
+    runtime: 'codex',
+    provider_family: 'gpt',
+    provider_pool_id: 'gpt',
     model_id: 'gpt-5.5',
     model_kind: 'explicit_version',
     display_name: 'GPT-5.5',
@@ -331,6 +377,35 @@ describe('model command parsing', () => {
     });
   });
 
+  it.each(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])(
+    'selects new pinned GPT model %s',
+    (modelId) => {
+      const result = parseModelBindingFromArgs([modelId]);
+
+      expect(result.error).toBeUndefined();
+      expect(result.binding).toMatchObject({
+        runtime: 'codex',
+        provider_family: 'gpt',
+        provider_pool_id: 'gpt',
+        selected_model: modelId,
+        model_kind: 'explicit_version',
+        resolved_model: modelId,
+      });
+    },
+  );
+
+  it('canonicalizes GPT-5.6 family alias to Sol', () => {
+    const result = parseModelBindingFromArgs(['gpt-5.6']);
+
+    expect(result.error).toBeUndefined();
+    expect(result.binding).toMatchObject({
+      runtime: 'codex',
+      provider_pool_id: 'gpt',
+      selected_model: 'gpt-5.6-sol',
+      resolved_model: 'gpt-5.6-sol',
+    });
+  });
+
   it('selects the Claude Fable alias', () => {
     const result = parseModelBindingFromArgs(['fable']);
 
@@ -467,6 +542,11 @@ describe('model command parsing', () => {
     expect(output).toContain('/model use claude fast');
     expect(output).toContain('/model use gpt fast');
     expect(output).toContain('GPT (gpt)');
+    expect(output).toContain('/model use gpt-5.6-sol');
+    expect(output).toContain('GPT-5.6 Sol · 固定版本 · 可用');
+    expect(output).toContain('短写：/model use gpt-5.6');
+    expect(output).toContain('/model use gpt-5.6-terra');
+    expect(output).toContain('/model use gpt-5.6-luna');
     expect(output).toContain('/model use gpt-5.5');
     expect(output).toContain('GPT-5.5 · 固定版本 · 可用');
     expect(output).toContain('Grok (grok)');

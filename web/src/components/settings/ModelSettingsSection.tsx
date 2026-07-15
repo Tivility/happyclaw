@@ -363,7 +363,7 @@ export function ModelSettingsSection() {
                   onChange={(event) => setAddModelId(event.target.value)}
                   placeholder={
                     selectedCatalogPool?.provider_family === 'gpt'
-                      ? 'gpt-5.5'
+                      ? 'gpt-5.6-sol'
                       : selectedCatalogPool?.provider_family === 'grok'
                         ? 'grok-4.5'
                         : 'claude-opus-4-8[1m]'

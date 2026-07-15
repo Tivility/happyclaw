@@ -1663,6 +1663,23 @@ function initializeModelSwitchingDefaults(): void {
       effort_levels: ['low', 'medium', 'high', 'xhigh', 'max'],
     },
   });
+  const gptFiveSixModelMetadata = (
+    model: string,
+    options: { aliases?: string[] } = {},
+  ) => ({
+    resolved_model: model,
+    ...(options.aliases?.length ? { aliases: options.aliases } : {}),
+    capabilities: {
+      context_window: 1_050_000,
+      max_output_tokens: 128_000,
+      input_modalities: ['text', 'image'],
+      output_modalities: ['text'],
+      reasoning: true,
+      supports_effort: true,
+      effort_levels: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
+      tools: ['functions', 'web_search', 'file_search', 'computer_use'],
+    },
+  });
   const insertPool = db.prepare(
     `INSERT OR IGNORE INTO provider_pools (
       provider_pool_id, runtime, provider_family, display_name,
@@ -1945,6 +1962,41 @@ function initializeModelSwitchingDefaults(): void {
       source: 'runtime_default',
       status: 'available',
       metadata: null,
+    },
+    {
+      runtime: 'codex',
+      providerFamily: 'gpt',
+      poolId: 'gpt',
+      modelId: 'gpt-5.6-sol',
+      modelKind: 'explicit_version',
+      displayName: 'GPT-5.6 Sol',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: gptFiveSixModelMetadata('gpt-5.6-sol', {
+        aliases: ['gpt-5.6'],
+      }),
+    },
+    {
+      runtime: 'codex',
+      providerFamily: 'gpt',
+      poolId: 'gpt',
+      modelId: 'gpt-5.6-terra',
+      modelKind: 'explicit_version',
+      displayName: 'GPT-5.6 Terra',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: gptFiveSixModelMetadata('gpt-5.6-terra'),
+    },
+    {
+      runtime: 'codex',
+      providerFamily: 'gpt',
+      poolId: 'gpt',
+      modelId: 'gpt-5.6-luna',
+      modelKind: 'explicit_version',
+      displayName: 'GPT-5.6 Luna',
+      source: 'admin_configured',
+      status: 'unverified',
+      metadata: gptFiveSixModelMetadata('gpt-5.6-luna'),
     },
     {
       runtime: 'codex',

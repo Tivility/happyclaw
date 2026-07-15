@@ -210,7 +210,7 @@ export function parseModelBindingFromArgs(
   if (args.length === 0) {
     return {
       error:
-        '用法：/model use <claude|gpt|grok> [model]\n例如：/model use opus-4.8-1m、/model use grok-4.5 或 /model use claude claude-opus-4-8[1m]',
+        '用法：/model use <claude|gpt|grok> [model]\n例如：/model use gpt-5.6、/model use opus-4.8-1m、/model use grok-4.5 或 /model use claude claude-opus-4-8[1m]',
     };
   }
 
