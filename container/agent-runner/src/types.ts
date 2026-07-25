@@ -67,6 +67,26 @@ export interface ContainerInput {
   plugins?: Array<{ type: 'local'; path: string }>;
   /** Runtime context audit bootstrap from the host/container launcher. */
   contextAudit?: ClaudeContextAudit;
+  /**
+   * Persona resolved from the workspace's agent profile (batch 5).
+   *
+   * Runtime-neutral on purpose: each adapter injects it through whatever channel
+   * it has — Claude via the SDK system prompt, Codex via CLI args, Grok via the
+   * ACP session's `_meta.rules`. Absent means "no persona", which must behave
+   * exactly as before agent profiles existed.
+   */
+  agentProfile?: {
+    id: string;
+    name: string;
+    identityPrompt: string;
+    soulPrompt: string;
+    agentsPrompt: string;
+    toolsPrompt: string;
+    /** 'append' keeps the built-in guidelines; 'replace' drops them. */
+    promptMode: string;
+    identityHash: string;
+    version: number;
+  };
 }
 
 export interface ContainerOutput {

@@ -61,7 +61,7 @@ import {
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
 let db: InstanceType<typeof Database>;
-const SCHEMA_VERSION = '41';
+const SCHEMA_VERSION = '42';
 const DB_BACKUP_ENV_OVERRIDE = 'HAPPYCLAW_ALLOW_DB_MIGRATION_WITHOUT_BACKUP';
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
@@ -926,6 +926,86 @@ export function initDatabase(): void {
     CREATE INDEX IF NOT EXISTS idx_turn_events_folder
       ON turn_events(group_folder, created_at);
 
+    -- Agent 人格体系（批次 5）。
+    --
+    -- 与工作区是 N:1 —— workspace_agent_profiles 以 group_folder 为主键、
+    -- agent_profile_id 为普通列，所以一个人格模板可挂多个工作区，改模板即同时
+    -- 改掉所有挂载它的工作区（决策 O1-a：接受这一共享语义）。
+    CREATE TABLE IF NOT EXISTS agent_profiles (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      identity_prompt TEXT NOT NULL DEFAULT '',
+      soul_prompt TEXT NOT NULL DEFAULT '',
+      agents_prompt TEXT NOT NULL DEFAULT '',
+      tools_prompt TEXT NOT NULL DEFAULT '',
+      prompt_mode TEXT NOT NULL DEFAULT 'append',
+      include_claude_preset INTEGER NOT NULL DEFAULT 1,
+      avatar_emoji TEXT,
+      avatar_color TEXT,
+      avatar_url TEXT,
+      runtime_policy TEXT NOT NULL DEFAULT '{}',
+      identity_hash TEXT NOT NULL DEFAULT '',
+      version INTEGER NOT NULL DEFAULT 1,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_profiles_default
+      ON agent_profiles(owner_user_id)
+      WHERE is_default = 1 AND status = 'active';
+    CREATE INDEX IF NOT EXISTS idx_agent_profiles_owner
+      ON agent_profiles(owner_user_id, status);
+
+    CREATE TABLE IF NOT EXISTS agent_profile_prompt_versions (
+      id TEXT PRIMARY KEY,
+      agent_profile_id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      identity_prompt TEXT NOT NULL DEFAULT '',
+      soul_prompt TEXT NOT NULL DEFAULT '',
+      agents_prompt TEXT NOT NULL DEFAULT '',
+      tools_prompt TEXT NOT NULL DEFAULT '',
+      prompt_mode TEXT NOT NULL DEFAULT 'append',
+      identity_hash TEXT NOT NULL,
+      change_source TEXT NOT NULL DEFAULT 'update',
+      restored_from_version INTEGER,
+      created_at TEXT NOT NULL,
+      UNIQUE(agent_profile_id, version)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_profile_prompt_versions_profile
+      ON agent_profile_prompt_versions(agent_profile_id, version DESC);
+
+    CREATE TABLE IF NOT EXISTS agent_builder_drafts (
+      id TEXT PRIMARY KEY,
+      owner_user_id TEXT NOT NULL,
+      source_group TEXT NOT NULL,
+      source_chat_jid TEXT NOT NULL,
+      target_agent_profile_id TEXT,
+      base_agent_version INTEGER,
+      revision INTEGER NOT NULL DEFAULT 1,
+      state TEXT NOT NULL DEFAULT 'ready',
+      definition_json TEXT NOT NULL,
+      assumptions_json TEXT NOT NULL DEFAULT '[]',
+      prepared_turn_id TEXT,
+      confirmation_phrase TEXT NOT NULL DEFAULT '',
+      published_agent_profile_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_builder_drafts_owner
+      ON agent_builder_drafts(owner_user_id, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS workspace_agent_profiles (
+      group_folder TEXT PRIMARY KEY,
+      agent_profile_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_agent_profiles_profile
+      ON workspace_agent_profiles(agent_profile_id);
+
     CREATE TABLE IF NOT EXISTS provider_pool_model_options (
       runtime TEXT NOT NULL,
       provider_family TEXT NOT NULL,
@@ -1008,6 +1088,15 @@ export function initDatabase(): void {
   ensureColumn('scheduled_tasks', 'workspace_folder', 'TEXT');
   ensureColumn('registered_groups', 'selected_skills', 'TEXT');
   ensureColumn('sessions', 'agent_id', "TEXT NOT NULL DEFAULT ''");
+  // Agent 人格身份指纹（批次 5）。加在本地已有的 sessions 表上，与
+  // conversation_runtime_sessions（per-runtime native session）是两张不同的表，
+  // 互不冲突——所以「合并会丢掉 per-runtime 多条结构」的担心不成立。
+  //
+  // identity_hash 只由人格内容决定，不含引擎（决策 A5）：换模型/换 runtime 不应
+  // 让全部会话集体失效，那由 runtimeFingerprint 单独判定。
+  ensureColumn('sessions', 'agent_profile_id', 'TEXT');
+  ensureColumn('sessions', 'identity_hash', 'TEXT');
+  ensureColumn('sessions', 'agent_profile_version', 'INTEGER');
   ensureColumn('agents', 'kind', "TEXT NOT NULL DEFAULT 'task'");
   ensureColumn('registered_groups', 'target_agent_id', 'TEXT');
   ensureColumn('registered_groups', 'target_main_jid', 'TEXT');
@@ -8110,4 +8199,376 @@ export function deleteTurnEventsForChat(chatJid: string): number {
     .prepare('DELETE FROM turn_events WHERE chat_jid = ?')
     .run(chatJid);
   return info.changes;
+}
+
+// --- Agent profiles (batch 5) ---
+
+/** Persona template. The four prompt parts inject identity / style / sub-agent / tool conventions. */
+export interface AgentProfile {
+  id: string;
+  ownerUserId: string;
+  name: string;
+  identityPrompt: string;
+  soulPrompt: string;
+  agentsPrompt: string;
+  toolsPrompt: string;
+  promptMode: string;
+  includeClaudePreset: boolean;
+  avatarEmoji: string | null;
+  avatarColor: string | null;
+  avatarUrl: string | null;
+  runtimePolicy: string;
+  identityHash: string;
+  version: number;
+  isDefault: boolean;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function mapAgentProfile(r: Record<string, unknown>): AgentProfile {
+  return {
+    id: r.id as string,
+    ownerUserId: r.owner_user_id as string,
+    name: r.name as string,
+    identityPrompt: (r.identity_prompt as string) ?? '',
+    soulPrompt: (r.soul_prompt as string) ?? '',
+    agentsPrompt: (r.agents_prompt as string) ?? '',
+    toolsPrompt: (r.tools_prompt as string) ?? '',
+    promptMode: (r.prompt_mode as string) ?? 'append',
+    includeClaudePreset: !!(r.include_claude_preset as number),
+    avatarEmoji: (r.avatar_emoji as string) ?? null,
+    avatarColor: (r.avatar_color as string) ?? null,
+    avatarUrl: (r.avatar_url as string) ?? null,
+    runtimePolicy: (r.runtime_policy as string) ?? '{}',
+    identityHash: (r.identity_hash as string) ?? '',
+    version: (r.version as number) ?? 1,
+    isDefault: !!(r.is_default as number),
+    status: (r.status as string) ?? 'active',
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
+}
+
+/**
+ * Identity fingerprint, derived from prompt content only.
+ *
+ * Deliberately excludes runtime / model / provider (decision A5): switching
+ * engines must not invalidate every session at once. Engine drift is tracked
+ * separately by the runtime fingerprint in conversation_runtime_sessions.
+ */
+export function computeAgentIdentityHash(
+  parts: Pick<
+    AgentProfile,
+    'identityPrompt' | 'soulPrompt' | 'agentsPrompt' | 'toolsPrompt' | 'promptMode'
+  >,
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      [
+        parts.identityPrompt,
+        parts.soulPrompt,
+        parts.agentsPrompt,
+        parts.toolsPrompt,
+        parts.promptMode,
+      ].join(' '),
+    )
+    .digest('hex')
+    .slice(0, 32);
+}
+
+export function getAgentProfile(id: string): AgentProfile | null {
+  const row = db
+    .prepare("SELECT * FROM agent_profiles WHERE id = ? AND status = 'active'")
+    .get(id) as Record<string, unknown> | undefined;
+  return row ? mapAgentProfile(row) : null;
+}
+
+export function listAgentProfiles(ownerUserId: string): AgentProfile[] {
+  const rows = db
+    .prepare(
+      "SELECT * FROM agent_profiles WHERE owner_user_id = ? AND status = 'active' ORDER BY is_default DESC, updated_at DESC",
+    )
+    .all(ownerUserId) as Array<Record<string, unknown>>;
+  return rows.map(mapAgentProfile);
+}
+
+/**
+ * Profile bound to a workspace, falling back to the owner's default when the
+ * workspace has no explicit binding.
+ *
+ * Returns null when the owner has no profiles at all. Callers must treat that as
+ * "no persona", never as an error, so a deployment that never creates a profile
+ * behaves exactly as it did before this table existed.
+ */
+export function getWorkspaceAgentProfile(
+  groupFolder: string,
+  ownerUserId?: string | null,
+): AgentProfile | null {
+  const bound = db
+    .prepare(
+      `SELECT p.* FROM workspace_agent_profiles w
+         JOIN agent_profiles p ON p.id = w.agent_profile_id
+        WHERE w.group_folder = ? AND p.status = 'active'`,
+    )
+    .get(groupFolder) as Record<string, unknown> | undefined;
+  if (bound) return mapAgentProfile(bound);
+
+  if (!ownerUserId) return null;
+  const fallback = db
+    .prepare(
+      "SELECT * FROM agent_profiles WHERE owner_user_id = ? AND is_default = 1 AND status = 'active'",
+    )
+    .get(ownerUserId) as Record<string, unknown> | undefined;
+  return fallback ? mapAgentProfile(fallback) : null;
+}
+
+/** Bind (or rebind) a workspace to a profile. N workspaces : 1 profile (O1-a). */
+export function setWorkspaceAgentProfile(
+  groupFolder: string,
+  agentProfileId: string,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO workspace_agent_profiles (group_folder, agent_profile_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?)
+     ON CONFLICT(group_folder) DO UPDATE SET
+       agent_profile_id = excluded.agent_profile_id,
+       updated_at = excluded.updated_at`,
+  ).run(groupFolder, agentProfileId, now, now);
+}
+
+export function clearWorkspaceAgentProfile(groupFolder: string): void {
+  db.prepare('DELETE FROM workspace_agent_profiles WHERE group_folder = ?').run(
+    groupFolder,
+  );
+}
+
+/** Create a profile. Returns the stored row, with its identity hash filled in. */
+export function createAgentProfile(input: {
+  id: string;
+  ownerUserId: string;
+  name: string;
+  identityPrompt?: string;
+  soulPrompt?: string;
+  agentsPrompt?: string;
+  toolsPrompt?: string;
+  promptMode?: string;
+  includeClaudePreset?: boolean;
+  avatarEmoji?: string | null;
+  avatarColor?: string | null;
+  isDefault?: boolean;
+}): AgentProfile {
+  const now = new Date().toISOString();
+  const parts = {
+    identityPrompt: input.identityPrompt ?? '',
+    soulPrompt: input.soulPrompt ?? '',
+    agentsPrompt: input.agentsPrompt ?? '',
+    toolsPrompt: input.toolsPrompt ?? '',
+    promptMode: input.promptMode ?? 'append',
+  };
+  const identityHash = computeAgentIdentityHash(parts);
+
+  const tx = db.transaction(() => {
+    // The partial unique index allows only one active default per owner, so an
+    // existing default must stand down before this one takes over.
+    if (input.isDefault) {
+      db.prepare(
+        "UPDATE agent_profiles SET is_default = 0, updated_at = ? WHERE owner_user_id = ? AND is_default = 1 AND status = 'active'",
+      ).run(now, input.ownerUserId);
+    }
+    db.prepare(
+      `INSERT INTO agent_profiles
+         (id, owner_user_id, name, identity_prompt, soul_prompt, agents_prompt,
+          tools_prompt, prompt_mode, include_claude_preset, avatar_emoji,
+          avatar_color, avatar_url, runtime_policy, identity_hash, version,
+          is_default, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '{}', ?, 1, ?, 'active', ?, ?)`,
+    ).run(
+      input.id,
+      input.ownerUserId,
+      input.name,
+      parts.identityPrompt,
+      parts.soulPrompt,
+      parts.agentsPrompt,
+      parts.toolsPrompt,
+      parts.promptMode,
+      input.includeClaudePreset === false ? 0 : 1,
+      input.avatarEmoji ?? null,
+      input.avatarColor ?? null,
+      identityHash,
+      input.isDefault ? 1 : 0,
+      now,
+      now,
+    );
+    db.prepare(
+      `INSERT INTO agent_profile_prompt_versions
+         (id, agent_profile_id, version, name, identity_prompt, soul_prompt,
+          agents_prompt, tools_prompt, prompt_mode, identity_hash,
+          change_source, created_at)
+       VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'create', ?)`,
+    ).run(
+      `${input.id}-v1`,
+      input.id,
+      input.name,
+      parts.identityPrompt,
+      parts.soulPrompt,
+      parts.agentsPrompt,
+      parts.toolsPrompt,
+      parts.promptMode,
+      identityHash,
+      now,
+    );
+  });
+  tx();
+
+  return getAgentProfile(input.id)!;
+}
+
+/**
+ * Update a profile's prompts, bumping its version and snapshotting the new text.
+ *
+ * Sessions started under the previous persona are intentionally left alone
+ * (decision O1-b) — see hasSessionAgentProfileMismatch.
+ */
+export function updateAgentProfilePrompts(
+  id: string,
+  patch: {
+    name?: string;
+    identityPrompt?: string;
+    soulPrompt?: string;
+    agentsPrompt?: string;
+    toolsPrompt?: string;
+    promptMode?: string;
+  },
+): AgentProfile | null {
+  const existing = getAgentProfile(id);
+  if (!existing) return null;
+
+  const merged = {
+    name: patch.name ?? existing.name,
+    identityPrompt: patch.identityPrompt ?? existing.identityPrompt,
+    soulPrompt: patch.soulPrompt ?? existing.soulPrompt,
+    agentsPrompt: patch.agentsPrompt ?? existing.agentsPrompt,
+    toolsPrompt: patch.toolsPrompt ?? existing.toolsPrompt,
+    promptMode: patch.promptMode ?? existing.promptMode,
+  };
+  const identityHash = computeAgentIdentityHash(merged);
+  const nextVersion = existing.version + 1;
+  const now = new Date().toISOString();
+
+  const tx = db.transaction(() => {
+    db.prepare(
+      `UPDATE agent_profiles
+          SET name = ?, identity_prompt = ?, soul_prompt = ?, agents_prompt = ?,
+              tools_prompt = ?, prompt_mode = ?, identity_hash = ?, version = ?,
+              updated_at = ?
+        WHERE id = ?`,
+    ).run(
+      merged.name,
+      merged.identityPrompt,
+      merged.soulPrompt,
+      merged.agentsPrompt,
+      merged.toolsPrompt,
+      merged.promptMode,
+      identityHash,
+      nextVersion,
+      now,
+      id,
+    );
+    db.prepare(
+      `INSERT INTO agent_profile_prompt_versions
+         (id, agent_profile_id, version, name, identity_prompt, soul_prompt,
+          agents_prompt, tools_prompt, prompt_mode, identity_hash,
+          change_source, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'update', ?)`,
+    ).run(
+      `${id}-v${nextVersion}`,
+      id,
+      nextVersion,
+      merged.name,
+      merged.identityPrompt,
+      merged.soulPrompt,
+      merged.agentsPrompt,
+      merged.toolsPrompt,
+      merged.promptMode,
+      identityHash,
+      now,
+    );
+  });
+  tx();
+
+  return getAgentProfile(id);
+}
+
+/** Soft-delete, so prompt version history and session references stay resolvable. */
+export function archiveAgentProfile(id: string): void {
+  db.prepare(
+    "UPDATE agent_profiles SET status = 'archived', is_default = 0, updated_at = ? WHERE id = ?",
+  ).run(new Date().toISOString(), id);
+  db.prepare('DELETE FROM workspace_agent_profiles WHERE agent_profile_id = ?').run(
+    id,
+  );
+}
+
+/** Record which persona a session was started under. */
+export function setSessionAgentIdentity(
+  groupFolder: string,
+  agentId: string,
+  identity: { agentProfileId: string; identityHash: string; version: number },
+): void {
+  db.prepare(
+    `UPDATE sessions
+        SET agent_profile_id = ?, identity_hash = ?, agent_profile_version = ?
+      WHERE group_folder = ? AND agent_id = ?`,
+  ).run(
+    identity.agentProfileId,
+    identity.identityHash,
+    identity.version,
+    groupFolder,
+    agentId,
+  );
+}
+
+export function getSessionAgentIdentity(
+  groupFolder: string,
+  agentId: string,
+): { agentProfileId: string | null; identityHash: string | null } | null {
+  const row = db
+    .prepare(
+      'SELECT agent_profile_id, identity_hash FROM sessions WHERE group_folder = ? AND agent_id = ?',
+    )
+    .get(groupFolder, agentId) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    agentProfileId: (row.agent_profile_id as string) ?? null,
+    identityHash: (row.identity_hash as string) ?? null,
+  };
+}
+
+/**
+ * Whether a session was started under a different persona than the current one.
+ *
+ * Reported, never acted on (decision O1-b). Upstream resets the session here,
+ * which is inconsistent with how this same codebase treats the other source of
+ * prompt-prefix drift: the global-memory and memory-recall prompt pieces are
+ * equally dynamic, and when the agent rewrites its own CLAUDE.md nothing deletes
+ * the session -- it simply resumes and pays one cache miss. A persona edit is
+ * the same class of event, so it gets the same treatment: keep the context, eat
+ * the miss. Measured cache-read ratio on this deployment is 99.97%, so such
+ * misses are rare and one-off rather than a standing cost.
+ */
+export function hasSessionAgentProfileMismatch(
+  groupFolder: string,
+  agentId: string,
+  current: { agentProfileId: string; identityHash: string },
+): boolean {
+  const recorded = getSessionAgentIdentity(groupFolder, agentId);
+  if (!recorded) return false;
+  if (!recorded.identityHash) return false;
+  return (
+    recorded.agentProfileId !== current.agentProfileId ||
+    recorded.identityHash !== current.identityHash
+  );
 }

@@ -40,6 +40,7 @@ import {
   parseTranscript,
 } from './session-history.js';
 import { StreamEventProcessor } from './stream-processor.js';
+import { buildPersonaBlock, describePersona, personaPromptMode } from './agent-persona.js';
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
 import { createMcpTools } from './mcp-tools.js';
 import { codexCliAdapter } from './codex-cli-runner.js';
@@ -1463,7 +1464,16 @@ async function runQuery(
   // SDK settingSources 只加载 ~/.claude/CLAUDE.md 本体，不递归加载 rules/；
   // 容器模式下 $HOME 指向会话目录，宿主机 CLAUDE.md 也读不到。因此 guidelines 必须 inline 注入。
   // guidelines 块按 claude runtime 感知（buildGuidelinesBlock），全局记忆内容作为独立 piece 注入。
+  // Persona from the workspace's agent profile (batch 5). Placed first so the
+  // model reads who it is before how it should behave; in 'replace' mode it also
+  // stands in for the built-in guidelines block below.
+  const personaBlock = buildPersonaBlock(containerInput);
+  const personaMode = personaPromptMode(containerInput);
+  const personaDescription = describePersona(containerInput);
+  if (personaDescription) log(`Agent profile: ${personaDescription} mode=${personaMode}`);
+
   const promptPieces: PromptPiece[] = [
+    ...(personaBlock ? [{ name: 'agent-persona', text: personaBlock }] : []),
     { name: 'interaction.md', text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>` },
     { name: 'skill-routing.md', text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>` },
     { name: 'security-rules.md', text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>` },
@@ -1473,7 +1483,13 @@ async function runQuery(
     ...(memoryRecall && memoryPromptName
       ? [{ name: memoryPromptName, text: `<memory-system>\n${memoryRecall}\n</memory-system>` }]
       : []),
-    { name: 'guidelines', text: buildGuidelinesBlock('claude') },
+    // 'replace' mode means the persona deliberately takes over the system
+    // prompt, so the built-in guidelines stand down. Everything else here
+    // (security rules, memory, channel format) still applies — those are
+    // safety/plumbing, not voice.
+    ...(personaMode === 'replace' && personaBlock
+      ? []
+      : [{ name: 'guidelines', text: buildGuidelinesBlock('claude') }]),
     ...(channelGuidelines
       ? [{ name: `channels/${channel}.md`, text: `<channel-format>\n${channelGuidelines}\n</channel-format>` }]
       : []),

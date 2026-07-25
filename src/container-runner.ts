@@ -42,6 +42,8 @@ import {
   deleteSession,
   getSessionProviderId,
   setSessionProviderId,
+  getWorkspaceAgentProfile,
+  hasSessionAgentProfileMismatch,
 } from './db.js';
 import { isApiError } from './agent-output-parser.js';
 import type {
@@ -260,6 +262,25 @@ export interface ContainerInput {
   plugins?: Array<{ type: 'local'; path: string }>;
   /** Runtime context audit bootstrap; agent-runner enriches it with SDK usage. */
   contextAudit?: ClaudeContextAudit;
+  /**
+   * Persona resolved from the workspace's agent profile (batch 5).
+   *
+   * Populated just-in-time by the two spawn paths via
+   * resolveAgentProfileForInput; never set by the caller. Runtime-neutral —
+   * agent-runner renders it once and every adapter injects it through its own
+   * channel (SDK system prompt / CLI args / ACP _meta.rules).
+   */
+  agentProfile?: {
+    id: string;
+    name: string;
+    identityPrompt: string;
+    soulPrompt: string;
+    agentsPrompt: string;
+    toolsPrompt: string;
+    promptMode: string;
+    identityHash: string;
+    version: number;
+  };
 }
 
 export interface ContainerOutput {
@@ -656,6 +677,59 @@ function selectGrokProviderForInput(
  * even when the user has plugins enabled. Failure is logged, never thrown —
  * the agent simply starts with whatever subset is already materialized.
  */
+/**
+ * Persona for a workspace, shaped for ContainerInput.
+ *
+ * N workspaces may share one profile (decision O1-a), and an unbound workspace
+ * falls back to its owner's default. Returns undefined when the owner has no
+ * profile at all, so a deployment that never creates one behaves exactly as it
+ * did before agent profiles existed.
+ *
+ * Note what this deliberately does NOT do: it never resets a session whose
+ * recorded identity hash differs from the current one (decision O1-b). The
+ * mismatch is logged so a later cache-cost investigation can find the moment the
+ * prompt prefix changed, but the conversation keeps its context and pays a single
+ * cache miss -- the same treatment this codebase already gives memory-driven
+ * prefix changes.
+ */
+function resolveAgentProfileForInput(
+  group: RegisteredGroup,
+  agentId?: string,
+): ContainerInput['agentProfile'] | undefined {
+  try {
+    const profile = getWorkspaceAgentProfile(group.folder, group.created_by);
+    if (!profile) return undefined;
+
+    if (
+      hasSessionAgentProfileMismatch(group.folder, agentId || '', {
+        agentProfileId: profile.id,
+        identityHash: profile.identityHash,
+      })
+    ) {
+      logger.info(
+        { folder: group.folder, agentProfileId: profile.id, version: profile.version },
+        'Agent persona changed since this session started; keeping context (prompt prefix cache will miss once)',
+      );
+    }
+
+    return {
+      id: profile.id,
+      name: profile.name,
+      identityPrompt: profile.identityPrompt,
+      soulPrompt: profile.soulPrompt,
+      agentsPrompt: profile.agentsPrompt,
+      toolsPrompt: profile.toolsPrompt,
+      promptMode: profile.promptMode,
+      identityHash: profile.identityHash,
+      version: profile.version,
+    };
+  } catch (err) {
+    // A persona lookup failure must never block a turn.
+    logger.warn({ err, folder: group.folder }, 'agent profile lookup failed');
+    return undefined;
+  }
+}
+
 export function prepareHostPlugins(ownerId: string | null | undefined): SdkPluginConfig[] {
   if (!ownerId) return [];
   try {
@@ -1273,6 +1347,7 @@ export async function runContainerAgent(
       // the caller's `input` object (queue/log/retry paths reuse the same ref).
       const dockerInput: ContainerInput = {
         ...input,
+        agentProfile: resolveAgentProfileForInput(group, input.agentId),
         plugins: group.created_by
           ? loadUserPlugins(group.created_by, { runtime: 'docker' })
           : [],
@@ -2149,6 +2224,7 @@ export async function runHostAgent(
       // plugins.
       const hostInput: ContainerInput = {
         ...input,
+        agentProfile: resolveAgentProfileForInput(group, input.agentId),
         plugins: prepareHostPlugins(group.created_by),
         contextAudit: hostClaudeContextPlan.audit,
       };
