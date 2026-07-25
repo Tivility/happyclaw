@@ -61,7 +61,7 @@ import {
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
 let db: InstanceType<typeof Database>;
-const SCHEMA_VERSION = '43';
+const SCHEMA_VERSION = '44';
 const DB_BACKUP_ENV_OVERRIDE = 'HAPPYCLAW_ALLOW_DB_MIGRATION_WITHOUT_BACKUP';
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
@@ -1048,6 +1048,42 @@ export function initDatabase(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_jid
       ON workspace_runtime_sessions(workspace_jid);
+
+    -- IM channel to workspace mounts (batch 7).
+    --
+    -- Replaces registered_groups.target_main_jid, which was a patch layer bolted
+    -- onto a column that already meant something else: an IM chat auto-registers
+    -- into its owner's home folder, so the folder column records where it was
+    -- registered while target_main_jid records where it actually runs. Those two
+    -- answers diverge for 21 of the 24 rows carrying folder='main' here, which is
+    -- what made a workspace reset kill unrelated workspaces (fix F3).
+    --
+    -- channel_jid is the primary key: one IM chat mounts to exactly one
+    -- workspace. Kept as its own table rather than more columns on
+    -- registered_groups so that routing has a single obvious home and the
+    -- ambiguity above cannot recur.
+    CREATE TABLE IF NOT EXISTS agent_channel_mounts (
+      channel_jid TEXT PRIMARY KEY,
+      agent_profile_id TEXT,
+      owner_user_id TEXT,
+      channel_type TEXT NOT NULL,
+      workspace_jid TEXT NOT NULL,
+      workspace_folder TEXT,
+      session_id TEXT,
+      routing_mode TEXT NOT NULL DEFAULT 'single_session',
+      reply_policy TEXT NOT NULL DEFAULT 'source_only',
+      activation_mode TEXT NOT NULL DEFAULT 'auto',
+      audience_mode TEXT NOT NULL DEFAULT 'everyone',
+      owner_im_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_profile
+      ON agent_channel_mounts(agent_profile_id);
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_workspace
+      ON agent_channel_mounts(workspace_jid);
+    CREATE INDEX IF NOT EXISTS idx_agent_channel_mounts_session
+      ON agent_channel_mounts(session_id);
 
     CREATE TABLE IF NOT EXISTS provider_pool_model_options (
       runtime TEXT NOT NULL,
@@ -8753,4 +8789,276 @@ export function verifyWorkspaceProjection(): {
   }
 
   return { ok: problems.length === 0, problems };
+}
+
+// --- Channel mounts (batch 7) ---
+
+export interface ChannelMount {
+  channelJid: string;
+  channelType: string;
+  workspaceJid: string;
+  workspaceFolder: string | null;
+  ownerUserId: string | null;
+  agentProfileId: string | null;
+  routingMode: string;
+  replyPolicy: string;
+  activationMode: string;
+  audienceMode: string;
+  ownerImId: string | null;
+}
+
+function mapMount(r: Record<string, unknown>): ChannelMount {
+  return {
+    channelJid: r.channel_jid as string,
+    channelType: r.channel_type as string,
+    workspaceJid: r.workspace_jid as string,
+    workspaceFolder: (r.workspace_folder as string) ?? null,
+    ownerUserId: (r.owner_user_id as string) ?? null,
+    agentProfileId: (r.agent_profile_id as string) ?? null,
+    routingMode: (r.routing_mode as string) ?? 'single_session',
+    replyPolicy: (r.reply_policy as string) ?? 'source_only',
+    activationMode: (r.activation_mode as string) ?? 'auto',
+    audienceMode: (r.audience_mode as string) ?? 'everyone',
+    ownerImId: (r.owner_im_id as string) ?? null,
+  };
+}
+
+export function getChannelMount(channelJid: string): ChannelMount | null {
+  const row = db
+    .prepare('SELECT * FROM agent_channel_mounts WHERE channel_jid = ?')
+    .get(channelJid) as Record<string, unknown> | undefined;
+  return row ? mapMount(row) : null;
+}
+
+export function listChannelMounts(): ChannelMount[] {
+  const rows = db
+    .prepare('SELECT * FROM agent_channel_mounts ORDER BY channel_jid')
+    .all() as Array<Record<string, unknown>>;
+  return rows.map(mapMount);
+}
+
+export function setChannelMount(mount: {
+  channelJid: string;
+  channelType: string;
+  workspaceJid: string;
+  workspaceFolder?: string | null;
+  ownerUserId?: string | null;
+  agentProfileId?: string | null;
+  routingMode?: string;
+  replyPolicy?: string;
+  activationMode?: string;
+  audienceMode?: string;
+  ownerImId?: string | null;
+}): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO agent_channel_mounts
+       (channel_jid, agent_profile_id, owner_user_id, channel_type, workspace_jid,
+        workspace_folder, session_id, routing_mode, reply_policy, activation_mode,
+        audience_mode, owner_im_id, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(channel_jid) DO UPDATE SET
+       agent_profile_id = excluded.agent_profile_id,
+       owner_user_id    = excluded.owner_user_id,
+       channel_type     = excluded.channel_type,
+       workspace_jid    = excluded.workspace_jid,
+       workspace_folder = excluded.workspace_folder,
+       routing_mode     = excluded.routing_mode,
+       reply_policy     = excluded.reply_policy,
+       activation_mode  = excluded.activation_mode,
+       audience_mode    = excluded.audience_mode,
+       owner_im_id      = excluded.owner_im_id,
+       updated_at       = excluded.updated_at`,
+  ).run(
+    mount.channelJid,
+    mount.agentProfileId ?? null,
+    mount.ownerUserId ?? null,
+    mount.channelType,
+    mount.workspaceJid,
+    mount.workspaceFolder ?? null,
+    mount.routingMode ?? 'single_session',
+    mount.replyPolicy ?? 'source_only',
+    mount.activationMode ?? 'auto',
+    mount.audienceMode ?? 'everyone',
+    mount.ownerImId ?? null,
+    now,
+    now,
+  );
+}
+
+export function deleteChannelMount(channelJid: string): void {
+  db.prepare('DELETE FROM agent_channel_mounts WHERE channel_jid = ?').run(
+    channelJid,
+  );
+}
+
+/**
+ * Copy every registered_groups.target_main_jid binding into agent_channel_mounts.
+ *
+ * Deliberately additive: target_main_jid is NOT cleared here. The two
+ * representations coexist until reconcileChannelMounts() confirms they agree on
+ * every row (decision M5: all accounts, all workspaces, correct in one pass, no
+ * compromise). Retiring the column while the new table is unverified would make
+ * a migration bug indistinguishable from a routing bug, with no way back except
+ * the backup.
+ *
+ * Idempotent: re-running converges rather than duplicating, so it is safe on
+ * every boot and safe to retry after a partial failure.
+ */
+export function migrateTargetMainJidToChannelMounts(): {
+  migrated: number;
+  skipped: Array<{ jid: string; reason: string }>;
+} {
+  const rows = db
+    .prepare(
+      `SELECT jid, folder, target_main_jid, created_by, owner_im_id,
+              reply_policy, activation_mode
+         FROM registered_groups
+        WHERE target_main_jid IS NOT NULL AND target_main_jid != ''`,
+    )
+    .all() as Array<Record<string, unknown>>;
+
+  const skipped: Array<{ jid: string; reason: string }> = [];
+  let migrated = 0;
+
+  const tx = db.transaction(() => {
+    for (const row of rows) {
+      const channelJid = row.jid as string;
+      const targetJid = row.target_main_jid as string;
+
+      // The mount must point at a workspace that exists, or routing would send
+      // messages into nothing. A dangling pointer is reported, never guessed at.
+      const target = db
+        .prepare('SELECT jid, folder FROM registered_groups WHERE jid = ?')
+        .get(targetJid) as { jid: string; folder: string } | undefined;
+      if (!target) {
+        skipped.push({ jid: channelJid, reason: `target ${targetJid} not registered` });
+        continue;
+      }
+
+      const sep = channelJid.indexOf(':');
+      const channelType = sep > 0 ? channelJid.slice(0, sep) : 'unknown';
+
+      db.prepare(
+        `INSERT INTO agent_channel_mounts
+           (channel_jid, agent_profile_id, owner_user_id, channel_type,
+            workspace_jid, workspace_folder, session_id, routing_mode,
+            reply_policy, activation_mode, audience_mode, owner_im_id,
+            created_at, updated_at)
+         VALUES (?, NULL, ?, ?, ?, ?, NULL, 'single_session', ?, ?, 'everyone', ?, ?, ?)
+         ON CONFLICT(channel_jid) DO UPDATE SET
+           owner_user_id    = excluded.owner_user_id,
+           channel_type     = excluded.channel_type,
+           workspace_jid    = excluded.workspace_jid,
+           workspace_folder = excluded.workspace_folder,
+           reply_policy     = excluded.reply_policy,
+           activation_mode  = excluded.activation_mode,
+           owner_im_id      = excluded.owner_im_id,
+           updated_at       = excluded.updated_at`,
+      ).run(
+        channelJid,
+        (row.created_by as string) ?? null,
+        channelType,
+        target.jid,
+        target.folder,
+        (row.reply_policy as string) || 'source_only',
+        (row.activation_mode as string) || 'auto',
+        (row.owner_im_id as string) ?? null,
+        new Date().toISOString(),
+        new Date().toISOString(),
+      );
+      migrated++;
+    }
+  });
+  tx();
+
+  return { migrated, skipped };
+}
+
+/**
+ * Reconcile agent_channel_mounts against the target_main_jid bindings it was
+ * built from.
+ *
+ * This is the M5 acceptance gate, run by script rather than by eye: every
+ * binding must be present, point at the same workspace, and nothing extra may
+ * have appeared. Any single disagreement fails the whole check — a partially
+ * correct routing table is worse than an unmigrated one, because it looks fine.
+ */
+export function reconcileChannelMounts(): {
+  ok: boolean;
+  checked: number;
+  problems: string[];
+} {
+  const problems: string[] = [];
+
+  const bindings = db
+    .prepare(
+      `SELECT g.jid, g.target_main_jid, t.folder AS target_folder
+         FROM registered_groups g
+         LEFT JOIN registered_groups t ON t.jid = g.target_main_jid
+        WHERE g.target_main_jid IS NOT NULL AND g.target_main_jid != ''`,
+    )
+    .all() as Array<{ jid: string; target_main_jid: string; target_folder: string | null }>;
+
+  for (const binding of bindings) {
+    const mount = db
+      .prepare(
+        'SELECT workspace_jid, workspace_folder FROM agent_channel_mounts WHERE channel_jid = ?',
+      )
+      .get(binding.jid) as
+      | { workspace_jid: string; workspace_folder: string | null }
+      | undefined;
+
+    if (!mount) {
+      // A dangling binding is legitimately absent — migration reports it as
+      // skipped rather than inventing a target.
+      if (binding.target_folder === null) continue;
+      problems.push(`missing mount for ${binding.jid}`);
+      continue;
+    }
+    if (mount.workspace_jid !== binding.target_main_jid) {
+      problems.push(
+        `mount ${binding.jid} points at ${mount.workspace_jid}, binding says ${binding.target_main_jid}`,
+      );
+    }
+    if (
+      binding.target_folder !== null &&
+      mount.workspace_folder !== binding.target_folder
+    ) {
+      problems.push(
+        `mount ${binding.jid} folder ${mount.workspace_folder} != ${binding.target_folder}`,
+      );
+    }
+  }
+
+  // Extra mounts are as bad as missing ones: they would route a channel that the
+  // source of truth says is unbound.
+  const extras = db
+    .prepare(
+      `SELECT m.channel_jid FROM agent_channel_mounts m
+        WHERE NOT EXISTS (
+          SELECT 1 FROM registered_groups g
+           WHERE g.jid = m.channel_jid
+             AND g.target_main_jid IS NOT NULL AND g.target_main_jid != ''
+        )
+        LIMIT 5`,
+    )
+    .all() as Array<{ channel_jid: string }>;
+  for (const extra of extras) {
+    problems.push(`unexpected mount not backed by a binding: ${extra.channel_jid}`);
+  }
+
+  // A mount pointing at an unregistered workspace routes into nothing.
+  const dangling = db
+    .prepare(
+      `SELECT m.channel_jid FROM agent_channel_mounts m
+        WHERE NOT EXISTS (SELECT 1 FROM registered_groups g WHERE g.jid = m.workspace_jid)
+        LIMIT 5`,
+    )
+    .all() as Array<{ channel_jid: string }>;
+  for (const row of dangling) {
+    problems.push(`mount ${row.channel_jid} points at an unregistered workspace`);
+  }
+
+  return { ok: problems.length === 0, checked: bindings.length, problems };
 }

@@ -99,6 +99,8 @@ import {
   promotePendingConversationRuntimeBinding,
   setConversationRuntimeBinding,
   backfillEmptyAllowlistsForUser,
+  migrateTargetMainJidToChannelMounts,
+  reconcileChannelMounts,
   rebuildWorkspaceProjection,
   verifyWorkspaceProjection,
 } from './db.js';
@@ -3186,6 +3188,34 @@ function loadState(): void {
       { deleted: privacyCleaned },
       'Privacy mode: cleaned up orphaned messages from previous session',
     );
+  }
+
+  // Migrate target_main_jid bindings into agent_channel_mounts (batch 7), then
+  // reconcile. Additive on purpose: target_main_jid stays in place until the new
+  // table is proven to agree on every row (decision M5). Retiring the column
+  // while the mounts are unverified would make a migration bug
+  // indistinguishable from a routing bug, with no way back except the backup.
+  try {
+    const { migrated, skipped } = migrateTargetMainJidToChannelMounts();
+    const recon = reconcileChannelMounts();
+    if (recon.ok) {
+      logger.info(
+        { migrated, checked: recon.checked, skipped: skipped.length },
+        'Channel mounts migrated and reconciled',
+      );
+    } else {
+      // Loud, and specific about which rows disagree — a partially correct
+      // routing table looks fine, which is what makes it dangerous.
+      logger.error(
+        { migrated, skipped, problems: recon.problems },
+        'Channel mount reconciliation FAILED — routing still served by target_main_jid',
+      );
+    }
+    if (skipped.length) {
+      logger.warn({ skipped }, 'Channel mounts skipped (dangling targets)');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Channel mount migration failed');
   }
 
   // Rebuild the workspaces projection (batch 6) from registered_groups/sessions.
