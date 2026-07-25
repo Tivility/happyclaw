@@ -101,6 +101,7 @@ import {
   backfillEmptyAllowlistsForUser,
   migrateTargetMainJidToChannelMounts,
   reconcileChannelMounts,
+  evaluateSessionValidity,
   setMessageDeliveryState,
   type DeliveryStatus,
   rebuildWorkspaceProjection,
@@ -1841,15 +1842,26 @@ function startModelSwitchWithHandoff(
       //
       // Summarising every switch was a deliberate cost trade-off originally;
       // measured in practice the cost is acceptable and the lost context is not.
-      const previousRuntime = ensureConversationRuntimeState(
+      const previousState = ensureConversationRuntimeState(
         input.target.folder,
         input.target.agentId ?? '',
-      ).runtime as string | null | undefined;
-      const runtimeChanged =
-        !!previousRuntime && previousRuntime !== input.binding.runtime;
+      );
+      // One shared judgement decides whether the stored session survives, so
+      // "provider change discards, model change does not" is defined once rather
+      // than re-derived at each switch site.
+      const validity = evaluateSessionValidity(
+        {
+          runtime: previousState.runtime as string | null,
+          resolvedModel: previousState.resolved_model as string | null,
+        },
+        {
+          runtime: input.binding.runtime,
+          resolvedModel: input.binding.resolved_model,
+        },
+      );
 
       const summary =
-        privacyMode || !runtimeChanged
+        privacyMode || !validity.shouldDiscard
           ? null
           : await createModelSwitchHandoffSummary({
               groupFolder: input.target.folder,

@@ -42,6 +42,7 @@ import {
   deleteSession,
   getSessionProviderId,
   setSessionProviderId,
+  evaluateSessionValidity,
   getWorkspaceAgentProfile,
   hasSessionAgentProfileMismatch,
 } from './db.js';
@@ -1231,13 +1232,22 @@ export async function runContainerAgent(
   let codexAuthMaterial: CodexProviderAuthMaterial | null = null;
   let grokAuthMaterial: GrokProviderAuthMaterial | null = null;
   let providerFailureReported = false;
-  if (poolResult?.resetSession && input.sessionId) {
+  // Route the discard decision through the shared judgement so all switch kinds
+  // answer to one rule. The pool already knows the provider moved; asking here
+  // keeps "provider change discards, model change does not" defined in exactly
+  // one place instead of drifting between call sites.
+  const providerValidity = evaluateSessionValidity(
+    { providerId: poolResult?.previousProviderId ?? null },
+    { providerId: selectedProfileId ?? null },
+  );
+  if (poolResult?.resetSession && providerValidity.shouldDiscard && input.sessionId) {
     logger.info(
       {
         groupFolder: group.folder,
         agentId: input.agentId || null,
         previousProviderId: poolResult.previousProviderId,
         providerId: selectedProfileId,
+        reasons: providerValidity.reasons,
       },
       'Clearing Claude session after switching providers',
     );
@@ -1886,13 +1896,23 @@ export async function runHostAgent(
     (isCodexRuntime ? 'gpt' : isGrokRuntime ? 'grok' : 'claude');
   const globalConfig = hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
-  if (hostPoolResult?.resetSession && input.sessionId) {
+  // Mirrors the docker path above: same judgement, same rule.
+  const hostProviderValidity = evaluateSessionValidity(
+    { providerId: hostPoolResult?.previousProviderId ?? null },
+    { providerId: hostSelectedProfileId ?? null },
+  );
+  if (
+    hostPoolResult?.resetSession &&
+    hostProviderValidity.shouldDiscard &&
+    input.sessionId
+  ) {
     logger.info(
       {
         groupFolder: group.folder,
         agentId: input.agentId || null,
         previousProviderId: hostPoolResult.previousProviderId,
         providerId: hostSelectedProfileId,
+        reasons: hostProviderValidity.reasons,
       },
       'Clearing Claude session after switching providers',
     );

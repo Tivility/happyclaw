@@ -738,3 +738,39 @@ schema 44 → 45。`messages` 加 delivery 五列。
 **顺带修掉一个 mock 缺项**：`model-runtime-claude-models.test.ts` mock 了 `db.js`，新导出未列入导致 4 个既有用例失败。补 mock 而非改行为——那 4 个测的是模型命名归一化，与会话续接无关。
 
 **仍未接入的（诚实记录）**：批次 9 的 `evaluateSessionValidity` / `evaluateStoredSessionValidity` 定义了、19 个用例全过，但**没有任何调用点，目前是死代码**。四条切换路径的判断逻辑仍散在各处。收口它属于纯内部清理、对使用者零可见变化，已告知使用者可择期再做。
+
+### 收口 · 四条切换路径统一由一处判定
+
+使用者确认「是个合理的抽象」后落地。
+
+**动手时发现我自己引入的矛盾**：`evaluateSessionValidity` 写的是 `model_changed → shouldDiscard: true`，但上一节刚把行为改成「同运行时换模型要保留」。两处直接冲突——**这正是这个抽象要防的事，而且它在被接入的第一刻就抓到了自己**。
+
+**修正后的规则**（只有让 session id **不可用**的漂移才丢弃）
+
+| 漂移 | 丢弃 | 理由 |
+|---|---|---|
+| `runtime_changed` | ✅ | 另一 runtime 签发自己的 session id |
+| `provider_changed` | ✅ | 换 OAuth 账号使 thinking block 签名失效 |
+| `model_changed` | ❌ | 同运行时内 transcript 与模型无关，carry-over 接得上 |
+| `persona_changed` | ❌ | O1-b：前缀变了，吃一次 cache miss |
+
+**收口的三处**
+- `container-runner.ts` docker 路径：provider 切换改为经 `evaluateSessionValidity` 判定
+- `container-runner.ts` host 路径：同上（两条必须对称）
+- `index.ts` 的 `/model` 切换：用统一判定替代上一节我写的 runtime 直接比对
+
+**没有收口的一处（有意）**：`group-queue.ts` 的 `hasPendingConversationRuntimeBinding` 是**排空调度**，不是有效性判断——把它并进来会把"何时应用新绑定"与"会话还能不能用"两件事混为一谈。
+
+**验收**：新增 6 用例，按调用点视角写（provider 轮换 / 同 provider 重选 / 跨运行时 / 同运行时换模型 / 人格编辑 / 首次无证据），使将来改规则时会在这里暴露而非在各站点静默分叉。118 文件 / 1398 通过，上线后启动零 ERROR。
+
+### 附 · 飞书会话内的 agent 切换机制（查证）
+
+使用者问「一个飞书会话内可以切换 agent 吗」。查证结论：**可以，但机制是「话题」而非命令。**
+
+| `binding_mode` | 行为 |
+|---|---|
+| 默认（`target_main_jid`） | 整群 → 工作区主会话，`agentId = null`，无法切换 |
+| `target_agent_id` | 整群 → 钉死一个 agent，无法切换 |
+| **`thread_map`** | **每个飞书话题 → 一个独立 agent**，由 `resolveOrCreateThreadAgent` 按需创建 |
+
+所以 `thread_map` 模式下开新话题即开新 agent、回旧话题即回该 agent 的上下文。这也解释了为何 agent 标签页各自独立会话是合理的——它们对应飞书里不同的话题，本就该是不同对话。

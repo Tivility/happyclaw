@@ -9234,11 +9234,11 @@ export interface SessionValidity {
   /**
    * Whether the caller should discard the session.
    *
-   * Persona drift alone never does (decision O1-b): the prompt prefix changes
-   * and the next turn pays one cache miss, exactly as it already does when the
-   * agent rewrites its own CLAUDE.md. Engine drift does, because a native
-   * session id issued by one runtime/provider is meaningless to another —
-   * resuming it produces an error, not a stale prefix.
+   * True only when the stored session id has become unusable: another runtime
+   * issues its own ids, and another OAuth account invalidates thinking-block
+   * signatures. Persona drift never discards (decision O1-b), and neither does a
+   * model change within one runtime — the transcript is model-agnostic and
+   * getCarryOverNativeSession carries the session across.
    */
   shouldDiscard: boolean;
 }
@@ -9288,11 +9288,26 @@ export function evaluateSessionValidity(
     reasons.push('model_changed');
   }
 
-  const engineDrift = reasons.some((r) => r !== 'persona_changed');
+  // Only drift that makes the stored session id *unusable* forces a discard:
+  //
+  //   runtime_changed   another runtime issues its own session ids
+  //   provider_changed  another OAuth account invalidates thinking-block signatures
+  //
+  // persona_changed does not (decision O1-b): the prompt prefix moved, so the
+  // next turn pays one cache miss, exactly as it already does when the agent
+  // rewrites its own CLAUDE.md.
+  //
+  // model_changed does not either: within one runtime the transcript is
+  // model-agnostic and getCarryOverNativeSession hands the session across, so
+  // discarding here would throw away context the platform is happy to resume.
+  const DISCARDING: readonly SessionInvalidReason[] = [
+    'runtime_changed',
+    'provider_changed',
+  ];
   return {
     valid: reasons.length === 0,
     reasons,
-    shouldDiscard: engineDrift,
+    shouldDiscard: reasons.some((r) => DISCARDING.includes(r)),
   };
 }
 

@@ -178,10 +178,12 @@ describe('evaluateSessionValidity', () => {
     expect(v.shouldDiscard).toBe(true);
   });
 
-  test('model drift discards', () => {
+  test('model drift is reported but does NOT discard within one runtime', () => {
+    // The transcript is model-agnostic and getCarryOverNativeSession hands the
+    // session across, so discarding here would throw away resumable context.
     const v = db.evaluateSessionValidity(base, { ...base, resolvedModel: 'sonnet' });
     expect(v.reasons).toContain('model_changed');
-    expect(v.shouldDiscard).toBe(true);
+    expect(v.shouldDiscard).toBe(false);
   });
 
   test('persona plus engine drift discards, and reports both', () => {
@@ -237,5 +239,67 @@ describe('evaluateStoredSessionValidity', () => {
         runtime: 'claude',
       }).valid,
     ).toBe(true);
+  });
+});
+
+/**
+ * The four switch paths (provider rotation, /model, persona edit, agent tabs)
+ * each used to decide "is this session still usable" on their own. They now all
+ * route through evaluateSessionValidity, so the rule lives in exactly one place.
+ *
+ * These cases are written as the call sites see them, so a future change to the
+ * rule shows up here rather than silently diverging between sites.
+ */
+describe('one rule across every switch path', () => {
+  test('provider rotation discards — the call site in container-runner', () => {
+    const v = db.evaluateSessionValidity(
+      { providerId: 'prov1' },
+      { providerId: 'prov2' },
+    );
+    expect(v.shouldDiscard).toBe(true);
+  });
+
+  test('same provider re-selected does not discard', () => {
+    // Sticky pool re-picking the same account must not throw the session away.
+    const v = db.evaluateSessionValidity(
+      { providerId: 'prov1' },
+      { providerId: 'prov1' },
+    );
+    expect(v.shouldDiscard).toBe(false);
+    expect(v.valid).toBe(true);
+  });
+
+  test('/model across runtimes discards, so a handoff summary is written', () => {
+    const v = db.evaluateSessionValidity(
+      { runtime: 'claude', resolvedModel: 'opus' },
+      { runtime: 'codex', resolvedModel: 'gpt' },
+    );
+    expect(v.shouldDiscard).toBe(true);
+  });
+
+  test('/model within one runtime keeps the session, so no summary is written', () => {
+    // This is the behaviour change: it used to summarise unconditionally.
+    const v = db.evaluateSessionValidity(
+      { runtime: 'claude', resolvedModel: 'opus' },
+      { runtime: 'claude', resolvedModel: 'sonnet' },
+    );
+    expect(v.reasons).toEqual(['model_changed']);
+    expect(v.shouldDiscard).toBe(false);
+  });
+
+  test('a persona edit keeps the session (O1-b)', () => {
+    const v = db.evaluateSessionValidity(
+      { identityHash: 'h1' },
+      { identityHash: 'h2' },
+    );
+    expect(v.shouldDiscard).toBe(false);
+  });
+
+  test('an unknown previous provider does not force a discard', () => {
+    // First run after the columns landed: no evidence of drift is not drift.
+    expect(
+      db.evaluateSessionValidity({ providerId: null }, { providerId: 'prov1' })
+        .shouldDiscard,
+    ).toBe(false);
   });
 });
