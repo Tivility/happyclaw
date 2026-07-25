@@ -12,6 +12,22 @@ allowed-tools: Bash(agent-browser:*)
 2. Snapshot: `agent-browser snapshot -i` — returns interactive elements with refs like `@e1`, `@e2`
 3. Interact using the refs
 4. Re-snapshot after navigation or significant DOM changes
+5. **Finish with `agent-browser close`** — required, see below
+
+## 用完必须关闭
+
+浏览器进程在多次 `agent-browser` 调用之间保持存活（这正是上一次 `snapshot` 拿到的
+`@e1` 还能用的原因），并且它是 detached 的——不会随任务结束自动退出。
+
+**任务结束前必须执行 `agent-browser close`。** 忘记关闭会留下常驻的 Chromium：
+曾经累积到 43 个进程、772% CPU、17% 内存。
+
+- 单个会话：`agent-browser close`
+- 排查残留：`agent-browser session list`
+- 不要用 `close --all`：它会关掉机器上所有会话，可能影响其他工作区
+
+即使忘了，宿主机模式下 HappyClaw 会在 agent 进程退出时按会话名兜底关闭一次；
+但那是兜底，不是替代——中途换任务、长时间不退出的会话仍会占资源。
 
 ```bash
 agent-browser open https://example.com/form

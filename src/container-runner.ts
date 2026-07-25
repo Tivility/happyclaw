@@ -1764,6 +1764,23 @@ export async function runHostAgent(
   // on non-macOS hosts (the var does not exist there).
   delete hostEnv['XPC_FLAGS'];
 
+  // Give every host run its own agent-browser session, so the Chromium it may
+  // start is addressable for cleanup on exit (see the 'close' handler below).
+  //
+  // agent-browser keeps a browser alive between CLI invocations — that is what
+  // makes `@e1` refs from a previous `snapshot` still resolvable — and it
+  // detaches, so it survives agent-runner's exit and escapes killProcessTree's
+  // process group. Without this, every run that forgot `agent-browser close`
+  // leaked a Chromium: 43 of them had accumulated at 772% CPU before the first
+  // manual cleanup.
+  //
+  // Naming the session per folder+agent means the exit cleanup closes only this
+  // run's browser: the operator's own Chrome and other workspaces' sessions are
+  // never touched (which a pid/name-matching sweep could not guarantee).
+  // Docker mode needs none of this — Chromium lives inside the `--rm` container.
+  const browserSessionName = `hc-${group.folder}${input.agentId ? `-${input.agentId}` : ''}`;
+  hostEnv['AGENT_BROWSER_SESSION'] = browserSessionName;
+
   // ─── Provider Pool selection (host mode) ───
   const isCodexRuntime = input.runtime === 'codex';
   const isGrokRuntime = input.runtime === 'grok';
@@ -2203,6 +2220,30 @@ export async function runHostAgent(
         clearTimeout(timeout);
         if (killTimer) clearTimeout(killTimer);
         const duration = Date.now() - startTime;
+
+        // Close this run's agent-browser session. Best-effort and fire-and-forget:
+        // the run's result must never depend on browser teardown. Scoped to
+        // AGENT_BROWSER_SESSION (see hostEnv above), so an operator's own Chrome
+        // and other workspaces' sessions are untouched. A run that never started
+        // a browser exits non-zero here, which is expected and stays at debug.
+        execFile(
+          'agent-browser',
+          ['--session', browserSessionName, 'close'],
+          { timeout: 15_000, env: hostEnv },
+          (browserErr) => {
+            if (browserErr) {
+              logger.debug(
+                { group: group.name, browserSessionName, err: browserErr.message },
+                'agent-browser session cleanup skipped (no session or CLI unavailable)',
+              );
+            } else {
+              logger.info(
+                { group: group.name, browserSessionName },
+                'Closed agent-browser session after host run',
+              );
+            }
+          },
+        );
 
         const closeCtx: CloseHandlerContext = {
           groupName: group.name,

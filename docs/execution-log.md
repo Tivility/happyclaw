@@ -220,3 +220,46 @@ plist 里有 `NODE_ENV=production`，npm 在该模式下连带 prune 掉已装�
 已挂后台观察等首次写入。**若届时「表观体积远大于实际占块」，说明不是 append 模式，需改为「轮转后重启服务」或改由应用自己管理日志文件** —— 脚本里的 `check_sparse()` 会在下次轮转时自动报出这一情况。
 
 **数据备份**：轮转本身即备份——原始 110 MB 日志已完整 gzip 归档在 `data/logs-archive/`（`data/` 已在 .gitignore 中）。
+
+**提交**：`12029c6`
+
+---
+
+### B-5 · P12 僵尸 Chrome 清理（a + b）
+
+**根因**：agent-browser 为了让 `@e1` 这类元素引用**跨多次 CLI 调用保持有效**，必须维持一个常驻浏览器进程，而且它是 detached 的——脱离 agent-runner 的进程组，`killProcessTree(-pid)` 收不到。三个条件叠加导致累积：常驻设计 + agent 用完不 close + HappyClaw 无退出清理（在 agent-runner 与 container-runner 里搜 `agent-browser|chromium` 曾**零匹配**）。曾累积到 43 个进程 / 772% CPU / 17% 内存。
+
+**调研结论：不需要 pid 匹配**
+
+agent-browser 是编译好的原生二进制（`agent-browser-darwin-arm64`），读不到源码，但 CLI 自带隔离机制：
+
+```
+--session <name>        Isolated session (or AGENT_BROWSER_SESSION env)
+session list            List active sessions
+close [--all]           Close browser (--all closes every session)
+```
+
+于是清理可以**按会话名精确定位**，而不是靠进程名/pid 猜——这是关键，因为 pid 匹配无法可靠区分"agent 起的 Chromium"和"操作者自己的 Chrome"。
+
+**落地**
+
+- **a · `container/skills/agent-browser/SKILL.md`**：核心流程加第 5 步「必须 `agent-browser close`」，并新增「用完必须关闭」小节，解释常驻+detached 的原因、给出 `session list` 排查方法、明确**禁止 `close --all`**（会关掉机器上所有会话，影响其他工作区）
+- **b · `src/container-runner.ts`**：
+  - `hostEnv` 注入 `AGENT_BROWSER_SESSION=hc-{folder}[-{agentId}]`，让每次宿主机运行拥有独立会话
+  - `proc.on('close')` 里 fire-and-forget 执行 `agent-browser --session <name> close`，15s 超时，失败只记 debug（未起过浏览器的运行本就非零退出）
+  - **仅宿主机模式需要**：docker 模式下 Chromium 活在 `--rm` 容器内，容器销毁即回收
+
+**验收（端到端实测）**
+
+| 步骤 | 结果 |
+|---|---|
+| `AGENT_BROWSER_SESSION=hc-probe-test agent-browser open ...` | ✅ 退出码 0 |
+| `agent-browser session list` | ✅ 显示 `hc-probe-test`，会话隔离生效 |
+| `agent-browser --session hc-probe-test close` | ✅ `✓ Browser closed` |
+| 清理后 `session list` | ✅ `No active sessions` |
+| 清理后 chromium 残留进程 | ✅ **0** |
+| `make typecheck` / `make test` | ✅ 全绿 / 1191 通过 |
+
+**设计取舍**：a 是降低产生率（提示词层，不可靠），b 是兜底根治。两者都做的理由是 b 只在 agent 进程退出时触发——中途换任务、长时间不退出的会话仍会占资源，所以仍需 a 要求 agent 主动关闭。SKILL.md 里明确写了「b 是兜底不是替代」。
+
+**数据备份**：不涉及（无数据/schema 变更）。
