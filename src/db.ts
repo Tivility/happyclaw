@@ -61,7 +61,7 @@ import {
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
 let db: InstanceType<typeof Database>;
-const SCHEMA_VERSION = '42';
+const SCHEMA_VERSION = '43';
 const DB_BACKUP_ENV_OVERRIDE = 'HAPPYCLAW_ALLOW_DB_MIGRATION_WITHOUT_BACKUP';
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
@@ -1005,6 +1005,49 @@ export function initDatabase(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_workspace_agent_profiles_profile
       ON workspace_agent_profiles(agent_profile_id);
+
+    -- Workspace projection (batch 6).
+    --
+    -- registered_groups stays the source of truth; this is a read-optimised
+    -- view of it under the upstream naming, so upstream code and future merges
+    -- have the shape they expect without a second write path. Every column here
+    -- is derived -- nothing is authored directly against this table.
+    CREATE TABLE IF NOT EXISTS workspaces (
+      jid TEXT PRIMARY KEY,
+      folder TEXT NOT NULL,
+      owner_user_id TEXT,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      is_home INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspaces_folder ON workspaces(folder);
+    CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_user_id, status);
+
+    -- Resume metadata projected from the sessions table. Deliberately not named
+    -- sessions: product conversation Sessions live in agents, while these rows
+    -- only carry SDK/provider resume state plus the persona fingerprint.
+    --
+    -- Note this is a projection of the LEGACY single-session-per-folder shape.
+    -- The local per-runtime native sessions live in conversation_runtime_sessions
+    -- and are richer (one row per runtime x provider x model); this table is not
+    -- a replacement for them and must never be written back into them.
+    CREATE TABLE IF NOT EXISTS workspace_runtime_sessions (
+      group_folder TEXT NOT NULL,
+      runtime_agent_id TEXT NOT NULL DEFAULT '',
+      workspace_jid TEXT NOT NULL,
+      sdk_session_id TEXT NOT NULL DEFAULT '',
+      provider_id TEXT,
+      agent_profile_id TEXT,
+      agent_profile_version INTEGER,
+      identity_hash TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (group_folder, runtime_agent_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_workspace_runtime_sessions_jid
+      ON workspace_runtime_sessions(workspace_jid);
 
     CREATE TABLE IF NOT EXISTS provider_pool_model_options (
       runtime TEXT NOT NULL,
@@ -8571,4 +8614,143 @@ export function hasSessionAgentProfileMismatch(
     recorded.agentProfileId !== current.agentProfileId ||
     recorded.identityHash !== current.identityHash
   );
+}
+
+// --- Workspace projection (batch 6) ---
+
+/**
+ * Rebuild the workspaces / workspace_runtime_sessions projection from
+ * registered_groups and sessions.
+ *
+ * Why a projection rather than a migration: registered_groups carries local-only
+ * columns (execution_mode, custom_cwd, selected_skills, require_mention,
+ * target_main_jid, ...) that upstream's workspaces table has no room for. Moving
+ * the source of truth would lose them. Projecting instead gives upstream code and
+ * future merges the shape they expect while keeping exactly one write path.
+ *
+ * Full rebuild rather than incremental sync, deliberately: the projection is
+ * cheap (tens of rows here) and a rebuild cannot drift. An incremental updater
+ * would need a hook on every registered_groups write, and a missed hook produces
+ * a silently stale projection -- the failure mode this is meant to avoid.
+ *
+ * Returns what it wrote so a caller can log or assert on it.
+ */
+export function rebuildWorkspaceProjection(): {
+  workspaces: number;
+  runtimeSessions: number;
+} {
+  const now = new Date().toISOString();
+
+  const tx = db.transaction(() => {
+    // DELETE + INSERT rather than UPSERT: rows removed from registered_groups
+    // must disappear here too, and a diff would have to find them anyway.
+    db.prepare('DELETE FROM workspaces').run();
+    db.prepare(
+      `INSERT INTO workspaces
+         (jid, folder, owner_user_id, name, status, is_home, created_at, updated_at)
+       SELECT jid,
+              folder,
+              created_by,
+              COALESCE(NULLIF(name, ''), folder),
+              'active',
+              COALESCE(is_home, 0),
+              COALESCE(NULLIF(added_at, ''), ?),
+              ?
+         FROM registered_groups`,
+    ).run(now, now);
+
+    db.prepare('DELETE FROM workspace_runtime_sessions').run();
+    // Only sessions whose folder still exists are projected; an orphan session
+    // row would produce a workspace_jid pointing at nothing.
+    db.prepare(
+      `INSERT INTO workspace_runtime_sessions
+         (group_folder, runtime_agent_id, workspace_jid, sdk_session_id,
+          provider_id, agent_profile_id, agent_profile_version, identity_hash,
+          created_at, updated_at)
+       SELECT s.group_folder,
+              COALESCE(s.agent_id, ''),
+              (SELECT g.jid FROM registered_groups g
+                WHERE g.folder = s.group_folder
+                ORDER BY g.is_home DESC, g.jid
+                LIMIT 1),
+              COALESCE(s.session_id, ''),
+              s.provider_id,
+              s.agent_profile_id,
+              s.agent_profile_version,
+              s.identity_hash,
+              ?,
+              ?
+         FROM sessions s
+        WHERE EXISTS (SELECT 1 FROM registered_groups g WHERE g.folder = s.group_folder)`,
+    ).run(now, now);
+  });
+  tx();
+
+  const workspaces = (
+    db.prepare('SELECT COUNT(*) AS c FROM workspaces').get() as { c: number }
+  ).c;
+  const runtimeSessions = (
+    db
+      .prepare('SELECT COUNT(*) AS c FROM workspace_runtime_sessions')
+      .get() as { c: number }
+  ).c;
+  return { workspaces, runtimeSessions };
+}
+
+/**
+ * Compare the projection against its sources.
+ *
+ * This is the acceptance gate for the projection (and the pattern batch 7's data
+ * migration will reuse): a mismatch means the projection is stale or the rebuild
+ * lost rows, and both are silent failures without an explicit check.
+ */
+export function verifyWorkspaceProjection(): {
+  ok: boolean;
+  problems: string[];
+} {
+  const problems: string[] = [];
+
+  const groupCount = (
+    db.prepare('SELECT COUNT(*) AS c FROM registered_groups').get() as { c: number }
+  ).c;
+  const wsCount = (
+    db.prepare('SELECT COUNT(*) AS c FROM workspaces').get() as { c: number }
+  ).c;
+  if (groupCount !== wsCount) {
+    problems.push(`workspaces count ${wsCount} != registered_groups ${groupCount}`);
+  }
+
+  const missing = db
+    .prepare(
+      `SELECT g.jid FROM registered_groups g
+        WHERE NOT EXISTS (SELECT 1 FROM workspaces w WHERE w.jid = g.jid)
+        LIMIT 5`,
+    )
+    .all() as Array<{ jid: string }>;
+  for (const row of missing) problems.push(`missing workspace row: ${row.jid}`);
+
+  const drifted = db
+    .prepare(
+      `SELECT g.jid FROM registered_groups g
+         JOIN workspaces w ON w.jid = g.jid
+        WHERE w.folder != g.folder
+           OR COALESCE(w.owner_user_id, '') != COALESCE(g.created_by, '')
+           OR w.is_home != COALESCE(g.is_home, 0)
+        LIMIT 5`,
+    )
+    .all() as Array<{ jid: string }>;
+  for (const row of drifted) problems.push(`drifted workspace row: ${row.jid}`);
+
+  const danglingSessions = db
+    .prepare(
+      `SELECT group_folder FROM workspace_runtime_sessions
+        WHERE workspace_jid IS NULL OR workspace_jid = ''
+        LIMIT 5`,
+    )
+    .all() as Array<{ group_folder: string }>;
+  for (const row of danglingSessions) {
+    problems.push(`runtime session without workspace jid: ${row.group_folder}`);
+  }
+
+  return { ok: problems.length === 0, problems };
 }

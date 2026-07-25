@@ -99,6 +99,8 @@ import {
   promotePendingConversationRuntimeBinding,
   setConversationRuntimeBinding,
   backfillEmptyAllowlistsForUser,
+  rebuildWorkspaceProjection,
+  verifyWorkspaceProjection,
 } from './db.js';
 // feishu.js deprecated exports are no longer needed; imManager handles all connections
 import { imManager } from './im-manager.js';
@@ -3184,6 +3186,28 @@ function loadState(): void {
       { deleted: privacyCleaned },
       'Privacy mode: cleaned up orphaned messages from previous session',
     );
+  }
+
+  // Rebuild the workspaces projection (batch 6) from registered_groups/sessions.
+  // Done on every boot rather than incrementally: the projection is small, a
+  // rebuild cannot drift, and an incremental updater would need a hook on every
+  // registered_groups write — a missed hook yields a silently stale projection,
+  // which is exactly the failure this is meant to prevent.
+  try {
+    const projected = rebuildWorkspaceProjection();
+    const check = verifyWorkspaceProjection();
+    if (check.ok) {
+      logger.info(projected, 'Workspace projection rebuilt');
+    } else {
+      logger.warn(
+        { ...projected, problems: check.problems },
+        'Workspace projection verification found problems',
+      );
+    }
+  } catch (err) {
+    // registered_groups stays the source of truth, so a projection failure must
+    // not stop the service from booting.
+    logger.warn({ err }, 'Workspace projection rebuild failed');
   }
 
   logger.info(
