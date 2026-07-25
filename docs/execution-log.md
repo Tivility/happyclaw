@@ -97,3 +97,47 @@ let queryRef: { interrupt(): Promise<unknown> } | null = null;
 **数据备份**：不涉及（无 schema 变更、无数据写入；新增函数是只读查询）。
 
 **退役时间**：阶段 E 批次 7 引入 `channel_mounts` 后，这三处改动连同 `target_main_jid` 一起删除。
+
+**提交**：`85b8496`
+
+---
+
+### B-2 · F5 飞书错误日志瘦身
+
+> ⚠️ **实现方式与原决策不同**，依据是动手前的新证据。原决策是「只给飞书上传路径加**流防护**」；实测后改为「飞书 API 错误日志瘦身」。理由见下，若判断不认可可回退。
+
+**原假设**：飞书 503 撕连接 → SDK 内部上传流异步抛 EPIPE → 逃出 `await` 的 try/catch → uncaughtException → `logger.ts:28` 无条件 `exit(1)`。
+
+**动手前的新证据**：量了 7-19 那条日志的实际落盘体积——
+
+```
+503 日志起始行 = 1736424   FATAL 行 = 1737827
+跨度 = 1403 行 / 48161 bytes
+```
+
+`logger.error({ err, chatId, mimeType }, ...)` 收到的是 AxiosError，它的 `request` / `response` / `config` 传递引用了 TLS socket、http agent 及其缓冲区。pino 把整张对象图序列化成了**单条 48 KB / 1403 行**的日志。
+
+而 `logger.ts` 用的是 `transport: { target: 'pino-pretty' }` —— pino 的 transport 走**管道到 worker**，不是直接写文件。48 KB 的巨型写入在飞往该管道的途中，进程随即死于 `write EPIPE`。
+
+**所以更可能的因果是**：不是上传 socket 抛 EPIPE，而是**把 48 KB 错误对象写进 pino transport 管道**时抛的。这也解释了为什么栈里没有任何 userland 帧。
+
+**为什么改了实现方式**：如果病因是日志写入，那"给上传流加防护"防不到它；反过来，把错误对象瘦身则同时消除了噪声与超大写入。而且 `lark.Client` 虽然支持注入 `httpInstance`，但要在第三方 SDK 的流上挂 error 监听仍然做不到——真正能阻止 `exit(1)` 的只有改 `logger.ts` 的 uncaughtException 策略，那正是本决策排除掉的选项。
+
+**落地**
+
+- `src/feishu.ts` 新增 `describeFeishuError(err)`：只保留 `name` / `code`（含 `cause.code`）/ `httpStatus` / `feishuCode` / `feishuMsg`（截 200）/ `message`（截 500）
+- 四处错误日志切换：文本回复（:1055）、卡片消息（:2004）、图片发送（:2062）、图片附件（:2000 warn）
+- 放在 `classifyFeishuError` 旁边，复用同一套错误字段解析心智模型
+
+**验收**
+
+| 项 | 结果 |
+|---|---|
+| 新增 `tests/feishu-error-describe.test.ts` | ✅ 6 用例 |
+| 循环引用的 socket 对象图 | ✅ 完全丢弃，序列化 < 500 bytes |
+| 凭据不泄漏（`config.headers.Authorization`） | ✅ 已验证不出现在输出中 |
+| `make typecheck` / `make test` | ✅ 全绿 / 1191 通过 |
+
+**残留风险（诚实记录）**：若那次 EPIPE 其实来自上传 socket 而非日志管道，本次改动不能根治它。但改动之后同类 503 只会产生一条小日志——**下次若再崩，就能凭「日志已瘦身仍崩」直接排除日志管道假设**，指向 socket，届时再决定是否放宽 `logger.ts` 的 EPIPE 策略。
+
+**数据备份**：不涉及（纯日志序列化改动）。

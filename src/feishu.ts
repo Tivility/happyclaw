@@ -152,6 +152,52 @@ const TRANSPORT_ERROR_CODES = new Set<string>([
 ]);
 
 /**
+ * Compact, log-safe view of an error thrown by the Feishu SDK.
+ *
+ * The SDK wraps axios, so a failed call throws an AxiosError whose `request` /
+ * `response` / `config` fields transitively reference the TLS socket, the http
+ * agent and their buffers. Passing that straight to `logger.error({ err })`
+ * made pino serialize the whole object graph: the 2026-07-19 503 on image
+ * upload produced a **single 48 KB / 1403-line** log entry, and the process
+ * died moments later on `write EPIPE` while that payload was in flight to the
+ * pino-pretty transport.
+ *
+ * Keeping only the fields we actually diagnose from (status, transport code,
+ * Feishu business code, message) removes both the noise and the oversized
+ * write. Truncation on `message` guards against an API echoing back a large
+ * body.
+ */
+export function describeFeishuError(err: unknown): Record<string, unknown> {
+  if (err === null || err === undefined) return { message: String(err) };
+  if (typeof err !== 'object') return { message: String(err) };
+
+  const e = err as {
+    name?: unknown;
+    code?: unknown;
+    message?: unknown;
+    cause?: { code?: unknown };
+    response?: { status?: unknown; data?: { code?: unknown; msg?: unknown } };
+  };
+  const pick = (v: unknown): string | undefined =>
+    typeof v === 'string' ? v : undefined;
+  const message = pick(e.message);
+
+  return {
+    name: pick(e.name),
+    // Transport code lives on the error itself or on its cause (undici/axios).
+    code: pick(e.code) ?? pick(e.cause?.code),
+    httpStatus:
+      typeof e.response?.status === 'number' ? e.response.status : undefined,
+    feishuCode:
+      typeof e.response?.data?.code === 'number'
+        ? e.response.data.code
+        : undefined,
+    feishuMsg: pick(e.response?.data?.msg)?.slice(0, 200),
+    message: message ? message.slice(0, 500) : undefined,
+  };
+}
+
+/**
  * 把 getChatInfo 抛出的异常分类为 ChatProbe。
  *
  * 默认归 'unknown'（我方/传输故障，零信息量）。只有能**明确匹配**"针对该群的
@@ -1006,7 +1052,10 @@ export function createFeishuConnection(
     try {
       await sendToFeishu(chatId, 'text', JSON.stringify({ text }));
     } catch (err) {
-      logger.error({ chatId, err }, 'Failed to send Feishu text reply');
+      logger.error(
+        { chatId, err: describeFeishuError(err) },
+        'Failed to send Feishu text reply',
+      );
     }
   }
 
@@ -1948,14 +1997,17 @@ export function createFeishuConnection(
             );
           } catch (imageErr) {
             logger.warn(
-              { chatId, localImagePath, err: imageErr },
+              { chatId, localImagePath, err: describeFeishuError(imageErr) },
               'Failed to send Feishu image attachment',
             );
           }
         }
         clearAckForTarget(chatId);
       } catch (err) {
-        logger.error({ err, chatId }, 'Failed to send Feishu card message');
+        logger.error(
+          { err: describeFeishuError(err), chatId },
+          'Failed to send Feishu card message',
+        );
         clearAckForTarget(chatId);
       }
     },
@@ -2013,7 +2065,10 @@ export function createFeishuConnection(
           'Feishu image sent',
         );
       } catch (err) {
-        logger.error({ err, chatId, mimeType }, 'Failed to send Feishu image');
+        logger.error(
+          { err: describeFeishuError(err), chatId, mimeType },
+          'Failed to send Feishu image',
+        );
         throw err;
       }
     },
