@@ -311,3 +311,63 @@ close [--all]           Close browser (--all closes every session)
 1. ~~**O2 的 append 模式判定**~~ — ✅ **已实测确认**（见 B-4）：truncate 后首次写入为 224 bytes 表观 / 4 KB 占块，无稀疏空洞，`O_APPEND` 成立，copy-and-truncate 安全。**无需重启即已生效**
 2. **F3 的实机效果**：从飞书群侧点重置，确认只停它路由到的工作区
 3. **P12 的实机效果**：跑一次用到浏览器的任务，确认退出后 `agent-browser session list` 为空
+
+---
+
+## 阶段 C · 无状态摘取
+
+### C-2a · F1 后台子 Agent 挂流（核心修复）
+
+> 这是本次全部改动里**用户体感最强**的一项：修的是「稍微长点的任务都会失败」。
+
+**根因**（`container/agent-runner/src/index.ts`）
+
+```ts
+const POST_RESULT_TIMEOUT_MS = 5_000;
+if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
+  interruptQueryForShutdown('Post-result timeout');   // ← 连坐杀掉后台子 Agent
+  stream.end();
+}
+```
+
+主 Agent 一输出最终文本，**5 秒后无条件关流**，仍在跑的后台子 Agent 被一起 interrupt。而本地 `getPendingSdkTaskCount` 出现次数为 **0/0**——根本没有能力知道还有几个后台任务在跑。
+
+**实测受害**（从工作区日志捞出）：`AI music generation research` ×2、`认知维度提取` / `知识维度提取` / `交互维度提取` 各 1、`Cognitive / Knowledge / Interaction extraction round 2` 各 1 —— **认知管线两轮六个子 Agent 全灭**。
+
+失败还是静默的：`agents` 表不记录 SDK Task（前端按「虚拟 Agent」处理），StreamEvent 也不落库，所以只有下一轮 resume 时 SDK 才报 `No completion record was found for background agent` ——**那是尸检报告，不是死因**。
+
+**落地**（移植 upstream `0cc9993`，适配本地三运行时架构）
+
+`stream-processor.ts`：
+- 新增 `pendingSdkTasks` Map + `SDK_TERMINAL_TASK_STATUSES`
+- `task_started`（`!skip_transcript`）登记；housekeeping 任务不登记，避免内部任务卡住收尾
+- `task_updated` 标记 `is_backgrounded`，终态状态时 settle
+- `processTaskNotification` **无条件 settle** —— 第二条兜底路径，不依赖 `task_updated` 是否报过终态（漏 settle 会永久推迟关流）
+- 三个查询接口：`getPendingSdkTaskCount` / `getBlockingPendingSdkTaskCount` / `describePendingSdkTasks`
+
+`index.ts` 关流判定：
+- 有 blocking 任务时 `resultReceivedAt = null` 撤销倒计时，并 emit「N 个后台任务运行中」状态事件
+- **用 blocking 口径而非总数**（F2 决策）：已 backgrounded 的 `local_bash`（dev server、`tail -f`）设计上就活过本 turn，等它只会把流挂到 IDLE_TIMEOUT
+- 两个 `resultReceivedAt = Date.now()` 重置点仍在（:1697 / :1917），后台任务 settle 后新 result 会重新起算倒计时并正常关流；永不 settle 的由 IDLE_TIMEOUT / CONTAINER_TIMEOUT 兜底
+
+**三运行时安全性**：Codex/Grok 不产生 SDK `task_started` 系统消息，`getBlockingPendingSdkTaskCount()` 恒为 0，走原有关流路径——**自然降级，不误伤**。
+
+**验收**
+
+| 项 | 结果 |
+|---|---|
+| 新增 `tests/pending-sdk-tasks.test.ts` | ✅ 14 用例 |
+| 三终态状态（completed/failed/killed）均 settle | ✅ |
+| 非终态状态保持 pending | ✅ |
+| 并发三任务独立 settle（认知管线形态） | ✅ |
+| `skip_transcript` 不登记 | ✅ |
+| 未知 task_id settle 是 no-op、重复 settle 不下溢 | ✅ |
+| backgrounded `local_bash` 计入总数但不计入 blocking | ✅ |
+| backgrounded **Agent** 仍计入 blocking（只豁免 local_bash） | ✅ |
+| `make typecheck` / `make test` | ✅ 全绿 / **1205 通过** |
+
+**过程中修掉的测试缺陷 1 个**：我对 `shorten(s, 80)` 的断言写成了 ≤81，实际是「截 80 + `...`」= 83。改的是测试不是实现。
+
+**数据备份**：不涉及（无数据/schema 变更）。
+
+**待实机验证**：需重启后跑一轮认知管线，确认三个维度子 Agent **都有产出**（对照修复前 6/6 全灭）。

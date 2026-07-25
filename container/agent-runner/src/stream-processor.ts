@@ -10,10 +10,15 @@
  */
 
 import type { ContainerOutput, StreamEvent } from './types.js';
-import { extractSkillName, summarizeToolInput, summarizeToolResult } from './utils.js';
+import { extractSkillName, shorten, summarizeToolInput, summarizeToolResult } from './utils.js';
 
 /** Tools with specialized input_json_delta handling — generic accumulation is skipped for these. */
 const SPECIAL_TOOLS = ['Skill', 'Task', 'Agent', 'AskUserQuestion', 'TodoWrite'];
+
+// SDK 任务终态：task_updated.patch.status 取这些值时不会再有后续信号。
+// 漏判一个状态的代价是 pendingSdkTasks 永久泄漏，关流被无限推迟——比误判更糟，
+// 所以 task_notification 也无条件 settle 一次作为第二条兜底路径。
+const SDK_TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'killed']);
 
 type EmitFn = (output: ContainerOutput) => void;
 type LogFn = (message: string) => void;
@@ -95,6 +100,24 @@ export class StreamEventProcessor {
   // task_notification (which carries SDK task_id) can be translated
   // back to the tool_use_id used at creation time.
   private readonly sdkTaskIdToToolUseId = new Map<string, string>();
+
+  // SDK 任务中尚未 settle 的（异步 Agent / backgrounded Bash 等）。
+  //
+  // 存在的理由：主 Agent 输出最终文本后，会话循环会在 POST_RESULT_TIMEOUT_MS 后
+  // 无条件关流，把仍在跑的后台子 Agent 连坐 interrupt 掉。实测代价是认知管线两轮
+  // 六个提取子 Agent 全部被杀，且失败是静默的——下一轮 resume 时 SDK 才报
+  // "No completion record was found for background agent"，那是尸检报告不是死因。
+  // 有未 settle 的任务时推迟关流，让它们跑完。
+  //
+  // skip_transcript 的 housekeeping 任务不登记，避免内部任务卡住收尾。
+  private readonly pendingSdkTasks = new Map<
+    string,
+    {
+      description: string;
+      taskType?: string;
+      isBackgrounded: boolean;
+    }
+  >();
 
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
@@ -779,6 +802,16 @@ export class StreamEventProcessor {
       }
       const effectiveToolUseId = message.tool_use_id || this.sdkTaskIdToToolUseId.get(message.task_id) || message.task_id;
       const desc = message.description || message.prompt || '';
+      if (message.task_id && !message.skip_transcript) {
+        this.pendingSdkTasks.set(message.task_id, {
+          description: desc,
+          taskType: typeof message.task_type === 'string' ? message.task_type : undefined,
+          isBackgrounded: false,
+        });
+        this.log(
+          `[pending-tasks] +${message.task_id.slice(0, 12)} (${shorten(desc, 60)}) → ${this.pendingSdkTasks.size} pending`,
+        );
+      }
       this.emitStreamEvent({
         eventType: 'task_start',
         agentScope: 'task',
@@ -815,6 +848,13 @@ export class StreamEventProcessor {
     }
     if (message.subtype === 'task_updated') {
       const effectiveToolUseId = this.sdkTaskIdToToolUseId.get(message.task_id) || message.task_id;
+      const pending = this.pendingSdkTasks.get(message.task_id);
+      if (pending && message.patch?.is_backgrounded === true) {
+        pending.isBackgrounded = true;
+      }
+      if (message.patch?.status && SDK_TERMINAL_TASK_STATUSES.has(message.patch.status)) {
+        this.settlePendingSdkTask(message.task_id, `task_updated:${message.patch.status}`);
+      }
       this.emitStreamEvent({
         eventType: 'task_updated',
         agentScope: 'task',
@@ -1362,7 +1402,43 @@ export class StreamEventProcessor {
    * The SDK's task_id differs from the API's tool_use_id used at task creation.
    * We resolve the effective toolUseId via: message.tool_use_id → sdkTaskId map → raw task_id.
    */
+  private settlePendingSdkTask(taskId: string | undefined, reason: string): void {
+    if (!taskId || !this.pendingSdkTasks.has(taskId)) return;
+    this.pendingSdkTasks.delete(taskId);
+    this.log(
+      `[pending-tasks] -${taskId.slice(0, 12)} (${reason}) → ${this.pendingSdkTasks.size} pending`,
+    );
+  }
+
+  /** 尚未 settle 的 SDK 任务总数（异步 Agent / backgrounded Bash 等）。 */
+  getPendingSdkTaskCount(): number {
+    return this.pendingSdkTasks.size;
+  }
+
+  /**
+   * 应当阻塞关流的任务数。
+   *
+   * 与总数的差别只有一类：已 backgrounded 的 local_bash。那类命令（dev server、
+   * tail -f、watch）设计上就会活过本 turn，等它反而会把流挂到 IDLE_TIMEOUT。
+   * 有限的 Agent / workflow 任务仍需等它的最终汇总，必须计入。
+   */
+  getBlockingPendingSdkTaskCount(): number {
+    let count = 0;
+    for (const pending of this.pendingSdkTasks.values()) {
+      if (!(pending.taskType === 'local_bash' && pending.isBackgrounded)) count++;
+    }
+    return count;
+  }
+
+  /** pending 任务的简述列表，用于日志与「N 个后台任务运行中」提示。 */
+  describePendingSdkTasks(): string[] {
+    return [...this.pendingSdkTasks.values()].map((pending) => shorten(pending.description, 80));
+  }
+
   processTaskNotification(message: { task_id: string; tool_use_id?: string; status: string; summary: string; output_file?: string; usage?: any }): void {
+    // 第二条 settle 路径，无条件执行：task_notification 到达即代表该任务有了终局，
+    // 不依赖 task_updated 是否报过终态状态（漏 settle 会永久推迟关流）。
+    this.settlePendingSdkTask(message.task_id, `task_notification:${message.status}`);
     const effectiveToolUseId = message.tool_use_id
       || this.sdkTaskIdToToolUseId.get(message.task_id)
       || message.task_id;

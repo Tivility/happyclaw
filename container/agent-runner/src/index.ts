@@ -1359,6 +1359,32 @@ async function runQuery(
     // 主循环会继续进入 waitForIpcMessage()，等待 _close/_drain 才退出。
     // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
     if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) {
+      // 后台任务未 settle 时推迟关流。没有这道判断，主 Agent 一输出最终文本，
+      // 5 秒后就会把仍在跑的后台子 Agent 连坐 interrupt 掉——实测认知管线两轮
+      // 六个提取子 Agent 全灭，且失败静默（agents 表不记录 SDK Task，StreamEvent
+      // 也不落库），只有下一轮 resume 时 SDK 报 "No completion record was found"。
+      //
+      // 用 blocking 口径而非总数：已 backgrounded 的 local_bash（dev server、
+      // tail -f）设计上就活过本 turn，等它只会把流挂到 IDLE_TIMEOUT。
+      // 永不 settle 的任务由 IDLE_TIMEOUT / CONTAINER_TIMEOUT 兜底回收。
+      const blockingTasks = processor.getBlockingPendingSdkTaskCount();
+      if (blockingTasks > 0) {
+        resultReceivedAt = null; // 撤销倒计时；下一个 result 会重新起算
+        log(
+          `Result emitted but ${blockingTasks} background task(s) still running, holding stream open: ${processor.describePendingSdkTasks().join(' | ')}`,
+        );
+        emit({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'status',
+            agentScope: 'system',
+            statusText: `${blockingTasks} 个后台任务运行中，完成后将继续汇总`,
+            displayLevel: 'primary',
+          },
+        });
+        return;
+      }
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
       interruptQueryForShutdown('Post-result timeout');
       stream.end();
