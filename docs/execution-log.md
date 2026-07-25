@@ -576,6 +576,63 @@ writeTaskResult 调用点：
 
 ---
 
+### F1 端到端验证结果 · ✅ 通过
+
+清掉污染会话后重放认知管线，真实跑通：
+
+| 状态 | turns | 结果 |
+|---|---|---|
+| 污染会话（07-23 / 07-25） | **0** | 无回复 |
+| 子 Agent 被杀（07-22 / 07-24） | 7 / 8 | 只有「三个子任务已启动，等待完成通知」 |
+| **修复后（07-25 21:43）** | **18** | **「天级统一提取完成…152 条消息，10 个工作区，19 条观察」** |
+
+`Usage: input=30 output=20897 cost=$10.87 turns=18`，日志里 `No completion record` 归零。管线还自己补齐了 07-21 / 07-22 两次未收尾的 cron。
+
+**准确归因**：本次直接解封的是**会话重置**；F1 的挂流机制防止再次污染。这一轮 agent 选择在 18 个 turn 内串行完成提取而非派发后台 SDK Task（`pending-tasks` 日志为 0），所以挂流路径本身未被这一轮触发——它的正确性由 14 个单测覆盖，等下一次真派发后台任务时会在日志里看到。
+
+---
+
+## 阶段 D · 资产层剥离
+
+### D-1 · `supportsPreCompactHook` 语义 —— 查证结论：**无需改动**
+
+原计划要把它「从决定产品能力有无降级为只表示 runtime 有无压缩事件」。全仓搜索后确认：该字段**只在 `runtime-adapter.ts:51` 的接口里声明，三个非 Claude adapter 把它设为 false，没有任何读取点**。它已经不 gate 任何东西，A1 担心的情况在当前代码里不成立。
+
+### D-2 · 归档改为 DB 驱动的连续写
+
+**证据**：归档此前只由 Claude SDK 的 PreCompact hook 写。实测——**最近 7 天全系统只写出 4 个归档文件**，`main` 上次归档停在 **2026-06-10（六周前）**。两个原因叠加：Codex / Grok 根本没有压缩事件（三个 adapter 全是 `supportsPreCompactHook: false`），而 ~1M 上下文窗口让 Claude 侧的压缩也几乎不发生。
+
+归档正是 `memory_search` 检索的对象 —— 陈旧归档意味着 **Agent 静默地失去近期记忆**。
+
+**落地**：新增 `src/conversation-archive.ts`，每个完成的 turn 从已持久化内容直接追加。按月文件保持可 grep 且有界；记录 runtime 使「哪条运行时没产出」在归档里直接可见；单条 turn 超 200k 字符截断；`privacy_mode` 跳过；全程 best-effort。接在 `index.ts` 结果落库之后，三条运行时共用。
+
+**验收**：11 个用例（含 privacy 跳过、空 turn、仅回复、截断、写失败不抛）。
+
+### D-3 · `turn_events` 轨迹落库
+
+**证据**：StreamEvent 广播到 WebSocket 后即丢弃。`messages` 留下最终文本，但「跑了哪些工具、子 Agent 得出什么结论」只存在于当时开着的那个浏览器标签页里。
+
+**落地**：`turn_events` 表（schema 40 → 41）+ `src/turn-trace.ts`
+
+- 只持久化结构性事件；`text_delta` / `thinking_delta` 明确不存（每 turn 数百条，且累积本身就是消息体，存下来行数翻约 100 倍）
+- payload 策略（决策 A3）：≤8KB 内联，超出落 `groups/{folder}/traces/{date}/` 并留 2000 字预览，使文件被裁剪后行仍可读
+- per-chat 单调 `seq`：同 turn 内事件常共享同一毫秒，`id` + `seq` 才是唯一可靠全序
+- 接在 `broadcastStreamEvent` 一个咽喉点，四处调用点全覆盖
+- 读取 API `GET /api/groups/:jid/turn-events`，支持 `turnId` 取一轮或 `beforeId` 分页；`turnId` 查询校验归属防跨会话读取
+- 删除路径同步覆盖 **5 处**。隐私模式尤其重要——轨迹带工具输入与子 Agent 输出，留下就是隐私泄漏
+
+**实机验证抓到一个漏采**：首版只落下工具名与 `toolUseId`，payload 为空——轨迹能显示「Read 跑过」却不知道读了什么。核对 `StreamEventType` 全集后发现漏了 **`tool_result`**（工具返回内容）与 **`sub_agent_result`**（子 Agent 结论，正是最该保住的东西），已补齐，另补 `compact_boundary` / `memory_recall`。
+
+**上线验证**：schema 迁移到 41、`turn_events` 表就位、`PRAGMA integrity_check` = ok。轻量任务实测落库 —— `context_audit`(1793B) → `tool_use_start`(Read) → `tool_progress`(90B) → `tool_use_end`，seq 有序、runtime 正确。
+
+**数据备份**：`messages-pre-schema41-*.db`（迁移前）；db.ts 自身也在 schema 迁移前自动备份。
+
+### D-4 · 记忆并入认知管线 —— 查证结论：**无 HappyClaw 代码改动**
+
+PreCompact 里的 memory flush 由 `hadCompaction` 触发，而压缩几乎不发生（同 D-2 的实测），所以这条路径**本就近乎从不执行**。决策要求把记忆维护并入认知管线——认知管线是**任务提示词**层面的事，且它现在已被 D-2/F1 解封并实测产出 19 条观察、写入 8 个工作区的 `observations.md`。HappyClaw 侧不需要改动，PreCompact 的 flush 保留为不影响正确性的残留路径。
+
+---
+
 ### C-1 补充 · 未摘的
 
 **未摘的**：Windows 兼容三连（`2408d73` / `1d02716` / `fbb37b1` / `0a08fd9`）—— macOS 部署零收益，且其中两个与 `container-runner.ts` 的 Grok 注入分支纠缠，摘入反增冲突面。系统代理（`3371b95`）当前无代理配置时为 no-op，价值待你配代理时再摘；PWA 缓存与浅色主题属纯前端观感，可随时补。
