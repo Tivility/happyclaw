@@ -245,6 +245,7 @@ import {
 import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
 import { executeSessionReset } from './commands.js';
+import { appendConversationArchive } from './conversation-archive.js';
 import {
   claimOwner,
   releaseOwner,
@@ -4450,6 +4451,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               });
               await flushPendingUsageForReply(lastReplyMsgId);
               lastSavedTurnId = effectiveTurnId;
+
+              // Archive the completed turn straight from what we just persisted.
+              // Replaces the Claude-only PreCompact hook as the archive of
+              // record: that hook fires on context compaction, which Codex and
+              // Grok never emit at all, and which a ~1M-token window makes rare
+              // even on Claude — measured here, only 4 archive files across all
+              // workspaces in 7 days, with `main` six weeks stale. Since
+              // memory_search greps these files, a stale archive silently costs
+              // the agent its recent recall.
+              appendConversationArchive({
+                folder: effectiveGroup.folder,
+                prompt: lastProcessed.content,
+                reply: text,
+                chatJid,
+                runtime: activeRuntimeResolution?.binding?.runtime ?? null,
+                privacyMode: !!effectiveGroup.privacy_mode,
+              });
               const persistedSessionId = result.sessionId || activeSessionId;
               if (
                 persistedSessionId &&
