@@ -543,4 +543,39 @@ writeTaskResult 调用点：
 
 **数据备份**：升级前的库快照已于「部署」一节留档（`messages-pre-restart-20260725-140948.db`）。本次为只读校验，未写入生产库。
 
+---
+
+## 端到端验证 · F1 的真实病理（比原诊断更严重）
+
+原本打算「等下次真实使用再观察」——那不是端到端。改为主动验证，过程中发现 F1 的破坏链**比我此前描述的更深一层**。
+
+### 认知管线四天的日志证据
+
+| 日期 | 关键日志 | 判读 |
+|---|---|---|
+| 07-22 | `Result #1: success text=<internal>三个子任务已启动，等待完成通知。</internal>` turns=8 $1.88 | 起了 3 个子 Agent，随即被 5 秒关流杀掉 |
+| 07-23 | `No completion record was found for background agent "Cognitive/Knowledge/Interaction extraction r3"` ×3 → `turns=0` → `error_during_execution` | **resume 到被污染的会话，0 turn 空返回** |
+| 07-24 | 同 07-22（turns=7 $1.97） | 再次起、再次被杀 |
+| 07-25 | 同 07-23 | 再次空转 |
+
+**交替循环：杀 → 污染 → 空转 → 杀。** 三天零产出的真正机制不是「子 Agent 被杀」这么简单——被杀的子 Agent **在会话里留下了无主的 task 记录**，此后每次 `resumeAt: latest` 都会先收到三条 `No completion record`，然后 SDK 立刻返回 `subtype=success` 但 `turns=0 / usage 全零 / result=null`，会话再也推不动。
+
+**⇒ F1 修复阻止未来的污染，但已污染的会话不会自愈。** 这是原方案里漏掉的一步。
+
+（顺带修正一次我自己的误判：看到 `usage` 全零时我一度认为是上游断流、并说 C-2d 暂缓断流续写判断错了。查完完整链条后确认——零 usage 是「resume 污染会话」的**下游症状**，不是上游截断。C-2d 的暂缓结论仍然成立。）
+
+### 处置
+
+1. **备份**：`data/backups/poisoned-session-task-1fa16ce0-20260725-142644.tar.gz`（3.6 MB，含整个 `.claude` 目录）
+2. **清理**：把三个 `.jsonl` 会话文件移入 `.poisoned-archive/`（移动而非删除，可回滚）。`resumeAt: latest` 因此解析不到旧会话，下次运行从干净状态开始
+3. **重放**：手工重放 11:00 那条从未产生回复的任务消息，用修复后的代码真实跑一遍
+
+### 观察到的即时差异
+
+被污染的运行都是**秒退**（turns=0）。重放后的运行持续数分钟、流式缓冲在写、agent 进程活跃——行为已经不同。
+
+---
+
+### C-1 补充 · 未摘的
+
 **未摘的**：Windows 兼容三连（`2408d73` / `1d02716` / `fbb37b1` / `0a08fd9`）—— macOS 部署零收益，且其中两个与 `container-runner.ts` 的 Grok 注入分支纠缠，摘入反增冲突面。系统代理（`3371b95`）当前无代理配置时为 no-op，价值待你配代理时再摘；PWA 缓存与浅色主题属纯前端观感，可随时补。
