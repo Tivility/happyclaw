@@ -874,3 +874,36 @@ D-3 建了表、写入、API，但**前端零消费**——轨迹依然看不到
 - **批次 5 人格**：缺整个 builder 子系统（upstream 约 2600 行 / 7 模块）
 - **批次 6 workspaces 投影**：纯写入，为将来合并铺形状
 - **批次 7 channel_mounts**：已迁移 21 条并通过对账，但路由仍走 `target_main_jid`（加法式并存是有意的安全边界）
+
+---
+
+## 三次 Review · 端到端验证新增的前端与 API
+
+前两轮查的是「代码对不对」和「用户能不能用上」。这轮查**刚写完、从未运行过的那部分**——前端组件与轨迹 API。
+
+### 端到端实测（此前只有单测）
+
+用真实签名 Cookie 打生产服务：
+
+| 项 | 结果 |
+|---|---|
+| 无认证 | ✅ 401 |
+| **member 用户读 admin 的工作区** | ✅ 返回 **404 而非 403**——不泄漏群组是否存在 |
+| admin 分页查询 | ✅ 返回 3 条，字段名与前端组件期望**完全一致**（camelCase） |
+| `turnId` 精确查询 | ✅ 4 条 |
+| 不存在的 `turnId` | ✅ 0 条 |
+| **拿别的工作区 jid 查同一 `turnId`** | ✅ **0 条**——归属校验生效 |
+| 前端构建 | ✅ 两个新组件均进入 `ChatPage` 产物 |
+
+排查过程中一度以为路由没生效（`/turn-events` 返回 Group not found），用同样编码打已知可用的 `/messages` 得到**相同错误**，才定位到是拿错了会话——那是 member 用户的 token，而目标工作区属 admin。**ACL 本身工作正常，是测试方法错了**，不是 bug。
+
+### 复查过、确认不成立的疑点
+
+- **轨迹与消息的 jid 会不会不一致**：广播用 `normalizeHomeJid`，而 `recordTurnEvent` 用原始 jid。查生产数据后确认两者都用原始 jid，前端传 `message.chat_jid` 能对上。不成立
+- **飞书工具在路由会话中是否可用**：`ctx.chatJid` 已经是 `currentSourceJid || chatJid`，而 `source_jid` 在生产数据里**全部填充**（21 个路由工作区都带 `feishu:oc_...`）。本地早有此机制（Discord 工具在用），我最初的警报不成立
+- **飞书工具是否被条件块误包**：位于 `if (!ctx.disableMemoryLayer)` 闭合之后，无条件注册
+
+### 已知遗留（未修，有意）
+
+- `seqByChat` Map 只增不减，且 `resetTurnTraceSeq` 仅测试调用。64 个会话下体量可忽略；`getTurnEventsForChat` 按 `id` 排序不受 seq 跨进程重置影响，`getTurnEvents(turnId)` 按 `seq,id` 排序而单个 turn 不跨重启，两者都正确
+- `turn_events` 无时间维度裁剪（符合 A3-b「永久保留」决策）
