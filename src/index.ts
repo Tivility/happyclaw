@@ -132,6 +132,7 @@ import {
   broadcastToOwnerIMChannels as broadcastToOwnerIMChannelsPure,
   resolveBroadcastFolder,
   resolveTaskRoutingDecision,
+  resolveSerializationKey,
 } from './task-routing.js';
 import { resolveImGroupDefaults } from './im-group-defaults.js';
 import {
@@ -10868,27 +10869,12 @@ async function main(): Promise<void> {
     const { effectiveGroup } = resolveEffectiveGroup(group);
     return effectiveGroup.executionMode === 'host';
   });
-  queue.setSerializationKeyResolver((groupJid: string) => {
-    // Agent virtual JIDs: {chatJid}#agent:{agentId} → separate serialization key
-    const agentSep = groupJid.indexOf('#agent:');
-    if (agentSep >= 0) {
-      const baseJid = groupJid.slice(0, agentSep);
-      const agentId = groupJid.slice(agentSep + 7);
-      const group = registeredGroups[baseJid];
-      const folder = group?.folder || baseJid;
-      return `${folder}#${agentId}`;
-    }
-    // Task virtual JIDs: {chatJid}#task:{taskId} → separate serialization key
-    const taskSep = groupJid.indexOf('#task:');
-    if (taskSep >= 0) {
-      const baseJid = groupJid.slice(0, taskSep);
-      const taskId = groupJid.slice(taskSep + 6);
-      const group = registeredGroups[baseJid];
-      return `${group?.folder || baseJid}#task:${taskId}`;
-    }
-    const group = registeredGroups[groupJid];
-    return group?.folder || groupJid;
-  });
+  // Keys on the folder each JID actually *executes* in (see resolveExecutingFolder):
+  // reading registeredGroups from memory keeps this O(1) per call, which matters
+  // because the queue calls it inside per-group scans.
+  queue.setSerializationKeyResolver((groupJid: string) =>
+    resolveSerializationKey(groupJid, registeredGroups),
+  );
   queue.setOnMaxRetriesExceeded((groupJid: string) => {
     const group = registeredGroups[groupJid];
     const name = group?.name || groupJid;

@@ -4513,6 +4513,38 @@ export function getJidsByFolder(folder: string): string[] {
   return rows.map((r) => r.jid);
 }
 
+/**
+ * JIDs whose agent actually *executes* in `folder` — the subset of
+ * getJidsByFolder() that does not route elsewhere.
+ *
+ * getJidsByFolder answers "which rows carry folder = X", which is the wrong
+ * question for anything that stops or interrupts a runner. IM groups are
+ * auto-registered to their owner's home folder (§8.2) and keep that stale
+ * `folder` value even after `target_main_jid` is later pointed at a dedicated
+ * workspace, so folder='main' currently collects 24 JIDs of which 21 execute
+ * in some other folder entirely. Killing "every sibling of main" therefore
+ * killed 21 unrelated workspaces' runs.
+ *
+ * A row is included when it has no routing pointer, when the pointer dangles
+ * (target row deleted), or when the pointer resolves back into the same folder
+ * (self-referential binding). Dangling pointers must fall back to the row's own
+ * folder rather than be dropped — excluding them would leave a runner that no
+ * reset or delete can ever stop. Mirrors resolveExecutingFolder() in
+ * task-routing.ts, which resolves the same rule against the in-memory map.
+ */
+export function getJidsExecutingInFolder(folder: string): string[] {
+  const rows = db
+    .prepare(
+      `SELECT g.jid AS jid
+         FROM registered_groups g
+         LEFT JOIN registered_groups t ON t.jid = g.target_main_jid
+        WHERE g.folder = ?
+          AND (g.target_main_jid IS NULL OR t.jid IS NULL OR t.folder = g.folder)`,
+    )
+    .all(folder) as Array<{ jid: string }>;
+  return rows.map((r) => r.jid);
+}
+
 /** Check if any registered group uses container execution mode (efficient targeted query). */
 export function hasContainerModeGroups(): boolean {
   const row = db

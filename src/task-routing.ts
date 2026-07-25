@@ -334,3 +334,69 @@ export function broadcastToOwnerIMChannels(
     }
   }
 }
+
+/**
+ * Minimal shape of a registered-group row needed for serialization routing.
+ * Declared locally (instead of importing RegisteredGroup) so this stays a pure
+ * module that tests can exercise with plain object literals.
+ */
+export interface GroupRoutingRow {
+  folder: string;
+  target_main_jid?: string | null;
+}
+
+/**
+ * Folder in which the agent serving `groupJid` actually executes.
+ *
+ * `registered_groups.folder` answers a different question: "which folder was
+ * this row registered under". IM chats auto-register to their owner's home
+ * folder (§8.2) and keep that value even after `target_main_jid` is later
+ * pointed at a dedicated workspace. On this deployment folder='main' collects
+ * 24 JIDs, 21 of which actually execute in their own workspace folder.
+ *
+ * Falls back to the row's own folder when there is no routing pointer, and to
+ * the JID itself when the row is unknown (mirrors the pre-existing behaviour of
+ * keying an unregistered JID by itself).
+ */
+export function resolveExecutingFolder(
+  groupJid: string,
+  groups: Record<string, GroupRoutingRow | undefined>,
+): string {
+  const group = groups[groupJid];
+  if (!group) return groupJid;
+  const target = group.target_main_jid
+    ? groups[group.target_main_jid]
+    : undefined;
+  return target?.folder || group.folder || groupJid;
+}
+
+/**
+ * Serialization key for the group queue: one key = one serialized runner.
+ *
+ * Virtual JIDs get their own key so a sub-agent or scheduled task does not
+ * serialize against (or get stopped alongside) the main conversation:
+ *   {chatJid}#agent:{agentId} → {executingFolder}#{agentId}
+ *   {chatJid}#task:{taskId}   → {executingFolder}#task:{taskId}
+ *
+ * Plain chat JIDs key on their executing folder, so sibling JIDs that share a
+ * folder column but route elsewhere no longer resolve to the same runner. This
+ * is what keeps `stopGroup` / `interruptQuery` from reaching across workspaces.
+ */
+export function resolveSerializationKey(
+  groupJid: string,
+  groups: Record<string, GroupRoutingRow | undefined>,
+): string {
+  const agentSep = groupJid.indexOf('#agent:');
+  if (agentSep >= 0) {
+    const baseJid = groupJid.slice(0, agentSep);
+    const agentId = groupJid.slice(agentSep + '#agent:'.length);
+    return `${resolveExecutingFolder(baseJid, groups)}#${agentId}`;
+  }
+  const taskSep = groupJid.indexOf('#task:');
+  if (taskSep >= 0) {
+    const baseJid = groupJid.slice(0, taskSep);
+    const taskId = groupJid.slice(taskSep + '#task:'.length);
+    return `${resolveExecutingFolder(baseJid, groups)}#task:${taskId}`;
+  }
+  return resolveExecutingFolder(groupJid, groups);
+}

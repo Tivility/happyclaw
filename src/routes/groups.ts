@@ -27,6 +27,7 @@ import {
   getAllRegisteredGroups,
   getAllChats,
   getJidsByFolder,
+  getJidsExecutingInFolder,
   updateChatName,
   deleteSession,
   deleteChatHistory,
@@ -897,7 +898,10 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
   // sub-agents (`{jid}#agent:{id}`) and scheduled tasks (`{jid}#task:{id}`) —
   // mirroring clear-history. Otherwise those runners keep executing with their
   // cwd/session dirs deleted out from under them (container/process leak + ENOENT).
-  const deleteSiblingJids = getJidsByFolder(existing.folder);
+  // Siblings are resolved by *execution* folder, not by the `folder` column: IM
+  // rows routed elsewhere via target_main_jid run in another workspace and must
+  // not be stopped just because they still carry this folder (see db.ts).
+  const deleteSiblingJids = getJidsExecutingInFolder(existing.folder);
   const deleteDescendantJids = Array.from(
     new Set(
       deleteSiblingJids.flatMap((j) => deps.queue.listDescendantJids(j)),
@@ -1088,8 +1092,11 @@ groupRoutes.post('/:jid/reset-session', authMiddleware, async (c) => {
       const virtualJid = `${jid}#agent:${agentId}`;
       await deps.queue.stopGroup(virtualJid, { force: true });
     } else {
-      // Main session: stop ALL processes for this folder
-      const siblingJids = getJidsByFolder(group.folder);
+      // Main session: stop every runner that actually executes in this folder.
+      // Deliberately *not* getJidsByFolder — IM rows routed elsewhere via
+      // target_main_jid serve another workspace, and resetting this folder must
+      // not kill their in-flight runs (see db.ts getJidsExecutingInFolder).
+      const siblingJids = getJidsExecutingInFolder(group.folder);
       await Promise.all(
         siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })),
       );
