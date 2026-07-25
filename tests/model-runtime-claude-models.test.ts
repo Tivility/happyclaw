@@ -50,6 +50,9 @@ vi.mock('../src/db.js', () => ({
     updated_at: '2026-07-06T00:00:00.000Z',
   }),
   getRuntimeNativeSession: () => undefined,
+  // Same-runtime model switches consult this fallback; undefined here keeps these
+  // normalization tests focused on model naming rather than session carry-over.
+  getCarryOverNativeSession: () => undefined,
   listProviderPoolModelOptions: () => [
     {
       runtime: 'claude',

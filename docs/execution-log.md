@@ -711,3 +711,30 @@ schema 44 → 45。`messages` 加 delivery 五列。
 | 3 飞书 10 工具 | — | 本次 |
 
 门禁：**117 文件 / 1382 测试全绿**。每次 schema 迁移前均有一致性备份。
+
+---
+
+## 后续 · 同运行时换模型保留上下文
+
+**触发**：使用者发现「会话切换 agent 会不会 clear，感觉应该保留上下文」。查证后确认系统里其实有**四条语义各异的切换路径**：
+
+| 切换什么 | 原上下文处理 | 是否合理 |
+|---|---|---|
+| Agent 人格（批次 5） | 完整保留，一次 cache miss | ✅ O1-b |
+| Agent 标签页（sub-agent） | 各自独立会话（`sessions` 按 `(folder, agent_id)` 分行） | ✅ 设计如此 |
+| **模型/运行时（`/model`）** | **一律生成交接摘要** | ⚠️ 过严 |
+| Provider（OAuth 轮换） | 删除会话 | ✅ 必须——跨账号 session id 无效 |
+
+**根因**：`conversation_runtime_sessions` 的主键含 `model_key`，所以 opus → sonnet 会查不到行、退化成从摘要重启。但对 Claude 而言这比平台要求更严——transcript 与模型无关，换模型可以直接续。原设计一律摘要是为降成本的有意取舍，实际用下来成本可接受，而丢掉的上下文不可接受。
+
+**落地**
+
+- `db.ts` 新增 `getCarryOverNativeSession`：同 runtime + 同 provider + 同 auth generation、仅 `model_key` 不同时取最近一条会话。三个约束都是硬的——换 runtime 则 session id 无意义，换 provider / 重新认证则 thinking block 签名失效（这正是 provider 切换路径要删会话的原因）
+- `model-runtime.ts`：精确键查不到时回退到 carry-over
+- `index.ts`：`/model` 切换先比对 runtime，**同运行时不再生成摘要**；跨运行时仍然生成（Claude 的 session id 对 Codex/Grok 毫无意义）
+
+**验收**：新增 10 用例，边界全部锁死（跨 runtime / 跨 provider / 跨 auth generation / 跨工作区 / 跨 agent 标签页都不串，空 session id 跳过，多候选取最近）。`make test` 118 文件 / 1392 通过。
+
+**顺带修掉一个 mock 缺项**：`model-runtime-claude-models.test.ts` mock 了 `db.js`，新导出未列入导致 4 个既有用例失败。补 mock 而非改行为——那 4 个测的是模型命名归一化，与会话续接无关。
+
+**仍未接入的（诚实记录）**：批次 9 的 `evaluateSessionValidity` / `evaluateStoredSessionValidity` 定义了、19 个用例全过，但**没有任何调用点，目前是死代码**。四条切换路径的判断逻辑仍散在各处。收口它属于纯内部清理、对使用者零可见变化，已告知使用者可择期再做。

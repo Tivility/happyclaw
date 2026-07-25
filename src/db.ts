@@ -9348,3 +9348,61 @@ export function evaluateStoredSessionValidity(
     current,
   );
 }
+
+/**
+ * Native session to carry over when only the model changed.
+ *
+ * conversation_runtime_sessions is keyed by model_key, so switching opus to
+ * sonnet looks up a row that does not exist and the conversation restarts from a
+ * handoff summary. For Claude that is stricter than the platform requires: the
+ * transcript is model-agnostic and a session can be resumed under a different
+ * model, so the summary was throwing away context it did not need to.
+ *
+ * The lookup stays narrow on purpose. Runtime and provider must both match:
+ *
+ *   - a different runtime issues its own session ids, so a Claude session id is
+ *     meaningless to Codex or Grok;
+ *   - a different provider (a different OAuth account) invalidates thinking-block
+ *     signatures, which is why the provider switch path deletes the session
+ *     outright.
+ *
+ * auth_profile_generation must match for the same reason as provider: a
+ * re-authenticated profile is a different credential lineage.
+ *
+ * Returns the most recently updated candidate, so a conversation that has moved
+ * between several models carries over from wherever it last actually ran.
+ */
+export function getCarryOverNativeSession(
+  key: Pick<
+    RuntimeSessionKey,
+    | 'group_folder'
+    | 'agent_id'
+    | 'runtime'
+    | 'provider_id'
+    | 'auth_profile_generation'
+    | 'model_key'
+  >,
+): RuntimeNativeSession | undefined {
+  const row = db
+    .prepare(
+      `SELECT * FROM conversation_runtime_sessions
+        WHERE group_folder = ?
+          AND agent_id = ?
+          AND runtime = ?
+          AND provider_id = ?
+          AND auth_profile_generation = ?
+          AND model_key != ?
+          AND native_session_id != ''
+        ORDER BY updated_at DESC
+        LIMIT 1`,
+    )
+    .get(
+      key.group_folder,
+      key.agent_id || '',
+      key.runtime,
+      key.provider_id || LEGACY_CLAUDE_PROVIDER_ID,
+      key.auth_profile_generation ?? LEGACY_CLAUDE_AUTH_GENERATION,
+      key.model_key || LEGACY_CLAUDE_MODEL_KEY,
+    ) as Record<string, unknown> | undefined;
+  return row ? mapRuntimeNativeSession(row) : undefined;
+}

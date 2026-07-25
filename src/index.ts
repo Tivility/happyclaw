@@ -1832,16 +1832,33 @@ function startModelSwitchWithHandoff(
         registeredGroups[input.target.baseChatJid] ??
         getRegisteredGroup(input.target.baseChatJid);
       const privacyMode = !!targetGroup?.privacy_mode;
-      const summary = privacyMode
-        ? null
-        : await createModelSwitchHandoffSummary({
-            groupFolder: input.target.folder,
-            agentId: input.target.agentId || '',
-            chatJid: input.target.targetChatJid,
-            reason: 'model_binding_changed',
-            createdBy: input.actor,
-            excludeMessageIds: input.excludeMessageIds,
-          });
+
+      // A handoff summary is only needed when the conversation genuinely cannot
+      // be resumed. Within one runtime it can: the native session carries over
+      // under the new model (see getCarryOverNativeSession), so summarising would
+      // discard verbatim context for nothing. Across runtimes it cannot — a
+      // Claude session id means nothing to Codex or Grok — so the summary stays.
+      //
+      // Summarising every switch was a deliberate cost trade-off originally;
+      // measured in practice the cost is acceptable and the lost context is not.
+      const previousRuntime = ensureConversationRuntimeState(
+        input.target.folder,
+        input.target.agentId ?? '',
+      ).runtime as string | null | undefined;
+      const runtimeChanged =
+        !!previousRuntime && previousRuntime !== input.binding.runtime;
+
+      const summary =
+        privacyMode || !runtimeChanged
+          ? null
+          : await createModelSwitchHandoffSummary({
+              groupFolder: input.target.folder,
+              agentId: input.target.agentId || '',
+              chatJid: input.target.targetChatJid,
+              reason: 'model_binding_changed',
+              createdBy: input.actor,
+              excludeMessageIds: input.excludeMessageIds,
+            });
       const state = setConversationRuntimeBinding(
         input.target.folder,
         input.target.agentId ?? '',

@@ -2,6 +2,7 @@ import {
   ensureConversationRuntimeState,
   getLatestSessionTokenUsage,
   getProviderPool,
+  getCarryOverNativeSession,
   getRuntimeNativeSession,
   LEGACY_CLAUDE_AUTH_GENERATION,
   LEGACY_CLAUDE_MODEL_KEY,
@@ -228,7 +229,19 @@ export function resolveRuntimeForScope(
     auth_profile_fingerprint: authProfileFingerprint,
     model_key: modelKey,
   };
-  const storedNativeSession = getRuntimeNativeSession(sessionKey);
+  // Exact-key lookup first. When only the model moved (opus -> sonnet within
+  // Claude), that row does not exist because conversation_runtime_sessions is
+  // keyed by model_key — fall back to the same runtime/provider under a
+  // different model and carry that session over.
+  //
+  // This used to fall through to a handoff summary, which was a deliberate cost
+  // trade-off; measured in practice the cost is acceptable and the lost context
+  // is not, so a same-runtime model change now resumes verbatim. Runtime and
+  // provider still must match: another runtime issues its own session ids, and
+  // another provider invalidates thinking-block signatures.
+  const exactNativeSession = getRuntimeNativeSession(sessionKey);
+  const storedNativeSession =
+    exactNativeSession ?? getCarryOverNativeSession(sessionKey);
   const nativeSession = shouldUseNativeSession(binding, storedNativeSession)
     ? storedNativeSession
     : undefined;
