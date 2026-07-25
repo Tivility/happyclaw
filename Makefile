@@ -1,6 +1,6 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web start \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
-       format format-check install install-host-tools clean reset-init update-sdk update-codex-sdk ensure-latest-sdk ensure-latest-codex-sdk sync-types \
+       format format-check install install-host-tools clean reset-init update-sdk update-codex-sdk ensure-latest-sdk ensure-latest-codex-sdk check-container-sdk sync-types \
        backup restore launchd-install launchd-uninstall launchd-restart \
        launchd-status launchd-log help _ensure-docker-image logs status stop \
        _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale \
@@ -12,6 +12,8 @@
 # 握手，该模式在 bun 的 HTTP server 下不触发，会导致 WS 全部握手失败（HTTP/接口正常，
 # 但前端实时流式卡片/通知全失效，飞书等 stdout 通道不受影响）。
 PORT    ?= $(or $(WEB_PORT),3000)
+# Container image name — mirrors the CONTAINER_IMAGE env default in src/config.ts.
+CONTAINER_IMAGE ?= happyclaw-agent:latest
 PKG     := npm
 RUN     := npx
 RUNNER  := npx tsx src/index.ts
@@ -56,7 +58,7 @@ build-web: ## 仅编译前端
 
 # ─── Production ──────────────────────────────────────────────
 
-start: ensure-latest-sdk ensure-latest-codex-sdk ## 一键启动生产环境（pm2 托管时自动走 pm2 restart；否则前台阻塞）
+start: ensure-latest-sdk ensure-latest-codex-sdk check-container-sdk ## 一键启动生产环境（pm2 托管时自动走 pm2 restart；否则前台阻塞）
 	@# pm2 注册过 happyclaw 就路由到 pm2，避免裸跑和 pm2 抢端口
 	@if command -v pm2 >/dev/null 2>&1 && pm2 describe happyclaw >/dev/null 2>&1; then \
 	  $(MAKE) --no-print-directory _start-pm2; \
@@ -271,6 +273,29 @@ ensure-latest-sdk: ## 启动前自动检测并更新 SDK（agent-runner + 主服
 		echo "✅ [主服务] SDK 更新完成"; \
 	else \
 		echo "✅ [主服务] Claude Agent SDK 已是最新 ($$ROOT_LOCAL)"; \
+	fi
+
+check-container-sdk: ## 检查 Docker 镜像内的 SDK 是否落后于宿主机
+	@if ! docker image inspect $(CONTAINER_IMAGE) >/dev/null 2>&1; then \
+		echo "ℹ️  镜像 $(CONTAINER_IMAGE) 不存在，跳过检查（container 模式工作区将无法启动）"; \
+		exit 0; \
+	fi; \
+	HOST_CODEX=$$(node -p "require('./container/agent-runner/node_modules/@openai/codex-sdk/package.json').version" 2>/dev/null || echo ""); \
+	IMG_CODEX=$$(docker run --rm --entrypoint sh $(CONTAINER_IMAGE) -c "cat /app/node_modules/@openai/codex-sdk/package.json 2>/dev/null" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).version)}catch{console.log('')}})" || echo ""); \
+	HOST_CLAUDE=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo ""); \
+	IMG_CLAUDE=$$(docker run --rm --entrypoint sh $(CONTAINER_IMAGE) -c "cat /app/node_modules/@anthropic-ai/claude-agent-sdk/package.json 2>/dev/null" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).version)}catch{console.log('')}})" || echo ""); \
+	STALE=0; \
+	if [ -n "$$IMG_CODEX" ] && [ -n "$$HOST_CODEX" ] && [ "$$IMG_CODEX" != "$$HOST_CODEX" ]; then \
+		echo "⚠️  Codex SDK 落后：镜像 $$IMG_CODEX ≠ 宿主机 $$HOST_CODEX"; STALE=1; \
+	fi; \
+	if [ -n "$$IMG_CLAUDE" ] && [ -n "$$HOST_CLAUDE" ] && [ "$$IMG_CLAUDE" != "$$HOST_CLAUDE" ]; then \
+		echo "⚠️  Claude SDK 落后：镜像 $$IMG_CLAUDE ≠ 宿主机 $$HOST_CLAUDE"; STALE=1; \
+	fi; \
+	if [ "$$STALE" = "1" ]; then \
+		echo "⚠️  container 模式工作区跑的是镜像内的旧 SDK，新模型可能不被识别。"; \
+		echo "⚠️  重建镜像：./container/build.sh"; \
+	else \
+		echo "✅ 镜像 SDK 与宿主机一致"; \
 	fi
 
 ensure-latest-codex-sdk: ## 启动前自动检测并更新 Codex SDK（有新版才更新）

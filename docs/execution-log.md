@@ -907,3 +907,48 @@ D-3 建了表、写入、API，但**前端零消费**——轨迹依然看不到
 
 - `seqByChat` Map 只增不减，且 `resetTurnTraceSeq` 仅测试调用。64 个会话下体量可忽略；`getTurnEventsForChat` 按 `id` 排序不受 seq 跨进程重置影响，`getTurnEvents(turnId)` 按 `seq,id` 排序而单个 turn 不跨重启，两者都正确
 - `turn_events` 无时间维度裁剪（符合 A3-b「永久保留」决策）
+
+---
+
+## 后续 · Opus 5 上架 + 容器镜像 SDK 落后检测
+
+### Opus 5
+
+`db.ts` 的 Claude 模型目录加 `claude-opus-5`。别名由 `model-command.ts` 的
+`shortClaudeModelName` 自动派生（`claude-opus-5` → `opus-5`），无需另写规则。
+
+未加 1M 变体：目录里 4.6/4.7/4.8 各有 `[1m]` 条目，而 Fable 5 / Sonnet 5 都没有；
+Opus 5 的 `capabilities.context_window` 已是 1000000，无需再开变体。
+
+### 容器镜像 SDK 落后（真问题，非只影响新模型）
+
+使用者反馈「docker 工作区不支持 gpt-5.6-sol」。逐层排查：
+
+| 假设 | 结论 |
+|---|---|
+| 镜像没装 Codex | ❌ 不成立——`@openai/codex-sdk` 在，平台二进制也在（只是不在 PATH，SDK 内部解析） |
+| agent-runner 代码是烤进镜像的旧版 | ❌ 不成立——源码从宿主机挂载、启动时重编译，本次所有 agent-runner 改动对 docker 工作区都生效 |
+| **镜像内 node_modules 太旧** | ✅ **成立** |
+
+实测：
+
+```
+镜像内 codex-sdk 0.142.3   宿主机 0.145.0
+镜像内 claude-sdk 0.3.195  宿主机 0.3.220
+```
+
+镜像是 3 周前构建的。**这是结构性缺口**：`make ensure-latest-sdk` /
+`ensure-latest-codex-sdk` 只更新宿主机与 agent-runner 的 `node_modules`，
+**从不碰 Docker 镜像**。于是 host 模式（admin 的 main）一直吃最新 SDK，而
+**27 个 container 模式工作区停在三周前**——不只 gpt-5.6-sol 不认，Claude 侧也落后
+25 个小版本。
+
+**修法**：新增 `make check-container-sdk`，对比镜像与宿主机的两个 SDK 版本，落后就
+明确告警并给出 `./container/build.sh`；挂进 `make start` 的依赖链，使其在每次正式
+启动时自动检查。镜像不存在时只提示不报错（container 工作区本就起不来，是另一个
+问题）。
+
+**已重建镜像**，检测转为「✅ 镜像 SDK 与宿主机一致」。
+
+**遗留**：检测只告警不自动重建。自动重建要拉 4GB 镜像、耗时数分钟，放在启动路径上
+会让每次重启不可预测地变慢——更适合由使用者按提示手动触发。
