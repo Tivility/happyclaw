@@ -10183,6 +10183,34 @@ async function main(): Promise<void> {
     logger.info('Plugin catalog auto-scan disabled by SystemSettings.pluginAutoScan');
   }
 
+  // --- Daily service-log rotation ---
+  // launchd redirects our stdout/stderr straight into data/launchd-*.log and
+  // never rotates them; they grew to 92 MB + 28 MB (~9 MB/day) before this.
+  // Scheduling lives in-process rather than in a second launchd agent because
+  // `make launchd-install` refuses to run when it finds any other
+  // com.happyclaw*.plist (see CLAUDE.md §10 — a second plist previously caused a
+  // double-service crash loop). The script archives every rotation (decision O2)
+  // and no-ops when the files are absent, so dev runs are unaffected.
+  const ROTATE_LOGS_INTERVAL_MS = 24 * 60 * 60 * 1000;
+  const rotateServiceLogs = (): void => {
+    execFile(
+      'bash',
+      [path.join(process.cwd(), 'scripts', 'rotate-logs.sh')],
+      { cwd: process.cwd(), timeout: 120_000 },
+      (err, stdout, stderr) => {
+        if (err) {
+          logger.warn({ err, stderr: stderr?.slice(0, 500) }, 'Log rotation failed');
+          return;
+        }
+        logger.info({ output: stdout?.trim().slice(0, 500) }, 'Service logs rotated');
+      },
+    );
+  };
+  const logRotationInterval = setInterval(
+    rotateServiceLogs,
+    ROTATE_LOGS_INTERVAL_MS,
+  );
+
   // --- Channel reload helpers (hot-reload on config save) ---
 
   let feishuSyncInterval: ReturnType<typeof setInterval> | null = null;
@@ -10215,6 +10243,7 @@ async function main(): Promise<void> {
 
     if (startupPluginScanTimer) clearTimeout(startupPluginScanTimer);
     if (periodicPluginScanInterval) clearInterval(periodicPluginScanInterval);
+    clearInterval(logRotationInterval);
 
     try {
       ipcWatcherManager?.closeAll();

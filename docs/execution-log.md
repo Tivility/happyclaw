@@ -186,3 +186,37 @@ plist 里有 `NODE_ENV=production`，npm 在该模式下连带 prune 掉已装�
 **数据备份**：`package.json` 两处 SDK 版本行由 git 管住；更新前已记录 `agent-runner=0.3.215 / root=0.3.215` 作为回滚基准。node_modules 可由 `npm install` 重建。
 
 **副产物**：本次顺带把 SDK 升到 0.3.220，且 P10 的类型放宽让它平稳通过——正是门禁想保证的效果。
+
+**提交**：`fdaeb14`
+
+---
+
+### B-4 · O2 日志轮转（每天一次，历史全保留）
+
+**背景**：launchd 把 stdout/stderr 直接重定向到 `data/launchd-*.log` 且从不轮转，实测已涨到 **92 MB + 28 MB，约 9 MB/天无上限**。
+
+**为什么用 copy-and-truncate 而不是 rename**：launchd 自己持有 `StandardOutPath` / `StandardErrorPath` 的文件描述符，直到服务重启为止。`mv` 之后 launchd 继续往**同一个 inode**（现在换了路径）写，原路径上的新文件永远是空的——这是 launchd/systemd 托管日志的经典轮转陷阱。truncate 保住 inode，服务不必重启也不丢行。
+
+**为什么调度放在进程内而不是第二个 launchd agent**：CLAUDE.md §10 明确「禁止手动创建 launchd plist」，且 `make launchd-install` 会扫描 `com.happyclaw*.plist`，发现任何非主 plist 就报错退出（历史上双 plist 造成过 crash loop）。所以按项目已有的 `setInterval` 模式（对照 `periodicPluginScanInterval`）做进程内每日定时。
+
+**落地**
+
+- 新增 `scripts/rotate-logs.sh`：gzip 归档到 `data/logs-archive/{name}-{date}.log.gz` → `sync` → truncate。**先归档、确认落盘后才 truncate**，中途崩溃只会多一份归档，不会丢日志。空文件跳过；同日二次运行加数字后缀而非覆盖
+- `src/index.ts` 加每日定时器 `logRotationInterval`（24h），关停时 `clearInterval`
+- 脚本内置**稀疏检测** `check_sparse()`：若 launchd 其实没用 `O_APPEND`，truncate 后描述符保留旧偏移，内核会填空洞——表现为「表观体积大、实际占块接近零」。检测到该背离就明确告警并给出替代方案，而不是静默轮转稀疏文件
+
+**验收**
+
+| 项 | 结果 |
+|---|---|
+| `bash -n` 语法 | ✅ |
+| 首次真实轮转 | ✅ **110 MB → 3.4 MB 归档（32× 压缩）**，两个日志清零 |
+| 幂等性（空文件重跑） | ✅ 正确跳过，不产生空归档 |
+| 服务在 truncate 后仍健康 | ✅ `/api/health` healthy；审计表确认请求仍在处理（`login_failed` 探针记录） |
+| `make typecheck` / `make test` | ✅ 全绿 / 1191 通过 |
+
+**待完成的验证（诚实记录）**：truncate 后**尚未观察到真实日志写入**，因此「launchd 是否 `O_APPEND`」还没有实测定论。已排除的干扰：`lsof -o` 读到偏移 0 但该读数在 macOS 上可能显示 SIZE 而非 OFFSET，不足为证；404 请求与登录失败都不产生 info 级日志（服务确实在处理，审计表有记录）。
+
+已挂后台观察等首次写入。**若届时「表观体积远大于实际占块」，说明不是 append 模式，需改为「轮转后重启服务」或改由应用自己管理日志文件** —— 脚本里的 `check_sparse()` 会在下次轮转时自动报出这一情况。
+
+**数据备份**：轮转本身即备份——原始 110 MB 日志已完整 gzip 归档在 `data/logs-archive/`（`data/` 已在 .gitignore 中）。
