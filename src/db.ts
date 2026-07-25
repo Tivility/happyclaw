@@ -61,7 +61,7 @@ import {
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
 let db: InstanceType<typeof Database>;
-const SCHEMA_VERSION = '40';
+const SCHEMA_VERSION = '41';
 const DB_BACKUP_ENV_OVERRIDE = 'HAPPYCLAW_ALLOW_DB_MIGRATION_WITHOUT_BACKUP';
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
@@ -883,6 +883,48 @@ export function initDatabase(): void {
       ON conversation_runtime_sessions(provider_id, auth_profile_generation);
     CREATE INDEX IF NOT EXISTS idx_crs_scope
       ON conversation_runtime_sessions(group_folder, agent_id);
+
+    -- Execution trace for a turn: tool calls, sub-agent results, thinking.
+    --
+    -- StreamEvents were broadcast over WebSocket and never persisted, so a page
+    -- refresh erased every tool-call and sub-agent panel — the *record* of what
+    -- the agent actually did existed only in the browser tab that watched it
+    -- happen. The messages table keeps the final text, which is the conclusion,
+    -- not the work.
+    --
+    -- High-frequency events (text_delta / thinking_delta) are deliberately NOT
+    -- stored: they arrive hundreds of times per turn and their accumulation is
+    -- already the message body. Only turn-structure events land here.
+    --
+    -- Payload policy (decision A3): small payloads inline in payload_json,
+    -- anything larger spills to a file under the workspace and is referenced by
+    -- payload_file, so the DB stays queryable and the row count — not the
+    -- byte count — drives its size.
+    CREATE TABLE IF NOT EXISTS turn_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      chat_jid TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      turn_id TEXT,
+      seq INTEGER NOT NULL,
+      event_type TEXT NOT NULL,
+      agent_scope TEXT,
+      runtime TEXT,
+      tool_name TEXT,
+      tool_use_id TEXT,
+      task_id TEXT,
+      agent_id TEXT,
+      title TEXT,
+      summary TEXT,
+      payload_json TEXT,
+      payload_file TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_turn_events_chat
+      ON turn_events(chat_jid, id);
+    CREATE INDEX IF NOT EXISTS idx_turn_events_turn
+      ON turn_events(turn_id);
+    CREATE INDEX IF NOT EXISTS idx_turn_events_folder
+      ON turn_events(group_folder, created_at);
 
     CREATE TABLE IF NOT EXISTS provider_pool_model_options (
       runtime TEXT NOT NULL,
@@ -2205,6 +2247,9 @@ export function isPrivacyJid(jid: string): boolean {
  * Called after the agent finishes processing to remove ephemeral messages from DB.
  */
 export function deletePrivacyMessages(chatJid: string): number {
+  // Trace rows carry tool inputs and sub-agent output for the same turns, so
+  // leaving them behind would defeat privacy mode.
+  db.prepare('DELETE FROM turn_events WHERE chat_jid = ?').run(chatJid);
   return db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(chatJid)
     .changes;
 }
@@ -2217,6 +2262,7 @@ export function deletePrivacyMessages(chatJid: string): number {
 export function cleanupAllPrivacyMessages(): number {
   let total = 0;
   for (const jid of privacyJids) {
+    db.prepare('DELETE FROM turn_events WHERE chat_jid = ?').run(jid);
     total += db
       .prepare('DELETE FROM messages WHERE chat_jid = ?')
       .run(jid).changes;
@@ -4821,6 +4867,7 @@ export function ensureUserHomeGroup(
 export function deleteChatHistory(chatJid: string): void {
   const tx = db.transaction((jid: string) => {
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
+    db.prepare('DELETE FROM turn_events WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
   });
   tx(chatJid);
@@ -4840,6 +4887,7 @@ export function deleteImGroupRecord(jid: string): void {
   const tx = db.transaction(() => {
     db.prepare('DELETE FROM registered_groups WHERE jid = ?').run(jid);
     db.prepare('DELETE FROM messages WHERE chat_jid = ?').run(jid);
+    db.prepare('DELETE FROM turn_events WHERE chat_jid = ?').run(jid);
     db.prepare('DELETE FROM chats WHERE jid = ?').run(jid);
     db.prepare('DELETE FROM user_pinned_groups WHERE jid = ?').run(jid);
     // Feishu thread agents (source_kind='feishu_thread') and other chat-scoped
@@ -7937,4 +7985,129 @@ export function closeDatabase(): void {
   if (db) {
     db.close();
   }
+}
+
+// ─── Turn events (execution trace) ───────────────────────────────
+
+/** One persisted execution-trace row. Mirrors the turn_events table. */
+export interface TurnEventRow {
+  id?: number;
+  chatJid: string;
+  groupFolder: string;
+  turnId?: string | null;
+  seq: number;
+  eventType: string;
+  agentScope?: string | null;
+  runtime?: string | null;
+  toolName?: string | null;
+  toolUseId?: string | null;
+  taskId?: string | null;
+  agentId?: string | null;
+  title?: string | null;
+  summary?: string | null;
+  payloadJson?: string | null;
+  payloadFile?: string | null;
+  createdAt?: string;
+}
+
+/**
+ * Persist one execution-trace event.
+ *
+ * Best-effort by contract: the caller is on the streaming hot path, and losing
+ * a trace row must never disturb the turn itself. Errors are swallowed after a
+ * warn.
+ */
+export function insertTurnEvent(row: TurnEventRow): void {
+  try {
+    db.prepare(
+      `INSERT INTO turn_events
+         (chat_jid, group_folder, turn_id, seq, event_type, agent_scope, runtime,
+          tool_name, tool_use_id, task_id, agent_id, title, summary,
+          payload_json, payload_file, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      row.chatJid,
+      row.groupFolder,
+      row.turnId ?? null,
+      row.seq,
+      row.eventType,
+      row.agentScope ?? null,
+      row.runtime ?? null,
+      row.toolName ?? null,
+      row.toolUseId ?? null,
+      row.taskId ?? null,
+      row.agentId ?? null,
+      row.title ?? null,
+      row.summary ?? null,
+      row.payloadJson ?? null,
+      row.payloadFile ?? null,
+      row.createdAt ?? new Date().toISOString(),
+    );
+  } catch (err) {
+    logger.warn({ err, chatJid: row.chatJid }, 'insertTurnEvent failed');
+  }
+}
+
+function mapTurnEventRow(r: Record<string, unknown>): TurnEventRow {
+  return {
+    id: r.id as number,
+    chatJid: r.chat_jid as string,
+    groupFolder: r.group_folder as string,
+    turnId: (r.turn_id as string) ?? null,
+    seq: r.seq as number,
+    eventType: r.event_type as string,
+    agentScope: (r.agent_scope as string) ?? null,
+    runtime: (r.runtime as string) ?? null,
+    toolName: (r.tool_name as string) ?? null,
+    toolUseId: (r.tool_use_id as string) ?? null,
+    taskId: (r.task_id as string) ?? null,
+    agentId: (r.agent_id as string) ?? null,
+    title: (r.title as string) ?? null,
+    summary: (r.summary as string) ?? null,
+    payloadJson: (r.payload_json as string) ?? null,
+    payloadFile: (r.payload_file as string) ?? null,
+    createdAt: r.created_at as string,
+  };
+}
+
+/** Trace rows for one turn, in emission order. */
+export function getTurnEvents(turnId: string): TurnEventRow[] {
+  const rows = db
+    .prepare('SELECT * FROM turn_events WHERE turn_id = ? ORDER BY seq, id')
+    .all(turnId) as Array<Record<string, unknown>>;
+  return rows.map(mapTurnEventRow);
+}
+
+/**
+ * Recent trace rows for a conversation, oldest-first.
+ *
+ * Paged by `id` rather than timestamp: two events inside one turn routinely
+ * share a millisecond, and the autoincrement id is the only total order we can
+ * rely on.
+ */
+export function getTurnEventsForChat(
+  chatJid: string,
+  opts: { limit?: number; beforeId?: number } = {},
+): TurnEventRow[] {
+  const limit = Math.min(Math.max(opts.limit ?? 200, 1), 1000);
+  const rows = opts.beforeId
+    ? (db
+        .prepare(
+          'SELECT * FROM turn_events WHERE chat_jid = ? AND id < ? ORDER BY id DESC LIMIT ?',
+        )
+        .all(chatJid, opts.beforeId, limit) as Array<Record<string, unknown>>)
+    : (db
+        .prepare(
+          'SELECT * FROM turn_events WHERE chat_jid = ? ORDER BY id DESC LIMIT ?',
+        )
+        .all(chatJid, limit) as Array<Record<string, unknown>>);
+  return rows.map(mapTurnEventRow).reverse();
+}
+
+/** Drop a conversation's trace rows (session reset / workspace delete). */
+export function deleteTurnEventsForChat(chatJid: string): number {
+  const info = db
+    .prepare('DELETE FROM turn_events WHERE chat_jid = ?')
+    .run(chatJid);
+  return info.changes;
 }

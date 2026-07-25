@@ -22,6 +22,8 @@ import {
 } from '../web-context.js';
 import {
   getRegisteredGroup,
+  getTurnEvents,
+  getTurnEventsForChat,
   setRegisteredGroup,
   deleteRegisteredGroup,
   getAllRegisteredGroups,
@@ -1860,3 +1862,52 @@ groupRoutes.post('/:jid/bind-im', authMiddleware, async (c) => {
 });
 
 export default groupRoutes;
+
+/**
+ * Execution trace for a conversation: which tools ran, what the sub-agents
+ * reported, what the model was reasoning about.
+ *
+ * Complements /:jid/messages, which returns the final text of each turn. The
+ * trace is the work behind that text — before turn_events existed it lived only
+ * in the WebSocket stream and vanished on refresh.
+ *
+ * Paged by row id (`beforeId`) rather than timestamp: events inside one turn
+ * routinely share a millisecond, so the autoincrement id is the only total
+ * order available. Pass `turnId` to fetch exactly one turn instead.
+ */
+groupRoutes.get('/:jid/turn-events', authMiddleware, async (c) => {
+  // Same sensitivity as message content.
+  c.header('Cache-Control', 'private, no-store');
+
+  const jid = c.req.param('jid');
+  const group = getRegisteredGroup(jid);
+  if (!group) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, group)) {
+    return c.json({ error: 'Group not found' }, 404);
+  }
+  if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) {
+    return c.json(
+      { error: 'Insufficient permissions for host execution mode' },
+      403,
+    );
+  }
+
+  const turnId = c.req.query('turnId');
+  if (turnId) {
+    const events = getTurnEvents(turnId);
+    // A turn id is client-supplied; make sure it belongs to this conversation
+    // before returning anything.
+    return c.json({ events: events.filter((e) => e.chatJid === jid) });
+  }
+
+  const limitRaw = parseInt(c.req.query('limit') || '200', 10);
+  const limit = Math.min(Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 200, 1000);
+  const beforeIdRaw = parseInt(c.req.query('beforeId') || '', 10);
+  const beforeId = Number.isFinite(beforeIdRaw) ? beforeIdRaw : undefined;
+
+  return c.json({ events: getTurnEventsForChat(jid, { limit, beforeId }) });
+});

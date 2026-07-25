@@ -84,6 +84,7 @@ import {
   getProviderPool,
   setConversationRuntimeBinding,
 } from './db.js';
+import { recordTurnEvent } from './turn-trace.js';
 import { markdownToPlainText } from './im-utils.js';
 import { isSessionExpired } from './auth.js';
 import type {
@@ -2504,6 +2505,15 @@ export function broadcastStreamEvent(
   // Agent streams use virtual JID format (jid#agent:agentId) as the key.
   const snapshotJid = agentId ? `${jid}#agent:${agentId}` : jid;
   updateStreamingSnapshot(snapshotJid, event);
+
+  // Persist turn structure. The snapshot above is in-memory and lives only as
+  // long as the stream, so without this the record of what the agent actually
+  // did — tools run, sub-agent findings — disappears on refresh. Filtering and
+  // failure handling live in recordTurnEvent; this call never throws.
+  const traceGroup = getRegisteredGroup(chatJid);
+  if (traceGroup?.folder) {
+    recordTurnEvent(chatJid, traceGroup.folder, event, agentId);
+  }
 }
 
 export function broadcastGroupCreated(
