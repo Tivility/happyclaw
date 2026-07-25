@@ -22,6 +22,24 @@ cd "$(dirname "$0")/.."
 ARCHIVE_DIR="data/logs-archive"
 mkdir -p "$ARCHIVE_DIR"
 
+# --if-due: rotate only when today has no archive yet.
+#
+# Needed because the scheduler is an in-process interval, and an interval that
+# counts from process start never fires for a service that restarts more often
+# than its period -- this service restarted 13 times in one day during
+# development, so a 24h timer would have rotated approximately never. Making the
+# script itself decide whether rotation is due turns "every 24h of uptime" into
+# "once a day", and makes a startup call safe to add.
+IF_DUE=0
+[ "${1:-}" = "--if-due" ] && IF_DUE=1
+
+TODAY=$(date +%Y-%m-%d)
+
+already_rotated_today() {
+  local base="$1"
+  ls "$ARCHIVE_DIR/$base-$TODAY"*.log.gz >/dev/null 2>&1
+}
+
 # Copy-and-truncate assumes launchd opened the log with O_APPEND, so that after
 # truncation the next write lands at offset 0. If that assumption is ever wrong,
 # the descriptor keeps its old offset and the kernel fills the gap with a hole:
@@ -44,6 +62,14 @@ rotate() {
   local logfile="$1"
   [ -f "$logfile" ] || return 0
 
+  local base
+  base=$(basename "$logfile" .log)
+
+  if [ "$IF_DUE" -eq 1 ] && already_rotated_today "$base"; then
+    echo "[rotate-logs] skip $logfile (already rotated today)"
+    return 0
+  fi
+
   local size
   size=$(wc -c < "$logfile" | tr -d ' ')
   if [ "$size" -eq 0 ]; then
@@ -51,9 +77,8 @@ rotate() {
     return 0
   fi
 
-  local base stamp target n
-  base=$(basename "$logfile" .log)
-  stamp=$(date +%Y-%m-%d)
+  local stamp target n
+  stamp="$TODAY"
   target="$ARCHIVE_DIR/$base-$stamp.log.gz"
   n=1
   while [ -e "$target" ]; do

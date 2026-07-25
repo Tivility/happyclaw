@@ -5155,7 +5155,8 @@ export function getMessagesPage(
   const sql = before
     ? `
       SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
-             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+             delivery_status
       FROM messages
       WHERE chat_jid = ? AND timestamp < ?
       ORDER BY timestamp DESC
@@ -5163,7 +5164,8 @@ export function getMessagesPage(
     `
     : `
       SELECT id, chat_jid, source_jid, sender, sender_name, content, timestamp, is_from_me, attachments, token_usage,
-             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason
+             turn_id, session_id, sdk_message_uuid, source_kind, finalization_reason,
+             delivery_status
       FROM messages
       WHERE chat_jid = ?
       ORDER BY timestamp DESC

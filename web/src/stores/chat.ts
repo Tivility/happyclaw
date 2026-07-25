@@ -27,6 +27,13 @@ export interface Message {
   attachments?: string;
   token_usage?: string;
   turn_id?: string | null;
+  /**
+   * Whether this reply reached its IM channel.
+   *
+   * null on web-only turns and on every message stored before delivery tracking
+   * existed — absence means "not tracked", never "failed".
+   */
+  delivery_status?: 'pending' | 'sent' | 'failed' | 'skipped' | null;
   session_id?: string | null;
   sdk_message_uuid?: string | null;
   source_kind?: 'sdk_final' | 'sdk_send_message' | 'interrupt_partial' | 'legacy' | null;

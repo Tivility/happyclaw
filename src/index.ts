@@ -10610,11 +10610,20 @@ async function main(): Promise<void> {
   // com.happyclaw*.plist (see CLAUDE.md §10 — a second plist previously caused a
   // double-service crash loop). The script archives every rotation (decision O2)
   // and no-ops when the files are absent, so dev runs are unaffected.
-  const ROTATE_LOGS_INTERVAL_MS = 24 * 60 * 60 * 1000;
+  // Checked hourly and once at startup, with the script itself deciding whether
+  // today's rotation is still due.
+  //
+  // A plain 24h interval counts from process start, so it never fires for a
+  // service that restarts more often than its period — during development this
+  // one restarted 13 times in a day, which would have meant no rotation at all.
+  // Asking "is it due?" frequently, instead of "has 24h elapsed?" once, makes
+  // the schedule survive restarts and makes a same-day double rotation
+  // impossible.
+  const ROTATE_LOGS_CHECK_INTERVAL_MS = 60 * 60 * 1000;
   const rotateServiceLogs = (): void => {
     execFile(
       'bash',
-      [path.join(process.cwd(), 'scripts', 'rotate-logs.sh')],
+      [path.join(process.cwd(), 'scripts', 'rotate-logs.sh'), '--if-due'],
       { cwd: process.cwd(), timeout: 120_000 },
       (err, stdout, stderr) => {
         if (err) {
@@ -10625,9 +10634,11 @@ async function main(): Promise<void> {
       },
     );
   };
+  // Startup check runs after boot settles so it never competes with load.
+  const startupLogRotationTimer = setTimeout(rotateServiceLogs, 30_000);
   const logRotationInterval = setInterval(
     rotateServiceLogs,
-    ROTATE_LOGS_INTERVAL_MS,
+    ROTATE_LOGS_CHECK_INTERVAL_MS,
   );
 
   // --- Channel reload helpers (hot-reload on config save) ---
@@ -10662,6 +10673,7 @@ async function main(): Promise<void> {
 
     if (startupPluginScanTimer) clearTimeout(startupPluginScanTimer);
     if (periodicPluginScanInterval) clearInterval(periodicPluginScanInterval);
+    clearTimeout(startupLogRotationTimer);
     clearInterval(logRotationInterval);
 
     try {

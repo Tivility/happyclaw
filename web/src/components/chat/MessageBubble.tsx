@@ -1,5 +1,5 @@
 import { useState, memo, lazy, Suspense } from 'react';
-import { Copy, Check, ChevronDown, ChevronUp, Ellipsis, ImageDown } from 'lucide-react';
+import { Copy, Check, ChevronDown, ChevronUp, Ellipsis, ImageDown , AlertTriangle } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { formatTokens } from '@/components/billing/utils';
 import { Message } from '../../stores/chat';
@@ -11,6 +11,7 @@ import { ImageLightbox } from './ImageLightbox';
 import { mediumTap } from '../../hooks/useHaptic';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
+import { TurnTracePanel } from './TurnTracePanel';
 
 const ShareImageDialog = lazy(() => import('./ShareImageDialog').then(m => ({ default: m.ShareImageDialog })));
 
@@ -590,6 +591,39 @@ export const MessageBubble = memo(function MessageBubble({ message, showTime, th
             {/* Token usage */}
             {message.is_from_me && message.token_usage && (
               <TokenUsageDisplay tokenUsageJson={message.token_usage} />
+            )}
+
+            {/* Delivery failure — a reply that never reached its channel used
+                to be indistinguishable from one that arrived, so the only way to
+                notice was the recipient saying nothing came. 'pending' is shown
+                too: a send that never settled is the same experience. */}
+            {message.is_from_me &&
+              (message.delivery_status === 'failed' ||
+                message.delivery_status === 'pending') && (
+                <div
+                  className={`mt-1 flex items-center gap-1 text-[11px] ${
+                    message.delivery_status === 'failed'
+                      ? 'text-rose-500'
+                      : 'text-amber-500'
+                  }`}
+                  title={
+                    message.delivery_status === 'failed'
+                      ? '这条回复未能送达 IM 渠道'
+                      : '这条回复的送达结果尚未确认'
+                  }
+                >
+                  <AlertTriangle className="w-3 h-3" />
+                  {message.delivery_status === 'failed' ? '未送达' : '送达未确认'}
+                </div>
+              )}
+
+            {/* Execution trace — what this turn actually did. Live streaming
+                shows this too, but that state dies with the tab; this reads it
+                back from turn_events. Hidden in shared views, which must not
+                expose tool inputs, and skipped without a turn_id since older
+                messages predate the trace. */}
+            {message.is_from_me && message.turn_id && !isShared && (
+              <TurnTracePanel groupJid={message.chat_jid} turnId={message.turn_id} />
             )}
           </div>
 
