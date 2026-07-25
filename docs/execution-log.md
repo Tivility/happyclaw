@@ -406,3 +406,38 @@ if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) 
 同批次的 `isStaleBackgroundWaitReply`（后台任务完成与模型出文的竞态防护）一并暂缓——在「过程卡 + 结果新消息」的形态下，那条陈旧进度消息正好落在过程卡上，本就是你想看到的「过程」。
 
 **批次 2 结论**：实际需要的代码只有 C-2a 一项，其余四项经查证或**已被本地满足**、或**与决策冲突**、或**属推测性收益**。
+
+---
+
+## 部署 · 阶段 A/B/C 改动上线
+
+**重启前状态确认**：0 个 Docker 容器、0 个宿主机 agent 进程、最后一条消息在 3 小时前（11:00）——完全空闲，重启无中断代价。
+
+**数据备份**（不可逆操作前的规定动作）
+
+```
+data/backups/messages-pre-restart-20260725-140948.db   147 MB
+```
+
+用 `sqlite3 .backup` 取**一致性快照**而非文件拷贝（WAL 模式下直接 cp 可能取到撕裂状态）。校验：备份内与生产库均为 **13727 条消息**，一致。
+
+**重启**：`make launchd-restart` → PID 35445 → 健康检查 healthy → 启动日志无 error（Database initialized / State loaded / Web server started / Scheduler loop started）。
+
+**部署验证**
+
+| 项 | 验证方式 | 结果 |
+|---|---|---|
+| F3 | 生产数据实测 | ✅ `folder='main'` 执行范围 **24 → 3** |
+| F1 | 构建产物比对 | ✅ `pending-tasks` 标记 ×2、`getBlockingPendingSdkTaskCount` 定义+调用均在 `dist/` |
+| P12 | 构建产物比对 | ✅ `AGENT_BROWSER_SESSION` ×2 在 `dist/container-runner.js` |
+| O2 | 已于 B-4 实测 | ✅ append 模式确认，轮转已生效 |
+| F6 | 已于 B-3 实测 | ✅ 真实 SDK 更新 0.3.215→0.3.220 走成功分支 |
+
+**仍需真实使用才能观察的两项**（无法在不占用你的工作区与 token 的前提下自行触发）
+
+1. **F1 端到端**：下次跑认知管线或长调研任务时，日志里应出现
+   `[pending-tasks] +xxx (...) → N pending`，随后
+   `Result emitted but N background task(s) still running, holding stream open`。
+   成功标志是**三个维度子 Agent 都有产出**（对照修复前 6/6 全灭）
+2. **P12 集成**：任一宿主机任务用过浏览器后退出，日志应出现
+   `Closed agent-browser session after host run`；`agent-browser session list` 应为空
