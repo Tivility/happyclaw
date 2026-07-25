@@ -62,6 +62,14 @@ export async function apiFetch<T>(path: string, options?: RequestInit & { timeou
   return res.json();
 }
 
+/**
+ * 按上传字节数推算请求超时，避免大文件在慢网络下被固定的 120s 超时误杀。
+ * 以 20KB/s 的保守下限估算，最少 120s，最多 10min（与后端 requestTimeout 对齐）。
+ */
+export function computeUploadTimeoutMs(bytes: number): number {
+  return Math.min(10 * 60_000, Math.max(120_000, Math.ceil(bytes / (20 * 1024)) * 1000));
+}
+
 export const api = {
   get: <T>(path: string) => apiFetch<T>(path),
   post: <T>(path: string, body?: unknown, timeoutMs?: number) => apiFetch<T>(path, { method: 'POST', body: body ? JSON.stringify(body) : undefined, ...(timeoutMs ? { timeoutMs } : {}) }),
@@ -70,9 +78,13 @@ export const api = {
   delete: <T>(path: string) => apiFetch<T>(path, { method: 'DELETE' }),
   uploadFiles: async <T>(path: string, files: FileList, extraFields?: Record<string, string>) => {
     const formData = new FormData();
-    for (const file of files) formData.append('files', file);
+    let totalBytes = 0;
+    for (const file of files) {
+      formData.append('files', file);
+      totalBytes += file.size;
+    }
     if (extraFields) for (const [k, v] of Object.entries(extraFields)) formData.append(k, v);
     // 不设 Content-Type，浏览器自动加 boundary
-    return apiFetch<T>(path, { method: 'POST', body: formData, headers: {} });
+    return apiFetch<T>(path, { method: 'POST', body: formData, headers: {}, timeoutMs: computeUploadTimeoutMs(totalBytes) });
   },
 };

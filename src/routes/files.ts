@@ -22,6 +22,7 @@ import {
   getFileRoot,
 } from '../file-manager.js';
 import { checkStorageLimit, isBillingEnabled } from '../billing.js';
+import { MAX_FILE_SIZE_MB } from '../config.js';
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -327,7 +328,9 @@ fileRoutes.post('/:jid/files', authMiddleware, async (c) => {
       // 检查文件大小
       if (file.size > MAX_FILE_SIZE) {
         return c.json(
-          { error: `File ${file.name} exceeds maximum size of 50MB` },
+          {
+            error: `File ${file.name} exceeds maximum size of ${MAX_FILE_SIZE_MB}MB`,
+          },
           400,
         );
       }

@@ -505,3 +505,42 @@ writeTaskResult 调用点：
 **数据备份**：不涉及（无 schema 变更；重启前的库快照已于上一节留档）。
 
 **待实机验证**：下次定时任务触发时，确认只触发一次、回投 IM 一次、不增殖；Codex/Grok 经独立 MCP server 调 `update_task` 的通路正常。
+
+---
+
+### C-1 · 机械修复（cherry-pick）
+
+按价值挑选而非全量照搬——Windows 兼容三连对 macOS 部署零收益，暂不摘。
+
+| commit | 内容 | 冲突 |
+|---|---|---|
+| `072e608` | 大文件上传/下载：超时误杀 + 50MB 上限写死 → `MAX_FILE_SIZE_MB` 可配 | CLAUDE.md（文档） |
+| `631e465` | Markdown 图片中文文件名解码 | `MarkdownRenderer.tsx` |
+| `9262274` | better-sqlite3 `^11.8.1` → `^12.10.0`（Node 26 原生编译兼容） | 无 |
+| `eabc1f3` | 飞书 IM 配置 appId 格式校验 + 保存前连通性测试 | 无 |
+
+**两处冲突的解决**
+
+- **CLAUDE.md**：本地版多三行（`feishu-streaming-card` / `qq-streaming-card` / `feishu-cards`）且 `im-manager` 描述含微信；upstream 更新了 `im-downloader` 的大小限制描述。**保留本地行 + 采纳 upstream 的事实更新**，两者不互斥
+- **`MarkdownRenderer.tsx`**：upstream 把内联的 `resolveImageSrc` 抽成了 `web/src/utils/markdownImageSrc.ts` 并配 122 行测试。**取 upstream 版**——抽出的实现更健壮（中文文件名解码正是这次修的），且带测试。删掉本地内联函数后 `toBase64Url` / `withBasePath` 的导入也随之不再需要
+
+**better-sqlite3 升级的额外验证**（原生模块，且要读 147 MB 生产库）
+
+```
+装上版本: 12.11.1
+原生模块加载: ✅（Node 25.9 / darwin-arm64，内存库读写往返正常）
+生产库只读校验: ✅ 13728 条消息 / 37 表 / schema 40 / journal=wal
+```
+
+**验收**
+
+| 项 | 结果 |
+|---|---|
+| `make typecheck` | ✅ 三项目全绿 |
+| `make test` | ✅ **109 文件 / 1258 通过**（cherry-pick 带来 +53 个用例） |
+| `make build` | ✅ 通过 |
+| 生产库兼容性 | ✅ 见上 |
+
+**数据备份**：升级前的库快照已于「部署」一节留档（`messages-pre-restart-20260725-140948.db`）。本次为只读校验，未写入生产库。
+
+**未摘的**：Windows 兼容三连（`2408d73` / `1d02716` / `fbb37b1` / `0a08fd9`）—— macOS 部署零收益，且其中两个与 `container-runner.ts` 的 Grok 注入分支纠缠，摘入反增冲突面。系统代理（`3371b95`）当前无代理配置时为 no-op，价值待你配代理时再摘；PWA 缓存与浅色主题属纯前端观感，可随时补。

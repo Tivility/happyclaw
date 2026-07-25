@@ -1,6 +1,6 @@
 import path from 'path';
 import fs from 'fs';
-import { DATA_DIR, GROUPS_DIR } from './config.js';
+import { DATA_DIR, GROUPS_DIR, MAX_FILE_SIZE } from './config.js';
 import { deleteContainerEnvConfig } from './runtime-config.js';
 import { logger } from './logger.js';
 
@@ -24,7 +24,9 @@ export interface FileEntry {
 }
 
 // 常量
-export const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+// MAX_FILE_SIZE 统一由 config.ts 定义（可通过 MAX_FILE_SIZE_MB 环境变量配置），
+// 此处 re-export 保持既有 import 路径不变。
+export { MAX_FILE_SIZE };
 const SYSTEM_PATHS = ['logs', 'CLAUDE.md', '.claude', 'conversations'];
 // 预先转小写一次，匹配大小写不敏感文件系统（macOS APFS / Windows NTFS）。
 const SYSTEM_PATHS_LOWER = SYSTEM_PATHS.map((p) => p.toLowerCase());

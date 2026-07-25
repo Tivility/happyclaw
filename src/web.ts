@@ -2727,6 +2727,17 @@ export function startWebServer(webDeps: WebDeps): void {
     {
       fetch: app.fetch,
       port: WEB_PORT,
+      // Node HTTP server 默认 requestTimeout=300s（5min）会掐断慢速的大文件
+      // 上传/下载。放宽到 10min，让大文件在一般网络下也能传完。
+      // 取舍：requestTimeout 是服务器全局设置、对所有路由生效，且是"整个请求
+      // 到达"的硬期限（收到数据也不重置），拉长必然同步放大 slow-POST 的连接
+      // 占用窗口（此处 5min→10min，2×）。headersTimeout 仍为 60s，只挡
+      // header-slowloris，挡不住慢速 body；暴露在不可信网络时应在前置反向代理
+      // 上做 body 限速/超时。10min 是"支持大文件"与"限制 DoS 占用"的折中默认值。
+      serverOptions: {
+        requestTimeout: 10 * 60 * 1000,
+        headersTimeout: 60 * 1000,
+      },
     },
     (info) => {
       logger.info({ port: info.port }, 'Web server started');

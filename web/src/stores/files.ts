@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api, apiFetch } from '../api/client';
+import { api, apiFetch, computeUploadTimeoutMs } from '../api/client';
 
 export interface FileEntry {
   name: string;
@@ -119,6 +119,7 @@ export const useFileStore = create<FileState>((set, get) => ({
           method: 'POST',
           body: formData,
           headers: {},
+          timeoutMs: computeUploadTimeoutMs(file.size),
         });
 
         uploadedBytes += file.size;

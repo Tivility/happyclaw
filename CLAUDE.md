@@ -21,7 +21,7 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/web.ts` | Hono 框架：路由挂载、WebSocket 升级、HMAC Cookie 认证、静态文件托管 |
 | `src/routes/auth.ts` | 认证：登录 / 登出 / 注册、`GET /api/auth/me`（含 `setupStatus`）、设置向导、RBAC、邀请码 |
 | `src/routes/groups.ts` | 群组 CRUD、消息分页、会话重置（重建工作区）、群组级容器环境变量 |
-| `src/routes/files.ts` | 文件上传（50MB 限制）/ 下载 / 删除、目录管理、路径遍历防护 |
+| `src/routes/files.ts` | 文件上传（默认 50MB 限制，见 `MAX_FILE_SIZE_MB`）/ 下载 / 删除、目录管理、路径遍历防护 |
 | `src/routes/config.ts` | Claude / 飞书配置（AES-256-GCM 加密存储）、连通性测试、批量应用到所有容器、per-user IM 通道配置（`/api/config/user-im/feishu`、`/api/config/user-im/telegram`、`/api/config/user-im/qq`、`/api/config/user-im/dingtalk`、`/api/config/user-im/whatsapp`） |
 | `src/routes/monitor.ts` | 系统状态：容器列表、队列状态、健康检查（`GET /api/health` 无需认证） |
 | `src/routes/memory.ts` | 记忆文件读写（`groups/global/` + `groups/{folder}/`）、全文检索 |
@@ -51,7 +51,7 @@ HappyClaw 是一个自托管的多用户 AI Agent 系统：
 | `src/feishu-streaming-card.ts` | 飞书流式卡片控制器（增量编辑、节流、runtime profile） |
 | `src/qq-streaming-card.ts` / `src/discord-streaming-edit.ts` | QQ / Discord 的流式编辑控制器 |
 | `src/feishu-cards/` | 飞书卡片构建工具（builder / sections / length / status-theme） |
-| `src/im-downloader.ts` | IM 文件下载工具：`saveDownloadedFile()` 将 Buffer 写入 `downloads/{channel}/{YYYY-MM-DD}/`，支持 `feishu`/`telegram`/`qq`/`dingtalk` 通道，处理路径安全、文件名冲突和 50MB 限制 |
+| `src/im-downloader.ts` | IM 文件下载工具：`saveDownloadedFile()` 将 Buffer 写入 `downloads/{channel}/{YYYY-MM-DD}/`，支持 `feishu`/`telegram`/`qq`/`dingtalk` 通道，处理路径安全、文件名冲突和大小限制（默认 50MB，见 `MAX_FILE_SIZE_MB`） |
 | `src/im-manager.ts` | IM 连接池管理器（`IMConnectionManager`）：per-user 全渠道（飞书/Telegram/QQ/钉钉/微信/Discord/WhatsApp）连接管理、热重连、批量断开 |
 | `src/container-runner.ts` | 容器生命周期：Docker run + 宿主机进程模式、卷挂载构建（isAdminHome 区分权限）、环境变量注入 |
 | `src/agent-output-parser.ts` | Agent 输出解析：OUTPUT_MARKER 流式输出解析、stdout/stderr 处理、进程生命周期回调（从 container-runner.ts 提取的共享逻辑） |
@@ -659,6 +659,7 @@ HappyClaw 支持除 Claude / Codex 之外的第三条 Agent 运行时：xAI 自�
 | `CONTAINER_IMAGE` | `happyclaw-agent:latest` | Docker 镜像名称 |
 | `CONTAINER_TIMEOUT` | `1800000`（30min） | 容器最大运行时间（可通过设置页覆盖） |
 | `CONTAINER_MAX_OUTPUT_SIZE` | `10485760`（10MB） | 单次输出最大字节（可通过设置页覆盖） |
+| `MAX_FILE_SIZE_MB` | `50` | 文件大小上限（MB）。Web 文件面板上传与 IM 渠道收文件共用（Web 下载为流式返回，不受此限制）；在 `config.ts` 统一定义，`file-manager.ts` 与 `im-downloader.ts` re-export |
 | `IDLE_TIMEOUT` | `1800000`（30min） | 容器空闲超时（可通过设置页覆盖） |
 | `MAX_CONCURRENT_CONTAINERS` | `20` | 最大并发容器数（可通过设置页覆盖） |
 | `MAX_CONCURRENT_HOST_PROCESSES` | `5` | 宿主机模式并发上限（可通过设置页覆盖） |
