@@ -952,3 +952,28 @@ Opus 5 的 `capabilities.context_window` 已是 1000000，无需再开变体。
 
 **遗留**：检测只告警不自动重建。自动重建要拉 4GB 镜像、耗时数分钟，放在启动路径上
 会让每次重启不可预测地变慢——更适合由使用者按提示手动触发。
+
+---
+
+## 后续 · 跨运行时交接改为「摘要 + 原文」
+
+**使用者判断**：切 runtime 时应该是摘要 + 最近 50k 消息注入，成本可接受。
+
+**原行为**：摘要与原文**互斥**——`renderRecentMessages` 那段有 `!handoffSummary` 条件，有摘要就完全不注入原文。摘要恰好压掉了接手方最需要的东西：上一个决定的原话、正在改的是哪个文件、用户到底问了什么。而跨运行时又无法 resume native session（Claude 的 session id 对 Codex/Grok 无意义），于是接手方只能从一段压缩描述重新开始。
+
+**落地**
+
+- `runtime-input-builder.ts` 新增 `handoff_history` 块，与 `handoff_summary` **并存**
+- `HANDOFF_HISTORY_TOKEN_BUDGET = 100_000`，**消息整条携带、不做按条截断**。半截的决定或被切断的代码块，往往比这条消息缺席更糟——模型无从知道被删掉的是什么。丢整条旧消息则降级干净：留下的每一条都是原文，丢了多少也如实标出
+- `estimateTokens` 做 **CJK 感知**：纯 `chars/4` 会把中文低估约 3 倍，导致预算严重超发。CJK 码点按约 1 token 计、其余按 4 字符 1 token，偏保守以确保预算被遵守而非静默突破
+- `selectMessagesWithinBudget` **从最新往回取**：丢最旧的降级优雅，丢最新的等于把一段缺了结尾的对话交出去
+- 超预算时在块上标 `truncated-older="N"`，让接手方知道记录是**部分的**，而不是误以为看到了全部
+- `collectRecentMessagesForRuntimeContext` 在交接时取 1000 条（`HANDOFF_HISTORY_MESSAGE_FETCH`），使**预算而非行数**成为约束
+- 唯一的例外：若**最新那一条**单独就超预算（病态情形），仍截断收下——交出一个空的历史块比交出一条被裁的更糟
+- 主路径与 sub-agent 路径**对称**处理
+
+**验收**：新增 13 用例（含最新保留最旧丢弃、整条不截断、放不下的旧消息整条丢弃而非裁剪、`truncated-older` 标记、privacy 与 `suppressRecentHistory` 仍抑制、无摘要时行为不变）。
+
+**更新了一个既有测试**：`runtime-input-builder.test.ts` 里那条 `uses a model-switch handoff summary instead of raw recent messages` 守的正是被替换掉的旧语义，已改为 `carries real transcript alongside...` 并断言两个块同时存在。
+
+119 文件 / 1416 测试通过。

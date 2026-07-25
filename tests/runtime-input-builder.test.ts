@@ -30,7 +30,7 @@ describe('RuntimeInputBuilder', () => {
     expect(result.prompt).toContain('之前的关键结论');
   });
 
-  it('uses a model-switch handoff summary instead of raw recent messages', () => {
+  it('carries real transcript alongside a model-switch handoff summary', () => {
     const result = buildRuntimePrompt({
       runtime: 'codex',
       groupFolder: 'demo',
@@ -46,7 +46,7 @@ describe('RuntimeInputBuilder', () => {
         {
           id: 'm1',
           sender_name: 'user',
-          content: '这条原文不应该注入',
+          content: '这条原文应当随摘要一起注入',
           timestamp: '2026-04-25T00:00:00.000Z',
           is_from_me: false,
         },
@@ -56,10 +56,18 @@ describe('RuntimeInputBuilder', () => {
 
     expect(result.resumeMode).toBe('soft_inject');
     expect(result.summaryId).toBe('summary-1');
-    expect(result.injectedBlockKinds).toEqual(['handoff_summary']);
+    // A summary alone compresses away the wording of the last decision and what
+    // was actually being worked on — exactly what the receiving runtime needs,
+    // and what it cannot recover because the native session is not resumable
+    // across runtimes. The raw tail now travels with it, bounded by a token
+    // budget.
+    expect(result.injectedBlockKinds).toEqual([
+      'handoff_summary',
+      'handoff_history',
+    ]);
     expect(result.prompt).toContain('<handoff-summary id="summary-1">');
     expect(result.prompt).toContain('用户正在测试模型切换');
-    expect(result.prompt).not.toContain('这条原文不应该注入');
+    expect(result.prompt).toContain('这条原文应当随摘要一起注入');
   });
 
   it('does not fall back to raw recent messages for model switches without a summary', () => {

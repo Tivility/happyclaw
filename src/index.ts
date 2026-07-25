@@ -3468,6 +3468,26 @@ export function collectMessageImages(
   return images;
 }
 
+/**
+ * Recent messages for runtime context injection.
+ *
+ * `limit` defaults to 20 for ordinary soft-injection, where the block is a small
+ * reminder rather than a transcript. A runtime handoff passes a much larger
+ * limit: the receiving runtime cannot resume the native session, so it needs
+ * real history, and the builder trims whatever does not fit its token budget.
+ * Fetching more than the budget can hold is deliberate — the budget, not the row
+ * count, decides how much survives.
+ */
+/**
+ * How many rows to fetch for a runtime handoff.
+ *
+ * Sized so the token budget — not the row count — is what limits the transcript.
+ * Messages are carried whole, so short ones are cheap and it takes many of them
+ * to reach 100k tokens; fetching 1000 keeps the builder the binding constraint
+ * on any realistic conversation while staying a bounded query.
+ */
+const HANDOFF_HISTORY_MESSAGE_FETCH = 1000;
+
 function collectRecentMessagesForRuntimeContext(
   chatJid: string,
   excludeMessageIds: Set<string>,
@@ -5251,9 +5271,13 @@ async function runAgent(
     return { status: 'error', error: unavailable };
   }
   const sessionId = getNativeSessionIdForResolution(runtimeResolution);
+  // A handoff needs enough rows to fill the builder's token budget; ordinary
+  // soft-injection only wants a short reminder. Fetching generously here is
+  // intentional — selectMessagesWithinBudget decides what actually survives.
   const recentRuntimeMessages = collectRecentMessagesForRuntimeContext(
     chatJid,
     new Set(contextOptions?.excludeMessageIds || []),
+    handoffSummary ? HANDOFF_HISTORY_MESSAGE_FETCH : undefined,
   );
   const runtimeContext = buildRuntimePrompt({
     runtime: runtimeResolution.binding.runtime,
@@ -7856,9 +7880,11 @@ async function processAgentConversation(
   // Get or use agent-specific session
   const sessionId = getNativeSessionIdForResolution(runtimeResolution);
   let currentAgentSessionId = sessionId;
+  // Mirrors the main path: a handoff fetches enough rows to fill the budget.
   const recentAgentRuntimeMessages = collectRecentMessagesForRuntimeContext(
     virtualChatJid,
     new Set(missedMessages.map((message) => message.id)),
+    handoffSummary ? HANDOFF_HISTORY_MESSAGE_FETCH : undefined,
   );
   const runtimeContext = buildRuntimePrompt({
     runtime: runtimeResolution.binding.runtime,

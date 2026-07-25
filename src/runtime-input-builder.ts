@@ -109,6 +109,113 @@ function shouldInjectRecentHistory(
   return false;
 }
 
+/**
+ * Token budget for the raw history that accompanies a handoff summary.
+ *
+ * A runtime switch cannot resume the native session — a Claude session id means
+ * nothing to Codex or Grok — so the receiving runtime previously started from
+ * the summary alone. A summary compresses away exactly what a continuing
+ * conversation needs: the wording of the last decision, the shape of the file
+ * that was being edited, what the user actually asked. Carrying real transcript
+ * alongside it costs one-off input tokens on the first turn after a switch,
+ * which is cheap next to re-deriving that context by asking again.
+ */
+const HANDOFF_HISTORY_TOKEN_BUDGET = 100_000;
+
+/**
+ * Rough token count, CJK-aware.
+ *
+ * A plain chars/4 estimate under-counts Chinese text by ~3x, which would let the
+ * budget overshoot badly on this deployment's mostly-Chinese conversations.
+ * Counting CJK codepoints as roughly one token each and the rest at four
+ * characters per token is imprecise but errs toward over-counting, so the budget
+ * is respected rather than silently exceeded.
+ */
+function estimateTokens(text: string): number {
+  let cjk = 0;
+  for (const ch of text) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (
+      (code >= 0x4e00 && code <= 0x9fff) ||
+      (code >= 0x3040 && code <= 0x30ff) ||
+      (code >= 0xac00 && code <= 0xd7af)
+    ) {
+      cjk++;
+    }
+  }
+  const rest = text.length - cjk;
+  return cjk + Math.ceil(rest / 4);
+}
+
+/**
+ * Fill backwards from the newest message until the token budget is spent.
+ *
+ * Messages are taken **whole**. Per-message truncation would hand the receiving
+ * runtime a transcript of mutilated messages — a half-quoted decision or a
+ * clipped code block is often worse than not having that message at all, since
+ * the model cannot tell what was removed. Dropping whole old messages instead
+ * degrades cleanly: everything present is verbatim, and the count of what was
+ * dropped is reported.
+ *
+ * Walking backwards is deliberate: the tail of a conversation is what a
+ * switched-to runtime needs, and dropping the newest would hand over a
+ * conversation missing its own ending.
+ */
+function selectMessagesWithinBudget(
+  messages: RuntimeContextMessage[],
+  tokenBudget: number,
+): { selected: RuntimeContextMessage[]; droppedCount: number } {
+  const picked: RuntimeContextMessage[] = [];
+  let used = 0;
+
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    const content = message.content || '';
+    const cost = estimateTokens(content) + 32; // per-message XML envelope
+
+    if (used + cost > tokenBudget) {
+      // A single newest message larger than the whole budget is pathological,
+      // but handing over an empty history block would be worse than handing
+      // over a clipped one — so this one case truncates rather than yielding
+      // nothing at all.
+      if (picked.length === 0) {
+        picked.push({
+          ...message,
+          content: truncateText(content, tokenBudget * 2),
+        });
+      }
+      break;
+    }
+
+    used += cost;
+    picked.push(message);
+  }
+
+  picked.reverse();
+  return { selected: picked, droppedCount: messages.length - picked.length };
+}
+
+/**
+ * History block that accompanies a handoff summary.
+ *
+ * Labelled distinctly from ordinary recent-history so the receiving model can
+ * tell "this is the transcript I am continuing" from "these are a few messages
+ * for context", and states the drop count so it knows the record is partial
+ * rather than assuming it has seen the whole conversation.
+ */
+function renderHandoffHistory(
+  messages: RuntimeContextMessage[],
+  droppedCount: number,
+): string {
+  const lines = messages.map((message) => {
+    const role = message.is_from_me ? 'assistant' : message.sender_name || 'user';
+    return `  <message id="${escapeXml(message.id)}" role="${escapeXml(role)}" time="${escapeXml(message.timestamp)}">${escapeXml(message.content || '')}</message>`;
+  });
+  const truncatedAttr =
+    droppedCount > 0 ? ` truncated-older="${droppedCount}"` : '';
+  return `<handoff-history${truncatedAttr}>\n${lines.join('\n')}\n</handoff-history>`;
+}
+
 function renderRecentMessages(messages: RuntimeContextMessage[]): string {
   const lines = messages.map((message) => {
     const role = message.is_from_me ? 'assistant' : message.sender_name || 'user';
@@ -218,6 +325,25 @@ export function buildRuntimePrompt(
       content: rendered,
       hash: sha256(rendered),
     });
+
+    // Real transcript alongside the summary. The summary alone compresses away
+    // the wording of the last decision and what was actually being worked on,
+    // which is what the receiving runtime needs most; the raw tail costs input
+    // tokens once, on the first turn after the switch.
+    if (!input.suppressRecentHistory && recentMessages.length > 0) {
+      const { selected, droppedCount } = selectMessagesWithinBudget(
+        recentMessages,
+        HANDOFF_HISTORY_TOKEN_BUDGET,
+      );
+      if (selected.length > 0) {
+        const history = renderHandoffHistory(selected, droppedCount);
+        blocks.push({
+          kind: 'handoff_history',
+          content: history,
+          hash: sha256(history),
+        });
+      }
+    }
   }
   const modelSwitchWithoutSummary =
     softInjectionReason === 'model_binding_changed' && !handoffSummary;
