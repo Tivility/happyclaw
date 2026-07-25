@@ -15,6 +15,7 @@ import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
+import { formatIsoLocal } from './utils.js';
 
 /** Context required by MCP tools. Passed at construction time. */
 export interface McpContext {
@@ -501,7 +502,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           .optional()
           .default('')
           .describe(
-            'What the agent should do (agent mode) or task description (script mode, optional).',
+            'The action to perform on EACH run (agent mode), or task description (script mode). The repeat cadence is expressed by schedule_type/schedule_value — do NOT put scheduling words like "每隔N/每天/定期/提醒我/every N" into the prompt. This prompt is replayed verbatim to the agent on every trigger to execute, so write it as a direct imperative action, not as a request to schedule something.',
           ),
         schedule_type: z
           .enum(['cron', 'interval', 'once'])
@@ -630,12 +631,14 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           hasCrossGroupAccess && args.target_group_jid
             ? args.target_group_jid
             : ctx.chatJid;
-        const data: Record<string, unknown> = {
+        const requestId = newRequestId();
+        const data: Record<string, unknown> & { requestId: string } = {
           type: 'schedule_task',
+          requestId,
           prompt: args.prompt || '',
           schedule_type: args.schedule_type,
           schedule_value: args.schedule_value,
-          context_mode: args.context_mode || 'isolated',
+          context_mode: args.context_mode || 'group',
           execution_type: execType,
           targetJid,
           createdBy: ctx.groupFolder,
@@ -647,16 +650,46 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         if (args.execution_mode) {
           data.execution_mode = args.execution_mode;
         }
-        const filename = writeIpcFile(TASKS_DIR, data);
         const modeLabel = execType === 'script' ? 'script' : 'agent';
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Task scheduled [${modeLabel}] (${filename}): ${args.schedule_type} - ${args.schedule_value}`,
-            },
-          ],
-        };
+        // 改为阻塞确认：等主进程真正落库后回执，避免 fire-and-forget 的“报成功但没建成”。
+        try {
+          const result = await pollIpcResult(TASKS_DIR, data, 'schedule_task_result');
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to schedule task: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const nextRun = result.nextRun
+            ? ` 下次触发：${formatIsoLocal(result.nextRun as string)}`
+            : '';
+          const dup = result.duplicate
+            ? '（已存在完全相同的活动任务，未重复创建，返回的是已有任务）'
+            : '';
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task scheduled [${modeLabel}] id=${result.taskId ?? '?'}: ${args.schedule_type} - ${args.schedule_value}.${nextRun}${dup}`,
+              },
+            ],
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: 'Timeout waiting for schedule_task confirmation. 任务可能已创建也可能未创建——请先用 list_tasks 核实，不要直接重试以免重复创建。',
+              },
+            ],
+            isError: true,
+          };
+        }
       },
     ),
 
@@ -708,7 +741,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           const formatted = tasks
             .map(
               (t) =>
-                `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${t.next_run || 'N/A'}`,
+                `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${formatIsoLocal(t.next_run)}`,
             )
             .join('\n');
           return {
@@ -738,20 +771,27 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       async (args) => {
         const data = {
           type: 'pause_task',
+          requestId: newRequestId(),
           taskId: args.task_id,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
-        writeIpcFile(TASKS_DIR, data);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Task ${args.task_id} pause requested.`,
-            },
-          ],
-        };
+        try {
+          const result = await pollIpcResult(TASKS_DIR, data, 'pause_task_result');
+          if (!result.success) {
+            return {
+              content: [{ type: 'text' as const, text: `Failed to pause task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              isError: true,
+            };
+          }
+          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} paused.` }] };
+        } catch {
+          return {
+            content: [{ type: 'text' as const, text: `Timeout waiting for pause confirmation for task ${args.task_id}.` }],
+            isError: true,
+          };
+        }
       },
     ),
 
@@ -763,20 +803,27 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       async (args) => {
         const data = {
           type: 'resume_task',
+          requestId: newRequestId(),
           taskId: args.task_id,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
-        writeIpcFile(TASKS_DIR, data);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Task ${args.task_id} resume requested.`,
-            },
-          ],
-        };
+        try {
+          const result = await pollIpcResult(TASKS_DIR, data, 'resume_task_result');
+          if (!result.success) {
+            return {
+              content: [{ type: 'text' as const, text: `Failed to resume task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              isError: true,
+            };
+          }
+          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} resumed.` }] };
+        } catch {
+          return {
+            content: [{ type: 'text' as const, text: `Timeout waiting for resume confirmation for task ${args.task_id}.` }],
+            isError: true,
+          };
+        }
       },
     ),
 
@@ -788,20 +835,82 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       async (args) => {
         const data = {
           type: 'cancel_task',
+          requestId: newRequestId(),
           taskId: args.task_id,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
-        writeIpcFile(TASKS_DIR, data);
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `Task ${args.task_id} cancellation requested.`,
-            },
-          ],
+        try {
+          const result = await pollIpcResult(TASKS_DIR, data, 'cancel_task_result');
+          if (!result.success) {
+            return {
+              content: [{ type: 'text' as const, text: `Failed to cancel task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              isError: true,
+            };
+          }
+          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} cancelled and deleted.` }] };
+        } catch {
+          return {
+            content: [{ type: 'text' as const, text: `Timeout waiting for cancel confirmation for task ${args.task_id}.` }],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- update_task ---
+    tool(
+      'update_task',
+      `Update an existing scheduled task IN PLACE. Strongly PREFER this over cancel_task + schedule_task when modifying an existing task: delete-then-recreate risks leaving a duplicate (if the delete silently fails) or losing the task entirely. Only the fields you pass are changed; omit a field to keep its current value.`,
+      {
+        task_id: z.string().describe('The task ID to update'),
+        prompt: z.string().optional().describe('New action/instructions for the task (agent mode)'),
+        schedule_type: z.enum(['cron', 'interval', 'once']).optional().describe('New schedule type. If you change this you MUST also pass schedule_value.'),
+        schedule_value: z
+          .string()
+          .optional()
+          .describe('New schedule value (LOCAL time): cron expr | interval ms | once "2026-02-01T15:30:00" (no Z).'),
+        context_mode: z.enum(['group', 'isolated']).optional().describe('New context mode (agent mode)'),
+        execution_type: z.enum(['agent', 'script']).optional().describe('New execution type (script is admin only)'),
+        script_command: z.string().max(4096).optional().describe('New shell command (script mode)'),
+        execution_mode: z.enum(['host', 'container']).optional().describe('New execution mode (host is admin only)'),
+      },
+      async (args) => {
+        // 改 schedule_type 必须同时给 schedule_value，否则主进程无法据新类型重算 next_run。
+        if (args.schedule_type && !args.schedule_value) {
+          return {
+            content: [{ type: 'text' as const, text: 'When changing schedule_type you must also provide a matching schedule_value.' }],
+            isError: true,
+          };
+        }
+        const data: Record<string, unknown> & { requestId: string } = {
+          type: 'update_task',
+          requestId: newRequestId(),
+          taskId: args.task_id,
+          groupFolder: ctx.groupFolder,
+          isMain: hasCrossGroupAccess,
+          timestamp: new Date().toISOString(),
         };
+        for (const k of ['prompt', 'schedule_type', 'schedule_value', 'context_mode', 'execution_type', 'script_command', 'execution_mode'] as const) {
+          if (args[k] !== undefined) data[k] = args[k];
+        }
+        try {
+          const result = await pollIpcResult(TASKS_DIR, data, 'update_task_result');
+          if (!result.success) {
+            return {
+              content: [{ type: 'text' as const, text: `Failed to update task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              isError: true,
+            };
+          }
+          const nextRun = result.nextRun ? ` 下次触发：${formatIsoLocal(result.nextRun as string)}` : '';
+          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} updated.${nextRun}` }] };
+        } catch {
+          return {
+            content: [{ type: 'text' as const, text: `Timeout waiting for update confirmation for task ${args.task_id}.` }],
+            isError: true,
+          };
+        }
       },
     ),
 

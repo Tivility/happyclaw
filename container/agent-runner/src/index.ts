@@ -34,7 +34,7 @@ import type {
 import type { ClaudeContextAudit } from './stream-event.types.js';
 export type { StreamEventType, StreamEvent } from './types.js';
 
-import { sanitizeFilename, generateFallbackName } from './utils.js';
+import { sanitizeFilename, generateFallbackName, formatLocalNow } from './utils.js';
 import {
   extractSessionHistory as extractSessionHistoryImpl,
   parseTranscript,
@@ -435,6 +435,12 @@ class MessageStream {
     if (allImagesDropped && !effectiveText.trim()) {
       effectiveText = `[用户发送了 ${originalImageCount} 张图片，但因尺寸超出 API 限制（最大 ${IMAGE_MAX_DIMENSION}px）被跳过。请提示用户压缩或截取后重发。]`;
     }
+
+    // 每条 user message 前置当前本地时间，让 agent 能正确推理相对时间 / schedule_task 的
+    // once/cron 取值（#563）。刻意放在 user message（缓存前缀之后的未缓存区）而非 system
+    // prompt：① 不会因每 turn 时间不同而击穿整段 system+历史的 prompt cache；② 长会话里
+    // 每个 turn 都拿到新鲜时间，而非会话启动那一刻的陈旧时间。
+    effectiveText = `[当前时间: ${formatLocalNow()}]\n${effectiveText}`;
 
     let content:
       | string
@@ -2292,6 +2298,8 @@ async function main(): Promise<void> {
       '重要：你正在定时任务模式下运行。你的最终输出不会自动发送给用户。你必须使用 mcp__happyclaw__send_message 工具来发送消息，否则用户将收不到任何内容。',
       '',
       '注意：只在完成任务后调用一次 send_message 发送最终结果，不要发送中间状态或重复消息。',
+      '',
+      '此外：本次运行就是该定时任务本身的执行，对应任务已在调度中。即使下面内容里出现「每隔/每天/定期/提醒我」等字样，也不要再调用 mcp__happyclaw__schedule_task 创建新的定时任务（除非内容明确要求你另外新建一个不同的任务）。',
     ];
     const scheduledTaskPrefix = scheduledTaskPrefixLines.join('\n');
     prompt = scheduledTaskPrefix + '\n\n' + prompt;

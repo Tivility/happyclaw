@@ -441,3 +441,67 @@ data/backups/messages-pre-restart-20260725-140948.db   147 MB
    成功标志是**三个维度子 Agent 都有产出**（对照修复前 6/6 全灭）
 2. **P12 集成**：任一宿主机任务用过浏览器后退出，日志应出现
    `Closed agent-browser session after host run`；`agent-browser session list` 应为空
+
+---
+
+### C-3 · 飞书 10 个 MCP 工具 —— **暂缓，撞到依赖墙**
+
+原计划把 upstream 的 `feishu_send_card` / `edit_message` / `recall_message` / `add_reaction` / `remove_reaction` / `get_chat` / `get_history` / `get_user` / `list_members` / `api_request` 十个工具作为「纯加法」摘过来。查证后发现**不是纯加法**。
+
+十个工具全部经由同一个 `callFeishuCapability(operation, params)` 走 IPC，而它的前置检查是：
+
+```ts
+const channelContext = currentChannelContext();
+if (channelContext?.provider !== 'feishu') throw ...
+if (!ctx.currentInputTurnId) throw ...
+```
+
+本地 `McpContext` **既没有 `channelContext` 也没有 `currentInputTurnId`**（已核对字段清单）。而 upstream 的 `ChannelTurnContext` 结构里带 `channelAccountId` —— 指向 `channel_accounts` 表，正是**本地已决定不采纳**的多账号模型。
+
+所以有两条路，都不适合现在做：
+
+| 选项 | 代价 |
+|---|---|
+| 等批次 7/8 的 channel 基础设施落地后再摘 | 顺序正确，但要等 |
+| 本地按 `ctx.chatJid`（已含 `feishu:` 前缀与 chat id）重新实现 | 约 400~600 行**重写**，且不与 upstream 同源——将来每次合并都要手工对齐 |
+
+**结论**：暂缓，移到批次 7 之后。这不是「不做」，是**顺序纠正**——原计划把它排在批次 3 是基于「纯加法」的误判。
+
+---
+
+### C-4 · 定时任务加固（cherry-pick 四连）
+
+**改动**：按时序 cherry-pick `c4ad5c0`（时区注入）→ `065e874`（阻塞确认 + `update_task` + 幂等去重）→ `ec62d7c`（触发框定堵递归增殖）→ `ae42183`（对抗审查 CR 修复）。
+
+**四个 commit 全部零冲突应用** —— 印证了此前的判断：它们不碰 `db.ts`、不需要 `task_runs` 表（租约队列由另一个 commit `2dbb553` 引入，属「任务执行保留本地」的不合范围）。
+
+**实际带来的能力**
+
+| 项 | 说明 |
+|---|---|
+| `update_task` | 新 MCP 工具，Agent 可就地改任务而非「取消再建」 |
+| 五个操作改阻塞确认 | `schedule` / `update` / `cancel` / `pause` / `resume` 均等待 `*_result` 回执，不再「发出即假定成功」 |
+| 递归增殖框定 | 任务触发提示词明确「这条只是触发信号，对应定时任务已在调度中，不要再 `schedule_task` 重复创建」 |
+| 时区注入 | 给 Agent 注入带时区的当前时间，`list_tasks` 按本地时区展示 |
+
+**集成完整性核对**（阻塞确认最怕主进程不写回执——那样每次任务操作都会阻塞到超时）
+
+```
+writeTaskResult 调用点：
+  cancel_task ×3   pause_task ×3   resume_task ×3   schedule_task ×3   update_task ×2
+```
+
+五个操作的成功/失败分支回执均已就位；孤儿结果文件的清理前缀列表也同步更新。
+
+**验收**
+
+| 项 | 结果 |
+|---|---|
+| cherry-pick 冲突 | ✅ **0** |
+| `make typecheck` | ✅ 三项目全绿 |
+| `make test` | ✅ 107 文件 / 1205 通过 |
+| `make build` | ✅ 通过，`update_task` 已进 `dist`（agent-runner ×4 / 主服务 ×6） |
+
+**数据备份**：不涉及（无 schema 变更；重启前的库快照已于上一节留档）。
+
+**待实机验证**：下次定时任务触发时，确认只触发一次、回投 IM 一次、不增殖；Codex/Grok 经独立 MCP server 调 `update_task` 的通路正常。

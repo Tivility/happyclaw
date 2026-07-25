@@ -215,3 +215,78 @@ export function generateFallbackName(): string {
   const time = new Date();
   return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
 }
+
+/**
+ * 解析当前时区名（IANA）。与主服务 src/config.ts 的 TIMEZONE 同一条 fallback 链
+ * （agent-runner 是独立项目，无法 import src/，故在此复刻）。容器模式下 entrypoint
+ * 注入了 TZ；host 模式可能没设 TZ，退回系统解析的时区，最后兜底 Asia/Shanghai。
+ */
+export function currentTimeZone(): string {
+  return (
+    process.env.TZ ||
+    Intl.DateTimeFormat().resolvedOptions().timeZone ||
+    'Asia/Shanghai'
+  );
+}
+
+interface LocalParts {
+  date: string; // YYYY-MM-DD
+  time: string; // HH:mm:ss
+  offset: string; // +08:00 / -05:00 / +00:00
+}
+
+function localDateTimeParts(d: Date, tz: string): LocalParts {
+  const dtParts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(d);
+  const get = (t: string) => dtParts.find((p) => p.type === t)?.value ?? '';
+  // en-CA + hour12:false 在午夜可能给出 '24'，归一到 '00'。
+  let hour = get('hour');
+  if (hour === '24') hour = '00';
+
+  const offsetParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz,
+    timeZoneName: 'longOffset',
+  }).formatToParts(d);
+  const offsetName =
+    offsetParts.find((p) => p.type === 'timeZoneName')?.value ?? 'GMT+00:00';
+  const m = offsetName.match(/GMT([+-]\d{2}:?\d{2})/);
+  let offset = m ? m[1] : '+00:00';
+  if (offset.length === 5) offset = `${offset.slice(0, 3)}:${offset.slice(3)}`; // +0800 -> +08:00
+
+  return {
+    date: `${get('year')}-${get('month')}-${get('day')}`,
+    time: `${hour}:${get('minute')}:${get('second')}`,
+    offset,
+  };
+}
+
+/**
+ * 当前时刻的本地 ISO-8601-with-offset 串 + 时区名，供注入 agent 上下文做相对时间推理。
+ * 形如：2026-06-12T10:50:00+08:00 (Asia/Shanghai)
+ */
+export function formatLocalNow(d: Date = new Date()): string {
+  const tz = currentTimeZone();
+  const { date, time, offset } = localDateTimeParts(d, tz);
+  return `${date}T${time}${offset} (${tz})`;
+}
+
+/**
+ * 把一个 UTC ISO 串（如存储层的 next_run）转成本地时区的可读串，供回执/列表展示。
+ * 形如：2026-06-12 10:50:00 (+08:00)。空/非法输入分别返回 'N/A' / 原样。
+ */
+export function formatIsoLocal(iso: string | null | undefined): string {
+  if (!iso) return 'N/A';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const tz = currentTimeZone();
+  const { date, time, offset } = localDateTimeParts(d, tz);
+  return `${date} ${time} (${offset})`;
+}
