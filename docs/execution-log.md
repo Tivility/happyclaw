@@ -977,3 +977,34 @@ Opus 5 的 `capabilities.context_window` 已是 1000000，无需再开变体。
 **更新了一个既有测试**：`runtime-input-builder.test.ts` 里那条 `uses a model-switch handoff summary instead of raw recent messages` 守的正是被替换掉的旧语义，已改为 `carries real transcript alongside...` 并断言两个块同时存在。
 
 119 文件 / 1416 测试通过。
+
+---
+
+## 后续 · 换 provider 与换 runtime 的上下文交接对齐
+
+**使用者指出**：换 provider 和换 runtime 应该保持一致。
+
+**查证后确认不一致，且比预想更明显**：
+
+| 路径 | 原行为 |
+|---|---|
+| 换 runtime | 摘要 + **1000 条候选 / 100k token / 整条携带** |
+| 换 provider | 独立的一套：**30 条 / 每条截 700 字** |
+| 崩溃恢复 | 又一套：**20 条 / 每条截 500 字** |
+
+三条路径都是「SDK session 没了、必须交接」，从用户视角是同一件事，却按触发原因给了三种差别很大的上下文量。
+
+**改法**：把 `conversation-history.ts` 的 `buildRecentConversationHistoryContext` 也改成整条填充 + token 预算，两个调用点（崩溃恢复、provider 切换）自动对齐到 100k。
+
+- 移除 `maxMessageLength` 按条截断参数
+- 默认取 1000 条候选、预算 100k token，与 runtime 交接一致
+- 同样做 **CJK 感知**估算（该文件独立实现一份，因为它不 import runtime-input-builder；两处注释互相指认）
+- 丢弃数量写进提示词正文（「更早的 N 条因长度限制未包含，这份记录是部分的」），而非只在日志里
+- 病态情形（最新一条单独超预算）仍截断收下，避免交出空块
+- 该函数原有的**孤立代理项剥离**与**闭合标签防逃逸**完整保留——那是安全逻辑，与预算无关
+
+**验收**：新增 13 用例，含「CJK 不被低估」（400 条中文消息必须被裁掉 300+ 条，用朴素 chars/4 估算则会全部放行并撑爆上下文）、「闭合标签仍无法逃逸」、「emoji 存活而孤立代理项被剥离」。
+
+120 文件 / 1429 测试通过。
+
+**现在三条丢会话路径的上下文交接完全一致**：换 runtime / 换 provider / 崩溃恢复，都是最近 100k token 的整条原文（runtime 切换额外带一份摘要，因为它还跨了模型家族）。

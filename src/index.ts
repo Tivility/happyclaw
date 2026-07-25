@@ -3669,8 +3669,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       chatJid,
       new Set(missedMessages.map((m) => m.id)),
       {
-        limit: 20,
-        maxMessageLength: 500,
         intro:
           '检测到上次有未完成消息，当前使用新会话恢复处理。以下是恢复前的最近对话记录，供你了解上下文。',
       },
@@ -3678,7 +3676,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (historyContext) {
       prompt = historyContext.context + prompt;
       logger.info(
-        { group: group.name, historyCount: historyContext.count },
+        {
+          group: group.name,
+          historyCount: historyContext.count,
+          droppedOlder: historyContext.droppedCount,
+        },
         'Recovery: injected recent conversation history into prompt',
       );
     }
@@ -3690,8 +3692,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       chatJid,
       new Set(missedMessages.map((m) => m.id)),
       {
-        limit: 30,
-        maxMessageLength: 700,
         intro:
           '检测到本次因切换 provider 需要使用新的底层模型 session。以下是 HappyClaw 保存的最近对话记录，供你延续上下文。',
       },
