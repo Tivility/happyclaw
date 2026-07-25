@@ -215,9 +215,21 @@ plist 里有 `NODE_ENV=production`，npm 在该模式下连带 prune 掉已装�
 | 服务在 truncate 后仍健康 | ✅ `/api/health` healthy；审计表确认请求仍在处理（`login_failed` 探针记录） |
 | `make typecheck` / `make test` | ✅ 全绿 / 1191 通过 |
 
-**待完成的验证（诚实记录）**：truncate 后**尚未观察到真实日志写入**，因此「launchd 是否 `O_APPEND`」还没有实测定论。已排除的干扰：`lsof -o` 读到偏移 0 但该读数在 macOS 上可能显示 SIZE 而非 OFFSET，不足为证；404 请求与登录失败都不产生 info 级日志（服务确实在处理，审计表有记录）。
+**✅ append 模式已实测确认（追加验证）**
 
-已挂后台观察等首次写入。**若届时「表观体积远大于实际占块」，说明不是 append 模式，需改为「轮转后重启服务」或改由应用自己管理日志文件** —— 脚本里的 `check_sparse()` 会在下次轮转时自动报出这一情况。
+truncate 后挂后台观察，等到第一条真实写入（05:54:50 的 `plugin-importer: scan complete`）：
+
+```
+data/launchd-stdout.log: 表观 224 bytes / 占块 4 KB
+```
+
+判定逻辑：truncate 前该文件 82 MB。若 launchd **没有**用 `O_APPEND`，描述符会保留约 82 MB 的旧偏移，这次写入会落在那个位置，形成稀疏文件——**表观约 82 MB、占块仅 4 KB**。实测表观 224 bytes 与占块 4 KB（单个文件系统块）一致，**没有空洞**。
+
+⇒ **launchd 使用 `O_APPEND`，copy-and-truncate 对这两个日志是安全的**：服务无需重启即继续正常写入，不丢行、不产生稀疏文件。内容也确认完整（时间戳、级别、pid、结构化字段都正常）。
+
+脚本里的 `check_sparse()` 作为长期回归保险保留——若将来 macOS/launchd 行为变化，下次轮转会立即报出。
+
+此前排除的两个不足为证的观察：`lsof -o` 读到偏移 0（macOS 上该列可能显示 SIZE 而非 OFFSET）；404 请求与登录失败都不产生 info 级日志（服务确实在处理，审计表有 `login_failed` 记录）。
 
 **数据备份**：轮转本身即备份——原始 110 MB 日志已完整 gzip 归档在 `data/logs-archive/`（`data/` 已在 .gitignore 中）。
 
@@ -296,6 +308,6 @@ close [--all]           Close browser (--all closes every session)
 
 ### 待验证项（需重启后观察）
 
-1. **O2 的 append 模式判定**：truncate 后至今（约 15 分钟）服务无 info 级日志写入，因此「launchd 是否 `O_APPEND`」仍无实测定论。重启会重开描述符、这一疑问自然消解；但下次轮转的判定仍依赖脚本内置的 `check_sparse()`
+1. ~~**O2 的 append 模式判定**~~ — ✅ **已实测确认**（见 B-4）：truncate 后首次写入为 224 bytes 表观 / 4 KB 占块，无稀疏空洞，`O_APPEND` 成立，copy-and-truncate 安全。**无需重启即已生效**
 2. **F3 的实机效果**：从飞书群侧点重置，确认只停它路由到的工作区
 3. **P12 的实机效果**：跑一次用到浏览器的任务，确认退出后 `agent-browser session list` 为空
