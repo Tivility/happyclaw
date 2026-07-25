@@ -140,6 +140,14 @@ export interface IMChannel {
     chatId: string,
     onCardCreated?: (messageId: string) => void,
   ): Promise<StreamingSession | undefined>;
+  /**
+   * Underlying provider SDK client, when the channel has one.
+   *
+   * Only Feishu implements this today; it backs the feishu_* MCP tools, which
+   * need endpoints (reactions, recall, member lists) that the channel-neutral
+   * IMChannel surface deliberately does not cover.
+   */
+  getProviderClient?(): unknown;
   getChatInfo?(chatId: string): Promise<ChatProbe>;
 }
 
@@ -284,6 +292,10 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       // 飞书未连接是我方状态，零信息量 → unknown（绝不当作群失效）
       if (!inner) return { status: 'unknown', reason: 'feishu not connected' };
       return inner.getChatInfo(chatId);
+    },
+
+    getProviderClient(): unknown {
+      return inner ? inner.getLarkClient() : null;
     },
 
     async createStreamingSession(

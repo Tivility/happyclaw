@@ -636,3 +636,78 @@ PreCompact 里的 memory flush 由 `hadCompaction` 触发，而压缩几乎不�
 ### C-1 补充 · 未摘的
 
 **未摘的**：Windows 兼容三连（`2408d73` / `1d02716` / `fbb37b1` / `0a08fd9`）—— macOS 部署零收益，且其中两个与 `container-runner.ts` 的 Grok 注入分支纠缠，摘入反增冲突面。系统代理（`3371b95`）当前无代理配置时为 no-op，价值待你配代理时再摘；PWA 缓存与浅色主题属纯前端观感，可随时补。
+
+---
+
+## 阶段 E · Agent-first
+
+### E-5 · Agent 人格体系（批次 5）
+
+schema 41 → 42。四张表 + `sessions` 三列身份指纹。
+
+**让表不再惰性的关键**：`systemPromptAppend` 由 `promptPieces` 拼成，而它**同时**喂给三条运行时（Claude 走 SDK systemPrompt、Codex 走 CLI 参数、Grok 走 ACP `_meta.rules`）。所以人格块加进 `promptPieces` 首位即三运行时全覆盖，无需在每个 adapter 各写一遍（那样必然漂移）。
+
+**决策落实**：O1-a 共享语义（N 工作区 : 1 模板）；O1-b 只报告不重置（测试专门断言人格改完后 `getSession()` 仍返回原会话）；A5 指纹只由人格内容决定，不含引擎。
+
+**A5 双指纹之争已消解**：三列加在本地已有的 `sessions` 表上，`conversation_runtime_sessions` 是另一张表，上线后 16 个既有会话完好。
+
+**M4 核实后暂缓**：64 个群组全部有 `created_by`，32 行 `group_members` 全部被覆盖，**零个 (用户,folder) 对只靠它拿权**——删除锁不死人。但纯清理零功能收益，却要在 ACL 上动 4 个授权分支，价值/风险不匹配，留到批次 7 之后与 channel 改造一并做。
+
+### E-6 · workspaces 投影层（批次 6）
+
+schema 42 → 43。**投影而非迁移**：`registered_groups` 带 `execution_mode` / `custom_cwd` / `selected_skills` / `require_mention` / `target_main_jid` 等本地独有列，upstream 的表没位置放，搬迁真相源会丢。
+
+全量重建而非增量：投影很小，重建不会漂移；增量要在每处写入挂钩子，漏一个就产生静默陈旧的投影。`verifyWorkspaceProjection` 作为验收门（也是批次 7 复用的模式）。
+
+**上线实测**：64 群组 → 64 workspaces、16 runtime sessions。
+
+### E-7 · channel_mounts（批次 7）· M5 零妥协
+
+schema 43 → 44。`agent_channel_mounts` 取代 `target_main_jid`。
+
+**迁移设计**：加法式（不清旧列）+ 幂等 + 悬空 target 明确跳过不猜测。**在挂载未经验证时就退役旧列，会让迁移 bug 与路由 bug 无法区分。**
+
+**四重验收**
+| 项 | 结果 |
+|---|---|
+| 单测 14 例 | ✅ |
+| 生产迁移 | ✅ migrated=21 / checked=21 / skipped=0 |
+| **独立脚本对账** | ✅ 迁移前导出 21 条基线，与迁移后逐条 `diff`，**零差异**（不只信应用日志） |
+| **回滚在副本上真跑** | ✅ schema 43、21 条绑定完好、无新表、integrity ok |
+
+M3 串台防御与 F3 补丁的退役留到新表稳定服务一段时间之后——现在路由仍由 `target_main_jid` 承担，并存是本设计的安全边界。
+
+### E-8/9 · 投递可靠性与会话语义融合
+
+schema 44 → 45。`messages` 加 delivery 五列。
+
+此前回复行只记「已存储」，发送抛异常与成功在库里长得一样。现在记录 sent / failed / **skipped**（有意不投递，不能读作失败）；存量行保持 NULL 而非回填猜测——回填会把一万三千条历史变成编造的投递记录。
+
+会话有效性把两套判定合一：人格漂移**只报告不丢弃**（O1-b），引擎漂移**必须丢弃**（一个 runtime 的 native session id 对另一个毫无意义）。任一侧缺值视为无漂移证据，存量会话不会集体失效。
+
+**测试抓到一个边界**：`olderThanMs=0` 时 cutoff 即当下，同毫秒写入的行被 `<` 判否。改为闭区间——生产中恰好落在边界的行也不该被静默排除。
+
+### E-3 · 飞书 10 个 MCP 工具（批次 3，依赖墙已拆）
+
+批次 3 此前因 `ChannelTurnContext` 耦合 `channel_accounts` 而暂缓。**按本地 `ctx.chatJid` 实现即可绕开**——它本就编码了 provider 与 chat id。
+
+- `container/agent-runner/src/mcp-tools.ts`：10 个工具，全部经 `callFeishu` 走阻塞 IPC（编辑/撤回必须知道是否真的生效，「假定成功」正是撤回静默失败的方式）
+- `src/feishu-capability.ts`：client 注入式 dispatch，**每条路径都返回而非抛出**——Agent 阻塞等回执，无人应答会把 turn 挂到 120s 超时
+- `src/im-channel.ts` 加 `getProviderClient()` 暴露 lark client
+- `api_request` 限制在 `/open-apis/` 命名空间：这是飞书逃生舱，不是通用 HTTP 客户端
+
+**行为判断**：`edit_message` 拒绝空文本而非清空消息——编辑成空白更可能是传错变量，想删该用 `recall_message`。测试原本断言相反，是测试错了，改测试并把意图写进代码注释。
+
+**验收**：20 用例（含撤回缺 id 时**根本不调 API**、路径越界拒绝、错误不抛出、错误消息 <200 字节不泄漏 socket 图）。
+
+### 阶段 E 小结
+
+| 批次 | schema | 提交 |
+|---|---|---|
+| 5 人格体系 | 41→42 | `83dc043` |
+| 6 workspaces 投影 | 42→43 | `e23e203` |
+| 7 channel_mounts + M5 | 43→44 | `6f06562` |
+| 8+9 投递与会话语义 | 44→45 | `65ce73d` |
+| 3 飞书 10 工具 | — | 本次 |
+
+门禁：**117 文件 / 1382 测试全绿**。每次 schema 迁移前均有一致性备份。

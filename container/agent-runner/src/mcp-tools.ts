@@ -1713,6 +1713,211 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
   );
   }
 
+    // --- Feishu channel tools (batch 3) ---
+    //
+    // Upstream routes these through a ChannelTurnContext carrying
+    // channelAccountId, which belongs to its multi-account channel_accounts
+    // model -- a model this fork deliberately did not adopt. Everything these
+    // tools actually need is already in ctx.chatJid, which encodes both the
+    // provider and the chat id (`feishu:oc_...`), so they are implemented
+    // against that instead. Same tool surface, no dependency on a table we do
+    // not have.
+    //
+    // Every call blocks on an IPC round-trip: the agent must know whether an
+    // edit or recall actually landed, since "assume it worked" is exactly how a
+    // recall silently fails to remove anything.
+    const feishuChatId = (): string => {
+      if (!ctx.chatJid.startsWith('feishu:')) {
+        throw new Error(
+          `Feishu tools are only available in a Feishu conversation (current: ${ctx.chatJid}).`,
+        );
+      }
+      return ctx.chatJid.slice('feishu:'.length);
+    };
+
+    const callFeishu = async (
+      operation: string,
+      params: Record<string, unknown>,
+    ): Promise<Record<string, unknown>> => {
+      const chatId = feishuChatId();
+      const requestId = newRequestId();
+      const result = await pollIpcResult(
+        TASKS_DIR,
+        {
+          type: 'feishu_capability',
+          operation,
+          requestId,
+          chatJid: ctx.chatJid,
+          chatId,
+          params,
+          timestamp: new Date().toISOString(),
+        },
+        'feishu_capability_result',
+        120_000,
+      );
+      if (!result.success) {
+        throw new Error(
+          typeof result.error === 'string'
+            ? result.error
+            : `Feishu ${operation} failed.`,
+        );
+      }
+      return result;
+    };
+
+    const feishuResult = (result: Record<string, unknown>) => ({
+      content: [
+        { type: 'text' as const, text: JSON.stringify(result.data ?? result, null, 2) },
+      ],
+    });
+
+    tools.push(
+      defineTool(
+        'feishu_send_card',
+        'Send an interactive Feishu card to the current chat. Pass the card JSON (schema 2.0) as `card`. Use this for structured output - buttons, columns, collapsible sections - that plain markdown cannot express.',
+        {
+          card: z
+            .record(z.string(), z.unknown())
+            .describe('Feishu interactive card JSON (schema 2.0)'),
+        },
+        async (args) => feishuResult(await callFeishu('send_card', { card: args.card })),
+      ),
+      defineTool(
+        'feishu_edit_message',
+        'Edit a message this bot previously sent in the current chat. Only the bot’s own messages can be edited, and only within the platform’s edit window.',
+        {
+          messageId: z.string().describe('Feishu message id (om_...)'),
+          text: z.string().describe('Replacement text content'),
+        },
+        async (args) =>
+          feishuResult(
+            await callFeishu('edit_message', {
+              messageId: args.messageId,
+              text: args.text,
+            }),
+          ),
+      ),
+      defineTool(
+        'feishu_recall_message',
+        'Recall (delete) a message this bot sent. Irreversible on the Feishu side - the message disappears for every participant.',
+        { messageId: z.string().describe('Feishu message id (om_...)') },
+        async (args) =>
+          feishuResult(await callFeishu('recall_message', { messageId: args.messageId })),
+      ),
+      defineTool(
+        'feishu_add_reaction',
+        'Add an emoji reaction to a message. Useful as a lightweight acknowledgement without sending a reply.',
+        {
+          messageId: z.string().describe('Feishu message id (om_...)'),
+          emojiType: z
+            .string()
+            .describe('Feishu emoji type, e.g. THUMBSUP / OK / DONE'),
+        },
+        async (args) =>
+          feishuResult(
+            await callFeishu('add_reaction', {
+              messageId: args.messageId,
+              emojiType: args.emojiType,
+            }),
+          ),
+      ),
+      defineTool(
+        'feishu_remove_reaction',
+        'Remove a reaction this bot previously added to a message.',
+        {
+          messageId: z.string().describe('Feishu message id (om_...)'),
+          reactionId: z
+            .string()
+            .describe('Reaction id returned when the reaction was created'),
+        },
+        async (args) =>
+          feishuResult(
+            await callFeishu('remove_reaction', {
+              messageId: args.messageId,
+              reactionId: args.reactionId,
+            }),
+          ),
+      ),
+      defineTool(
+        'feishu_get_chat',
+        'Get metadata for the current Feishu chat: name, description, type, owner, member count.',
+        {},
+        async () => feishuResult(await callFeishu('get_chat', {})),
+      ),
+      defineTool(
+        'feishu_list_members',
+        'List members of the current Feishu group chat.',
+        {
+          pageSize: z
+            .number()
+            .optional()
+            .describe('Members per page (default 50, max 100)'),
+          pageToken: z.string().optional().describe('Pagination token from a previous call'),
+        },
+        async (args) =>
+          feishuResult(
+            await callFeishu('list_members', {
+              pageSize: args.pageSize,
+              pageToken: args.pageToken,
+            }),
+          ),
+      ),
+      defineTool(
+        'feishu_get_user',
+        'Look up a Feishu user by open_id. Returns name, avatar and department info subject to app permissions.',
+        { openId: z.string().describe('Feishu user open_id (ou_...)') },
+        async (args) => feishuResult(await callFeishu('get_user', { openId: args.openId })),
+      ),
+      defineTool(
+        'feishu_get_history',
+        'Read recent message history from the current Feishu chat directly from the platform. Use when you need messages this workspace never received - for example anything sent before the bot joined.',
+        {
+          pageSize: z
+            .number()
+            .optional()
+            .describe('Messages per page (default 20, max 50)'),
+          pageToken: z.string().optional().describe('Pagination token from a previous call'),
+          startTime: z.string().optional().describe('Unix seconds, inclusive lower bound'),
+          endTime: z.string().optional().describe('Unix seconds, inclusive upper bound'),
+        },
+        async (args) =>
+          feishuResult(
+            await callFeishu('get_history', {
+              pageSize: args.pageSize,
+              pageToken: args.pageToken,
+              startTime: args.startTime,
+              endTime: args.endTime,
+            }),
+          ),
+      ),
+      defineTool(
+        'feishu_api_request',
+        'Call an arbitrary Feishu OpenAPI endpoint with the bot’s tenant token. Escape hatch for endpoints without a dedicated tool - prefer the specific tools above when one exists, since they validate their arguments.',
+        {
+          method: z
+            .enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
+            .describe('HTTP method'),
+          path: z
+            .string()
+            .describe('API path beginning with /open-apis/, e.g. /open-apis/im/v1/chats'),
+          body: z.record(z.string(), z.unknown()).optional().describe('JSON request body'),
+          query: z
+            .record(z.string(), z.unknown())
+            .optional()
+            .describe('Query string parameters'),
+        },
+        async (args) =>
+          feishuResult(
+            await callFeishu('api_request', {
+              method: args.method,
+              path: args.path,
+              body: args.body,
+              query: args.query,
+            }),
+          ),
+      ),
+    );
+
   return tools;
 }
 

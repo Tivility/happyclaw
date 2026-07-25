@@ -252,6 +252,7 @@ import { verifyPairingCode } from './telegram-pairing.js';
 import { sdkQuery } from './sdk-query.js';
 import { executeSessionReset } from './commands.js';
 import { appendConversationArchive } from './conversation-archive.js';
+import { runFeishuCapability, type FeishuCapabilityClient } from './feishu-capability.js';
 import {
   claimOwner,
   releaseOwner,
@@ -6464,6 +6465,10 @@ async function processTaskIpc(
     // For discord_get_history
     limit?: number;
     before?: string;
+    // For feishu_capability (the ten feishu_* MCP tools)
+    operation?: string;
+    chatId?: string;
+    params?: Record<string, unknown>;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isAdminHome: boolean, // Whether source is admin home container
@@ -6740,6 +6745,42 @@ async function processTaskIpc(
         });
       }
       break;
+
+    case 'feishu_capability': {
+      // Backs the ten feishu_* MCP tools (batch 3). The agent is blocked on this
+      // round-trip, so every path must write a result file — an unanswered
+      // request hangs the turn until the 120s timeout.
+      const respond = (result: Record<string, unknown>): void => {
+        writeTaskResult(tasksDir, 'feishu_capability', data.requestId, result);
+      };
+      // sourceGroup is a folder; resolve its owner through any registered jid.
+      const ownerId = getJidsByFolder(sourceGroup)
+        .map((j) => getRegisteredGroup(j)?.created_by)
+        .find((id): id is string => !!id);
+      const channel = ownerId ? imManager.getFeishuConnection(ownerId) : undefined;
+      const client = channel?.getProviderClient?.() as
+        | FeishuCapabilityClient
+        | null
+        | undefined;
+      if (!client) {
+        respond({
+          success: false,
+          error: 'Feishu is not connected for this workspace owner.',
+        });
+        break;
+      }
+      runFeishuCapability(client, {
+        operation: String(data.operation || ''),
+        chatId: String(data.chatId || ''),
+        params: (data.params as Record<string, unknown>) || {},
+      })
+        .then(respond)
+        .catch((err) => {
+          logger.warn({ err, operation: data.operation }, 'feishu_capability threw');
+          respond({ success: false, error: 'Feishu capability failed unexpectedly.' });
+        });
+      break;
+    }
 
     case 'update_task': {
       const failUpdate = (error: string): void => {
