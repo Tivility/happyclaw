@@ -1289,8 +1289,11 @@ async function runQuery(
   // before force-closing the stream.
   let resultReceivedAt: number | null = null;
   const POST_RESULT_TIMEOUT_MS = 5_000;
-  // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt()
-  let queryRef: { interrupt(): Promise<void> } | null = null;
+  // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt().
+  // The return type stays `Promise<unknown>` on purpose: the SDK's Query.interrupt() resolves to
+  // SDKControlInterruptResponse | undefined, and every caller here discards the value. Pinning it
+  // to Promise<void> made agent-runner fail typecheck on the 0.3.210 → 0.3.215 SDK bump.
+  let queryRef: { interrupt(): Promise<unknown> } | null = null;
   let messageCount = 0;
   let resultCount = 0;
   let postResultInterruptRequested = false;
