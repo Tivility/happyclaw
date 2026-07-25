@@ -6,11 +6,13 @@ import { isClearCommand } from '../src/commands.js';
 const {
   deleteSessionMock,
   getJidsByFolderMock,
+  getJidsExecutingInFolderMock,
   storeMessageDirectMock,
   ensureChatExistsMock,
 } = vi.hoisted(() => ({
   deleteSessionMock: vi.fn(),
   getJidsByFolderMock: vi.fn(),
+  getJidsExecutingInFolderMock: vi.fn(),
   storeMessageDirectMock: vi.fn(),
   ensureChatExistsMock: vi.fn(),
 }));
@@ -18,6 +20,7 @@ const {
 vi.mock('../src/db.js', () => ({
   deleteSession: deleteSessionMock,
   getJidsByFolder: getJidsByFolderMock,
+  getJidsExecutingInFolder: getJidsExecutingInFolderMock,
   storeMessageDirect: storeMessageDirectMock,
   ensureChatExists: ensureChatExistsMock,
 }));
@@ -57,6 +60,7 @@ describe('executeSessionReset', () => {
   beforeEach(() => {
     deleteSessionMock.mockReset();
     getJidsByFolderMock.mockReset();
+    getJidsExecutingInFolderMock.mockReset();
     storeMessageDirectMock.mockReset();
     ensureChatExistsMock.mockReset();
     vi.useRealTimers();
@@ -108,7 +112,7 @@ describe('executeSessionReset', () => {
     expect(sessions).toHaveProperty('flow-graduation', 'session-1');
   });
 
-  test('resets a main session by stopping all sibling JIDs and clearing the folder cache', async () => {
+  test('resets a main session by stopping the JIDs that execute in this folder', async () => {
     const { executeSessionReset } = await import('../src/commands.js');
     const stopGroup = vi.fn(async () => {});
     const broadcast = vi.fn();
@@ -118,7 +122,10 @@ describe('executeSessionReset', () => {
       'other-folder': 'session-other',
     } as Record<string, string>;
 
-    getJidsByFolderMock.mockReturnValue(['web:foo', 'feishu:bar']);
+    // Siblings are resolved by *execution* folder, not by the folder column: an
+    // IM row routed elsewhere via target_main_jid serves another workspace and
+    // must not be stopped, nor have its message cursor advanced, by a reset here.
+    getJidsExecutingInFolderMock.mockReturnValue(['web:foo', 'feishu:bar']);
 
     await executeSessionReset(
       'web:foo',
@@ -164,5 +171,41 @@ describe('executeSessionReset', () => {
         content: 'context_reset',
       }),
     );
+  });
+});
+
+/**
+ * Regression for the third call site of the folder-vs-execution bug.
+ *
+ * routes/groups.ts had two call sites fixed; executeSessionReset was a third,
+ * reachable from both the /clear IM command and the web reset route. Left
+ * unfixed, resetting one workspace kept force-stopping every IM chat that merely
+ * carried the same folder value — 21 of 24 rows on the reference deployment.
+ */
+describe('executeSessionReset targets only the executing folder', () => {
+  test('a JID routed to another workspace is neither stopped nor cursor-advanced', async () => {
+    const { executeSessionReset } = await import('../src/commands.js');
+    const stopGroup = vi.fn(async () => {});
+    const setLastAgentTimestamp = vi.fn();
+
+    // The folder column would return three rows; only two actually run here.
+    getJidsByFolderMock.mockReturnValue(['web:foo', 'feishu:bar', 'feishu:elsewhere']);
+    getJidsExecutingInFolderMock.mockReturnValue(['web:foo', 'feishu:bar']);
+
+    await executeSessionReset('web:foo', 'home-u1', {
+      queue: { stopGroup },
+      sessions: { 'home-u1': 'session-main' } as Record<string, string>,
+      broadcast: vi.fn(),
+      setLastAgentTimestamp,
+    });
+
+    expect(stopGroup).not.toHaveBeenCalledWith('feishu:elsewhere', {
+      force: true,
+    });
+    expect(setLastAgentTimestamp).not.toHaveBeenCalledWith(
+      'feishu:elsewhere',
+      expect.anything(),
+    );
+    expect(stopGroup).toHaveBeenCalledTimes(2);
   });
 });

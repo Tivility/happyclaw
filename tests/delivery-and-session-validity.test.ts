@@ -303,3 +303,51 @@ describe('one rule across every switch path', () => {
     ).toBe(false);
   });
 });
+
+/**
+ * Regression cases for two defects found while reviewing batch 8.
+ *
+ * A reply whose route switches channels is delivered by a *separate* routed send
+ * that runs after the row is stored. The first implementation wrote 'skipped' at
+ * store time, so the column claimed the reply was never sent while it had in
+ * fact arrived — actively misleading on the one path whose failures were
+ * otherwise swallowed by an empty catch.
+ */
+describe('deferred delivery (routed sends)', () => {
+  test("a deferred reply is 'pending' until the routed send settles it", () => {
+    const chat = 'feishu:oc_deferred';
+    const id = storeReply(chat);
+    // What sendMessage records when it knows a routed send will follow.
+    db.setMessageDeliveryState(id, chat, { status: 'pending' });
+    expect(statusOf(id, chat)).toBe('pending');
+
+    // What the routed send records on success.
+    db.setMessageDeliveryState(id, chat, { status: 'sent', mode: 'feishu' });
+    expect(statusOf(id, chat)).toBe('sent');
+  });
+
+  test('a failed routed send lands as failed, not as a silent pending', () => {
+    const chat = 'feishu:oc_deferred_fail';
+    const id = storeReply(chat);
+    db.setMessageDeliveryState(id, chat, { status: 'pending' });
+    db.setMessageDeliveryState(id, chat, { status: 'failed', mode: 'feishu' });
+    expect(statusOf(id, chat)).toBe('failed');
+  });
+
+  test('a routed send that never settles surfaces as stale, not as delivered', () => {
+    // The process dying mid-send must be discoverable; 'pending' forever is the
+    // signal the user experiences as "the agent never answered".
+    const chat = 'feishu:oc_deferred_stuck';
+    const id = storeReply(chat);
+    db.setMessageDeliveryState(id, chat, { status: 'pending' });
+    expect(db.getStalePendingDeliveries(0).map((r) => r.id)).toContain(id);
+  });
+
+  test("'skipped' still means genuinely not headed for any channel", () => {
+    const chat = 'feishu:oc_really_skipped';
+    const id = storeReply(chat);
+    db.setMessageDeliveryState(id, chat, { status: 'skipped' });
+    expect(statusOf(id, chat)).toBe('skipped');
+    expect(db.getStalePendingDeliveries(0).map((r) => r.id)).not.toContain(id);
+  });
+});

@@ -1495,8 +1495,29 @@ function sendImWithFailTracking(
   imJid: string,
   text: string,
   localImagePaths: string[],
+  settle?: { messageId: string; chatJid: string },
 ): void {
-  sendImWithRetry(imJid, text, localImagePaths).catch(() => {});
+  // Fire-and-forget by design — the turn has already produced its reply and must
+  // not block on delivery. But the outcome is now recorded: this is the routed /
+  // mirrored path, whose failures were previously swallowed whole by the empty
+  // catch, leaving no trace that a reply never arrived.
+  sendImWithRetry(imJid, text, localImagePaths)
+    .then(() => {
+      if (settle) {
+        setMessageDeliveryState(settle.messageId, settle.chatJid, {
+          status: 'sent',
+          mode: getChannelType(imJid),
+        });
+      }
+    })
+    .catch(() => {
+      if (settle) {
+        setMessageDeliveryState(settle.messageId, settle.chatJid, {
+          status: 'failed',
+          mode: getChannelType(imJid),
+        });
+      }
+    });
 }
 
 export function isCursorAfter(
@@ -2931,6 +2952,16 @@ async function setTyping(jid: string, isTyping: boolean): Promise<void> {
 interface SendMessageOptions {
   /** Whether to forward the reply to the IM channel (Feishu/Telegram). Defaults to true for IM JIDs. */
   sendToIM?: boolean;
+  /**
+   * A routed or mirrored IM send will follow this call, so delivery is recorded
+   * as 'pending' here and settled by that send instead of being written off as
+   * 'skipped'.
+   *
+   * Without this, a reply whose route switched channels was stored as 'skipped'
+   * while it had in fact been delivered — the delivery column would have been
+   * actively misleading precisely on the path most likely to fail silently.
+   */
+  deliveryDeferred?: boolean;
   /** Pre-computed local image paths to attach to IM messages. Avoids redundant filesystem scans. */
   localImagePaths?: string[];
   /** Message source identifier (e.g. 'scheduled_task') for frontend routing. */
@@ -4524,8 +4555,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                   ? undefined // no turnId → fresh INSERT, no UPSERT dedup
                   : effectiveTurnId;
 
+              // A routed send follows below when the reply route moved to another
+              // channel; delivery is settled there rather than written off here.
+              const deliveryDeferred =
+                routeSwitchedAway && !streamingCardHandledIM && !sentReply;
               lastReplyMsgId = await sendMessage(chatJid, text, {
                 sendToIM: directImReply && !skipImSend,
+                deliveryDeferred,
                 localImagePaths,
                 messageMeta: {
                   turnId: turnIdForDb,
@@ -4586,6 +4622,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     replySourceImJid,
                     text,
                     localImagePaths,
+                    lastReplyMsgId
+                      ? { messageId: lastReplyMsgId, chatJid }
+                      : undefined,
                   );
                 }
               }
@@ -4602,6 +4641,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 )
                   continue;
                 if (g.reply_policy !== 'mirror') continue;
+                // Mirror sends are not settled onto the stored row: several may
+                // fan out for one reply and the single delivery_status column
+                // cannot represent "3 of 4 arrived". They stay fire-and-forget,
+                // which is why their failures are logged inside sendImWithRetry.
                 if (getChannelType(imJid))
                   sendImWithFailTracking(imJid, text, localImagePaths);
               }
@@ -5513,8 +5556,9 @@ async function sendMessage(
         logger.error({ jid, err }, 'Failed to send message to IM channel');
       }
     } else if (isIMChannel) {
-      // An IM chat whose reply was deliberately routed elsewhere (or web-only).
-      deliveryStatus = 'skipped';
+      // 'pending' when a routed/mirrored send will settle it; 'skipped' only
+      // when the reply genuinely was not headed for any channel.
+      deliveryStatus = options.deliveryDeferred ? 'pending' : 'skipped';
     }
 
     // Persist assistant reply so Web polling can render it and clear waiting state.

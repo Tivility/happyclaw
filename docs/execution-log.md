@@ -774,3 +774,56 @@ schema 44 → 45。`messages` 加 delivery 五列。
 | **`thread_map`** | **每个飞书话题 → 一个独立 agent**，由 `resolveOrCreateThreadAgent` 按需创建 |
 
 所以 `thread_map` 模式下开新话题即开新 agent、回旧话题即回该 agent 的上下文。这也解释了为何 agent 标签页各自独立会话是合理的——它们对应飞书里不同的话题，本就该是不同对话。
+
+---
+
+## 完整 Review
+
+对 25 个提交、78 文件、11332 行改动做逐项复查。**不是重跑测试，而是找缺陷**——共发现 4 项，其中 2 项是真 bug。
+
+### 🔴 缺陷 1（真 bug）· F3 漏修第三、第四处
+
+`routes/groups.ts` 的两处已修，但 `commands.ts` 的 `executeSessionReset` 有**两处**同样的 `getJidsByFolder`，且它有两个可达入口（`/clear` IM 命令、Web 重置路由）：
+
+| 位置 | 后果 |
+|---|---|
+| `commands.ts:50` 停止 sibling | 与原 F3 同——重置一个工作区仍会 force-kill 路由到别处的 21 个会话 |
+| `commands.ts:98` **推进消息游标** | **比停止更严重**——给路由到别处的会话推进 `lastAgentTimestamp`，会让**那些会话跳过尚未处理的消息** |
+
+第二处是静默丢消息，不是杀进程，排查起来更难。两处均已改用 `getJidsExecutingInFolder`。
+
+**既有测试抓到了这个改动**（`commands.test.ts` 守着"停所有 sibling"），已更新为反映修正后的语义，并新增一条守住修复本身：路由到别处的 JID **既不被停止、也不被推进游标**。
+
+### 🔴 缺陷 2（真 bug）· 批次 8 的投递状态误报
+
+回复路由到别的渠道时，真实投递由 `sendImWithFailTracking` 完成，而它在 `sendMessage` **之后**执行且 `.catch(() => {})` 吞掉一切。结果：
+
+- 库里记成 `skipped`，但消息**其实已投递** —— 列的含义与事实相反
+- 而且**恰恰是这条最容易静默失败的路径完全没有跟踪**
+
+修法：新增 `deliveryDeferred` 选项，`sendMessage` 在得知后续会有路由投递时记 `pending`，由路由投递结算成 `sent` / `failed`。若进程中途死亡，该行保持 `pending`，被 `getStalePendingDeliveries` 捞出——这正是用户体感的「Agent 没回我」。
+
+**mirror 投递有意不结算**：一条回复可能扇出多个渠道，单个 `delivery_status` 列无法表达「4 个里到了 3 个」，其失败仍由 `sendImWithRetry` 内部记日志。已把这个取舍写进代码注释。
+
+### 🟡 缺陷 3 · 16 个函数只有测试引用
+
+最重要的一条：**人格功能实际上用不了**。批次 5 建了表、建了 CRUD、建了三运行时注入，但**没有任何 API 路由能创建人格**，生产库 `agent_profiles` 为 0 行。注入逻辑只在存在 profile 时才触发，所以整套功能目前是惰性的——除非直接写 SQL。
+
+同类还有：`channel_mounts` 的管理 API（迁移会填，但无法手工管理）、投递监控三函数（记录了但没有接口暴露）。
+
+另有 2 个是真冗余：`evaluateStoredSessionValidity`（被直接接入 `evaluateSessionValidity` 取代）、`deleteTurnEventsForChat`（删除路径用的是内联 SQL）。
+
+### 🟡 缺陷 4 · `make format` 会重排全仓
+
+跑 `make format` 改动 84 个文件，其中 65 个与本次无关，另外 19 个里 prettier 还重排了我只改了几行的文件的其余部分（如 `web.ts` 改 8 行、重排 315 行）。**说明仓库本来就不是 prettier-clean 的**。已全部还原——全仓重排不属于本次范围，应单独一个提交做。
+
+### 复查确认无问题的
+
+- ✅ `getJidsByFolder` 的其余调用点：扫描全部停止/中断类上下文，无遗漏
+- ✅ docker / host 两条 spawn 路径对称（人格注入 4 处、会话判定 3 处）
+- ✅ `turn_events` 清理覆盖 5 处（含隐私模式——轨迹带工具输入与子 Agent 输出）
+- ✅ 空库从零初始化：21 个测试文件每次都建全新库，schema 45 路径已被覆盖
+- ✅ 生产库：13732 消息 / 64 群组 / 21 挂载 / schema 45 / `integrity_check` = ok
+- ✅ 归档连续写实际在工作（14:45 写入）
+
+**验收**：118 文件 / **1403 测试**通过（本轮新增 9 个回归用例），构建通过，上线后启动零 ERROR。

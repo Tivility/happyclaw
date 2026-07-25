@@ -6,6 +6,7 @@ import crypto from 'crypto';
 import {
   deleteSession,
   getJidsByFolder,
+  getJidsExecutingInFolder,
   storeMessageDirect,
   ensureChatExists,
 } from './db.js';
@@ -46,8 +47,14 @@ export async function executeSessionReset(
     // Agent-specific reset: only stop the agent's virtual JID process
     await deps.queue.stopGroup(targetJid, { force: true });
   } else {
-    // Main session reset: stop all processes for this folder
-    const siblingJids = getJidsByFolder(folder);
+    // Main session reset: stop every runner that actually executes in this
+    // folder. Deliberately not getJidsByFolder — IM rows routed elsewhere via
+    // target_main_jid serve another workspace, and resetting this folder must not
+    // kill their in-flight runs. On the reference deployment folder='main'
+    // collects 24 JIDs of which 21 run elsewhere (see db.ts
+    // getJidsExecutingInFolder). Reached from both the /clear IM command and the
+    // web reset route, so this was the third call site of the same bug.
+    const siblingJids = getJidsExecutingInFolder(folder);
     await Promise.all(
       siblingJids.map((j) => deps.queue.stopGroup(j, { force: true })),
     );
@@ -88,7 +95,11 @@ export async function executeSessionReset(
   if (agentId) {
     deps.setLastAgentTimestamp(targetJid, { timestamp, id: dividerMessageId });
   } else {
-    const siblingJids = getJidsByFolder(folder);
+    // Same execution-folder scoping as the stop above, and for a sharper reason:
+    // advancing the cursor of a JID that runs in another workspace would make
+    // *that* conversation skip every message before this divider. Resetting one
+    // workspace must not silently drop another's pending input.
+    const siblingJids = getJidsExecutingInFolder(folder);
     for (const siblingJid of siblingJids) {
       deps.setLastAgentTimestamp(siblingJid, {
         timestamp,
