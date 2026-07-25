@@ -141,3 +141,48 @@ let queryRef: { interrupt(): Promise<unknown> } | null = null;
 **残留风险（诚实记录）**：若那次 EPIPE 其实来自上传 socket 而非日志管道，本次改动不能根治它。但改动之后同类 503 只会产生一条小日志——**下次若再崩，就能凭「日志已瘦身仍崩」直接排除日志管道假设**，指向 socket，届时再决定是否放宽 `logger.ts` 的 EPIPE 策略。
 
 **数据备份**：不涉及（纯日志序列化改动）。
+
+**提交**：`7070477`
+
+---
+
+### B-3 · F6 SDK 自动更新门禁
+
+**背景**：`Makefile` 的 `ensure-latest-sdk` 有两个缺陷，7-19 那次自动更新把两个都触发了。
+
+**缺陷一 · 构建失败被吞掉**
+
+```make
+(cd container/agent-runner && $(PKG) update ... && $(PKG) run build); \
+```
+
+`npm run build` 就是 `tsc`。0.3.215 的类型破坏**当时已经完整打进日志**，但整条命令以 `;` 结尾——make 只看最后一条命令的退出码，失败被吞，随后照样打印「✅ SDK 更新完成」。所以门禁不是"要多跑一次检查"，是**别再吞掉已有的失败信号**，成本≈0。
+
+**缺陷二 · `npm update` 裁掉 devDependencies**
+
+plist 里有 `NODE_ENV=production`，npm 在该模式下连带 prune 掉已装的 devDependencies。这就是 P9 的根因——启动脚本每次跑 SDK 自检，第一次真更新就把 vitest / prettier / tsx / `@types/*` 清了。
+
+**落地**（`ensure-latest-sdk` + `ensure-latest-codex-sdk` 两个 target 同样处理）
+
+- 所有 `npm update` / `npm install` 加 `--include=dev`，根治 devDeps 被裁
+- 构建包进 `if (...); then ... else ... fi`：成功才写回 `package.json` 的 `"*"`；失败则回滚到更新前版本并重新构建，最后 `exit 1`
+- 回滚前判断 `!= "0.0.0"`（此前未安装则无版本可回滚，明确提示而非误装）
+- agent-runner 构建失败时**跳过主服务的 SDK 更新**，避免两侧版本分叉
+- `exit 1` 由 `scripts/launchd-start.sh` 现有的 `|| { ... }` 兜住，服务继续用回滚后的 SDK 启动，不会因此起不来
+
+**验收**
+
+| 项 | 结果 |
+|---|---|
+| `make -n` make 层语法 | ✅ |
+| **真实更新 0.3.215 → 0.3.220** | ✅ 构建通过，走成功分支 |
+| `--include=dev` 效果 | ✅ **同一步操作此前会裁掉 devDeps，本次 vitest / prettier / tsx / `@types/*` 全部存活** |
+| 新 SDK 下 `make typecheck` | ✅ 三项目全绿 |
+| 新 SDK 下 `make test` | ✅ 1191 通过 |
+| 失败分支的 shell 逻辑 | ✅ 用强制失败替代 npm 验证：报错 → 回滚提示 → 跳过主服务 → exit 1；`0.0.0` 无版本可回滚的分支也正确 |
+
+**未端到端验证的部分（诚实记录）**：失败分支里的 `npm install <上一版本> && npm run build` 这一段没有真实跑过——需要一个"能装上但构建失败"的 SDK 版本才能触发，而 0.3.220 构建是通过的。已验证的是分支结构、提示与退出码；npm 回滚命令本身与成功路径用的是同一套 `$(PKG) install --include=dev` 形式。
+
+**数据备份**：`package.json` 两处 SDK 版本行由 git 管住；更新前已记录 `agent-runner=0.3.215 / root=0.3.215` 作为回滚基准。node_modules 可由 `npm install` 重建。
+
+**副产物**：本次顺带把 SDK 升到 0.3.220，且 P10 的类型放宽让它平稳通过——正是门禁想保证的效果。

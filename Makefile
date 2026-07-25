@@ -246,15 +246,27 @@ ensure-latest-sdk: ## 启动前自动检测并更新 SDK（agent-runner + 主服
 	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
 		echo "🔄 [agent-runner] Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
-		(cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build); \
-		sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json; \
-		echo "✅ [agent-runner] SDK 更新完成（内置 Claude Code 版本随之更新）"; \
+		if (cd container/agent-runner && $(PKG) update --include=dev @anthropic-ai/claude-agent-sdk && $(PKG) run build); then \
+			sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json; \
+			echo "✅ [agent-runner] SDK 更新完成（内置 Claude Code 版本随之更新）"; \
+		else \
+			echo "❌ [agent-runner] SDK $$LATEST 构建失败"; \
+			if [ "$$LOCAL" != "0.0.0" ]; then \
+				echo "↩️  回滚到 $$LOCAL ..."; \
+				(cd container/agent-runner && $(PKG) install --include=dev @anthropic-ai/claude-agent-sdk@$$LOCAL && $(PKG) run build) \
+					|| echo "⚠️  回滚构建也失败，dist 可能是陈旧产物——请手动检查 container/agent-runner"; \
+			else \
+				echo "⚠️  无可回滚的版本（此前未安装）"; \
+			fi; \
+			echo "⚠️  跳过主服务 SDK 更新，避免两侧版本分叉"; \
+			exit 1; \
+		fi; \
 	else \
 		echo "✅ [agent-runner] Claude Agent SDK 已是最新 ($$LOCAL)"; \
 	fi; \
 	if [ "$$ROOT_LOCAL" != "$$LATEST" ]; then \
 		echo "🔄 [主服务] Claude Agent SDK 有新版本: $$ROOT_LOCAL → $$LATEST，正在更新..."; \
-		$(PKG) update @anthropic-ai/claude-agent-sdk; \
+		$(PKG) update --include=dev @anthropic-ai/claude-agent-sdk; \
 		sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' package.json; \
 		echo "✅ [主服务] SDK 更新完成"; \
 	else \
@@ -269,11 +281,23 @@ ensure-latest-codex-sdk: ## 启动前自动检测并更新 Codex SDK（有新版
 	LATEST=$$(npm view @openai/codex-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
 		echo "🔄 Codex SDK 有新版本或未安装: host=$$HOST_LOCAL, runner=$$RUNNER_LOCAL → $$LATEST，正在更新..."; \
-		$(PKG) update @openai/codex-sdk; \
-		(cd container/agent-runner && $(PKG) update @openai/codex-sdk && $(PKG) run build); \
-		sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' package.json; \
-		sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' container/agent-runner/package.json; \
-		echo "✅ Codex SDK 更新完成"; \
+		$(PKG) update --include=dev @openai/codex-sdk; \
+		if (cd container/agent-runner && $(PKG) update --include=dev @openai/codex-sdk && $(PKG) run build); then \
+			sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' package.json; \
+			sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' container/agent-runner/package.json; \
+			echo "✅ Codex SDK 更新完成"; \
+		else \
+			echo "❌ Codex SDK $$LATEST 构建失败"; \
+			if [ "$$RUNNER_LOCAL" != "0.0.0" ]; then \
+				echo "↩️  回滚到 $$RUNNER_LOCAL ..."; \
+				$(PKG) install --include=dev @openai/codex-sdk@$$RUNNER_LOCAL; \
+				(cd container/agent-runner && $(PKG) install --include=dev @openai/codex-sdk@$$RUNNER_LOCAL && $(PKG) run build) \
+					|| echo "⚠️  回滚构建也失败，dist 可能是陈旧产物——请手动检查 container/agent-runner"; \
+			else \
+				echo "⚠️  无可回滚的版本（此前未安装）"; \
+			fi; \
+			exit 1; \
+		fi; \
 	else \
 		echo "✅ Codex SDK 已是最新 ($$LOCAL)"; \
 	fi
