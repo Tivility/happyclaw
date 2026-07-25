@@ -101,6 +101,8 @@ import {
   backfillEmptyAllowlistsForUser,
   migrateTargetMainJidToChannelMounts,
   reconcileChannelMounts,
+  setMessageDeliveryState,
+  type DeliveryStatus,
   rebuildWorkspaceProjection,
   verifyWorkspaceProjection,
 } from './db.js';
@@ -5462,6 +5464,10 @@ async function sendMessage(
 ): Promise<string | undefined> {
   const isIMChannel = getChannelType(jid) !== null;
   const sendToIM = options.sendToIM ?? isIMChannel;
+  // Delivery outcome for this reply (batch 8). Left null for pure web turns —
+  // those were never headed for a channel, so recording a status would invent
+  // delivery history where none applies.
+  let deliveryStatus: DeliveryStatus | null = null;
   try {
     if (sendToIM && isIMChannel) {
       try {
@@ -5469,9 +5475,16 @@ async function sendMessage(
           options.localImagePaths ??
           extractLocalImImagePaths(text, resolveEffectiveFolder(jid));
         await imManager.sendMessage(jid, text, localImagePaths);
+        deliveryStatus = 'sent';
       } catch (err) {
+        // Previously this was logged and forgotten: a reply that never reached
+        // the channel looked identical in the DB to one that arrived.
+        deliveryStatus = 'failed';
         logger.error({ jid, err }, 'Failed to send message to IM channel');
       }
+    } else if (isIMChannel) {
+      // An IM chat whose reply was deliberately routed elsewhere (or web-only).
+      deliveryStatus = 'skipped';
     }
 
     // Persist assistant reply so Web polling can render it and clear waiting state.
@@ -5488,6 +5501,14 @@ async function sendMessage(
       true,
       { meta: options.messageMeta },
     );
+
+    if (deliveryStatus) {
+      setMessageDeliveryState(persistedMsgId, jid, {
+        status: deliveryStatus,
+        mode: getChannelType(jid),
+        runId: options.messageMeta?.turnId ?? null,
+      });
+    }
 
     broadcastNewMessage(
       jid,

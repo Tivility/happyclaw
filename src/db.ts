@@ -61,7 +61,7 @@ import {
 import { getDefaultPermissions, normalizePermissions } from './permissions.js';
 
 let db: InstanceType<typeof Database>;
-const SCHEMA_VERSION = '44';
+const SCHEMA_VERSION = '45';
 const DB_BACKUP_ENV_OVERRIDE = 'HAPPYCLAW_ALLOW_DB_MIGRATION_WITHOUT_BACKUP';
 
 // Prepared statement cache — lazy-initialized on first use after initDatabase()
@@ -1173,6 +1173,19 @@ export function initDatabase(): void {
   //
   // identity_hash 只由人格内容决定，不含引擎（决策 A5）：换模型/换 runtime 不应
   // 让全部会话集体失效，那由 runtimeFingerprint 单独判定。
+  // Delivery state (batch 8). Reply rows previously recorded only that they were
+  // stored; whether they actually reached the channel was invisible, so a send
+  // that failed looked identical to one that succeeded. These columns make the
+  // outcome inspectable and a retry decidable.
+  //
+  // Nullable on purpose: existing rows keep NULL, which reads as "delivery not
+  // tracked" rather than "delivery failed" -- backfilling a guess would turn
+  // 13k historical rows into fabricated delivery history.
+  ensureColumn('messages', 'delivery_mode', 'TEXT');
+  ensureColumn('messages', 'delivery_status', 'TEXT');
+  ensureColumn('messages', 'delivery_run_id', 'TEXT');
+  ensureColumn('messages', 'delivery_priority', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn('messages', 'delivery_updated_at', 'TEXT');
   ensureColumn('sessions', 'agent_profile_id', 'TEXT');
   ensureColumn('sessions', 'identity_hash', 'TEXT');
   ensureColumn('sessions', 'agent_profile_version', 'INTEGER');
@@ -9061,4 +9074,277 @@ export function reconcileChannelMounts(): {
   }
 
   return { ok: problems.length === 0, checked: bindings.length, problems };
+}
+
+// --- Delivery state (batch 8) ---
+
+export type DeliveryStatus = 'pending' | 'sent' | 'failed' | 'skipped';
+
+/**
+ * Record what happened when a stored reply was pushed to its channel.
+ *
+ * Before this, a reply row said only that it had been stored. Whether it
+ * actually reached Feishu/QQ/WeChat was invisible: a send that threw looked
+ * exactly like one that succeeded, so a silently dropped reply could only be
+ * found by the user noticing it never arrived.
+ *
+ * Statuses:
+ *   pending  queued, outcome not yet known
+ *   sent     the channel accepted it
+ *   failed   the channel rejected it or the send threw
+ *   skipped  intentionally not delivered (web-only turn, muted route)
+ *
+ * Best-effort: a bookkeeping failure must never fail the turn that already
+ * produced a reply.
+ */
+export function setMessageDeliveryState(
+  messageId: string,
+  chatJid: string,
+  state: {
+    status: DeliveryStatus;
+    mode?: string | null;
+    runId?: string | null;
+    priority?: number;
+  },
+): void {
+  try {
+    db.prepare(
+      `UPDATE messages
+          SET delivery_status = ?,
+              delivery_mode = COALESCE(?, delivery_mode),
+              delivery_run_id = COALESCE(?, delivery_run_id),
+              delivery_priority = COALESCE(?, delivery_priority),
+              delivery_updated_at = ?
+        WHERE id = ? AND chat_jid = ?`,
+    ).run(
+      state.status,
+      state.mode ?? null,
+      state.runId ?? null,
+      state.priority ?? null,
+      new Date().toISOString(),
+      messageId,
+      chatJid,
+    );
+  } catch (err) {
+    logger.warn({ err, messageId, chatJid }, 'setMessageDeliveryState failed');
+  }
+}
+
+/**
+ * Replies that were queued for a channel but never reached a terminal state.
+ *
+ * A row goes 'pending' at send time and is expected to settle within seconds, so
+ * anything still pending after `olderThanMs` means the process died mid-send or
+ * the channel call hung. The cutoff is inclusive: a row written in the same
+ * millisecond as the cutoff is stale too, and `olderThanMs = 0` therefore means
+ * "every pending row" rather than silently excluding the newest ones. Those are exactly the messages a user experiences as
+ * "the agent never answered".
+ */
+export function getStalePendingDeliveries(
+  olderThanMs = 5 * 60 * 1000,
+  limit = 100,
+): Array<{ id: string; chatJid: string; updatedAt: string | null }> {
+  const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+  const rows = db
+    .prepare(
+      `SELECT id, chat_jid, delivery_updated_at
+         FROM messages
+        WHERE delivery_status = 'pending'
+          AND (delivery_updated_at IS NULL OR delivery_updated_at <= ?)
+        ORDER BY delivery_updated_at IS NULL DESC, delivery_updated_at ASC
+        LIMIT ?`,
+    )
+    .all(cutoff, limit) as Array<Record<string, unknown>>;
+  return rows.map((r) => ({
+    id: r.id as string,
+    chatJid: r.chat_jid as string,
+    updatedAt: (r.delivery_updated_at as string) ?? null,
+  }));
+}
+
+/** Delivery state for one message, or null when the row is untracked/absent. */
+export function getMessageDeliveryState(
+  messageId: string,
+  chatJid: string,
+): {
+  status: string | null;
+  mode: string | null;
+  runId: string | null;
+  priority: number;
+  updatedAt: string | null;
+} | null {
+  const row = db
+    .prepare(
+      `SELECT delivery_status, delivery_mode, delivery_run_id,
+              delivery_priority, delivery_updated_at
+         FROM messages WHERE id = ? AND chat_jid = ?`,
+    )
+    .get(messageId, chatJid) as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return {
+    status: (row.delivery_status as string) ?? null,
+    mode: (row.delivery_mode as string) ?? null,
+    runId: (row.delivery_run_id as string) ?? null,
+    priority: (row.delivery_priority as number) ?? 0,
+    updatedAt: (row.delivery_updated_at as string) ?? null,
+  };
+}
+
+/** Delivery outcome counts, for the monitor endpoint and for spotting a spike in failures. */
+export function getDeliveryStats(sinceIso?: string): Record<string, number> {
+  const rows = sinceIso
+    ? (db
+        .prepare(
+          `SELECT delivery_status AS s, COUNT(*) AS c FROM messages
+            WHERE delivery_status IS NOT NULL AND timestamp >= ?
+            GROUP BY delivery_status`,
+        )
+        .all(sinceIso) as Array<{ s: string; c: number }>)
+    : (db
+        .prepare(
+          `SELECT delivery_status AS s, COUNT(*) AS c FROM messages
+            WHERE delivery_status IS NOT NULL GROUP BY delivery_status`,
+        )
+        .all() as Array<{ s: string; c: number }>);
+  const out: Record<string, number> = {};
+  for (const row of rows) out[row.s] = row.c;
+  return out;
+}
+
+// --- Session validity (batch 9) ---
+
+/**
+ * Why a session may no longer be resumable.
+ *
+ * The two codebases each tracked one half of this and neither saw the other's:
+ * upstream invalidated on persona drift, this fork on runtime/provider/model
+ * drift. A session is only genuinely resumable when both hold, so the two
+ * checks are combined here rather than left to whichever call site remembers to
+ * ask both.
+ */
+export type SessionInvalidReason =
+  | 'persona_changed'
+  | 'runtime_changed'
+  | 'provider_changed'
+  | 'model_changed';
+
+export interface SessionValidity {
+  valid: boolean;
+  reasons: SessionInvalidReason[];
+  /**
+   * Whether the caller should discard the session.
+   *
+   * Persona drift alone never does (decision O1-b): the prompt prefix changes
+   * and the next turn pays one cache miss, exactly as it already does when the
+   * agent rewrites its own CLAUDE.md. Engine drift does, because a native
+   * session id issued by one runtime/provider is meaningless to another —
+   * resuming it produces an error, not a stale prefix.
+   */
+  shouldDiscard: boolean;
+}
+
+/**
+ * Combined validity check for a stored session.
+ *
+ * `recorded` is what the session was started under; `current` is what the next
+ * turn would run with. Anything unknown on either side is treated as "no
+ * evidence of drift" so that sessions predating these columns are not all
+ * invalidated the moment the feature lands.
+ */
+export function evaluateSessionValidity(
+  recorded: {
+    identityHash?: string | null;
+    agentProfileId?: string | null;
+    runtime?: string | null;
+    providerId?: string | null;
+    resolvedModel?: string | null;
+  },
+  current: {
+    identityHash?: string | null;
+    agentProfileId?: string | null;
+    runtime?: string | null;
+    providerId?: string | null;
+    resolvedModel?: string | null;
+  },
+): SessionValidity {
+  const reasons: SessionInvalidReason[] = [];
+
+  // Only compare when both sides know the value; a missing side is silence, not
+  // a mismatch.
+  const drifted = (a?: string | null, b?: string | null): boolean =>
+    !!a && !!b && a !== b;
+
+  if (
+    drifted(recorded.identityHash, current.identityHash) ||
+    drifted(recorded.agentProfileId, current.agentProfileId)
+  ) {
+    reasons.push('persona_changed');
+  }
+  if (drifted(recorded.runtime, current.runtime)) reasons.push('runtime_changed');
+  if (drifted(recorded.providerId, current.providerId)) {
+    reasons.push('provider_changed');
+  }
+  if (drifted(recorded.resolvedModel, current.resolvedModel)) {
+    reasons.push('model_changed');
+  }
+
+  const engineDrift = reasons.some((r) => r !== 'persona_changed');
+  return {
+    valid: reasons.length === 0,
+    reasons,
+    shouldDiscard: engineDrift,
+  };
+}
+
+/**
+ * Validity for a stored session, reading both halves from where each lives.
+ *
+ * Persona identity is on `sessions` (batch 5); the native session's runtime and
+ * provider live in `conversation_runtime_sessions`, which is a different table
+ * with a different grain (one row per runtime x provider x model). Keeping the
+ * lookup here means call sites cannot accidentally consult only one of them.
+ */
+export function evaluateStoredSessionValidity(
+  groupFolder: string,
+  agentId: string,
+  current: {
+    identityHash?: string | null;
+    agentProfileId?: string | null;
+    runtime?: string | null;
+    providerId?: string | null;
+    resolvedModel?: string | null;
+  },
+): SessionValidity {
+  const personaRow = db
+    .prepare(
+      'SELECT agent_profile_id, identity_hash, provider_id FROM sessions WHERE group_folder = ? AND agent_id = ?',
+    )
+    .get(groupFolder, agentId) as Record<string, unknown> | undefined;
+
+  const runtimeRow = current.runtime
+    ? (db
+        .prepare(
+          `SELECT runtime, provider_id, resolved_model
+             FROM conversation_runtime_sessions
+            WHERE group_folder = ? AND agent_id = ? AND runtime = ?
+            ORDER BY updated_at DESC LIMIT 1`,
+        )
+        .get(groupFolder, agentId, current.runtime) as
+        | Record<string, unknown>
+        | undefined)
+    : undefined;
+
+  return evaluateSessionValidity(
+    {
+      identityHash: (personaRow?.identity_hash as string) ?? null,
+      agentProfileId: (personaRow?.agent_profile_id as string) ?? null,
+      runtime: (runtimeRow?.runtime as string) ?? null,
+      providerId:
+        (runtimeRow?.provider_id as string) ??
+        (personaRow?.provider_id as string) ??
+        null,
+      resolvedModel: (runtimeRow?.resolved_model as string) ?? null,
+    },
+    current,
+  );
 }
