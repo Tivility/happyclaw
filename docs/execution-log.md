@@ -371,3 +371,38 @@ if (resultReceivedAt && Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS) 
 **数据备份**：不涉及（无数据/schema 变更）。
 
 **待实机验证**：需重启后跑一轮认知管线，确认三个维度子 Agent **都有产出**（对照修复前 6/6 全灭）。
+
+### C-2b · F2 完成通知 —— 查证结论：**无需改动**
+
+原计划要为 F2（「过程放挂起卡、结果发新消息」）写本地增强。读完本地实现后确认**现有行为已经满足**，反而是移植 upstream 会破坏它。
+
+**证据链**
+
+1. **状态横幅已通**：C-2a 新增的 `status` 事件（`N 个后台任务运行中`）→ `index.ts:416` 的 `case 'status'` → `session.setSystemStatus()` → 卡片渲染。**「过程」的可见性已经有了**
+2. **结果自动成为新消息**：`index.ts:4356` 有「Rebuild streaming card after completion」——定稿后立即重建新卡，注释写明「so subsequent messages get a fresh streaming card」。所以后台任务完成后的第二个 result 落在**新卡** = 一条新飞书消息
+3. **多 result 是被显式支持的**：`index.ts:4430` 专门处理重复 turnId——`sentReply && effectiveTurnId === lastSavedTurnId` 时用 fresh INSERT，**避免第二条回复覆盖第一条**。这说明「一次运行多个 result 各自投递」是既有设计而非意外
+
+⇒ upstream commit `5f04246` 描述的那个 bug（「首条回复后的 result 只入库不发 IM，飞书端永远看不到汇总」）**本地不存在**。
+
+### C-2c · 五连里三项**不移植**（按既有决策）
+
+| upstream commit | 内容 | 不移植的理由 |
+|---|---|---|
+| `5f04246` | 挂起完成——后台任务结束前不定稿、内容同卡追加 | 与 F2 决策**直接冲突**：它把过程与结果合并进同一张卡，而你要的是结果单独发消息 |
+| `81f0b5a` | 挂起序列全渠道合并为一条回复 | 同上，它进一步把多个 turn 合并成**同一行 DB 消息** |
+| `453eed3` | 定稿剔除工具调用间的过程旁白 | B 决策已定**保留本地**（全量拼接 + 分段折叠面板） |
+
+移植它们会把行为推向你明确不要的方向。
+
+### C-2d · 断流续写 —— **暂缓，理由如下**
+
+`c4fb789` 的指纹是 `usage.input_tokens === 0 && output_tokens === 0 && 文本非空` → 判定为上游断流截断 → 自动开续写 turn。
+
+暂缓的判断：
+- **收益是推测性的**：你从未反馈过「回复被截断」，而认知管线/调研任务的失败已由 C-2a 解释清楚（关流杀子 Agent），不是断流
+- **多运行时误判风险实在**：Codex 与 Grok 的 usage 上报口径各不相同（Codex 的 `inputTokens` 含 cachedRead，Grok 走 ACP `_meta`），零 usage 在它们那里可能是正常情形。误报的代价是凭空多跑一个 turn 烧 token
+- 若将来真观察到截断回复，再按 checklist「gate 到 claude runtime」补上即可，改动是独立的
+
+同批次的 `isStaleBackgroundWaitReply`（后台任务完成与模型出文的竞态防护）一并暂缓——在「过程卡 + 结果新消息」的形态下，那条陈旧进度消息正好落在过程卡上，本就是你想看到的「过程」。
+
+**批次 2 结论**：实际需要的代码只有 C-2a 一项，其余四项经查证或**已被本地满足**、或**与决策冲突**、或**属推测性收益**。
