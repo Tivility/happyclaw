@@ -352,8 +352,22 @@ const DEFAULT_BALANCING_CONFIG: BalancingConfig = {
   recoveryIntervalMs: 300_000,
 };
 
-/** V4 磁盘格式 — 每个供应商的 secrets 独立加密 */
-interface StoredProviderV4 {
+/**
+ * 磁盘格式版本。
+ *
+ * 刻意从 4 推到 5：upstream 也用 `version: 4`，但它的 schema 少了 runtime /
+ * providerFamily / providerPoolId / authMode / authProfileGeneration 五个字段，
+ * secrets 也只有 4 个键。它的读写函数是显式对象字面量、无展开符 —— 一旦它认领
+ * 这个文件，任何一次写盘都会把 codexAuthJson / grokAuthJson / openaiApiKey
+ * 从加密块里抹掉，且不可恢复（要重新 grok login + 重贴 ChatGPT OAuth）。
+ *
+ * 版本号做成字面量类型，任何写入非 5 的尝试都编译不过。
+ */
+type ProviderFileVersion = 5;
+const PROVIDER_FILE_VERSION: ProviderFileVersion = 5;
+
+/** V5 磁盘格式 — 每个供应商的 secrets 独立加密 */
+interface StoredProviderV5 {
   id: string;
   name: string;
   type: 'official' | 'third_party';
@@ -377,9 +391,9 @@ interface StoredProviderV4 {
   updatedAt: string;
 }
 
-interface StoredClaudeProviderConfigV4 {
-  version: 4;
-  providers: StoredProviderV4[];
+interface StoredClaudeProviderConfigV5 {
+  version: ProviderFileVersion;
+  providers: StoredProviderV5[];
   balancing: BalancingConfig;
   updatedAt: string;
 }
@@ -1086,7 +1100,7 @@ function writeStoredState(state: ClaudeStoredStateV3Resolved): void {
 
 // ─── V4 统一供应商 Read / Write / CRUD ──────────────────────────
 
-function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
+function toStoredProviderV5(provider: UnifiedProvider): StoredProviderV5 {
   const secrets: SecretPayload = {
     anthropicAuthToken: provider.anthropicAuthToken || '',
     anthropicApiKey: provider.anthropicApiKey || '',
@@ -1120,7 +1134,7 @@ function toStoredProviderV4(provider: UnifiedProvider): StoredProviderV4 {
   };
 }
 
-function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
+function fromStoredProviderV5(stored: StoredProviderV5): UnifiedProvider {
   const secrets = decryptSecrets(stored.secrets);
   const providerFamily = stored.providerFamily ?? 'claude';
   const runtime =
@@ -1166,7 +1180,7 @@ function fromStoredProviderV4(stored: StoredProviderV4): UnifiedProvider {
 }
 
 /** Migrate V3 stored state to V4 unified provider list */
-function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
+function migrateV3toV5(v3: ClaudeStoredStateV3Resolved): {
   providers: UnifiedProvider[];
   balancing: BalancingConfig;
 } {
@@ -1282,8 +1296,8 @@ function migrateV3toV4(v3: ClaudeStoredStateV3Resolved): {
   return { providers, balancing };
 }
 
-/** Read V4 config, with automatic V3→V4 migration */
-function readStoredStateV4(): {
+/** Read V5 config, with automatic V4→V5 relabel and V3→V5 migration */
+function readStoredStateV5(): {
   providers: UnifiedProvider[];
   balancing: BalancingConfig;
 } | null {
@@ -1292,30 +1306,51 @@ function readStoredStateV4(): {
     const content = fs.readFileSync(CLAUDE_CONFIG_FILE, 'utf-8');
     const parsed = JSON.parse(content) as Record<string, unknown>;
 
-    if (parsed.version === 4) {
-      const v4 = parsed as unknown as StoredClaudeProviderConfigV4;
-      return {
-        providers: v4.providers.map(fromStoredProviderV4),
+    // 4 和 5 的字段形状在本地是一致的 —— 5 只是为了把文件从 upstream 的 v4
+    // 读写路径里摘出来。所以 4 直接按同一形状解析，随后惰性改写为 5。
+    if (parsed.version === PROVIDER_FILE_VERSION || parsed.version === 4) {
+      const stored = parsed as unknown as StoredClaudeProviderConfigV5;
+      const state = {
+        providers: stored.providers.map(fromStoredProviderV5),
         balancing: {
-          strategy: v4.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
+          strategy:
+            stored.balancing?.strategy || DEFAULT_BALANCING_CONFIG.strategy,
           unhealthyThreshold:
-            v4.balancing?.unhealthyThreshold ??
+            stored.balancing?.unhealthyThreshold ??
             DEFAULT_BALANCING_CONFIG.unhealthyThreshold,
           recoveryIntervalMs:
-            v4.balancing?.recoveryIntervalMs ??
+            stored.balancing?.recoveryIntervalMs ??
             DEFAULT_BALANCING_CONFIG.recoveryIntervalMs,
         },
       };
+
+      if (parsed.version === 4) {
+        writeStoredStateV5(state.providers, state.balancing);
+        logger.info(
+          { providerCount: state.providers.length },
+          'Relabelled Claude provider config v4 → v5 (keeps upstream v4 readers off this file)',
+        );
+      }
+
+      return state;
+    }
+
+    // 版本比本地新 —— 拒绝而不是当成旧格式迁移，否则会用 V3 路径读出空配置
+    // 并把一份残缺的 v5 写回去，抹掉未知字段。
+    if (typeof parsed.version === 'number' && parsed.version > PROVIDER_FILE_VERSION) {
+      throw new Error(
+        `Claude provider config version ${parsed.version} is newer than supported ${PROVIDER_FILE_VERSION}; refusing to downgrade`,
+      );
     }
 
     // V3 or older → read as V3, then migrate
     const v3 = readStoredState();
     if (!v3) return null;
 
-    const migrated = migrateV3toV4(v3);
+    const migrated = migrateV3toV5(v3);
 
     // Auto-save as V4 on first read (lazy migration)
-    writeStoredStateV4(migrated.providers, migrated.balancing);
+    writeStoredStateV5(migrated.providers, migrated.balancing);
     logger.info(
       { providerCount: migrated.providers.length },
       'Migrated Claude provider config from V3 to V4',
@@ -1331,13 +1366,13 @@ function readStoredStateV4(): {
   }
 }
 
-function writeStoredStateV4(
+function writeStoredStateV5(
   providers: UnifiedProvider[],
   balancing: BalancingConfig,
 ): void {
-  const payload: StoredClaudeProviderConfigV4 = {
-    version: 4,
-    providers: providers.map(toStoredProviderV4),
+  const payload: StoredClaudeProviderConfigV5 = {
+    version: PROVIDER_FILE_VERSION,
+    providers: providers.map(toStoredProviderV5),
     balancing,
     updatedAt: new Date().toISOString(),
   };
@@ -1346,10 +1381,10 @@ function writeStoredStateV4(
   writeSecretFile(CLAUDE_CONFIG_FILE, JSON.stringify(payload, null, 2) + '\n');
 }
 
-// ─── V4 公开 API ─────────────────────────────────────────────
+// ─── V5 公开 API ─────────────────────────────────────────────
 
 export function getProviders(): UnifiedProvider[] {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   return state?.providers ?? [];
 }
 
@@ -1374,14 +1409,14 @@ export function getProviderById(providerId: string): UnifiedProvider | null {
 }
 
 export function getBalancingConfig(): BalancingConfig {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   return state?.balancing ?? { ...DEFAULT_BALANCING_CONFIG };
 }
 
 export function saveBalancingConfig(
   config: Partial<BalancingConfig>,
 ): BalancingConfig {
-  const state = readStoredStateV4() || {
+  const state = readStoredStateV5() || {
     providers: [],
     balancing: { ...DEFAULT_BALANCING_CONFIG },
   };
@@ -1389,7 +1424,7 @@ export function saveBalancingConfig(
     ...state.balancing,
     ...config,
   };
-  writeStoredStateV4(state.providers, merged);
+  writeStoredStateV5(state.providers, merged);
   return merged;
 }
 
@@ -1419,7 +1454,7 @@ export function createProvider(input: {
   weight?: number;
   enabled?: boolean;
 }): UnifiedProvider {
-  const state = readStoredStateV4() || {
+  const state = readStoredStateV5() || {
     providers: [],
     balancing: { ...DEFAULT_BALANCING_CONFIG },
   };
@@ -1489,7 +1524,7 @@ export function createProvider(input: {
   };
 
   state.providers.push(provider);
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
   return provider;
 }
 
@@ -1503,7 +1538,7 @@ export function updateProvider(
     weight?: number;
   },
 ): UnifiedProvider {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) throw new Error('Claude 配置不存在');
 
   const idx = state.providers.findIndex((p) => p.id === id);
@@ -1535,7 +1570,7 @@ export function updateProvider(
   };
 
   state.providers[idx] = updated;
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
   return updated;
 }
 
@@ -1559,7 +1594,7 @@ export function updateProviderSecrets(
     authMode?: UnifiedProvider['authMode'];
   },
 ): UnifiedProvider {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) throw new Error('Claude 配置不存在');
 
   const idx = state.providers.findIndex((p) => p.id === id);
@@ -1649,12 +1684,12 @@ export function updateProviderSecrets(
   }
 
   state.providers[idx] = updated;
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
   return updated;
 }
 
 export function toggleProvider(id: string): UnifiedProvider {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) throw new Error('Claude 配置不存在');
 
   const idx = state.providers.findIndex((p) => p.id === id);
@@ -1680,12 +1715,12 @@ export function toggleProvider(id: string): UnifiedProvider {
     enabled: newEnabled,
     updatedAt: new Date().toISOString(),
   };
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
   return state.providers[idx];
 }
 
 export function deleteProvider(id: string): void {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) throw new Error('Claude 配置不存在');
 
   const idx = state.providers.findIndex((p) => p.id === id);
@@ -1728,7 +1763,7 @@ export function deleteProvider(id: string): void {
     if (fallback) fallback.enabled = true;
   }
 
-  writeStoredStateV4(state.providers, state.balancing);
+  writeStoredStateV5(state.providers, state.balancing);
 }
 
 /** Convert a UnifiedProvider to the flat ClaudeProviderConfig used by container runner */
@@ -2042,7 +2077,7 @@ export function resolveProviderById(providerId: string): {
   config: ClaudeProviderConfig;
   customEnv: Record<string, string>;
 } {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) return { config: defaultsFromEnv(), customEnv: {} };
 
   const provider = state.providers.find((p) => p.id === providerId);
@@ -2393,7 +2428,7 @@ export function validateClaudeProviderConfig(
 
 export function getClaudeProviderConfig(): ClaudeProviderConfig {
   try {
-    const state = readStoredStateV4();
+    const state = readStoredStateV5();
     if (state) {
       const enabled =
         state.providers.find((p) => p.enabled) || state.providers[0];
@@ -2910,7 +2945,7 @@ export function buildClaudeEnvLines(
 }
 
 export function getActiveProfileCustomEnv(): Record<string, string> {
-  const state = readStoredStateV4();
+  const state = readStoredStateV5();
   if (!state) return {};
 
   const enabled = state.providers.find((p) => p.enabled) || state.providers[0];
