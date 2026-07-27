@@ -1,5 +1,10 @@
 # Dependencies
 node_modules/
+# 不带斜杠也要匹配：git worktree 里 node_modules 常做成指向主仓库的**符号链接**，
+# 那是个文件而不是目录，`node_modules/` 匹配不到，会被 git add -A 跟踪进去。
+# 一旦提交，另一侧 merge 时会把真实的 node_modules 目录替换成这个链接文件，
+# 直接毁掉依赖（实际发生过一次）。
+node_modules
 
 # Build output
 dist/
