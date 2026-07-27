@@ -48,6 +48,8 @@ import {
 import {
   classifyRuntimeError,
   runtimeErrorMessage,
+  buildResumeFailureRetryInput,
+  runtimeContextMetaFromRunInput,
 } from './runtime-adapter.js';
 import { writeMcpContext } from './codex-cli-runner.js';
 
@@ -401,6 +403,40 @@ export const grokCliAdapter: AgentRuntimeAdapter = {
           error: errorText,
           errorClass,
           newSessionId: sessionId,
+        };
+      }
+      // resume 失败 → 用新会话重试（对齐 codex 的同名处理）。
+      //
+      // session/load 在 GROK_HOME 的 sessions/ 里找不到会话文件时会失败
+      // （"Path not found"）—— 换机器、清缓存、会话文件被 CLI 轮转掉都会触发。
+      // 不 fallback 的话整个会话从此永久报错，用户只能手动 /clear。
+      //
+      // 只在**带了 sessionId** 时才重试：没带说明本来就是新会话，那种失败是
+      // 真错误，重试没有意义。
+      if (
+        input.sessionId &&
+        /session|resume|conversation|thread|not found|does not exist|path not found/i.test(
+          stderr || errorText,
+        )
+      ) {
+        emit({
+          status: 'stream',
+          result: null,
+          streamEvent: {
+            eventType: 'status',
+            statusText: 'Grok resume 失败，正在用新会话重试...',
+          },
+        });
+        const retryInput = buildResumeFailureRetryInput(
+          input,
+          'grok_resume_failed',
+        );
+        const retryResult = await grokCliAdapter.run(retryInput, emit);
+        return {
+          ...retryResult,
+          runtimeContext:
+            retryResult.runtimeContext ||
+            runtimeContextMetaFromRunInput(retryInput),
         };
       }
       return {
