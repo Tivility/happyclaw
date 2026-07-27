@@ -54,7 +54,8 @@ import {
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
-  clearStaleTaskLeases,
+  listHeldTaskLeases,
+  releaseTaskLeaseByRunner,
   claimTaskForRun,
   deleteGroupData,
   getDueTasks,
@@ -803,6 +804,43 @@ function getTaskLeaseMs(): number {
     Math.max(settings.containerTimeout, settings.idleTimeout) +
     SCHEDULER_POLL_INTERVAL
   );
+}
+
+/**
+ * 启动时回收**已死进程**持有的旧机制租约。
+ *
+ * 旧租约（scheduled_tasks.running_until / runner_id）时长是
+ * max(containerTimeout, idleTimeout) + 一个轮询周期，默认约 31 分钟。硬崩溃
+ * （kill -9 / OOM / 断电）后这些租约仍留在库里，claimTaskForRun 要求
+ * `running_until IS NULL OR running_until <= now`，于是重启后所有当时正在跑的
+ * 定时任务最长 31 分钟不会再被调度 —— 用户看到的现象是「重启后任务不跑了」。
+ *
+ * 不能用 clearStaleTaskLeases（无条件清空全部）：那会连仍在运行的兄弟调度
+ * 进程的活跃租约一起清掉，同一任务被两个进程同时执行。租约持有者 id 形如
+ * `pid:uuid`，且租约存在本机 SQLite 里（持有者必然同主机），所以可以按 pid
+ * 是否存活精确判定。
+ *
+ * pid 可能被回收复用：那种情况下判定为「还活着」而跳过，退回自然过期 —— 偏
+ * 保守的方向，不会误清。
+ */
+function reclaimDeadRunnerLeases(): number {
+  let reclaimed = 0;
+  for (const held of listHeldTaskLeases()) {
+    if (held.runner_id === SCHEDULER_RUNNER_ID) continue;
+    const pid = Number(held.runner_id.split(':')[0]);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    let alive = true;
+    try {
+      // signal 0 只做存在性/权限探测，不投递信号。
+      process.kill(pid, 0);
+    } catch (err) {
+      // ESRCH = 进程不存在（可回收）；EPERM = 存在但不属于本用户（保守跳过）。
+      alive = (err as NodeJS.ErrnoException).code !== 'ESRCH';
+    }
+    if (alive) continue;
+    if (releaseTaskLeaseByRunner(held.id, held.runner_id)) reclaimed++;
+  }
+  return reclaimed;
 }
 
 function claimScheduledRun(taskId: string, label: string): boolean {
@@ -3023,6 +3061,16 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   runningTaskIds.clear();
   pendingManualTaskIds.clear();
   pendingScheduledTaskIds.clear();
+
+  // 旧机制租约：只回收持有者进程已死的那些（见 reclaimDeadRunnerLeases 的
+  // 说明）。durable V2 租约不动 —— 它靠 owner+token 围栏，按过期自然恢复。
+  const reclaimedLeases = reclaimDeadRunnerLeases();
+  if (reclaimedLeases > 0) {
+    logger.info(
+      { reclaimedLeases },
+      'Reclaimed legacy task leases held by dead scheduler runners',
+    );
+  }
 
   // Durable V2 leases recover by expiry and must remain untouched. Legacy
   // running logs have no lease/owner, so after startup they are necessarily

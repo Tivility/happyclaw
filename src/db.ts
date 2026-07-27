@@ -5760,6 +5760,54 @@ export function clearStaleTaskLeases(): number {
   return result.changes;
 }
 
+/**
+ * 列出当前持有旧机制租约（scheduled_tasks.running_until / runner_id）的任务。
+ *
+ * 给启动恢复用：调用方据 runner_id 判定持有者是否还活着，只释放死进程的租约。
+ */
+export function listHeldTaskLeases(): Array<{
+  id: string;
+  runner_id: string;
+  running_until: string | null;
+}> {
+  return db
+    .prepare(
+      `
+      SELECT id, runner_id, running_until
+      FROM scheduled_tasks
+      WHERE runner_id IS NOT NULL
+    `,
+    )
+    .all() as Array<{
+    id: string;
+    runner_id: string;
+    running_until: string | null;
+  }>;
+}
+
+/**
+ * 释放指定 runner 持有的旧机制租约。
+ *
+ * 与 clearStaleTaskLeases 的区别：那个无条件清空全部，会误杀仍在运行的
+ * 兄弟调度进程的租约（导致同一任务被两个进程同时跑）。这个按持有者定向
+ * 释放，只有调用方已确认持有者死亡时才用。
+ */
+export function releaseTaskLeaseByRunner(
+  taskId: string,
+  runnerId: string,
+): boolean {
+  const result = db
+    .prepare(
+      `
+      UPDATE scheduled_tasks
+      SET running_until = NULL, runner_id = NULL
+      WHERE id = ? AND runner_id = ?
+    `,
+    )
+    .run(taskId, runnerId);
+  return result.changes === 1;
+}
+
 export function claimTaskForRun(
   id: string,
   runnerId: string,

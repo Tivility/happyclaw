@@ -29,6 +29,8 @@ const {
   advanceSkippedTask,
   updateTaskAfterRun,
   clearStaleTaskLeases,
+  listHeldTaskLeases,
+  releaseTaskLeaseByRunner,
 } = await import('../src/db.js');
 
 const { shouldSkipBackfill, validateCronMinimumInterval } =
@@ -219,5 +221,61 @@ describe('task backfill grace — decision predicate', () => {
     const now = Date.now();
     const exactlyFiveMinutesAgo = new Date(now - 300_000).toISOString();
     expect(shouldSkipBackfill(exactlyFiveMinutesAgo, now, 300_000)).toBe(false);
+  });
+});
+
+describe('旧机制租约 · 按持有者定向回收', () => {
+  test('listHeldTaskLeases 只列出真正持有租约的任务', () => {
+    const held = makeTask({
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+    });
+    const free = makeTask({
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+    });
+    expect(claimTaskForRun(held, '999999:abc', 60_000)).toBe(true);
+
+    const ids = listHeldTaskLeases().map((r) => r.id);
+    expect(ids).toContain(held);
+    expect(ids).not.toContain(free);
+    expect(
+      listHeldTaskLeases().find((r) => r.id === held)?.runner_id,
+    ).toBe('999999:abc');
+  });
+
+  test('releaseTaskLeaseByRunner 只释放指定持有者的租约', () => {
+    const id = makeTask({
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+    });
+    expect(claimTaskForRun(id, 'runner-x:1', 60_000)).toBe(true);
+
+    // 持有者不匹配 → 不动。这条是安全性关键：否则重启的进程会清掉仍在
+    // 运行的兄弟进程的租约，同一任务被跑两遍。
+    expect(releaseTaskLeaseByRunner(id, 'runner-y:2')).toBe(false);
+    expect(getDueTasks().map((t) => t.id)).not.toContain(id);
+
+    // 持有者匹配 → 释放，任务重新变成 due。
+    expect(releaseTaskLeaseByRunner(id, 'runner-x:1')).toBe(true);
+    expect(getDueTasks().map((t) => t.id)).toContain(id);
+  });
+
+  test('回收判定用 pid 存活：本进程 pid 判为活、不存在的 pid 判为死', () => {
+    // 复刻 reclaimDeadRunnerLeases 的判定，锁住「signal 0 探测 + ESRCH 才算死」
+    // 这个语义。EPERM（进程存在但非本用户）必须算活，否则会误清。
+    const isAlive = (runnerId: string): boolean => {
+      const pid = Number(runnerId.split(':')[0]);
+      if (!Number.isInteger(pid) || pid <= 0) return true;
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (err) {
+        return (err as NodeJS.ErrnoException).code !== 'ESRCH';
+      }
+    };
+
+    expect(isAlive(`${process.pid}:self`)).toBe(true);
+    // 4194304 超过 Linux/macOS 的默认 pid 上限，必然不存在。
+    expect(isAlive('4194304:dead')).toBe(false);
+    // runner_id 形态异常时保守判活，宁可等自然过期也不误清。
+    expect(isAlive('not-a-pid:x')).toBe(true);
   });
 });
