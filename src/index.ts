@@ -2495,6 +2495,8 @@ function writeUsageRecords(opts: {
   /** upstream 调用点传入的来源标识（chat_jid 前缀 / 'agent'）。 */
   source?: string;
   usage: {
+    /** 上游 usage 事件 id，幂等键（见 writeUsageRecords 内的说明）。 */
+    eventId?: string;
     inputTokens: number;
     outputTokens: number;
     cacheReadInputTokens: number;
@@ -2518,6 +2520,13 @@ function writeUsageRecords(opts: {
 }): void {
   const { userId, groupFolder, messageId, agentId, runtimeResolution, usage } =
     opts;
+  // 幂等键：同一个 usage 事件会被流式路径和定稿路径各写一次，必须两次都用
+  // 上游给的 eventId，否则 usage_events 的 INSERT OR IGNORE 命不中，
+  // 每轮用量落两行、日汇总翻倍。
+  //
+  // modelUsage 拆行时给每个 model 派生一个稳定后缀 —— 一个事件多模型要各占
+  // 一行，但重放同一事件必须命中同一批 id。
+  const usageEventId = usage.eventId ?? null;
   const runtimeMetadata = runtimeResolution
     ? {
         runtime: runtimeResolution.binding.runtime,
@@ -2549,6 +2558,7 @@ function writeUsageRecords(opts: {
         agentId,
         messageId,
         model,
+        eventId: usageEventId ? `${usageEventId}#${model}` : null,
         inputTokens: mu.inputTokens,
         outputTokens: mu.outputTokens,
         cacheReadInputTokens: mu.cacheReadInputTokens || 0,
@@ -2569,6 +2579,7 @@ function writeUsageRecords(opts: {
       agentId,
       messageId,
       model: fallbackModel,
+      eventId: usageEventId,
       inputTokens: usage.inputTokens,
       outputTokens: usage.outputTokens,
       cacheReadInputTokens: usage.cacheReadInputTokens,
@@ -7360,6 +7371,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     'system',
                   groupFolder: effectiveGroup.folder,
                   messageId: lastReplyMsgId,
+                  // 用量归因（决策 11）：runtime / provider_* / cost_status 全靠这个
+                  // resolution。漏传的话 runtime 列为 NULL、model 退化成 'unknown'，
+                  // 按运行时拆分的用量统计整段失效 —— 而这几处正是日常消息回复路径。
+                  runtimeResolution: activeRuntimeResolution,
                   source: chatJid.split(':', 1)[0] || 'unknown',
                   usage: result.streamEvent.usage,
                 });
@@ -7778,6 +7793,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     'system',
                   groupFolder: effectiveGroup.folder,
                   messageId: lastReplyMsgId,
+                  // 用量归因（决策 11）：runtime / provider_* / cost_status 全靠这个
+                  // resolution。漏传的话 runtime 列为 NULL、model 退化成 'unknown'，
+                  // 按运行时拆分的用量统计整段失效 —— 而这几处正是日常消息回复路径。
+                  runtimeResolution: activeRuntimeResolution,
                   source: chatJid.split(':', 1)[0] || 'unknown',
                   usage: se.usage,
                 });
@@ -15138,6 +15157,10 @@ async function processAgentConversation(
             groupFolder: effectiveGroup.folder,
             agentId,
             messageId: lastAgentReplyMsgId,
+            // 用量归因（决策 11）：runtime / provider_* / cost_status 全靠这个
+            // resolution。漏传的话 runtime 列为 NULL、model 退化成 'unknown'，
+            // 按运行时拆分的用量统计整段失效 —— 而这几处正是日常消息回复路径。
+            runtimeResolution: activeAgentRuntimeResolution,
             source: chatJid.split(':', 1)[0] || 'unknown',
             usage: output.streamEvent.usage,
           });
@@ -15338,6 +15361,10 @@ async function processAgentConversation(
             groupFolder: effectiveGroup.folder,
             agentId,
             messageId: lastAgentReplyMsgId,
+            // 用量归因（决策 11）：runtime / provider_* / cost_status 全靠这个
+            // resolution。漏传的话 runtime 列为 NULL、model 退化成 'unknown'，
+            // 按运行时拆分的用量统计整段失效 —— 而这几处正是日常消息回复路径。
+            runtimeResolution: activeAgentRuntimeResolution,
             source: chatJid.split(':', 1)[0] || 'unknown',
             usage: output.streamEvent.usage,
           });

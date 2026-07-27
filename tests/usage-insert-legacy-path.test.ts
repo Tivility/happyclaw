@@ -169,3 +169,96 @@ describe('usage 旧写入路径（insertUsageRecord）', () => {
     expect(rows[0].request_count).toBe(2);
   });
 });
+
+describe('usage 事件幂等（同一事件重放不双计）', () => {
+  test('同一 eventId 写两次只落一行', () => {
+    const payload = {
+      userId: 'u-idem',
+      groupFolder: 'ws-idem',
+      model: 'idem-probe',
+      inputTokens: 50,
+      outputTokens: 60,
+      cacheReadInputTokens: 70,
+      cacheCreationInputTokens: 0,
+      costUSD: 0.5,
+      eventId: 'evt-fixed-001',
+    } as Parameters<typeof db.insertUsageRecord>[0];
+
+    // 真实链路里同一个 usage 事件会被写两次：流式路径先算金额供实时展示，
+    // 定稿路径再关联最终消息 id。幂等靠 usage_events 的 INSERT OR IGNORE，
+    // 前提是两次传同一个 eventId —— 此前 insertUsageRecord 无条件
+    // crypto.randomUUID()，幂等永不命中，每轮用量落两行、日汇总翻倍。
+    db.insertUsageRecord(payload);
+    db.insertUsageRecord(payload);
+
+    const raw = new Database(path.join(tmpStoreDir, 'messages.db'), {
+      readonly: true,
+    });
+    const rows = raw
+      .prepare('SELECT * FROM usage_records WHERE user_id = ?')
+      .all('u-idem') as Array<Record<string, unknown>>;
+    const summary = raw
+      .prepare(
+        'SELECT * FROM usage_daily_summary WHERE user_id = ? AND model = ?',
+      )
+      .get('u-idem', 'idem-probe') as Record<string, unknown>;
+    raw.close();
+
+    expect(rows).toHaveLength(1);
+    // 日汇总也不能翻倍。
+    expect(summary.total_input_tokens).toBe(50);
+    expect(summary.request_count).toBe(1);
+  });
+
+  test('不同 eventId 各自落一行（正常的多事件场景）', () => {
+    for (const id of ['evt-a', 'evt-b']) {
+      db.insertUsageRecord({
+        userId: 'u-multi',
+        groupFolder: 'ws-idem',
+        model: 'multi-probe',
+        inputTokens: 10,
+        outputTokens: 1,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0,
+        eventId: id,
+      } as Parameters<typeof db.insertUsageRecord>[0]);
+    }
+    const raw = new Database(path.join(tmpStoreDir, 'messages.db'), {
+      readonly: true,
+    });
+    const n = (
+      raw
+        .prepare('SELECT COUNT(*) AS n FROM usage_records WHERE user_id = ?')
+        .get('u-multi') as { n: number }
+    ).n;
+    raw.close();
+    expect(n).toBe(2);
+  });
+
+  test('缺省 eventId 时回退随机 id，两次写各自落一行', () => {
+    // 没有上游事件 id 的调用方（脚本任务等）不该被误去重成一行。
+    for (let i = 0; i < 2; i++) {
+      db.insertUsageRecord({
+        userId: 'u-noevent',
+        groupFolder: 'ws-idem',
+        model: 'noevent-probe',
+        inputTokens: 3,
+        outputTokens: 1,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+        costUSD: 0,
+      } as Parameters<typeof db.insertUsageRecord>[0]);
+    }
+    const raw = new Database(path.join(tmpStoreDir, 'messages.db'), {
+      readonly: true,
+    });
+    const n = (
+      raw
+        .prepare('SELECT COUNT(*) AS n FROM usage_records WHERE user_id = ?')
+        .get('u-noevent') as { n: number }
+    ).n;
+    raw.close();
+    expect(n).toBe(2);
+  });
+});

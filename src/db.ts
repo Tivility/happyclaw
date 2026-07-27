@@ -4344,6 +4344,17 @@ export function getUsageDateWindow(
  * Insert a usage record and update daily summary.
  */
 export function insertUsageRecord(record: {
+  /**
+   * 上游 usage 事件的 id（`StreamEvent.usage.eventId`）。
+   *
+   * 同一个 usage 事件会被两条路径各写一次（流式展示时先算一遍金额，定稿时
+   * 再关联最终消息 id）。幂等靠 usage_events 的 `INSERT OR IGNORE` + 主键，
+   * **前提是两次传同一个 eventId**。此前这里无条件 `crypto.randomUUID()`，
+   * 两次各生成一个新 id → 幂等永不命中，每轮用量落两行、日汇总翻倍。
+   *
+   * 缺省时才回退到随机 id（没有上游事件 id 的调用方，例如脚本任务）。
+   */
+  eventId?: string | null;
   userId: string;
   groupFolder: string;
   agentId?: string | null;
@@ -4385,7 +4396,7 @@ export function insertUsageRecord(record: {
   // trackBillingUsage:false 沿用 upstream —— 这条旧路径不进计费聚合，
   // 计费由 billing.ts 的独立入口负责。
   recordUsageEventBatch({
-    eventId: crypto.randomUUID(),
+    eventId: record.eventId || crypto.randomUUID(),
     userId: record.userId,
     groupFolder: record.groupFolder,
     agentId: record.agentId,
