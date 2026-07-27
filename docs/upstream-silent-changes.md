@@ -402,3 +402,56 @@ upstream 移除 `vite-plugin-pwa`，`vite.config.ts` 从 274 行砍到 47 行，
 4. 决定 `delivery_status` 五列的归属（§5）
 5. 合并 `shared/stream-event.ts` 后必须 `make sync-types`（4 份副本全冲突）
 6. `container/build.sh` 重建镜像（§7 的 Skills 挂载模型）
+
+---
+
+## 追加 · 2026-07-27 轮
+
+> 基线：本地 `main` = `5d3217f` · `upstream/main` = `bd5b846` · merge-base = `dba1e41`
+> 规模：7 个 upstream 提交 · 17 个冲突块 · 下面两条**都不在冲突标记里**
+
+### A1 · env 目录改为按渠道账号分层
+
+`src/container-runner.ts`（upstream `4367fd0`）
+
+```
+改前  const envDir = path.join(DATA_DIR, 'env', group.folder);
+改后  const envDir = getContainerRuntimeEnvDir(folder, ipcAgentId, taskRunId, feishuChannelAccountId)
+      → data/env/{folder}/{channel-accounts/<id> | default}/{agents/<id> | main}[/tasks/<runId>]
+```
+
+目的是让注入的 feishu-cli 凭据只对绑定的那个 Bot 可见，多账号下不串。
+
+**为什么静默**：这一行本地没改过，git 判「一侧改一侧未动」，干净采纳。
+
+**影响面**：所有容器与宿主机 spawn 都走这里。env 文件每次运行重新生成，
+`file-manager.ts` 删的是 `env/{folder}` 整棵树，读写两侧一致，**不需要迁移**；
+旧的 `data/env/{folder}/env` 变成孤儿文件，无害但会留着。
+
+**抓到的方式**：`tests/codex-container-conformance.test.ts` 的挂载断言失败。
+若无该测试，这个变更会完全无声地过去。
+
+### A2 · container_config 解析从「丢字段」改为 fail-closed
+
+`src/db.ts` `parseGroupRow`（upstream `b5724f6`）
+
+| | 改前（本地） | 改后（upstream） |
+|---|---|---|
+| JSON 损坏 | warn + 丢字段，工作区照常启动 | 置 `containerConfigError`，工作区**起不来** |
+| 形状非法 | 不校验 | 同上，且新解析器**拒绝未知字段** |
+
+upstream 的理由写在注释里：损坏的持久化授权边界不该被静默降级成「看起来安全」
+的工作区。`buildVolumeMounts` 见到 `containerConfigError` 直接抛
+`AdditionalMountValidationError`。
+
+**风险**：存量库里任何不合新规的 `container_config` 会让该工作区直接停摆。
+另外带 `additionalMounts` 的工作区，owner 必须通过 `canExecuteOnHost`
+（role=admin ∧ status=active ∧ 未在撤权名单），否则同样抛错。
+
+**实测结论（生产库副本）**：67 个工作区，`containerConfigError` 为 0；
+唯一一个带 `additionalMounts` 的工作区经
+`parseContainerConfig` → `validateAdditionalMounts` → `canExecuteOnHost`
+全链路通过（owner 为活跃 admin）。本次升级无阻塞。
+
+**下次注意**：这类 fail-closed 收紧只能靠「生产库副本实跑」发现，
+typecheck 和测试都不会报 —— 属于手册里的形态 D（前提被取消）。

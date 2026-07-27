@@ -51,18 +51,42 @@ function hasUnsafeCredentialCharacters(value: string): boolean {
  * Select the Bot identity a container run must use without reading secrets.
  * Host mode deliberately never calls this helper: feishu-cli on the host owns
  * its complete native environment/config resolution.
+ *
+ * 工作区级回落必须先看 provider。upstream 那边 `channel_account_id` 语义上就是
+ * 「这个工作区绑的飞书 Bot」，本 fork 里它是**任意渠道**的账号 —— 微信 / QQ 绑定
+ * 同样写在这一列。不加判断地回落，会把一个微信账号当成飞书 Bot 交给下游，而
+ * `resolveFeishuCliRuntimeBinding()` 是 fail-closed 的，直接抛
+ * 「wrong provider」让整个工作区起不来（实测命中 2 个用户的微信主容器）。
+ *
+ * 语义上「工作区绑的是微信账号」等于「没有绑飞书 Bot」，与无绑定同样返回 null。
+ * turn 级账号不走这条豁免：飞书 turn 带来的账号 id 若 provider 不对，那是真的
+ * 配置错乱或越权信号，仍然由下游 fail-closed 拦住。
  */
 export function resolveFeishuCliBoundAccountId(
   input: Pick<
     ResolveFeishuCliRuntimeBindingInput,
     'channelContext' | 'workspaceChannelAccountId'
   >,
+  dependencies?: Pick<FeishuCliBindingDependencies, 'getChannelAccount'>,
 ): string | null {
   const isFeishuTurn = input.channelContext?.provider === 'feishu';
   const turnAccountId = isFeishuTurn
     ? optionalTrimmed(input.channelContext?.channelAccountId)
     : null;
-  return turnAccountId ?? optionalTrimmed(input.workspaceChannelAccountId);
+  if (turnAccountId) return turnAccountId;
+
+  const workspaceAccountId = optionalTrimmed(input.workspaceChannelAccountId);
+  if (!workspaceAccountId) return null;
+  // 依赖在这里才解析，不写成默认参数：默认参数每次调用都会求值，而多数调用方
+  // （如 group-queue 只传 channelContext）根本走不到查库这一步。提前引用会让
+  // 那些只 mock 了部分 db 导出的测试无谓地炸。
+  const account = (dependencies?.getChannelAccount ?? getChannelAccount)(
+    workspaceAccountId,
+  );
+  // 账号查不到时保留原样返回：那是「绑定悬空」，应由 resolveFeishuCliRuntimeBinding
+  // 报 "no longer exists"，而不是在这里静默退化成「未绑定」。
+  if (account && account.provider !== 'feishu') return null;
+  return workspaceAccountId;
 }
 
 /**
@@ -88,7 +112,12 @@ export function resolveFeishuCliRuntimeBinding(
   const turnAccountId = isFeishuTurn
     ? optionalTrimmed(input.channelContext?.channelAccountId)
     : null;
-  const candidateAccountId = resolveFeishuCliBoundAccountId(input);
+  // 依赖必须往下传：工作区级回落现在要查 provider，不转发的话注入的 double 会
+  // 被绕过、穿透到真实 DB。
+  const candidateAccountId = resolveFeishuCliBoundAccountId(
+    input,
+    dependencies,
+  );
 
   if (!candidateAccountId) return null;
 
