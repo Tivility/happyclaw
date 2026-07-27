@@ -5678,6 +5678,24 @@ export function updateTaskWorkspace(
   ).run(workspaceJid, workspaceFolder, id);
 }
 
+/**
+ * 列出软删除已超过保留期、可以物理回收的任务。
+ *
+ * upstream 把任务删除改成了可恢复的软删除（deleted_at + /restore），但全仓
+ * 没有任何回收路径 —— flow-* 专属工作区会永久留在磁盘上。这个查询给 purge
+ * 用：只挑 deleted_at 早于 cutoff 的，仍在保留期内的任务必须能 restore。
+ */
+export function getPurgeableTasks(cutoffIso: string): ScheduledTask[] {
+  return db
+    .prepare(
+      `SELECT * FROM scheduled_tasks
+       WHERE deleted_at IS NOT NULL AND deleted_at <= ?
+       ORDER BY deleted_at ASC`,
+    )
+    .all(cutoffIso)
+    .map(mapTaskRow);
+}
+
 export function deleteTask(id: string): void {
   // Delete child records first (FK constraint)
   db.prepare('DELETE FROM task_runs WHERE task_id = ?').run(id);

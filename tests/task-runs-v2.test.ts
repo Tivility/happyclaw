@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
+import Database from 'better-sqlite3';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -941,5 +942,45 @@ describe('notification-only retry state', () => {
         failed_channels: ['telegram'],
       },
     });
+  });
+});
+
+describe('软删除任务的保留期回收', () => {
+  test('getPurgeableTasks 只返回 deleted_at 早于 cutoff 的任务', () => {
+    const fresh = createDefinition('purge-fresh');
+    const old = createDefinition('purge-old');
+
+    const freshDel = db.softDeleteTaskWithRevision(fresh.id, fresh.revision);
+    const oldDel = db.softDeleteTaskWithRevision(old.id, old.revision);
+    expect(freshDel.status).toBe('updated');
+    expect(oldDel.status).toBe('updated');
+
+    // 把 old 的删除时间推到 30 天前，fresh 保持刚删。
+    const thirtyDaysAgo = new Date(
+      Date.now() - 30 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    // 直接改库造「30 天前删除」—— 与 schema-* 迁移测试同一套做法：
+    // 同一个 SQLite 文件另开一个连接。db 模块不暴露原始连接。
+    const raw = new Database(path.join(tmpStoreDir, 'messages.db'));
+    raw
+      .prepare('UPDATE scheduled_tasks SET deleted_at = ? WHERE id = ?')
+      .run(thirtyDaysAgo, old.id);
+    raw.close();
+
+    // 保留期 7 天 → cutoff 是 7 天前：只有 old 过期。
+    const cutoff = new Date(
+      Date.now() - 7 * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const purgeable = db.getPurgeableTasks(cutoff).map((t) => t.id);
+    expect(purgeable).toContain(old.id);
+    // 关键不变量：仍在保留期内的任务不能被回收，否则 /restore 会恢复出一个
+    // 工作区已被物理抹掉的任务。
+    expect(purgeable).not.toContain(fresh.id);
+  });
+
+  test('未删除的任务永不出现在可回收集合里', () => {
+    const live = createDefinition('purge-live');
+    const cutoff = new Date(Date.now() + 60_000).toISOString();
+    expect(db.getPurgeableTasks(cutoff).map((t) => t.id)).not.toContain(live.id);
   });
 });

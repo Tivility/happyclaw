@@ -107,6 +107,7 @@ export interface SystemSettings {
   maxConcurrentScripts: number;
   scriptTimeout: number;
   taskBackfillGraceMs: number;
+  deletedTaskRetentionDays: number;
   maxRepliesPerTurn: number;
   maxTasksPerUser: number;
   fallbackModel: string;

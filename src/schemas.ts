@@ -547,6 +547,7 @@ export const SystemSettingsSchema = z
         'taskBackfillGraceMs must be 0 (disabled) or between 1000 (1s) and 86400000 (24h)',
       )
       .optional(),
+    deletedTaskRetentionDays: z.number().int().min(0).max(365).optional(),
     maxRepliesPerTurn: z.number().int().min(0).max(500).optional(),
     maxTasksPerUser: z.number().int().min(0).max(10000).optional(),
     fallbackModel: z.string().max(64).optional(),

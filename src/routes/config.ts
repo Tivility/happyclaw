@@ -3327,6 +3327,7 @@ function toSystemSettingsResponse(
     maxConcurrentScripts: settings.maxConcurrentScripts,
     scriptTimeout: settings.scriptTimeout,
     taskBackfillGraceMs: settings.taskBackfillGraceMs,
+    deletedTaskRetentionDays: settings.deletedTaskRetentionDays,
     maxRepliesPerTurn: settings.maxRepliesPerTurn,
     maxTasksPerUser: settings.maxTasksPerUser,
     fallbackModel: settings.fallbackModel,

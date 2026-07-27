@@ -22,6 +22,7 @@ type NumericSettingKey =
   | 'maxConcurrentScripts'
   | 'scriptTimeout'
   | 'taskBackfillGraceMs'
+  | 'deletedTaskRetentionDays'
   | 'maxRepliesPerTurn'
   | 'maxTasksPerUser';
 
@@ -169,6 +170,18 @@ const fieldGroups: FieldGroup[] = [
         toStored: (value) => value * 60_000,
         min: 0,
         max: 1440,
+        step: 1,
+      },
+      {
+        key: 'deletedTaskRetentionDays',
+        label: '已删除任务保留期',
+        description:
+          '删除任务后保留多少天可恢复；超期后连同任务的专属工作区一并物理回收。0 表示永久保留（只能手动清理）。',
+        unit: '天',
+        toDisplay: (value) => value,
+        toStored: (value) => value,
+        min: 0,
+        max: 365,
         step: 1,
       },
       {

@@ -54,6 +54,8 @@ import {
   getAllTasks,
   cleanupOldTaskRunLogs,
   cleanupStaleRunningLogs,
+  deleteTask,
+  getPurgeableTasks,
   listHeldTaskLeases,
   releaseTaskLeaseByRunner,
   claimTaskForRun,
@@ -823,6 +825,55 @@ function getTaskLeaseMs(): number {
  * pid 可能被回收复用：那种情况下判定为「还活着」而跳过，退回自然过期 —— 偏
  * 保守的方向，不会误清。
  */
+/**
+ * 回收软删除已超过保留期的任务，连同其 flow-* 专属工作区。
+ *
+ * upstream 把任务删除改成了可恢复的软删除（`deleted_at` + `/restore`），本地
+ * 原实现在删除时物理销毁专属工作区。两者不能并存：留着清理，`/restore` 会
+ * 恢复出一个工作区已被抹掉的任务。合并时取了 upstream 侧（软删除路径不得
+ * 销毁数据），代价是 `flow-*` 工作区失去全部回收路径 —— 磁盘只增不减。
+ *
+ * 这里补上回收：**只动已过保留期的**，仍在保留期内的必须能完整 restore。
+ * `deletedTaskRetentionDays = 0` 时整个函数不做事（保守默认），回收只能由
+ * 显式 purge 触发。
+ *
+ * 与启动时的 once-task 清理是两回事：那个清的是已完成一次性任务的 `task-*`
+ * 工作区，与软删除无关。
+ */
+function purgeExpiredDeletedTasks(deps: SchedulerDependencies): number {
+  const retentionDays = getSystemSettings().deletedTaskRetentionDays;
+  if (!retentionDays || retentionDays <= 0) return 0;
+
+  const cutoff = new Date(
+    Date.now() - retentionDays * 24 * 60 * 60 * 1000,
+  ).toISOString();
+
+  let purged = 0;
+  const groups = deps.registeredGroups();
+  for (const task of getPurgeableTasks(cutoff)) {
+    try {
+      // 工作区先删、任务行后删：反过来的话中途失败会留下无主工作区，
+      // 而且再没有任何记录指向它。
+      if (task.workspace_jid && task.workspace_folder) {
+        if (groups[task.workspace_jid]) {
+          deleteGroupData(task.workspace_jid, task.workspace_folder);
+          delete groups[task.workspace_jid];
+        }
+        removeFlowArtifacts(task.workspace_folder);
+      }
+      deleteTask(task.id);
+      purged++;
+    } catch (err) {
+      // 单个任务回收失败不该挡住其余的 —— 下次启动会再试。
+      logger.error(
+        { taskId: task.id, err },
+        'Failed to purge expired soft-deleted task',
+      );
+    }
+  }
+  return purged;
+}
+
 function reclaimDeadRunnerLeases(): number {
   let reclaimed = 0;
   for (const held of listHeldTaskLeases()) {
@@ -3114,6 +3165,19 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
     }
   } catch (err) {
     logger.error({ err }, 'Failed to cleanup orphaned once-task workspaces');
+  }
+
+  // 软删除任务的保留期回收（见 purgeExpiredDeletedTasks）。默认关闭。
+  try {
+    const purged = purgeExpiredDeletedTasks(deps);
+    if (purged > 0) {
+      logger.info(
+        { purged },
+        'Purged expired soft-deleted tasks and their flow workspaces',
+      );
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to purge expired soft-deleted tasks');
   }
 
   logger.info('Task Scheduler V2 started');

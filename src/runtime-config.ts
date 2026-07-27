@@ -4381,6 +4381,11 @@ export interface SystemSettings {
   // 跨天积压任务集体在重启那一秒并发 fire 刷屏。
   // 0 = 关闭（保留旧行为：无视逾期时长全部 backfill）。默认 300000 (5 分钟)。
   taskBackfillGraceMs: number;
+  // 软删除任务的保留天数。upstream 把任务删除改成了可恢复的软删除
+  // （deleted_at + /restore），但全仓没有任何回收路径 —— flow-* 专属工作区
+  // 会永久留在磁盘上。这里给保留期：过期后连同专属工作区一并物理回收。
+  // 0 = 永不自动回收（只能显式 purge），保守默认。
+  deletedTaskRetentionDays: number;
   // 健康检查确认某 IM 群"针对该群的确定性否定"达阈值后，是否自动解绑该群。
   // 默认 false：只打 warn 旗标、等待人工复核，绝不自动毁数据（避免误判错删）。
   // true：用可恢复的 unbindImGroup（清空 target_* 指针）自动解绑。
@@ -4433,6 +4438,7 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   fallbackModel: '',
   pluginAutoScan: true,
   taskBackfillGraceMs: 300000,
+  deletedTaskRetentionDays: 0,
   autoRemoveDeadImGroup: false,
   maxRepliesPerTurn: 20,
   maxTasksPerUser: 200,
@@ -4499,6 +4505,14 @@ function normalizeSystemSettings(
   if (taskBackfillGraceMs !== taskBackfillRaw) {
     invalidFields.add('taskBackfillGraceMs');
   }
+
+  // 上限 365 天：更长的保留期实际等于「永不回收」，直接用 0 表达更清楚。
+  const deletedTaskRetentionDays = numberField(
+    'deletedTaskRetentionDays',
+    DEFAULT_SYSTEM_SETTINGS.deletedTaskRetentionDays,
+    0,
+    365,
+  );
 
   const maxRepliesPerTurn = numberField(
     'maxRepliesPerTurn',
@@ -4687,6 +4701,7 @@ function normalizeSystemSettings(
       DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
     ),
     taskBackfillGraceMs,
+    deletedTaskRetentionDays,
     // 本地独有设置项。upstream 的规范化函数没有这四项；缺了它们会被静默
     // 丢弃——设置页照常显示与保存，运行时永远读到默认值。
     maxConcurrentHostProcesses: numberField(
@@ -4758,6 +4773,7 @@ function buildEnvFallbackSettings(): SystemSettings {
       fallbackModel: process.env.FALLBACK_MODEL,
       pluginAutoScan: process.env.PLUGIN_AUTO_SCAN,
       taskBackfillGraceMs: process.env.TASK_BACKFILL_GRACE_MS,
+      deletedTaskRetentionDays: process.env.DELETED_TASK_RETENTION_DAYS,
       // 本地独有设置项：upstream 的 normalizeSystemSettings 不认识这四个，
       // 只取它的骨架会让这些设置「页面能改、schema 里有、永不生效」。
       maxConcurrentHostProcesses: process.env.MAX_CONCURRENT_HOST_PROCESSES,
