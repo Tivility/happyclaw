@@ -256,6 +256,14 @@ const InteractionModeSchema = z
   .enum(['assistant', 'proactive', 'persona'])
   .transform((mode) => (mode === 'persona' ? 'proactive' : mode));
 
+export const AdditionalMountCreateSchema = z
+  .object({
+    host_path: z.string().trim().min(1).max(4096),
+    container_path: z.string().trim().min(1).max(512),
+    readonly: z.boolean().optional().default(true),
+  })
+  .strict();
+
 export const GroupCreateSchema = z.object({
   name: z.string().min(1).max(MAX_GROUP_NAME_LEN),
   agent_profile_id: z
@@ -277,6 +285,7 @@ export const GroupCreateSchema = z.object({
     .optional()
     .transform((val) => (val && val.trim() ? val.trim() : undefined)),
   privacy_mode: z.boolean().optional(),
+  additional_mounts: z.array(AdditionalMountCreateSchema).max(8).optional(),
 });
 
 export const GroupAgentProfilePatchSchema = z.object({

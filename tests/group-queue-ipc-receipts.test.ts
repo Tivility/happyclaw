@@ -51,7 +51,12 @@ function readPayloads(): Array<{ receipt?: Receipt; queryRunId?: string }> {
     );
 }
 
-async function startRunner(): Promise<void> {
+async function startRunner(
+  options: {
+    containerName?: string | null;
+    feishuCliAccountId?: string | null;
+  } = {},
+): Promise<void> {
   queue.enqueueMessageCheck(JID);
   await tick();
   queue.registerProcess(
@@ -63,7 +68,11 @@ async function startRunner(): Promise<void> {
         return true;
       },
     } as never,
-    { containerName: null, groupFolder: FOLDER },
+    {
+      containerName: options.containerName ?? null,
+      groupFolder: FOLDER,
+      feishuCliAccountId: options.feishuCliAccountId,
+    },
   );
 }
 
@@ -103,6 +112,125 @@ afterEach(async () => {
 });
 
 describe('GroupQueue IPC delivery receipts', () => {
+  test('restarts a container before switching the injected Feishu Bot', async () => {
+    await startRunner({
+      containerName: 'happyclaw-bot-a',
+      feishuCliAccountId: 'account-a',
+    });
+
+    expect(
+      queue.sendMessage(
+        JID,
+        'use bot b',
+        undefined,
+        undefined,
+        JID,
+        undefined,
+        undefined,
+        {
+          schemaVersion: 1,
+          provider: 'feishu',
+          channelAccountId: 'account-b',
+          sourceJid: 'feishu:chat#account:account-b',
+        },
+      ),
+    ).toBe('no_active');
+    expect(readPayloads()).toEqual([]);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
+  });
+
+  test('keeps a warm container for the same injected Feishu Bot', async () => {
+    await startRunner({
+      containerName: 'happyclaw-bot-a',
+      feishuCliAccountId: 'account-a',
+    });
+
+    expect(
+      queue.sendMessage(
+        JID,
+        'still bot a',
+        undefined,
+        undefined,
+        JID,
+        undefined,
+        undefined,
+        {
+          schemaVersion: 1,
+          provider: 'feishu',
+          channelAccountId: 'account-a',
+          sourceJid: 'feishu:chat#account:account-a',
+        },
+      ),
+    ).toBe('sent');
+    expect(readPayloads()).toHaveLength(1);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+  });
+
+  test('restarts a Bot-bound container for an explicitly unbound request', async () => {
+    await startRunner({
+      containerName: 'happyclaw-bot-a',
+      feishuCliAccountId: 'account-a',
+    });
+
+    expect(
+      queue.requiresFeishuCliContainerRestart(JID, {
+        feishuCliAccountId: null,
+      }),
+    ).toBe(true);
+    expect(
+      queue.sendMessage(
+        JID,
+        'use native unbound config',
+        undefined,
+        undefined,
+        JID,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        { feishuCliAccountId: null },
+      ),
+    ).toBe('no_active');
+    expect(readPayloads()).toEqual([]);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(true);
+  });
+
+  test('keeps compatibility for internal IPC without an identity constraint', async () => {
+    await startRunner({
+      containerName: 'happyclaw-bot-a',
+      feishuCliAccountId: 'account-a',
+    });
+
+    expect(
+      queue.sendMessage(JID, 'internal message without turn identity'),
+    ).toBe('sent');
+    expect(readPayloads()).toHaveLength(1);
+    expect(fs.existsSync(path.join(inputDir(), '_drain'))).toBe(false);
+  });
+
+  test('does not impose container Bot identity on host-mode runners', async () => {
+    await startRunner();
+
+    expect(
+      queue.sendMessage(
+        JID,
+        'host native config',
+        undefined,
+        undefined,
+        JID,
+        undefined,
+        undefined,
+        {
+          schemaVersion: 1,
+          provider: 'feishu',
+          channelAccountId: 'account-b',
+          sourceJid: 'feishu:chat#account:account-b',
+        },
+      ),
+    ).toBe('sent');
+    expect(readPayloads()).toHaveLength(1);
+  });
+
   test('stamps each warm IPC file with its exact query attempt', async () => {
     await startRunner();
     const runA = queue.getActiveQueryId(JID);

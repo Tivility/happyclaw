@@ -138,7 +138,12 @@ async function loadContainerRunner(tmpDir: string) {
           : { servers: { ...layers.system, ...layers.user }, missing: [] },
   }));
 
-  vi.doMock('../src/mount-security.js', () => ({
+  // 只中和白名单校验，其余导出保留真实实现。整体替换的写法每次 upstream 往
+  // mount-security 加一个被 buildVolumeMounts 调用的导出（如 parseContainerConfig）
+  // 就会以「No export is defined on the mock」炸掉，而那跟本测试要验的
+  // codex 容器挂载语义毫无关系。
+  vi.doMock('../src/mount-security.js', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('../src/mount-security.js')>()),
     loadMountAllowlist: () => null,
     validateAdditionalMounts: () => [],
   }));
@@ -276,13 +281,17 @@ describe('Codex container runtime conformance', () => {
         `${path.join(dataDir, 'config', 'container-claude-json.json')}:/workspace/claude-json-template:ro`,
         `${path.join(dataDir, 'ipc', group.folder)}:/workspace/ipc`,
         `${path.join(dataDir, 'config', 'codex', provider.id)}:/workspace/codex-home`,
-        `${path.join(dataDir, 'env', group.folder)}:/workspace/env-dir:ro`,
+        // env 目录按「渠道账号 / 运行体」分层：{folder}/{channel-accounts/<id>|default}/{agents/<id>|main}。
+        // upstream 4367fd0 引入，为的是让注入的 feishu-cli 凭据只对绑定的那个 Bot 可见。
+        // 这里保持硬编码而不是复用 getContainerRuntimeEnvDir()：容器实际看到的路径
+        // 就是契约本身，布局再变一次应该由这条断言拦下来。
+        `${path.join(dataDir, 'env', group.folder, 'default', 'main')}:/workspace/env-dir:ro`,
         `${path.join(process.cwd(), 'container', 'agent-runner', 'src')}:/app/src:ro`,
       ]),
     );
     expect(spawnCalls[0].args.at(-1)).toBe('happyclaw:test');
 
-    const envFile = path.join(dataDir, 'env', group.folder, 'env');
+    const envFile = path.join(dataDir, 'env', group.folder, 'default', 'main', 'env');
     const envContent = fs.readFileSync(envFile, 'utf-8');
     expect(envContent).toContain('OPENAI_API_KEY=sk-test-container');
     expect(envContent).toContain('CODEX_HOME=/workspace/codex-home');

@@ -33,9 +33,12 @@ import {
   resolveHostNodeBinary,
 } from './node-resolver.js';
 import {
+  AdditionalMountValidationError,
   loadMountAllowlist,
+  parseContainerConfig,
   validateAdditionalMounts,
 } from './mount-security.js';
+import { canExecuteOnHost } from './host-execution-policy.js';
 import {
   buildContainerEnvLines,
   clearInheritedClaudeProviderEnv,
@@ -146,6 +149,12 @@ import {
   resolveHostSkillPolicy,
   type HostSkillPolicy,
 } from './agent-profile-policy.js';
+import {
+  applyFeishuCliBindingToEnvLines,
+  resolveFeishuCliRuntimeBinding,
+  type FeishuCliRuntimeBinding,
+} from './feishu-cli-runtime.js';
+import { assertValidWorkspaceFolderName } from './workspace-folder.js';
 
 /**
  * 宿主机的 ~/.claude.json 路径。
@@ -1203,6 +1212,95 @@ export function applyFallbackModelToEnvLines(
   envLines.push(`HAPPYCLAW_FALLBACK_MODEL=${fallbackModel}`);
 }
 
+function assertRuntimeEnvPathSegment(value: string, label: string): string {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new Error(`Invalid ${label} for container environment isolation`);
+  }
+  return value;
+}
+
+/**
+ * Keep generated env files isolated by both runtime and Feishu Bot identity.
+ *
+ * Conversation agents and task runs can execute concurrently inside one
+ * workspace. A bound channel account is also included so two Bots routed to
+ * the same main workspace can never overwrite each other's credentials.
+ */
+export function getContainerRuntimeEnvDir(
+  groupFolder: string,
+  ipcAgentId?: string,
+  taskRunId?: string,
+  feishuChannelAccountId?: string | null,
+): string {
+  const safeGroupFolder = assertValidWorkspaceFolderName(
+    groupFolder,
+    'group folder',
+  );
+  const identityPath = feishuChannelAccountId
+    ? [
+        'channel-accounts',
+        assertRuntimeEnvPathSegment(
+          feishuChannelAccountId,
+          'Feishu channel account id',
+        ),
+      ]
+    : ['default'];
+  const runtimePath = ipcAgentId
+    ? ['agents', assertRuntimeEnvPathSegment(ipcAgentId, 'agent id')]
+    : taskRunId
+      ? ['tasks-run', assertRuntimeEnvPathSegment(taskRunId, 'task run id')]
+      : ['main'];
+  return path.join(
+    DATA_DIR,
+    'env',
+    safeGroupFolder,
+    ...identityPath,
+    ...runtimePath,
+  );
+}
+
+/**
+ * Remove every identity-specific environment snapshot for one isolated task
+ * run. The scheduler does not need to retain or rediscover which Bot identity
+ * was selected after the container exits.
+ */
+export function cleanupContainerTaskRuntimeEnvDirs(
+  groupFolder: string,
+  taskRunId: string,
+): void {
+  const safeTaskRunId = assertRuntimeEnvPathSegment(taskRunId, 'task run id');
+  const safeGroupFolder = assertValidWorkspaceFolderName(
+    groupFolder,
+    'group folder',
+  );
+  const workspaceEnvRoot = path.join(DATA_DIR, 'env', safeGroupFolder);
+  const taskRuntimeSuffix = path.join('tasks-run', safeTaskRunId);
+
+  fs.rmSync(path.join(workspaceEnvRoot, 'default', taskRuntimeSuffix), {
+    recursive: true,
+    force: true,
+  });
+
+  const accountRoot = path.join(workspaceEnvRoot, 'channel-accounts');
+  let accountEntries: fs.Dirent[];
+  try {
+    accountEntries = fs.readdirSync(accountRoot, { withFileTypes: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  for (const entry of accountEntries) {
+    if (!entry.isDirectory()) continue;
+    // Ignore unexpected legacy/manual entries instead of letting them broaden
+    // the deletion target.
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(entry.name)) continue;
+    fs.rmSync(path.join(accountRoot, entry.name, taskRuntimeSuffix), {
+      recursive: true,
+      force: true,
+    });
+  }
+}
+
 export function buildVolumeMounts(
   group: RegisteredGroup,
   isAdminHome: boolean,
@@ -1216,8 +1314,37 @@ export function buildVolumeMounts(
   grokAuthMaterial?: GrokProviderAuthMaterial | null,
   ipcAgentId?: string,
   agentProfile?: RunnerAgentProfile,
+  channelContext?: ChannelTurnContext,
 ): VolumeMount[] {
+  if (group.containerConfigError) {
+    throw new AdditionalMountValidationError([
+      `Persisted container configuration is invalid: ${group.containerConfigError}`,
+    ]);
+  }
+  const parsedContainerConfig = parseContainerConfig(group.containerConfig);
+  if (parsedContainerConfig.error) {
+    throw new AdditionalMountValidationError([parsedContainerConfig.error]);
+  }
+  const configuredAdditionalMounts =
+    parsedContainerConfig.config?.additionalMounts;
+  if (configuredAdditionalMounts && configuredAdditionalMounts.length > 0) {
+    let currentOwner;
+    try {
+      currentOwner = group.created_by
+        ? getUserById(group.created_by)
+        : undefined;
+    } catch {
+      currentOwner = undefined;
+    }
+    if (!canExecuteOnHost(currentOwner)) {
+      throw new Error(
+        'Host directory mounts require a currently active administrator owner',
+      );
+    }
+  }
+
   const mounts: VolumeMount[] = [];
+  let feishuCliBinding: FeishuCliRuntimeBinding | null = null;
   const projectRoot = process.cwd();
   const groupDir = path.join(GROUPS_DIR, group.folder);
 
@@ -1391,9 +1518,11 @@ export function buildVolumeMounts(
     });
   }
 
-  // Per-user feishu-cli OAuth state (token.json + config.yaml).
+  // Per-user native feishu-cli state (profiles, token.json, config.yaml).
   // Without this mount, every container restart loses the user's feishu OAuth
-  // authorization, forcing re-auth every IDLE_TIMEOUT (#477).
+  // authorization, forcing re-auth every IDLE_TIMEOUT (#477). HappyClaw never
+  // creates or switches profiles here: the CLI keeps ownership of its native
+  // config, while a bound Bot's App credentials are overlaid via env below.
   if (ownerId) {
     const userFeishuCliDir = path.join(
       DATA_DIR,
@@ -1407,6 +1536,17 @@ export function buildVolumeMounts(
       hostPath: userFeishuCliDir,
       containerPath: '/home/node/.feishu-cli',
       readonly: false,
+    });
+    feishuCliBinding = resolveFeishuCliRuntimeBinding({
+      ownerUserId: ownerId,
+      channelContext,
+      workspaceChannelAccountId: group.channel_account_id,
+    });
+  } else {
+    feishuCliBinding = resolveFeishuCliRuntimeBinding({
+      ownerUserId: ownerId,
+      channelContext,
+      workspaceChannelAccountId: group.channel_account_id,
     });
   }
 
@@ -1475,7 +1615,14 @@ export function buildVolumeMounts(
 
   // Per-container environment file (keeps credentials out of process listings)
   // Global config merged with per-container overrides.
-  const envDir = path.join(DATA_DIR, 'env', group.folder);
+  const envDir = getContainerRuntimeEnvDir(
+    group.folder,
+    ipcAgentId,
+    taskRunId,
+    feishuCliBinding?.source === 'channel_account'
+      ? feishuCliBinding.accountId
+      : null,
+  );
   fs.mkdirSync(envDir, { recursive: true });
   const globalConfig = resolvedProvider?.config ?? getClaudeProviderConfig();
   const containerOverride = getContainerEnvConfig(group.folder);
@@ -1545,6 +1692,7 @@ export function buildVolumeMounts(
     envLines.push(`HAPPYCLAW_AGENT_MCP_POLICY=${mcpPolicyMode}`);
   }
   applyFallbackModelToEnvLines(envLines);
+  applyFeishuCliBindingToEnvLines(envLines, feishuCliBinding);
   if (envLines.length > 0) {
     const envFilePath = path.join(envDir, 'env');
     const quotedLines = shellQuoteEnvLines(envLines);
@@ -1656,11 +1804,11 @@ export function buildVolumeMounts(
   });
 
   // Additional mounts validated against external allowlist (tamper-proof from containers)
-  if (group.containerConfig?.additionalMounts) {
+  if (configuredAdditionalMounts && configuredAdditionalMounts.length > 0) {
     const validatedMounts = validateAdditionalMounts(
-      group.containerConfig.additionalMounts,
+      configuredAdditionalMounts,
       group.name,
-      isAdminHome,
+      group.is_home === true,
     );
     mounts.push(...validatedMounts);
   }
@@ -1821,6 +1969,7 @@ export async function runContainerAgent(
       grokAuthMaterial,
       input.agentId,
       input.agentProfile,
+      input.channelContext,
     );
     const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
     const agentSuffix = sessionAgentId

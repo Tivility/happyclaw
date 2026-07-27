@@ -221,6 +221,157 @@ describe('Feishu capability mutation outbox', () => {
     expect(sibling.status).toBe('delivered');
   });
 
+  test('an Axios-style Feishu HTTP 400 is definitive and leaves text fallback available', async () => {
+    const run = store.createChannelTurnRun({
+      ...route,
+      idempotencyKey: 'feishu-mutation-http-400',
+    }).run;
+    const request = {
+      operation: 'send_card' as const,
+      params: {
+        card: {
+          schema: '2.0',
+          body: { elements: [{ tag: 'unsupported' }] },
+        },
+      },
+    };
+    const rejected = await deliverFeishuCapabilityMutation({
+      ...route,
+      turnRunId: run.id,
+      requestId: 'invalid-v2-card',
+      request,
+      owner: 'invalid-v2-card-worker',
+      execute: async () => {
+        throw Object.assign(new Error('Request failed with status code 400'), {
+          response: {
+            status: 400,
+            data: {
+              code: 230099,
+              msg: 'cards of schema V2 do not support this component',
+            },
+          },
+        });
+      },
+    });
+
+    expect(rejected.delivery).toMatchObject({
+      status: 'failed',
+      error: expect.stringContaining('http=400'),
+    });
+    expect(store.getUncertainChannelOutboxForTurn(run.id)).toBeUndefined();
+
+    const fallback = await delivery.deliverChannelOutboxItem({
+      ...route,
+      turnRunId: run.id,
+      ordinal: 2,
+      kind: 'text',
+      payload: { text: 'The report is ready: https://example.com/report' },
+      owner: 'fallback-worker',
+      delivery: {
+        mode: 'single',
+        send: async () => ({ providerMessageId: 'om_fallback' }),
+      },
+    });
+    expect(fallback.status).toBe('delivered');
+  });
+
+  test('a Feishu HTTP 429 enters retry wait instead of failing permanently', async () => {
+    const now = '2026-07-26T08:00:00.000Z';
+    const run = store.createChannelTurnRun({
+      ...route,
+      idempotencyKey: 'feishu-mutation-http-429',
+      now,
+    }).run;
+    const result = await deliverFeishuCapabilityMutation({
+      ...route,
+      turnRunId: run.id,
+      requestId: 'provider-429',
+      request: {
+        operation: 'send_card',
+        params: { card: { schema: '2.0', body: { elements: [] } } },
+      },
+      owner: 'provider-429-worker',
+      now: () => now,
+      execute: async () => {
+        throw Object.assign(new Error('Request failed with status code 429'), {
+          response: {
+            status: 429,
+            headers: { 'retry-after': '2' },
+            data: { code: 99991400, msg: 'rate limit exceeded' },
+          },
+        });
+      },
+    });
+
+    expect(result.delivery).toMatchObject({
+      status: 'retry_wait',
+      error: expect.stringContaining('http=429'),
+    });
+    expect(
+      store.getChannelOutboxItem(result.delivery.itemId)?.availableAt,
+    ).toBe('2026-07-26T08:00:02.000Z');
+    expect(store.getUncertainChannelOutboxForTurn(run.id)).toBeUndefined();
+  });
+
+  test('a Feishu 5xx remains uncertain because acceptance cannot be ruled out', async () => {
+    const run = store.createChannelTurnRun({
+      ...route,
+      idempotencyKey: 'feishu-mutation-http-502',
+    }).run;
+    const request = {
+      operation: 'send_card' as const,
+      params: { card: { schema: '2.0', body: { elements: [] } } },
+    };
+    const result = await deliverFeishuCapabilityMutation({
+      ...route,
+      turnRunId: run.id,
+      requestId: 'provider-502',
+      request,
+      owner: 'provider-502-worker',
+      execute: async () => {
+        throw Object.assign(new Error('Request failed with status code 502'), {
+          response: {
+            status: 502,
+            data: { code: 230099, msg: 'upstream failure' },
+          },
+        });
+      },
+    });
+
+    expect(result.delivery).toMatchObject({
+      status: 'uncertain',
+      error: 'Request failed with status code 502',
+    });
+    expect(store.getUncertainChannelOutboxForTurn(run.id)).toMatchObject({
+      status: 'uncertain',
+    });
+  });
+
+  test('an intermediary HTTP 408 remains uncertain', async () => {
+    const run = store.createChannelTurnRun({
+      ...route,
+      idempotencyKey: 'feishu-mutation-http-408',
+    }).run;
+    const request = {
+      operation: 'send_card' as const,
+      params: { card: { schema: '2.0', body: { elements: [] } } },
+    };
+    const result = await deliverFeishuCapabilityMutation({
+      ...route,
+      turnRunId: run.id,
+      requestId: 'provider-408',
+      request,
+      owner: 'provider-408-worker',
+      execute: async () => {
+        throw Object.assign(new Error('Request failed with status code 408'), {
+          response: { status: 408, data: { code: 408, msg: 'timeout' } },
+        });
+      },
+    });
+
+    expect(result.delivery.status).toBe('uncertain');
+  });
+
   test('the host integration requires exact input scope for mutations', () => {
     const main = fs.readFileSync(
       path.join(process.cwd(), 'src/index.ts'),

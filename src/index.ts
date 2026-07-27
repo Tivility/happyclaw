@@ -82,6 +82,7 @@ import {
   AvailableGroup,
   ContainerInput,
   ContainerOutput,
+  cleanupContainerTaskRuntimeEnvDirs,
   runContainerAgent,
   runHostAgent,
   runAgentWithModelFallback,
@@ -89,9 +90,9 @@ import {
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
-import {
-  PROVIDER_FAILURE_USER_NOTICE,
-} from './provider-failure.js';
+import { resolveFeishuCliBoundAccountId } from './feishu-cli-runtime.js';
+import { isValidWorkspaceFolderName } from './workspace-folder.js';
+import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   closeDatabase,
   createTaskWithinOwnerLimit,
@@ -545,6 +546,10 @@ import {
   canExecuteOnHost,
   HOST_EXECUTION_FORBIDDEN_ERROR,
 } from './host-execution-policy.js';
+import {
+  parseContainerConfig,
+  validateAdditionalMountsStrict,
+} from './mount-security.js';
 import {
   ensureAgentDirectories,
   isRealpathInside,
@@ -5451,12 +5456,51 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
   // folder 会直接拼到 path.join(GROUPS_DIR, ...) 上。任何含 `..`、绝对路径或
   // 路径分隔符的 folder 都会让 mkdir/写入跑出 GROUPS_DIR 之外（agent
   // bypass-permissions 模式下完全可达）。规则与典型 unix 目录命名一致。
-  if (
-    !group.folder ||
-    !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(group.folder)
-  ) {
+  if (!group.folder || !isValidWorkspaceFolderName(group.folder)) {
     throw new Error(`registerGroup: invalid folder name: ${group.folder}`);
   }
+
+  // register_group is reachable from an agent IPC channel. Treat its
+  // containerConfig as untrusted and apply the same structural, privilege and
+  // filesystem policy checks as the HTTP creation route.
+  const parsedContainerConfig = parseContainerConfig(group.containerConfig);
+  if (parsedContainerConfig.error) {
+    throw new Error(
+      `registerGroup: invalid container config: ${parsedContainerConfig.error}`,
+    );
+  }
+  const additionalMounts = parsedContainerConfig.config?.additionalMounts ?? [];
+  if (additionalMounts.length > 0) {
+    if (group.executionMode === 'host') {
+      throw new Error(
+        'registerGroup: additional mounts require container execution mode',
+      );
+    }
+    const currentOwner = group.created_by
+      ? getUserById(group.created_by)
+      : undefined;
+    if (!canExecuteOnHost(currentOwner)) {
+      throw new Error(
+        'registerGroup: host directory mounts require a currently active administrator owner',
+      );
+    }
+    const validated = validateAdditionalMountsStrict(
+      additionalMounts,
+      group.name,
+      group.is_home === true,
+    );
+    group = {
+      ...group,
+      containerConfig: {
+        ...parsedContainerConfig.config,
+        version: 1,
+        additionalMounts: validated.map((mount) => mount.persisted),
+      },
+    };
+  } else if (parsedContainerConfig.config) {
+    group = { ...group, containerConfig: parsedContainerConfig.config };
+  }
+
   registeredGroups[jid] = group;
   setRegisteredGroup(jid, group);
 
@@ -6490,6 +6534,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         utteranceDelivered:
           channelPhysicalDeliveryAckByInput.get(inputTurnId) === true,
         runnerFailed: true,
+        healthyInputTurnCompleted: healthyCompletedInputTurns.has(inputTurnId),
       })
     ) {
       return false;
@@ -9118,6 +9163,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       mode: interactionMode,
       utteranceDelivered: ipcReplyTurnTracker.delivered,
       runnerFailed: isErrorExit,
+      healthyInputTurnCompleted: healthyCompletedInputTurns.has(
+        ipcReplyTurnTracker.inputTurnId,
+      ),
     })
   ) {
     await notifyProactiveTailInterruption(ipcReplyTurnTracker.inputTurnId);
@@ -9691,6 +9739,13 @@ async function runAgent(
   ipcWatcherManager?.watchGroup(group.folder);
   try {
     const executionMode = group.executionMode || 'container';
+    const feishuCliAccountId =
+      executionMode === 'container'
+        ? resolveFeishuCliBoundAccountId({
+            channelContext,
+            workspaceChannelAccountId: group.channel_account_id,
+          })
+        : null;
 
     const onProcessCb = (
       proc: ChildProcess,
@@ -9705,6 +9760,7 @@ async function runAgent(
         displayName: identifier,
         selectedProviderId,
         runtime: runtimeResolution.binding.runtime,
+        feishuCliAccountId,
       });
     };
 
@@ -11413,6 +11469,7 @@ function startIpcWatcher(): void {
                 ),
                 { recursive: true, force: true },
               );
+              cleanupContainerTaskRuntimeEnvDirs(sourceGroup, ipcTaskId);
             })
           ) {
             logger.debug(
@@ -14107,17 +14164,23 @@ async function processAgentConversation(
         utteranceDelivered:
           agentPhysicalDeliveryAckByInput.get(inputTurnId) === true,
         runnerFailed: true,
+        healthyInputTurnCompleted:
+          healthyAgentCompletedInputTurns.has(inputTurnId),
       })
     ) {
       return false;
     }
     proactiveAgentTailNoticesDelivered.add(inputTurnId);
+    // 用该 input turn 自己的 outbox scope 定位回投目标：replySourceImJid 是本轮
+    // 起始时算出的，跨渠道/多账号场景下可能已经不是这条 turn 该回的地方。
+    const scope = agentChannelOutboxScopesByInput.get(inputTurnId);
     return deliverProactiveTailInterruptionNotice({
       logicalChatJid: virtualChatJid,
       scopeKey: channelTurnScope(effectiveGroup.folder, agentId),
       inputTurnId,
       agentId,
-      targetJid: replySourceImJid,
+      targetJid: scope?.sourceJid ?? replySourceImJid,
+      scope,
     });
   };
   const currentAgentSourceJid = lastProcessed.source_jid || chatJid;
@@ -16078,6 +16141,13 @@ async function processAgentConversation(
       );
     }
     const executionMode = effectiveGroup.executionMode || 'container';
+    const feishuCliAccountId =
+      executionMode === 'container'
+        ? resolveFeishuCliBoundAccountId({
+            channelContext: currentAgentChannelContext,
+            workspaceChannelAccountId: effectiveGroup.channel_account_id,
+          })
+        : null;
     const onProcessCb = (
       proc: ChildProcess,
       identifier: string,
@@ -16091,6 +16161,7 @@ async function processAgentConversation(
         agentId,
         selectedProviderId,
         runtime: runtimeResolution.binding.runtime,
+        feishuCliAccountId,
       });
     };
 
@@ -16750,6 +16821,9 @@ async function processAgentConversation(
         utteranceDelivered:
           agentPhysicalDeliveryAckByInput.get(activeAgentInputTurnId) === true,
         runnerFailed: hadError || agentClosed,
+        healthyInputTurnCompleted: healthyAgentCompletedInputTurns.has(
+          activeAgentInputTurnId,
+        ),
       })
     ) {
       await notifyProactiveAgentTailInterruption(activeAgentInputTurnId);
@@ -16915,6 +16989,32 @@ async function startMessageLoop(): Promise<void> {
             chatJid,
             messagesToSend,
           );
+          const { effectiveGroup: activeEffectiveGroup } =
+            resolveEffectiveGroup(group);
+          const warmChannelContext = resolveBatchChannelContext(
+            messagesToSend,
+            chatJid,
+          );
+          const requiredFeishuCliAccountId =
+            (activeEffectiveGroup.executionMode || 'container') === 'container'
+              ? resolveFeishuCliBoundAccountId({
+                  channelContext: warmChannelContext,
+                  workspaceChannelAccountId:
+                    activeEffectiveGroup.channel_account_id,
+                })
+              : null;
+
+          // Plugin expansion may execute inline commands inside the active
+          // container. Reject a cross-Bot warm path before expansion so even
+          // those commands cannot observe the previous Bot's credentials.
+          if (
+            queue.requiresFeishuCliContainerRestart(chatJid, {
+              feishuCliAccountId: requiredFeishuCliAccountId,
+            })
+          ) {
+            queue.enqueueMessageCheck(chatJid);
+            continue;
+          }
 
           // Plugin command expander (DMI commands) — same as cold-start path.
           // Active-runner IPC injection: replies advance the cursor without
@@ -16926,8 +17026,6 @@ async function startMessageLoop(): Promise<void> {
           // returns null on the non-home sibling and DMI commands stop working
           // once a runner is up (#18 P2-bug-3).
           {
-            const { effectiveGroup: activeEffectiveGroup } =
-              resolveEffectiveGroup(group);
             const fallbackExpandCtx = buildExpandContext(
               chatJid,
               activeEffectiveGroup,
@@ -17022,10 +17120,6 @@ async function startMessageLoop(): Promise<void> {
           // task's send_message output loses task attribution and the host skips
           // the notify_channels broadcast (riba2534/happyclaw#559).
           const injectionTaskId = extractLastTaskId(messagesToSend);
-          const warmChannelContext = resolveBatchChannelContext(
-            messagesToSend,
-            chatJid,
-          );
 
           const sendResult = queue.sendMessage(
             chatJid,
@@ -17067,6 +17161,7 @@ async function startMessageLoop(): Promise<void> {
                 lastSourceJidForRoute,
                 receipt,
               ),
+            { feishuCliAccountId: requiredFeishuCliAccountId },
           );
           if (sendResult === 'sent' && deliveryTarget) {
             logger.debug(
