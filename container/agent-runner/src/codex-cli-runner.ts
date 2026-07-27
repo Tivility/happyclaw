@@ -1,3 +1,4 @@
+import { allowsExternalMcpServers } from './runtime-mcp-policy.js';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -245,11 +246,16 @@ function pushMcpConfigArgs(
   args: string[],
   contextPath: string,
   cwd: string,
+  runtimePolicy?: unknown,
 ): void {
-  const externalServers = {
-    ...loadUserMcpServers(),
-    ...loadWorkspaceMcpServers(cwd),
-  };
+  // 档案把 MCP 设成 disabled 时不挂任何外部 server；happyclaw 内建工具是
+  // first-class 能力，不受该策略约束（否则 send_message 契约直接断）。
+  const externalServers = allowsExternalMcpServers(runtimePolicy)
+    ? {
+        ...loadUserMcpServers(),
+        ...loadWorkspaceMcpServers(cwd),
+      }
+    : {};
   for (const [name, config] of Object.entries(externalServers)) {
     if (!config || typeof config !== 'object') continue;
     if (name === 'happyclaw') continue;
@@ -512,6 +518,16 @@ function emitCodexItemEvent(
       toolName,
       toolUseId: id,
       toolInputSummary: codexToolSummary(item),
+      // 阶段 3 对齐：带上工具结果，否则 Codex 的执行轨迹只有「调用了什么」、
+      // 没有「返回了什么」。Grok 的 normalizer 一直带 toolResult，此前只有
+      // Codex 这条漏了。命令执行取 aggregated_output，MCP 调用取 result.content。
+      toolResult: truncate(
+        itemType === 'command_execution'
+          ? String(item.aggregated_output || '')
+          : itemType === 'mcp_tool_call'
+            ? contentBlocksToText(asRecord(item.result)?.content)
+            : '',
+      ),
     },
   });
   return null;
@@ -562,6 +578,8 @@ export function emitCodexEvent(
           outputTokens: Number(usage.output_tokens || 0),
           cacheReadInputTokens: Number(usage.cached_input_tokens || 0),
           cacheCreationInputTokens: 0,
+          // OpenAI 口径：input_tokens 已含 cached_input_tokens。
+          inputTokensIncludeCacheRead: true,
           // OpenAI/xAI 口径：outputTokens 已含 reasoning，不另计（CLAUDE.md §8.14）
           reasoningTokens: 0,
           costUSD: 0,
@@ -656,7 +674,12 @@ export const codexCliAdapter: AgentRuntimeAdapter = {
       '-c',
       `project_root_markers=["${WORKSPACE_ROOT_MARKER}",".git"]`,
     );
-    pushMcpConfigArgs(args, mcpContextPath, input.cwd);
+    pushMcpConfigArgs(
+      args,
+      mcpContextPath,
+      input.cwd,
+      input.input.agentProfile?.runtimePolicy,
+    );
     args.push('--output-last-message', outputFile);
     if (model) args.push('--model', model);
     for (const imageFile of imageFiles) args.push('--image', imageFile);

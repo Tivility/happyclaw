@@ -214,6 +214,11 @@ function emptyAssistantUsage(): SessionAssistantUsage {
 }
 
 function usageTotal(usage: SessionAssistantUsage): number {
+  // 这里相加是对的：数据源是 `.claude/projects/*.jsonl`（Claude 会话归档），
+  // Anthropic 口径下 input_tokens **不含** cache read，两列必须相加。
+  // Codex/Grok 的 inputTokens 是全量（已含 cacheRead），但它们不写这个
+  // JSONL，永远走不到这里 —— 那条口径差在 StreamEvent 侧用
+  // inputTokensIncludeCacheRead 处理（见 shared/stream-event.ts）。
   return (
     usage.inputTokens +
     usage.outputTokens +

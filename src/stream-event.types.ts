@@ -389,6 +389,19 @@ export interface StreamEvent {
     costUSD: number;
     durationMs: number;
     numTurns: number;
+    /**
+     * `inputTokens` 是否**已含** `cacheReadInputTokens`。
+     *
+     * 两种口径并存且都不该改：
+     * - Anthropic（Claude）：input_tokens 不含 cache read，两列相加才是总输入 →
+     *   该标记缺省 / false。
+     * - OpenAI（Codex）与 xAI（Grok）：inputTokens 是全量、已含 cachedRead →
+     *   该标记为 true。
+     *
+     * 入库仍按 CLAUDE.md §8.14「分列 SUM 不相减」保留原始值，
+     * 只有需要算「总量 / 新增输入」的展示与聚合侧才据此扣减，避免重复计数。
+     */
+    inputTokensIncludeCacheRead?: boolean;
     modelUsage?: Record<
       string,
       {

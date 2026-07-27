@@ -169,9 +169,46 @@ describe('GrokEventNormalizer — 用量解析', () => {
     });
   });
 
-  test('usage_update（上下文水位）绝不 emit usage', () => {
+  test('usage_update 只发上下文水位 status，绝不 emit usage', () => {
     const { events } = run([FIX[9]]);
-    expect(events).toHaveLength(0);
+    // 水位接上后这里会有一条 status；关键不变量是「不产生 usage」——
+    // 计费用量真身在 session/prompt 响应的 _meta，水位不能进用量管线。
+    expect(events.map((e) => e.eventType)).toEqual(['status']);
+    expect(events[0].statusText).toContain('上下文');
+    expect(events.some((e) => e.eventType === 'usage')).toBe(false);
+  });
+
+  test('上下文水位按 10% 台阶去抖，同台阶不重复上报', () => {
+    const line = (used: number) =>
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: 'sess_01',
+          update: { sessionUpdate: 'usage_update', used, size: 1000 },
+        },
+      });
+    // 12% → 15%（同台阶，吞）→ 27%（跨台阶，报）
+    const { events } = run([line(120), line(150), line(270)]);
+    expect(events.map((e) => e.statusText)).toEqual([
+      '上下文 12%（120/1000）',
+      '上下文 27%（270/1000）',
+    ]);
+  });
+
+  test('size 为 0 或非数时不发水位（避免除零/NaN 文案）', () => {
+    const bad = (u: unknown, sz: unknown) =>
+      JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'session/update',
+        params: {
+          sessionId: 'sess_01',
+          update: { sessionUpdate: 'usage_update', used: u, size: sz },
+        },
+      });
+    expect(run([bad(10, 0)]).events).toHaveLength(0);
+    expect(run([bad(10, null)]).events).toHaveLength(0);
+    expect(run([bad('x', 100)]).events).toHaveLength(0);
   });
 });
 
@@ -188,10 +225,20 @@ describe('GrokEventNormalizer — 端到端 + 兜底', () => {
       'assistant_text_boundary',
       'text_delta',
       'todo_update',
+      // usage_update → 上下文水位 status（不进用量管线）
+      'status',
       'usage',
     ]);
     expect(normalizer.emittedUsage).toBe(true);
     expect(normalizer.pendingToolCount).toBe(0);
+  });
+
+  test('usage 事件声明 xAI 口径：inputTokens 已含 cacheRead', () => {
+    const { events } = run(FIX);
+    const usage = events.find((e) => e.eventType === 'usage');
+    // 少了这个标记，展示/聚合侧会把 cacheRead 再加一遍 → 总量虚高、
+    // 卡片把同一批 token 同时算进 new 和 cached。
+    expect(usage?.usage?.inputTokensIncludeCacheRead).toBe(true);
   });
 
   test('无完成事件时 finalize() 补全 0 usage', () => {

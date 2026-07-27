@@ -98,6 +98,37 @@ afterEach(() => {
 });
 
 describe('Feishu CardKit streaming controller', () => {
+  test('patchUsageNote 在卡片尚未 completed 时也记住用量', async () => {
+    // agent-runner 在最终结果之后才发 usage，很短的回复会让 usage 先到。
+    // 若 patchUsageNote 在非 completed 态直接 early-return 而不存值，
+    // 定稿卡片就永远拿不到用量（合并期间这行赋值曾被丢掉）。
+    const { controller } = await createThinkingController();
+    expect(controller.currentState).not.toBe('completed');
+
+    await controller.patchUsageNote({
+      inputTokens: 1000,
+      outputTokens: 42,
+      costUSD: 0,
+      durationMs: 1234,
+      numTurns: 1,
+      cacheReadInputTokens: 700,
+      inputTokensIncludeCacheRead: true,
+    });
+
+    const stored = (controller as any).usageNote as {
+      inputTokens: number;
+      cacheReadInputTokens: number;
+      cacheCreationInputTokens: number;
+      inputTokensIncludeCacheRead?: boolean;
+    } | null;
+    expect(stored).not.toBeNull();
+    expect(stored?.inputTokens).toBe(1000);
+    // 缺省的缓存列要补 0，定稿渲染按必填字段读。
+    expect(stored?.cacheCreationInputTokens).toBe(0);
+    // 口径标记必须一路带到渲染侧，否则 new/cached 会重复显示同一批 token。
+    expect(stored?.inputTokensIncludeCacheRead).toBe(true);
+  });
+
   test('thinking/tool-only runs start with deterministic progress instead of a bare ellipsis', async () => {
     const { cardCreate, controller } = await createThinkingController();
     const initialCard = JSON.parse(cardCreate.mock.calls[0][0].data.data);

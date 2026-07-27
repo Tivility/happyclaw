@@ -5,6 +5,7 @@
  * Each user can have independent IM connections that route messages
  * to their home container.
  */
+import type { StreamingCardRuntimeProfile } from './feishu-cards/sections.js';
 import {
   type IMChannel,
   type IMChannelConnectOpts,
@@ -48,6 +49,7 @@ import type { StreamingCardLifecycle } from './feishu-streaming-card.js';
 import type { StreamingCardRecord } from './channel-reliability-store.js';
 import {
   getRegisteredGroup,
+  getConversationRuntimeState,
   getDefaultChannelAccount,
   getLegacyChannelAccount,
   getChannelAccount,
@@ -192,6 +194,22 @@ export interface ConnectFeishuOptions {
     operatorImId: string,
   ) => FollowUpActionResult;
   onP2pSender?: (senderOpenId: string) => void;
+}
+
+/**
+ * 卡片文案要跟当前会话真正在跑的运行时对齐（阶段 3）。
+ *
+ * 只读解析：拿不到分组或运行时状态就退回 'claude'（与卡片默认值一致），
+ * 不写库、不 ensure —— 建卡片属于展示路径，不该产生运行时状态副作用。
+ */
+function resolveStreamingCardRuntimeProfile(
+  jid: string,
+): StreamingCardRuntimeProfile {
+  const folder = getRegisteredGroup(jid)?.folder;
+  if (!folder) return 'claude';
+  const state = getConversationRuntimeState(folder);
+  const runtime = state?.active_runtime ?? state?.runtime;
+  return runtime === 'codex' || runtime === 'grok' ? runtime : 'claude';
 }
 
 export class IMConnectionManager {
@@ -988,7 +1006,12 @@ export class IMConnectionManager {
     const chatId = extractProviderTarget(jid);
     const channel = this.findChannelForJid(jid, channelType);
     if (channel?.createStreamingSession) {
-      return channel.createStreamingSession(chatId, onCardCreated, lifecycle);
+      return channel.createStreamingSession(
+        chatId,
+        onCardCreated,
+        lifecycle,
+        resolveStreamingCardRuntimeProfile(jid),
+      );
     }
     return undefined;
   }

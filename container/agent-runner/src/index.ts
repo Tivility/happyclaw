@@ -134,7 +134,6 @@ import {
 // ── 本地多运行时（Codex / Grok）模块 ──
 import { buildPersonaBlock, describePersona, personaPromptMode } from './agent-persona.js';
 import { codexCliAdapter } from './codex-cli-runner.js';
-import { codexSdkAdapter } from './codex-sdk-runner.js';
 import { grokCliAdapter } from './grok-cli-runner.js';
 import type { AgentRuntimeAdapter } from './runtime-adapter.js';
 import {
@@ -3995,8 +3994,30 @@ async function runOneTurnRuntime(
 ): Promise<{ newSessionId: string | undefined }> {
   const { containerInput } = opts;
   let sessionId = opts.sessionId;
+  const abortController = new AbortController();
+
+  // 首响应看门狗（阶段 3 对齐）：Claude 侧在 SDK 迭代器上挂了这个保护，
+  // Codex/Grok 此前完全没有 —— 第三方 CLI 把 API 错误只写进 transcript、
+  // 不往 stdout 吐任何事件时，整轮会一直挂到容器超时（默认 30 分钟）。
+  // 这里按「任何输出都算首响应」判定，比 SDK 侧的消息类型白名单更宽松，
+  // 因为这三条运行时的事件形状本就不同。
+  let firstResponseSeen = false;
+  const firstResponseWatchdog = new SdkFirstResponseWatchdog(
+    SDK_FIRST_RESPONSE_TIMEOUT_MS,
+    () => {
+      if (firstResponseSeen) return;
+      log(
+        `${adapter.runtime} produced no output within ${SDK_FIRST_RESPONSE_TIMEOUT_MS / 1000}s; aborting turn`,
+      );
+      abortController.abort();
+    },
+  );
 
   const emit = (output: ContainerOutput): void => {
+    if (!firstResponseSeen) {
+      firstResponseSeen = true;
+      firstResponseWatchdog.clear();
+    }
     if (output.streamEvent) {
       output = {
         ...output,
@@ -4019,7 +4040,6 @@ async function runOneTurnRuntime(
     writeOutput(output);
   };
 
-  const abortController = new AbortController();
   let interrupted = false;
   let closed = false;
 
@@ -4103,6 +4123,8 @@ async function runOneTurnRuntime(
     )
     .finally(() => {
       controlWatcher.close();
+      // 定时器必须清：留着会让 node 事件循环空转到超时才退出。
+      firstResponseWatchdog.clear();
     });
 
   if (result.newSessionId) {
@@ -4361,8 +4383,36 @@ async function main(): Promise<void> {
       runtime === 'grok'
         ? '当前运行时是 Grok。HappyClaw 会把你的最终文本作为本轮回复发送给用户；请直接完成用户当前请求。'
         : '当前运行时是 Codex。HappyClaw 会把你的最终文本作为本轮回复发送给用户；请直接完成用户当前请求。';
+    // 人格注入（阶段 3 对齐）：buildPersonaBlock 只读 containerInput.agentProfile，
+    // 运行时中立。此前只在 Claude 分支构造，Codex/Grok 的 Agent 档案形同虚设。
+    // personaMode==='replace' 时人格接管系统提示，内建 guidelines 让位
+    //（安全规则 / 记忆 / 渠道格式属于管道，仍然保留）。
+    const personaBlock = buildPersonaBlock(containerInput);
+    const personaMode = personaPromptMode(containerInput);
+    const personaDescription = describePersona(containerInput);
+    if (personaDescription) {
+      log(`Agent profile: ${personaDescription} mode=${personaMode}`);
+    }
+    const personaReplaces = personaMode === 'replace' && !!personaBlock;
+
+    // 投递契约（阶段 3 对齐）：主动模式下 Agent 必须自己调 send_message 交付，
+    // 助手模式下靠 SDK/CLI 的最终文本。此前只注入到 Claude 的 promptPieces，
+    // Codex/Grok 拿不到契约 → 主动模式形同虚设（用户等不到主动推送）。
+    // 定时任务/消息任务另有自己的输出约定，不叠加这段。
+    const deliveryContract =
+      containerInput.isScheduledTask || containerInput.messageTaskId
+        ? null
+        : usesProactiveInteractiveContract(containerInput)
+          ? PROACTIVE_DELIVERY_CONTRACT
+          : ASSISTANT_DELIVERY_CONTRACT;
+
     const systemPromptAppend = [
-      `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
+      personaBlock,
+      deliveryContract &&
+        `<delivery-contract>\n${deliveryContract}\n</delivery-contract>`,
+      personaReplaces
+        ? ''
+        : `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
       `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n${CODEX_SKILL_FILE_GUIDELINES}\n\n${skillContext}\n</skill-routing>`,
       `<security>\n${SECURITY_RULES}\n</security>`,
       globalMemoryContext,
@@ -4374,7 +4424,7 @@ async function main(): Promise<void> {
         globalMemoryFile: globalClaudeMdPath(),
         workspaceClaudeMdPath: path.join(WORKSPACE_GROUP, 'CLAUDE.md'),
       }),
-      buildGuidelinesBlock(runtime),
+      personaReplaces ? '' : buildGuidelinesBlock(runtime),
       // grok 经 search_tool 间接发现 MCP 工具：显式把 happyclaw 工具清单写进 rules，
       // 否则模型不知道工具存在 → scheduled-task 的 send_message 回复契约失效。
       buildHappyClawToolsHint(runtime) &&
@@ -4390,17 +4440,13 @@ async function main(): Promise<void> {
     // 决策 38：Codex 只保留 CLI 一条实现（OAuth 走 codex CLI 自带链路），
     // SDK 适配器不再参与运行时选择。
     const adapter: AgentRuntimeAdapter =
-      runtime === 'grok'
-        ? grokCliAdapter
-        : // 本地两条 codex 实现：默认走 @openai/codex-sdk，HAPPYCLAW_CODEX_RUNNER=cli
-          // 时退回 codex CLI exec。合并中这个分支被写死成 CLI，SDK 实现整条失联。
-          process.env.HAPPYCLAW_CODEX_RUNNER === 'cli'
-          ? codexCliAdapter
-          : codexSdkAdapter;
+      runtime === 'grok' ? grokCliAdapter : codexCliAdapter;
 
     await runOneTurnRuntime(adapter, {
       containerInput,
-      prompt,
+      // 阶段 3 对齐：渠道上下文（来源渠道 / 群名 / 发言人）此前只装饰 Claude 的
+      // user turn，Codex/Grok 拿到的是裸 prompt —— 群聊里分不清谁在说话。
+      prompt: decorateChannelUserTurn(prompt, containerInput.channelContext),
       sessionId,
       systemPromptAppend,
       additionalDirectories,

@@ -15,6 +15,7 @@
  * 反向请求 fs/terminal，配合 --always-approve（yolo）permission 也不来；故 Client
  * 只实现 sessionUpdate（→ normalizer）+ requestPermission（兜底返回 allow）。
  */
+import { allowsExternalMcpServers } from './runtime-mcp-policy.js';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -130,9 +131,14 @@ function envMapToAcpEnv(
 export function buildAcpMcpServers(
   contextPath: string,
   cwd: string,
+  runtimePolicy?: unknown,
 ): McpServer[] {
   const servers: McpServer[] = [];
-  const external = loadExternalMcpServers(cwd);
+  // 档案把 MCP 设成 disabled 时不挂任何外部 server；happyclaw 内建工具是
+  // first-class 能力，不受该策略约束（否则 send_message 契约直接断）。
+  const external = allowsExternalMcpServers(runtimePolicy)
+    ? loadExternalMcpServers(cwd)
+    : {};
   for (const [name, config] of Object.entries(external)) {
     if (!config || typeof config !== 'object') continue;
     if (name === 'happyclaw') continue;
@@ -176,7 +182,11 @@ export const grokCliAdapter: AgentRuntimeAdapter = {
     // 否则本仓库 CLAUDE.md（约 1.7 万 token）会被当项目指令灌进人格。
     ensureWorkspaceRootMarker(input.cwd);
     ensureWorkspaceGitRoot(input.cwd, input.input.contextAudit?.executionMode);
-    const mcpServers = buildAcpMcpServers(contextPath, input.cwd);
+    const mcpServers = buildAcpMcpServers(
+      contextPath,
+      input.cwd,
+      input.input.agentProfile?.runtimePolicy,
+    );
     const model = input.model || input.input.selectedModel || 'grok-4.5';
     const startedAt = Date.now();
     const normalizer = new GrokEventNormalizer(emit, startedAt);

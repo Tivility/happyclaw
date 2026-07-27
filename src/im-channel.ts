@@ -4,6 +4,7 @@
  * Defines a standard interface for all IM integrations (Feishu, Telegram, etc.)
  * and provides adapter factories that wrap existing connection implementations.
  */
+import type { StreamingCardRuntimeProfile } from './feishu-cards/sections.js';
 import {
   createFeishuConnection,
   parseFeishuRouteTarget,
@@ -213,6 +214,12 @@ export interface IMChannel {
     chatId: string,
     onCardCreated?: (messageId: string) => void,
     lifecycle?: StreamingCardLifecycle,
+    /**
+     * 卡片文案的运行时特化（阶段 3 对齐）。卡片里「Codex 处理中 / 推理中 /
+     * 运行日志」这套文案一直存在但没人传参，实际永远渲染成 Claude 口径。
+     * 由 im-manager 按 jid 解析后传入；不支持该特化的渠道忽略即可。
+     */
+    runtimeProfile?: StreamingCardRuntimeProfile,
   ): Promise<StreamingSession | undefined>;
   /**
    * Underlying provider SDK client, when the channel has one.
@@ -402,6 +409,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
       chatId: string,
       onCardCreated?: (messageId: string) => void,
       lifecycle?: StreamingCardLifecycle,
+      runtimeProfile?: StreamingCardRuntimeProfile,
     ): Promise<StreamingSession | undefined> {
       if (!inner) return undefined;
       const larkClient = inner.getLarkClient();
@@ -414,6 +422,7 @@ export function createFeishuChannel(config: FeishuConnectionConfig): IMChannel {
         replyInThread: target.replyInThread,
         onCardCreated,
         lifecycle,
+        runtimeProfile,
         // 降级可观测性：卡片连续更新失败进入 error 态时记一条 warn。
         // 终态收口与静态消息兜底分别由 schedulePatch 的 best-effort patch
         // 和 index.ts 的 result 路径负责，这里只补日志。

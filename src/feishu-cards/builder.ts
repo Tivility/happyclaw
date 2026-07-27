@@ -243,8 +243,16 @@ export function buildStreamingAgentCard(
   };
 
   if (!useRich) {
+    // 阶段 3 对齐：非富卡兜底的状态文案带上运行时名。此前只硬编码了 codex，
+    // grok 会退回泛化的「生成中」，用户看不出当前跑的是哪条运行时。
+    // 思考/轨迹类文案仍按 isCodex 分流 —— grok 的 thought/plan/工具调用口径
+    // 与 Claude 一致，套 codex 的「推理中 / 运行日志」反而是错的。
     const statusNote =
-      opts.runtimeProfile === 'codex' ? '⏳ Codex 处理中...' : '⏳ 生成中...';
+      opts.runtimeProfile === 'codex'
+        ? '⏳ Codex 处理中...'
+        : opts.runtimeProfile === 'grok'
+          ? '⏳ Grok 处理中...'
+          : '⏳ 生成中...';
     return {
       schema: '2.0',
       config: baseConfig,

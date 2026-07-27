@@ -91,6 +91,8 @@ interface UsageNoteData {
   costUSD: number;
   durationMs: number;
   numTurns: number;
+  /** 见 shared/stream-event.ts：Codex/Grok 的 inputTokens 已含 cacheRead。 */
+  inputTokensIncludeCacheRead?: boolean;
   /** 各模型的分项用量。字段全可选：StreamEvent 侧允许部分缺省，
    *  渲染时按 ?? 0 兜底（决策 66：分列显示，不相加）。 */
   modelUsage?: Record<
@@ -890,7 +892,13 @@ function formatUsageNote(usage: UsageNoteData): string {
   const fmt = (n: number) =>
     n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
   const parts: string[] = [];
-  const newInput = usage.inputTokens + usage.cacheCreationInputTokens;
+  // 「new」要的是**非缓存**的新增输入。Codex/Grok 的 inputTokens 是全量、
+  // 已含 cacheRead，直接当 new 会把缓存读算成新增，且下面 cached 再列一次
+  // → 同一批 token 显示两遍。Claude 的 input_tokens 本就不含 cacheRead。
+  const uncachedInput = usage.inputTokensIncludeCacheRead
+    ? Math.max(0, usage.inputTokens - usage.cacheReadInputTokens)
+    : usage.inputTokens;
+  const newInput = uncachedInput + usage.cacheCreationInputTokens;
   if (newInput > 0) parts.push(`🆕 ${fmt(newInput)} new`);
   if (usage.cacheReadInputTokens > 0)
     parts.push(`🗂 ${fmt(usage.cacheReadInputTokens)} cached`);
@@ -2787,10 +2795,18 @@ export class StreamingCardController {
     cacheReadInputTokens?: number;
     cacheCreationInputTokens?: number;
     reasoningTokens?: number;
+    inputTokensIncludeCacheRead?: boolean;
     modelUsage?: Record<string, { outputTokens?: number }>;
   }): Promise<void> {
+    // 先记住用量再判状态：agent-runner 在最终结果之后才发 usage，很短的回复
+    // 会让 usage 早于 complete() 到达（见 finalize 处的竞态说明）。原先这里
+    // 直接 early-return 而不存，usageNote 永远是 null —— 定稿卡片拿不到用量。
+    this.usageNote = {
+      ...usage,
+      cacheReadInputTokens: usage.cacheReadInputTokens ?? 0,
+      cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+    };
     if (this.state !== 'completed') return;
-
     try {
       if (this.backendMode === 'streaming' && this.streamingBackend) {
         // Skip if card was split during finalization — rebuilding a single card

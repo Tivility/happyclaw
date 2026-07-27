@@ -26,6 +26,8 @@ export interface GrokEventNormalizerState {
   currentSegmentText: string;
   toolCalls: Map<string, GrokToolState>;
   emittedUsage: boolean;
+  /** 上次上报的上下文水位台阶（0-10 对应 0%-100%），用于去抖 */
+  lastContextBucket: number;
 }
 
 type PlanStatus = 'pending' | 'in_progress' | 'completed';
@@ -114,6 +116,9 @@ function emitUsage(
         reasoningTokens: 0,
         cacheCreationInputTokens: 0, // grok 无此概念
         costUSD: 0, // 订阅制无 per-token 价 → 上层标 cost_status='unavailable'
+        // xAI 口径：inputTokens 已含 cachedRead。展示/聚合侧据此扣减，
+        // 否则「总量」和「新增输入」会把缓存读重复计一遍。
+        inputTokensIncludeCacheRead: true,
         durationMs: Date.now() - startedAt,
         numTurns: 1,
       },
@@ -306,9 +311,31 @@ export function emitGrokEvent(
       return {};
     }
 
-    case 'usage_update':
-      // 上下文水位，绝不落库（用量真身在 session/prompt 响应 _meta）
+    case 'usage_update': {
+      // 上下文水位（阶段 3 接上）：ACP 的 usage_update 带 {used, size}，是
+      // context window 占用而非计费用量 —— 用量真身在 session/prompt 响应的
+      // _meta 里，这里**绝不落库**，只发瞬时 status 供前端显示。
+      //
+      // grok 每轮会推多次，按 10% 台阶去抖：只在跨台阶时上报一次，
+      // 避免刷屏把执行轨迹淹掉。
+      const used = Number(u.used);
+      const size = Number(u.size);
+      if (!Number.isFinite(used) || !Number.isFinite(size) || size <= 0)
+        return {};
+      const pct = Math.min(100, Math.max(0, (used / size) * 100));
+      const bucket = Math.floor(pct / 10);
+      if (bucket === state.lastContextBucket) return {};
+      state.lastContextBucket = bucket;
+      emit({
+        status: 'stream',
+        result: null,
+        streamEvent: {
+          eventType: 'status',
+          statusText: `上下文 ${Math.round(pct)}%（${used}/${size}）`,
+        },
+      });
       return {};
+    }
 
     case 'available_commands_update':
     case 'current_mode_update':
@@ -332,6 +359,7 @@ export class GrokEventNormalizer {
     currentSegmentText: '',
     toolCalls: new Map(),
     emittedUsage: false,
+    lastContextBucket: -1,
   };
 
   constructor(
