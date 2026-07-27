@@ -7,6 +7,7 @@ export interface SearchInputProps {
   value: string;
   onChange: (value: string) => void;
   placeholder?: string;
+  ariaLabel?: string;
   debounce?: number;
   className?: string;
   autoFocus?: boolean;
@@ -16,6 +17,7 @@ export function SearchInput({
   value,
   onChange,
   placeholder = '搜索...',
+  ariaLabel,
   debounce = 300,
   className,
   autoFocus,
@@ -48,6 +50,7 @@ export function SearchInput({
         value={localValue}
         onChange={(e) => handleChange(e.target.value)}
         placeholder={placeholder}
+        aria-label={ariaLabel ?? placeholder}
         className="pl-9 pr-8"
         autoFocus={autoFocus}
       />
@@ -55,6 +58,7 @@ export function SearchInput({
         <button
           type="button"
           onClick={handleClear}
+          aria-label="清空搜索"
           className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded-sm text-muted-foreground hover:text-foreground transition-colors"
         >
           <X className="size-3.5" />

@@ -607,21 +607,6 @@ function describeFailure(result: InlineExecResult): string {
 // --- Batch helper ----------------------------------------------------------
 
 /**
- * Per-message ExpandContext resolver. Callers that share a chat across
- * multiple senders (e.g. the admin-shared `web:main` workspace where
- * each admin's plugin runtime is per-user) can use this to look up the
- * correct context for each message in the batch instead of pinning one
- * context for the whole batch.
- *
- * Returning `null` means "no expansion for this message" — pass-through.
- * That's the same semantics as `makeExpandContext()` returning null when
- * the resolved owner is empty.
- */
-export type ResolveContextFn<M extends ExpandableMessage> = (
-  msg: M,
-) => ExpandContext | null;
-
-/**
  * Process a list of pending messages, splitting into:
  *   - toSend: forward to agent (miss = unchanged content; expanded = prompt)
  *   - replies: in-band system reply (conflict / no container / etc.)
@@ -640,28 +625,15 @@ export type ResolveContextFn<M extends ExpandableMessage> = (
  * single-message web fast-path) can pass undefined and the recovery
  * window stays the same as before this fix. Production cold-start callers
  * MUST pass the DB writer.
- *
- * Per-message context (#23 round-15 P2-2): the second positional argument
- * accepts either a single `ExpandContext` (legacy: same context for every
- * message in the batch) or a `ResolveContextFn` that's called per-message.
- * The per-message form is required when the chat is shared across multiple
- * plugin owners — e.g. the admin-shared `web:main` workspace where
- * runtimeOwner is per-sender. Pinning one context for the whole batch
- * caused mixed-admin batches to expand under the wrong runtime.
  */
 export async function expandMessagesIfNeeded<M extends ExpandableMessage>(
   messages: M[],
-  ctxOrResolver: ExpandContext | ResolveContextFn<M>,
+  ctx: ExpandContext,
   overrides?: ExpandOverrides,
   persistExpansion?: PersistExpansionFn,
 ): Promise<BatchExpansionOutcome<M>> {
   const toSend: M[] = [];
   const replies: Array<{ originalMsg: M; text: string }> = [];
-
-  const resolveCtx: ResolveContextFn<M> =
-    typeof ctxOrResolver === 'function'
-      ? (ctxOrResolver as ResolveContextFn<M>)
-      : () => ctxOrResolver;
 
   for (const msg of messages) {
     // Recovery short-circuit: if a prior run already expanded this message
@@ -671,13 +643,6 @@ export async function expandMessagesIfNeeded<M extends ExpandableMessage>(
     const persisted = readPluginExpansionFromAttachments(msg.attachments);
     if (persisted) {
       toSend.push({ ...msg, content: persisted.prompt });
-      continue;
-    }
-
-    const ctx = resolveCtx(msg);
-    if (!ctx) {
-      // No resolvable owner / context for this message → pass-through.
-      toSend.push(msg);
       continue;
     }
 

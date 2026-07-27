@@ -1,323 +1,271 @@
-# ACL 权限矩阵
+# HappyClaw 权限矩阵
 
-Issue #518 follow-up。记录所有 Web API / WebSocket / IM 操作的权限级别。
+本文档描述当前授权边界。具体中间件和条件分支以代码为准：
 
-## 权限级别
+- Cookie 与 Permission Middleware：`src/web-context.ts`
+- 资源级工作区判断：`canAccessGroup()`、`canModifyGroup()`、`canDeleteGroup()`
+- IM Owner 命令：`src/im-command-utils.ts`
+- 渠道响应对象：`src/im-audience-policy.ts`
+- 路由实现：`src/routes/` 与 `src/web.ts`
 
-| 级别 | 函数 / 中间件 | 含义 |
-|------|--------------|------|
-| Login | `authMiddleware` | 已登录即可 |
-| Access | `canAccessGroup(user, group)` | owner 或 `group_members` 成员 |
-| Modify | `canModifyGroup(user, group)` | 仅 owner（`created_by`） |
-| Delete | `canDeleteGroup(user, group)` | 仅 owner，且非 home group |
-| ManageMembers | `canManageGroupMembers(user, group)` | 仅 owner，且非 home group |
-| SystemConfig | `systemConfigMiddleware` | `manage_system_config` 权限 |
-| ManageUsers | `usersManageMiddleware` | `manage_users` 权限 |
-| ManageInvites | `inviteManageMiddleware` | `manage_invites` 权限 |
-| ViewAudit | `auditViewMiddleware` | `view_audit_log` 权限 |
-| Admin | `user.role === 'admin'` | 仅管理员角色 |
-| HostPerm | `hasHostExecutionPermission(user)` | 仅 admin（宿主机操作） |
-| Public | 无 | 无需认证 |
+## 1. 权限层次
 
-> **补充说明**：所有涉及 host 执行模式的群组操作，在基础 ACL 检查之上，还会额外检查 `isHostExecutionGroup(group) && hasHostExecutionPermission(user)`，非 admin 无法操作 host 模式群组。下表中标注 `+HostPerm` 表示此额外检查。
+| 层次     | 代码入口                     | 含义                                   |
+| -------- | ---------------------------- | -------------------------------------- |
+| Public   | 无 `authMiddleware`          | 无需登录                               |
+| Login    | `authMiddleware`             | 有效登录 Session                       |
+| Access   | `canAccessGroup`             | 当前用户可以查看和使用工作区           |
+| Modify   | `canModifyGroup`             | 当前用户是工作区 owner                 |
+| Delete   | `canDeleteGroup`             | 当前用户是 owner 且不是 Home Workspace |
+| Host     | `hasHostExecutionPermission` | admin 角色                             |
+| System   | `systemConfigMiddleware`     | `manage_system_config`                 |
+| Users    | `usersManageMiddleware`      | `manage_users`                         |
+| Invites  | `inviteManageMiddleware`     | `manage_invites`                       |
+| Audit    | `auditViewMiddleware`        | `view_audit_log`                       |
+| Billing  | Billing Middleware           | `manage_billing`                       |
+| IM Owner | `owner_im_id` 比对           | 当前渠道原生 sender 是记录的主人       |
 
-## HTTP 路由
+核心原则：
 
-### 认证（`src/routes/auth.ts`）
+- admin 不自动绕过工作区所有权。Home、Web Workspace 和 IM Chat 均按
+  `created_by` 隔离。
+- Host 是额外边界：有工作区权限不代表可以执行 Host 操作。
+- 非 owner 的用户即使拥有系统级 Permission，也不能读取或修改其他用户工作区中的
+  Secret、环境变量和运行能力。
+- 查不到资源和无权访问资源通常都返回 `404`，避免跨用户枚举。
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/auth/status` | GET | Public | 返回系统初始化状态 |
-| `/api/auth/setup` | POST | Public | 仅用户表为空时可用 |
-| `/api/auth/login` | POST | Public | 频率限制 |
-| `/api/auth/register` | POST | Public | 受注册开关/邀请码控制 |
-| `/api/auth/logout` | POST | Login | |
-| `/api/auth/me` | GET | Login | |
-| `/api/auth/profile` | PUT | Login | 修改自己的资料 |
-| `/api/auth/password` | PUT | Login | 修改自己的密码 |
-| `/api/auth/sessions` | GET | Login | 列出自己的会话 |
-| `/api/auth/sessions/:id` | DELETE | Login | 撤销自己的会话 |
-| `/api/auth/avatar` | POST | Login | 上传头像 |
+## 2. Public 接口
 
-### 群组（`src/routes/groups.ts`）
+| 路由                            | 方法 | 附加条件               |
+| ------------------------------- | ---- | ---------------------- |
+| `/api/auth/status`              | GET  | 无                     |
+| `/api/auth/setup`               | POST | 仅用户表为空           |
+| `/api/auth/login`               | POST | 登录限流               |
+| `/api/auth/register/status`     | GET  | 无                     |
+| `/api/auth/register`            | POST | 注册策略、邀请码、限流 |
+| `/api/auth/avatars/:filename`   | GET  | 仅允许受管头像路径     |
+| `/api/config/appearance/public` | GET  | 只返回公开外观         |
+| `/api/health`                   | GET  | 不返回敏感运行详情     |
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/groups` | GET | Login | `buildGroupsPayload` 内部过滤，用 `canAccessGroup` |
-| `/api/groups` | POST | Login | 创建群组；host 模式需 HostPerm；`init_source_path`/`init_git_url` 需 admin |
-| `/api/groups/:jid` | PATCH | Access(仅 pin) / Modify(其他) +HostPerm | pin/unpin 只需 Access；rename/skills/execution_mode 需 Modify |
-| `/api/groups/:jid` | DELETE | Delete +HostPerm | home group 不可删 |
-| `/api/groups/:jid/reset-owner` | POST | **Admin** | break-glass：清 `owner_im_id`+`sender_allowlist`、`owner_mentioned`→`when_mentioned`。解 owner 离群死锁；下一位用户 `/owner_mention` 或 DM 自动认领接手 |
-| `/api/groups/:jid/stop` | POST | Access | **P2 待改**：需 queue 追踪 query initiator 后收紧为"仅 owner 或发起者" |
-| `/api/groups/:jid/interrupt` | POST | Access | **P2 待改**：同上 |
-| `/api/groups/:jid/reset-session` | POST | Modify +HostPerm | |
-| `/api/groups/:jid/clear-history` | POST | Modify +HostPerm | |
-| `/api/groups/:jid/messages` | GET | Access +HostPerm | home 群组合并同 folder 下的 sibling JID |
-| `/api/groups/:jid/messages/:messageId` | DELETE | Access | admin 可删任意消息；非 admin 只能删自己的非 AI 消息 |
-| `/api/groups/:jid/env` | GET | Access + `manage_group_env` | 非 admin 且无权限则隐藏 `customEnv` |
-| `/api/groups/:jid/env` | PUT | Access + `manage_group_env` +HostPerm | |
-| `/api/groups/:jid/members` | GET | Access | |
-| `/api/groups/:jid/members/search` | GET | ManageMembers | |
-| `/api/groups/:jid/members` | POST | ManageMembers | home group 不可添加成员 |
-| `/api/groups/:jid/members/:userId` | DELETE | ManageMembers / 自退 | 自己退出不需要 ManageMembers；owner 不可被移除 |
-| `/api/groups/:jid/mcp` | GET | Access | **Dead code**：`setRegisteredGroup` 在 `db.ts:2588` 硬编码 `mcp_mode='inherit'` / `selected_mcps=null`，前端实际走 `workspace-config/mcp-servers` |
-| `/api/groups/:jid/mcp` | PUT | Access | **Dead code**：同上，PUT 写不进 DB，保留仅为不破坏旧调用 |
+`/ws` 不是 Public。Upgrade 时必须同时通过 Cookie Session 与 Origin 校验。
 
-### 消息（`src/web.ts`）
+## 3. 当前用户资源
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/messages` | POST | Access +HostPerm | 普通消息走 Access；`/clear` 命令**已收紧为 Modify**（与 `reset-session` 对齐，destructive 操作必须 owner） |
+以下资源以登录用户 ID 为作用域，不接受客户端指定其他 owner：
 
-### Sub-Agent（`src/routes/agents.ts`）
+| 路由族                                              | 权限                                          |
+| --------------------------------------------------- | --------------------------------------------- |
+| `/api/auth/me`、profile、password、sessions、avatar | Login，仅本人                                 |
+| `/api/agent-profiles/*`                             | Login，仅本人 Agent                           |
+| `/api/channel-accounts/*`                           | Login，仅本人渠道账号                         |
+| `/api/skills/*`                                     | Login，仅本人用户 Skills                      |
+| 用户级 `/api/mcp-servers/*`                         | Login，仅本人配置                             |
+| `/api/memory/*`                                     | Login，仅本人可访问记忆                       |
+| `/api/usage/*`                                      | Login；普通用户只见本人，管理视图再按角色过滤 |
+| `/api/billing/my/*`                                 | Login，仅本人                                 |
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/groups/:jid/agents` | GET | Access | 读类，共享成员可见 |
-| `/api/groups/:jid/agents` | POST | **Modify** | 创建对话**已收紧为 owner-only**（与 workspace-config 一致）；非成员 404、非 owner 成员 403 |
-| `/api/groups/:jid/agents/:agentId` | PATCH | **Modify** | 重命名，同上 |
-| `/api/groups/:jid/agents/:agentId` | DELETE | **Modify** | 同上；有 IM 绑定时仍拒绝删除 |
-| `/api/groups/:jid/im-groups` | GET | Access | 列出可绑定的 IM 群组 |
-| `/api/groups/:jid/agents/:agentId/im-binding` | PUT | **Modify** (工作区) + Access (imGroup) | 工作区侧**已随 CRUD 收紧为 owner-only**；imGroup 侧保留 Access |
-| `/api/groups/:jid/agents/:agentId/im-binding/:imJid` | DELETE | **Modify** + Access | 同上；thread_map unbind 会 `deleteAgent` owner 的 topic agents，必须 owner |
-| `/api/groups/:jid/im-binding` | PUT | **Modify** + Access | 绑定 IM 群到主对话，owner-only |
-| `/api/groups/:jid/im-binding/:imJid` | DELETE | **Modify** + Access | owner-only |
-| `/api/groups/:jid/im-binding` | PUT | Access (双向) | 绑定 IM 到工作区主对话 |
-| `/api/groups/:jid/im-binding/:imJid` | DELETE | Access (双向) | |
+产品级 Agent 删除前必须先迁移其工作区。渠道账号删除、登出或断开时必须清理/更新
+自身连接和绑定，不能影响其他用户或其他账号。
 
-### 文件（`src/routes/files.ts`）
+## 4. 工作区 ACL
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/groups/:jid/files` | GET | Access +HostPerm | |
-| `/api/groups/:jid/files` | POST | Access +HostPerm | 上传 |
-| `/api/groups/:jid/files/open-directory` | POST | Access + **HostPerm(硬性)** | 打开本地目录必须 admin |
-| `/api/groups/:jid/files/download/:path` | GET | Access +HostPerm | |
-| `/api/groups/:jid/files/preview/:path` | GET | Access +HostPerm | |
-| `/api/groups/:jid/files/content/:path` | GET | Access +HostPerm | |
-| `/api/groups/:jid/files/content/:path` | PUT | Access +HostPerm | |
-| `/api/groups/:jid/files/:path` | DELETE | Access +HostPerm | |
-| `/api/groups/:jid/directories` | POST | Access +HostPerm | |
+### 4.1 Access
 
-### 记忆（`src/routes/memory.ts`）
+`canAccessGroup()` 对所有角色使用同一规则：
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/memory/sources` | GET | Login | 内部按 `created_by` 过滤 folder |
-| `/api/memory/search` | GET | Login | 同上 |
-| `/api/memory/file` | GET | Login | `resolveMemoryPath` 内部做 userId 校验 |
-| `/api/memory/file` | PUT | Login | 同上 + 系统路径写保护 |
-| `/api/memory/global` | GET | Login | 读自己的 user-global |
-| `/api/memory/global` | PUT | Login | 写自己的 user-global |
+- Home Workspace：仅 `created_by`。
+- Web Workspace：仅创建者。
+- IM Chat：优先使用自身 `created_by`；旧记录没有 owner 时，只允许通过同 folder
+  的 Home Workspace 解析 owner；解析失败默认拒绝。
 
-### 定时任务（`src/routes/tasks.ts`）
+需要 Access 的典型操作：
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/tasks` | GET | Login | 内部按 `canAccessGroup` 过滤 |
-| `/api/tasks` | POST | Access | 创建任务 |
-| `/api/tasks/:id` | PATCH | Access | 更新任务 |
-| `/api/tasks/:id` | DELETE | Access | 删除任务 |
-| `/api/tasks/:id/run` | POST | Access | 手动触发 |
-| `/api/tasks/:id/logs` | GET | Access | 查看执行日志 |
-| `/api/tasks/ai` | POST | Access | AI 辅助创建 |
-| `/api/tasks/parse` | POST | Login | 解析自然语言 |
+- 列表中的工作区投影
+- 读取消息与文件
+- 发送普通消息
+- 查看 Runtime Session、绑定和项目能力
+- 打开 Web 终端前的资源检查
 
-### 配置（`src/routes/config.ts`）
+Host Workspace 在 Access 之外还要求 admin。
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/config/claude` | GET | SystemConfig | |
-| `/api/config/claude/providers` | GET | SystemConfig | |
-| `/api/config/claude/providers` | POST | SystemConfig | |
-| `/api/config/claude/providers/:id` | PATCH | SystemConfig | |
-| `/api/config/claude/providers/:id/secrets` | PUT | SystemConfig | |
-| `/api/config/claude/providers/:id` | DELETE | SystemConfig | |
-| `/api/config/claude/providers/:id/toggle` | POST | SystemConfig | |
-| `/api/config/claude/providers/:id/reset-health` | POST | SystemConfig | |
-| `/api/config/claude/providers/health` | GET | SystemConfig | |
-| `/api/config/claude/providers/:id/usage` | GET | SystemConfig | |
-| `/api/config/claude/balancing` | PUT | SystemConfig | |
-| `/api/config/claude/apply` | POST | SystemConfig | |
-| `/api/config/claude/oauth/start` | POST | SystemConfig | |
-| `/api/config/claude/oauth/callback` | POST | SystemConfig | |
-| `/api/config/claude/custom-env` | PUT | SystemConfig | |
-| `/api/config/feishu` | GET/PUT | SystemConfig | deprecated，改用 user-im |
-| `/api/config/telegram` | GET/PUT | SystemConfig | deprecated，改用 user-im |
-| `/api/config/telegram/test` | POST | SystemConfig | |
-| `/api/config/registration` | GET/PUT | SystemConfig | |
-| `/api/config/appearance` | GET/PUT | SystemConfig | |
-| `/api/config/appearance/public` | GET | **Public** | 仅返回 appName/aiName/emoji/color |
-| `/api/config/system` | GET/PUT | SystemConfig | |
-| `/api/config/external-resources` | GET | SystemConfig + Admin 角色检查 | 非 admin 返回空数据 |
-| `/api/config/external-resources/rule` | GET | SystemConfig + Admin 角色检查 | |
-| `/api/config/user-im/status` | GET | Login | 返回自己的 IM 连接状态 |
-| `/api/config/user-im/feishu` | GET/PUT | Login | 操作自己的配置 |
-| `/api/config/user-im/telegram` | GET/PUT | Login | |
-| `/api/config/user-im/telegram/test` | POST | Login | |
-| `/api/config/user-im/telegram/pairing-code` | POST | Login | |
-| `/api/config/user-im/telegram/paired-chats` | GET | Login | 按 `created_by` 过滤 |
-| `/api/config/user-im/telegram/paired-chats/:jid` | DELETE | Login + owner 检查 | `created_by === user.id` |
-| `/api/config/user-im/qq` | GET/PUT | Login | |
-| `/api/config/user-im/qq/test` | POST | Login | |
-| `/api/config/user-im/qq/pairing-code` | POST | Login | |
-| `/api/config/user-im/qq/paired-chats` | GET | Login | 按 `created_by` 过滤 |
-| `/api/config/user-im/qq/paired-chats/:jid` | PUT/DELETE | Login + owner 检查 | |
-| `/api/config/user-im/dingtalk` | GET/PUT | Login | |
-| `/api/config/user-im/dingtalk/test` | POST | Login | |
-| `/api/config/user-im/discord` | GET/PUT | Login | |
-| `/api/config/user-im/discord/test` | POST | Login | |
-| `/api/config/user-im/wechat` | GET/PUT | Login | |
-| `/api/config/user-im/wechat/qrcode` | POST | Login | |
-| `/api/config/user-im/wechat/qrcode-status` | GET | Login | |
-| `/api/config/user-im/wechat/disconnect` | POST | Login | |
-| `/api/config/user-im/whatsapp` | GET/PUT | Login | |
-| `/api/config/user-im/whatsapp/logout` | POST | Login | |
-| `/api/config/user-im/bindings/:imJid` | PUT | Access | 操作 IM 绑定 |
-| `/api/config/user-im/bindings/:imJid/reset-allowlist` | POST | Access + owner 检查 | `created_by === user.id` |
+### 4.2 Modify
 
-### 管理（`src/routes/admin.ts`）
+`canModifyGroup()` 是 owner-only。需要 Modify 的典型操作：
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/admin/users` | GET | ManageUsers | |
-| `/api/admin/users` | POST | ManageUsers | 非 admin 不可创建 admin 用户 |
-| `/api/admin/users/:id` | PATCH | ManageUsers | 非 admin 不可管理 admin 用户 |
-| `/api/admin/users/:id` | DELETE | ManageUsers | 不可删自己；不可删最后一个 admin |
-| `/api/admin/users/:id/restore` | POST | ManageUsers | |
-| `/api/admin/users/:id/sessions` | DELETE | ManageUsers | |
-| `/api/admin/permission-templates` | GET | Login + (`manage_users` \| `manage_invites`) | |
-| `/api/admin/invites` | GET | ManageInvites | |
-| `/api/admin/invites` | POST | ManageInvites | |
-| `/api/admin/invites/:code` | DELETE | ManageInvites | |
-| `/api/admin/audit-log` | GET | ViewAudit | |
-| `/api/admin/audit-log/export` | GET | ViewAudit | |
+- 重命名、切换 Agent、修改执行方式
+- stop、interrupt、reset-session、clear-history
+- 创建、修改、删除 Runtime Session
+- 写入工作区 Skills/MCP
+- 修改群聊绑定、激活方式、响应对象和 owner
+- `/clear` 的 HTTP 与 WebSocket 分支
 
-### 监控（`src/routes/monitor.ts`）
+Pin 是当前用户自己的偏好，只要求 Access，不修改共享工作区状态。
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/health` | GET | **Public** | 健康检查 |
-| `/api/status` | GET | Login | 非 admin 只能看自己 `canAccessGroup` 的群组 |
-| `/api/docker/build` | POST | SystemConfig | 构建 Docker 镜像 |
-| `/api/docker/status` | GET | SystemConfig | |
+### 4.3 Delete
 
-### Skills（`src/routes/skills.ts`）
+Home Workspace 永远不可删除。其他工作区必须通过 Modify，删除过程会：
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/skills` | GET | Login | |
-| `/api/skills/search` | GET | Login | |
-| `/api/skills/search/detail` | GET | Login | |
-| `/api/skills/:id` | GET | Login | |
-| `/api/skills/:id` | PATCH | Login | |
-| `/api/skills/user-all` | DELETE | Login | |
-| `/api/skills/:id` | DELETE | Login | |
-| `/api/skills/install` | POST | Login | |
-| `/api/skills/:id/reinstall` | POST | Login | |
+1. 暂停相关序列化键。
+2. 停止工作区、Runtime Session 和虚拟任务 Runner。
+3. 删除数据库、文件和绑定状态。
+4. 仅在提交成功后丢弃被暂停的旧工作；失败则恢复。
 
-### MCP Servers（`src/routes/mcp-servers.ts`）
+### 4.4 环境变量
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/mcp-servers` | GET | Login | per-user 数据 |
-| `/api/mcp-servers` | POST | Login | |
-| `/api/mcp-servers/:id` | PATCH | Login | |
-| `/api/mcp-servers/:id` | DELETE | Login | |
-| `/api/mcp-servers/sync-host` | POST | Login | |
+`GET|PUT /api/groups/:jid/env`：
 
-### Plugins（`src/routes/plugins.ts`）
+- 必须 Access。
+- Host Workspace 必须 admin。
+- 非 admin 必须同时是 owner 且拥有 `manage_group_env`。
+- admin 仍需先通过工作区 Access，不能借 admin 角色读取其他用户工作区。
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/plugins` | GET | Login | admin 可见额外信息 |
-| `/api/plugins/enabled/:pluginFullId` | PATCH | Login | |
-| `/api/plugins/materialize` | POST | Login | |
-| `/api/plugins/marketplaces/:name` | DELETE | Login | 仅删自己的 enabled refs |
-| `/api/plugins/commands` | GET | Login | |
-| `/api/plugins/catalog` | GET | Login | admin 可见额外信息 |
-| `/api/plugins/catalog/marketplaces/:mp` | GET | Login | admin 可见额外信息 |
-| `/api/plugins/catalog/scan` | POST | **Admin 角色检查** | `role !== 'admin'` → 403 |
+## 5. 工作区与 Session 渠道绑定
 
-### 用量统计（`src/routes/usage.ts`）
+写操作统一要求目标工作区 Modify，同时校验 IM Chat 属于同一用户、同一渠道账号，
+并验证会话类型：
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/usage/*` | ALL | Login | 全局 `authMiddleware` |
+| 绑定                  | 允许目标 | 路由                                              |
+| --------------------- | -------- | ------------------------------------------------- |
+| Workspace Mount       | 群聊     | `/api/groups/:jid/im-binding`                     |
+| Runtime Session Mount | 私聊     | `/api/groups/:jid/sessions/:sessionId/im-binding` |
+| `/agents` 兼容 Mount  | 私聊     | `/api/groups/:jid/agents/:agentId/im-binding`     |
 
-### 目录浏览（`src/routes/browse.ts`）
+附加规则：
 
-| 路由 | 方法 | ACL | 备注 |
-|------|------|-----|------|
-| `/api/browse/directories` | GET/POST | Login | 受 mount-allowlist 白名单约束 |
+- `channel_account_id` 必须属于当前用户。
+- 账号编码在 JID 中时，必须与数据库记录一致。
+- 原生话题容器使用 `thread_map`，不能绑定到一个固定 Session 后吞并所有话题。
+- Unbind 必须原子恢复该 Bot 的默认工作区；无法解析默认目标时保留旧绑定并报错。
 
-## WebSocket 操作
+## 6. 系统和管理权限
 
-WebSocket 连接建立时从 Cookie 解析会话，验证通过后缓存 `session.user_id` 和 `session.role`。
+| 路由族/操作                                       | 权限                                               |
+| ------------------------------------------------- | -------------------------------------------------- |
+| Provider、系统容量、Host 集成、注册策略、系统外观 | `manage_system_config`                             |
+| Plugin Catalog 手动扫描                           | admin / `manage_system_config` 路径中的 admin 检查 |
+| 系统 MCP 写入                                     | admin                                              |
+| 用户创建、禁用、恢复、角色与权限                  | `manage_users`                                     |
+| 邀请码                                            | `manage_invites`                                   |
+| 审计日志和导出                                    | `view_audit_log`                                   |
+| `/api/billing/admin/*`                            | `manage_billing`                                   |
+| `/api/docker/build`、运行监控管理                 | `manage_system_config`                             |
+| `/api/status/channel-outbox/*` 人工裁决           | `manage_system_config`                             |
+| `POST /api/groups/:jid/reset-owner`               | admin break-glass，同时仍验证目标资源              |
 
-| 操作 | ACL | 备注 |
-|------|-----|------|
-| `send_message` | Access +HostPerm | 对目标群组做 `canAccessGroup` |
-| `send_message` + `/clear` | **Modify** +HostPerm | 已收紧为 owner-only（与 HTTP `/clear` + `reset-session` 对齐） |
-| `send_message` + `/sw` | Access +HostPerm | spawn 并行任务，复用 send_message ACL |
-| `terminal_start` | Access | `canAccessGroup`；host 模式直接拒绝（不支持终端） |
-| `terminal_input` | 无额外检查 | 依赖 `terminal_start` 时的 ACL |
-| `terminal_resize` | 无额外检查 | 同上 |
-| `terminal_stop` | 无额外检查 | 同上 |
+系统 MCP 默认仅 admin 可用；只有显式设置为 shared 后，普通成员的 Agent 才能进入
+有效能力清单。API 不回传 Secret 明文。
 
-## IM 斜杠命令
+## 7. WebSocket
 
-IM 命令通过 `handleCommand()` 在主进程 `src/index.ts` 中处理，**不经过 Web 认证中间件**。
+连接建立时把认证用户 ID、角色和 Permission 固定到 Session；每个操作仍重新检查
+目标资源。
 
-**Owner gate**：`OWNER_REQUIRED_IM_COMMANDS`（`src/im-command-utils.ts`）覆盖 destructive 命令，通过 `senderImId === group.owner_im_id` 比对（裸 ID 格式，与 feishu/dingtalk/telegram/qq 的 `onCommand` 现网一致）。
+| 操作                             | 权限                               |
+| -------------------------------- | ---------------------------------- |
+| `send_message`                   | Access；Host 再加 Host             |
+| `send_message` 中的 `/clear`     | Modify；Host 再加 Host             |
+| Runtime Session 消息             | Access + Session 属于该 Workspace  |
+| `terminal_start`                 | Access；只支持 Container Workspace |
+| `terminal_input` / resize / stop | 必须是当前 WebSocket 已拥有的终端  |
+| Docker Build 流                  | 对应系统管理权限                   |
 
-**DM 自动认领**：未认领 owner 的群组若是 1:1 私聊（`isDirectMessageJid()` 判定），在 owner-required 命令到达时自动把发送者认领为 owner，省去单人 DM 先发 `/owner_mention` 的冗余。群聊永不自动认领（`isDirectMessageJid` 对群组返回 false，首个发命令者不能静默夺权）。Feishu 由 DM owner-learn 路径自动设 owner，不走此分支。
+不能仅依赖 `terminal_start` 的历史授权；终端 owner 映射和连接关闭清理是协议的一部分。
 
-| 命令 | ACL | 备注 |
-|------|-----|------|
-| `/clear` | **Owner** | senderImId 必须等于 `group.owner_im_id`；未认领的 DM 自动认领发送者 |
-| `/bind` | **Owner** | 同上 |
-| `/unbind` | **Owner** | 同上 |
-| `/new` | **Owner** | 同上 |
-| `/sw`、`/spawn` | **Owner** | 同上 |
-| `/list`、`/ls` | 无 | 读类，群成员可见 |
-| `/status` | 无 | 读类 |
-| `/recall`、`/rc` | 无 | 读类（带 60s 节流） |
-| `/where` | 无 | 读类 |
-| `/owner_mention` | **bootstrap** | **必须开放**——未认领 owner 的群通过此命令 self-claim |
-| `/release_owner` | **Owner** | 当前 owner 释放身份后清空 `owner_im_id` **和 `sender_allowlist`**（避免新 owner 被旧白名单锁死），并把 `owner_mentioned` 模式降级为 `when_mentioned`（否则清 owner 后 bot 全群沉默）；下一位用户可通过 `/owner_mention` 重新认领 |
-| `/require_mention` | 内置 owner 检查 | 仅 `activation_mode === 'owner_mentioned'` 时限制；本 PR 不改 |
-| `/allow` | 内置 owner 检查 | handler 内部检查 `senderImId === group.owner_im_id` |
-| `/disallow` | 内置 owner 检查 | 同上 |
-| `/allowlist` | 无 | 读类 |
+## 8. IM 响应对象与激活
 
-**Telegram/QQ sender 透传**：本 PR 补 `onCommand` 现场传递裸 ID（`String(ctx.from.id)` / `userOpenId` / `memberOpenId`），与 feishu/dingtalk 的现有 `onCommand` 格式一致。不与 `messages.sender_id` 的 `tg:` / `qq:` 前缀混淆——后者是 DB 存储格式，不影响 `owner_im_id` 比对。
+渠道消息先执行响应对象检查，再执行 @/话题激活：
 
-**QQ owner_im_id namespace（C2C vs Group 隔离）**：QQ Bot API v2 的 C2C event 给的是 `author.user_openid`，Group event 给的是 `author.member_openid`，**协议层面两者是不同的 ID namespace 不互通**——同一个用户在 DM 和群里的 ID 不一样。为避免 owner 在 DM 认领的 `owner_im_id` 与群里发命令时的 sender 比对失败，`src/qq.ts` 的 `onCommand` 现场对 senderImId 加 namespace 前缀：C2C 传 `c2c:${userOpenId}`，Group 传 `group:${memberOpenId}`。这样 DM 与群聊各自认领独立的 owner 记录，互不干扰。`messages.sender_id` 的存储格式（裸 `qq:${userOpenId}` / `qq:${memberOpenId}`）不变——前缀化只发生在 `onCommand` 调用现场，影响 `owner_im_id` 比对路径。
+| 策略                             | 行为                             |
+| -------------------------------- | -------------------------------- |
+| `audience_mode=everyone`         | 所有允许成员可以触发             |
+| `audience_mode=owner_only`       | 只有 `owner_im_id` 可以触发      |
+| `activation_mode=always`         | 无需 @                           |
+| `activation_mode=when_mentioned` | 需要首次 @，原生话题激活后可继续 |
+| `activation_mode=disabled`       | DM 和群聊都停止响应              |
 
-## 已知不一致
+响应对象和激活方式是独立维度。Legacy `owner_mentioned` 读取时会规范化为
+`audience_mode=owner_only + activation_mode=when_mentioned`。
 
-### P1 已修复的
+Owner Claim：
 
-- **系统消息渲染**（commit `579123f`）：`__system__` 消息的 if-else 链改为 registry + fallback，修复 `context_reset:` 前缀消息被静默丢弃的 bug；`context_overflow:` 消息路由到 `MessageBubble` 的红色卡片 UI（之前是 dead code）。
-- **`resolveSystemMessage()` 单测**（P2 PR）：补回 P1 缺口，覆盖 8 个 case + fallback。
+- 可信的 1:1 私聊可以从第一条持久化人类消息学习 owner。
+- 未认领群聊不会让“第一个发命令的人”自动成为 owner。
+- 群聊用 `/owner_mention` 显式认领。
+- `/release_owner` 清除 owner 与 allowlist，并把 legacy `owner_mentioned` 降级。
+- admin 的 `reset-owner` 是 owner 离群/换号后的 break-glass。
 
-### P2 已修复的（本 PR）
+## 9. IM 命令
 
-- **Web `/clear` ACL 收紧**：HTTP `POST /api/messages` 与 WS `send_message` 的 `/clear` 分支前 inline `canModifyGroup`，与 `reset-session` 对齐。WS 路径用 `session.user_id/role`（非 `authUser`）。WS `agentId` 校验保留。
-- **workspace-config 后端写路由收紧**：mcp-servers + skills 的 POST/PATCH/DELETE 共 6 个写路由通过 `requireWorkspaceOwner()` helper 加 `canModifyGroup` 检查。GET 路由保留 `canAccessGroup`。
-- **workspace-config 前端按钮 UX 同步**：`WorkspaceSkillsPanel.tsx` 和 `WorkspaceMcpPanel.tsx` 写按钮按 `group?.member_role === 'owner'` 条件渲染。`canModify` prop 默认 false，避免加载态按钮闪烁。
-- **Telegram/QQ `onCommand` sender 透传**：DM/C2C/Group 调用现场补传裸 ID（与 feishu/dingtalk 现有 `onCommand` 格式一致），解锁 IM owner gate 对 Telegram/QQ 通道生效。
-- **IM 破坏性命令 owner gate**：`handleCommand` 顶部 `checkImOwnerCommand()` 拦截 `/clear` / `/bind` / `/unbind` / `/new` / `/sw` / `/spawn`，要求 `senderImId === group.owner_im_id`；旧群 `owner_im_id` 为空时提示走 `/owner_mention` 自我认领。`/owner_mention` 排除出 gate（bootstrap 入口）。
-- **Owner reclaim path（`/release_owner`）**：补 reclaim 入口便于 owner 主动让位。命令进入 `OWNER_REQUIRED_IM_COMMANDS`，复用 gate 强制"仅当前 owner 自己可释放"，执行时清空 `owner_im_id` **和 `sender_allowlist`**（否则新 owner 被旧白名单锁死、`/allow` 也无法自救），并把 `owner_mentioned` 模式降级为 `when_mentioned`，下一位用户可发 `/owner_mention` 接手。只能由当前 owner 本人调用——owner 离群/换号无人能触发的场景由本 PR 的 admin break-glass `POST /reset-owner` 兜底（见下）。
-- **WhatsApp/DingTalk/Discord `onBotAddedToGroup` 隔离**：`connectUserIMChannels` 拆出 `feishuOnBotAddedToGroup`（带 `getFeishuOwnerOpenId`，写入 `owner_im_id` + 锁定白名单）与通用 `onBotAddedToGroup`（不带 owner getter）。前者只给飞书使用，后者用于其他渠道，避免把飞书 open_id 错写进 WhatsApp/DingTalk/Discord 群的 owner 字段。
-- **Sub-Agent CRUD + IM-binding 收紧 owner-only**：`src/routes/agents.ts` 的 POST/PATCH/DELETE `/:jid/agents` 及 4 个 IM-binding 写路由（PUT/DELETE `.../im-binding` 的工作区侧）由 `canAccessGroup` 改为两段式（非成员 404 隐藏存在、非 owner 成员 403），与 workspace-config 对齐（imGroup 侧保留 Access）。IM-binding 一并收紧是因为 thread_map unbind 会 `deleteAgent` 掉 owner 的 topic agents（破坏性）。前端 `AgentTabBar` + `TopicSidebar` 加 `canModify` prop（默认 false），非 owner 隐藏 create/rename/delete/bind 入口，仅保留只读 tab 选择。覆盖 `tests/routes-agents-acl.test.ts`（含 IM-binding）。
-- **owner 离群死锁的 admin 凌驾路径（`POST /api/groups/:jid/reset-owner`）**：admin-only break-glass，清 `owner_im_id`+`sender_allowlist`、`owner_mentioned`→`when_mentioned`，解 owner 离群/换号导致 owner-only 命令永久锁死。覆盖 `tests/routes-groups-owner-acl.test.ts`。
-- **`PATCH /api/groups/:jid` 静默 wipe 根因修复**：该路由原先用显式字段列表重建整行，而 `setRegisteredGroup` 是 `INSERT OR REPLACE`（整行覆盖），导致每次改名/改 activation_mode 都会把 `owner_im_id` / `sender_allowlist` / `conversation_source` / `conversation_nav_mode` / `binding_mode` / `feishu_chat_mode` / `feishu_group_message_type` 静默清空——直接破坏 owner gate 的安全锚点并损坏 feishu_thread 工作区。改为 `...existing` spread，只覆盖本次实际修改的字段。覆盖回归测试。
-- **DM 自动认领 owner（非 Feishu）**：新增 `isDirectMessageJid()` 纯函数（覆盖 qq/dingtalk/discord/whatsapp/wechat/telegram 各自 jid 编码 + feishu→false），`handleCommand` 在 owner gate 前对未认领的 DM 自动认领发送者，消除 Telegram/QQ/WeChat/WhatsApp/DingTalk 单人 DM 首次需 `/owner_mention` 的回归。群聊仍走 `/owner_mention`。覆盖 `tests/im-owner-gate.test.ts`。
-- **HTTP `/api/messages` 集成测试 + `createAppForTest()` factory**：`src/web.ts` 的 `app` 原先未 export，无法做 route-level 测试。新增 `createAppForTest(webDeps)` factory（镜像 `startWebServer` 的 deps 注入，但不启 HTTP/WS/状态广播定时器，返回已挂全部路由的 `app`）。`tests/routes-messages-acl.test.ts` 覆盖 `POST /api/messages` 的 `/clear` 拦截 ACL：无效 body 400 / 未知群 404 / 非成员 403（Access denied）/ 共享成员 403（owner-only）/ owner 200（真实 reset：`queue.stopGroup` 调用 + `context_reset` divider 落库）。
-- **owner 生命周期写操作收敛（`src/group-owner.ts`）**：`owner_im_id` / `sender_allowlist` / `activation_mode` 原散在 9 处手搓 `setRegisteredGroup` + 内存 cache 同步。收敛到 `group-owner.ts` 纯函数子系统：`claimOwner`（设 owner，**不动** activation_mode）/ `releaseOwner`（清 owner+allowlist，`owner_mentioned`→`when_mentioned`）/ `addToAllowlist` / `removeFromAllowlist`，配 `persistGroupUpdate`（把 db 写与 cache sync 绑定为一步，杜绝漏同步导致的陈旧内存态）。`/release_owner`（`index.ts`）与 admin `/reset-owner`（`groups.ts`）现共享 `releaseOwner`，消除两处手抄的「清 owner 必降级 mode」不变量。`buildOnNewChat`（注册时 owner 出生）与 `/require_mention` 的 activation_mode 写入（单站、无跨站不变量）刻意留 inline，仅 persist 走 helper。覆盖 `tests/group-owner.test.ts`（10 例，含两个关键不变量）。
+命令由主进程 `handleCommand()` 处理，不经过 Web Middleware，但使用渠道 sender ID
+执行独立 Owner Gate。
 
-### 待后续 PR 修复的
+| 命令                                 | 权限                                         |
+| ------------------------------------ | -------------------------------------------- |
+| `/list`、`/ls`、`/status`、`/where`  | 只读                                         |
+| `/recall`、`/rc`                     | 只读，带节流                                 |
+| `/allowlist`                         | 只读                                         |
+| `/clear`、`/bind`、`/unbind`、`/new` | IM Owner                                     |
+| `/sw`、`/spawn`                      | IM Owner                                     |
+| `/release_owner`                     | IM Owner                                     |
+| `/owner_mention`                     | 未认领群的 bootstrap，不可被 Owner Gate 锁死 |
+| `/allow`、`/disallow`                | Handler 内检查 IM Owner                      |
+| `/require_mention`                   | Handler 内按当前 owner/策略检查              |
 
-- **`POST /api/groups/:jid/stop` 和 `interrupt`**：当前为 `canAccessGroup`，共享成员可停止/中断 owner 的容器。直接收紧为 `canModifyGroup` 会导致成员无法中断自己发起的查询（UX 回归）。正确方案：在 queue 层追踪 query initiator，实现"仅 owner 或发起者可操作"的资源级检查（参考删除消息路由的 `canAccessGroup` + sender 检查模式）。
+不同 Provider 的原生 sender ID namespace 不得混用。例如 QQ C2C 与 Group 使用不同
+ID 空间；owner 比对必须使用渠道适配器传入的规范化 ID。
+
+## 10. MCP 与 Agent 侧操作
+
+Agent MCP 调用没有 Cookie，但必须携带由主进程创建的运行上下文：
+
+- `ownerUserId`
+- Workspace/Session 身份
+- IPC 目录
+- 当前 `ChannelTurnContext`
+- Agent Profile 和能力 Manifest
+
+消息、图片和文件工具必须限制在授权的 Session 或当前 Turn 路由。跨工作区操作必须
+经过主进程 owner 检查；不能根据 Agent 文本参数自行扩大范围。
+
+定时任务：
+
+- Agent 任务继承创建者、Workspace 和 Agent 身份。
+- Script 任务仅允许 admin 的 Host Workspace。
+- `group` 模式注入主 Session；`isolated` 使用独立 Session、IPC 和运行记录。
+- 立即运行使用 idempotency key；取消只影响对应 Run。
+
+定时任务的 IPC/MCP 面授权与 Web 面同源，均为 `canAccessGroup`，**admin 不提供
+全局旁路**：
+
+- 判定实现在 `src/task-acl.ts`，覆盖 `schedule_task`、`pause_task`、
+  `resume_task`、`cancel_task`、`update_task`、`run_task_now`、`stop_task_run`、
+  `restore_task`、`list_task_runs` 以及 `list_tasks` 的可见性过滤。
+- 允许两条路径：目标是 Agent 自身工作区目录；或该工作区属主同样拥有目标群组。
+- `isAdminHome` 只保留为能力判定（Script 任务、Host 执行模式），不参与工作区范围
+  判定。原因：admin Home Agent 是会接触不可信内容的 LLM，而任务 `prompt` 会被按
+  计划重放、以 Bot 身份在目标会话发言、并计费到目标工作区。
+- 任务 `prompt` 属于用户内容，因此 `list_tasks` 不允许跨租户枚举。
+
+## 11. 修改 ACL 的验证要求
+
+任何 ACL 修改至少补充以下测试维度：
+
+1. owner 成功。
+2. 非 owner 被拒绝。
+3. admin 是否应该绕过必须显式测试；默认不绕过。
+4. Host/Container 分支。
+5. 资源不存在与跨用户资源的返回值。
+6. 多渠道账号不能串用凭据或绑定。
+7. HTTP、WebSocket、IM、MCP 的同一动作保持一致。
+8. 失败路径不留下半写绑定、陈旧 Runner 或已推进游标。
+
+相关现有测试集中在：
+
+- `tests/routes-*-acl.test.ts`
+- `tests/owner-gate.test.ts`
+- `tests/im-owner-gate.test.ts`
+- `tests/im-audience-policy.test.ts`
+- `tests/channel-binding-rest-contract.test.ts`
+- `tests/channel-account-*.test.ts`
+- `tests/mcp-runtime-secret-boundary.test.ts`
+- `tests/host-execution-policy.test.ts`

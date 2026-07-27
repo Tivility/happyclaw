@@ -4,6 +4,7 @@
  */
 import crypto from 'crypto';
 import {
+  clearSessionChannelOwner,
   deleteSession,
   getJidsByFolder,
   getJidsExecutingInFolder,
@@ -39,9 +40,7 @@ export async function executeSessionReset(
   deps: CommandDeps,
   agentId?: string,
 ): Promise<void> {
-  const targetJid = agentId
-    ? `${baseChatJid}#agent:${agentId}`
-    : baseChatJid;
+  const targetJid = agentId ? `${baseChatJid}#agent:${agentId}` : baseChatJid;
 
   if (agentId) {
     // Agent-specific reset: only stop the agent's virtual JID process
@@ -65,6 +64,7 @@ export async function executeSessionReset(
 
   // 3. Delete runtime-aware native session state from DB.
   deleteSession(folder, agentId);
+  clearSessionChannelOwner(folder, agentId);
 
   // 4. Insert context_reset divider message into the correct JID
   const dividerMessageId = crypto.randomUUID();

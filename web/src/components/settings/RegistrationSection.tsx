@@ -14,7 +14,11 @@ export function RegistrationSection() {
   const loadConfig = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await api.get<{ allowRegistration: boolean; requireInviteCode: boolean; updatedAt: string | null }>('/api/config/registration');
+      const data = await api.get<{
+        allowRegistration: boolean;
+        requireInviteCode: boolean;
+        updatedAt: string | null;
+      }>('/api/config/registration');
       setAllowRegistration(data.allowRegistration);
       setRequireInviteCode(data.requireInviteCode);
       setUpdatedAt(data.updatedAt);
@@ -25,12 +29,18 @@ export function RegistrationSection() {
     }
   }, []);
 
-  useEffect(() => { loadConfig(); }, [loadConfig]);
+  useEffect(() => {
+    loadConfig();
+  }, [loadConfig]);
 
   const saveConfig = useCallback(async (allow: boolean, invite: boolean) => {
     setSaving(true);
     try {
-      const data = await api.put<{ allowRegistration: boolean; requireInviteCode: boolean; updatedAt: string | null }>('/api/config/registration', {
+      const data = await api.put<{
+        allowRegistration: boolean;
+        requireInviteCode: boolean;
+        updatedAt: string | null;
+      }>('/api/config/registration', {
         allowRegistration: allow,
         requireInviteCode: invite,
       });
@@ -54,7 +64,9 @@ export function RegistrationSection() {
       <div className="flex items-center justify-between">
         <div>
           <div className="text-sm font-medium text-foreground">允许注册</div>
-          <div className="text-xs text-muted-foreground mt-0.5">关闭后注册入口不可用</div>
+          <div className="text-xs text-muted-foreground mt-0.5">
+            关闭后注册入口不可用
+          </div>
         </div>
         <button
           type="button"
@@ -77,13 +89,17 @@ export function RegistrationSection() {
       <div className="flex items-center justify-between">
         <div>
           <div className="text-sm font-medium text-foreground">需要邀请码</div>
-          <div className="text-xs text-muted-foreground mt-0.5">关闭后任何人可直接注册</div>
+          <div className="text-xs text-muted-foreground mt-0.5">
+            {allowRegistration
+              ? '关闭后任何人都可以直接注册'
+              : '注册已关闭；该规则会在重新开放注册后继续生效'}
+          </div>
         </div>
         <button
           type="button"
           role="switch"
           aria-checked={requireInviteCode}
-          disabled={saving}
+          disabled={saving || !allowRegistration}
           onClick={() => saveConfig(allowRegistration, !requireInviteCode)}
           className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:opacity-50 ${
             requireInviteCode ? 'bg-primary' : 'bg-muted-foreground/40'
@@ -98,7 +114,8 @@ export function RegistrationSection() {
       </div>
 
       <div className="text-xs text-muted-foreground">
-        最近保存：{updatedAt ? new Date(updatedAt).toLocaleString('zh-CN') : '未记录'}
+        最近保存：
+        {updatedAt ? new Date(updatedAt).toLocaleString('zh-CN') : '未记录'}
       </div>
     </div>
   );

@@ -1,30 +1,35 @@
 // Task management routes
 
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import * as crypto from 'node:crypto';
-import fs from 'fs';
-import path from 'path';
-import { CronExpressionParser } from 'cron-parser';
 import { sdkQuery } from '../sdk-query.js';
-import { GROUPS_DIR } from '../config.js';
-import { removeFlowArtifacts } from '../file-manager.js';
+import { getSystemSettings } from '../runtime-config.js';
 import type { Variables } from '../web-context.js';
 import { authMiddleware } from '../middleware/auth.js';
-import { TaskCreateSchema, TaskPatchSchema } from '../schemas.js';
+import {
+  MAX_TASK_PROMPT_LENGTH,
+  TaskCreateSchema,
+  TaskPatchSchema,
+} from '../schemas.js';
 import { logger } from '../logger.js';
 import {
   getAllTasks,
+  getDeletedTasks,
   getTaskById,
-  createTask,
-  updateTask,
-  deleteTask,
+  createTaskWithinOwnerLimit,
   getTaskRunLogs,
+  updateTaskWithRevision,
+  softDeleteTaskWithRevision,
+  restoreTaskWithRevision,
+  getTaskRunById,
+  getActiveTaskRunForTask,
+  getTaskRunsForTask,
   getRegisteredGroup,
   getAllRegisteredGroups,
   getUserHomeGroup,
-  deleteGroupData,
 } from '../db.js';
-import type { AuthUser } from '../types.js';
+import { getMergedTaskRunHistory } from '../task-run-history.js';
+import type { AuthUser, ScheduledTask } from '../types.js';
 import { TIMEZONE } from '../config.js';
 import {
   isHostExecutionGroup,
@@ -32,21 +37,77 @@ import {
   canAccessGroup,
   getWebDeps,
 } from '../web-context.js';
-import { getRunningTaskIds } from '../task-scheduler.js';
+import {
+  computeNextRunForSchedule,
+  computeNextRunForTaskResume,
+  getRunningTaskIds,
+  notifyTaskSchedulerChanged,
+} from '../task-scheduler.js';
 import { getChannelType, extractChatId } from '../im-channel.js';
+import {
+  getScriptTaskHostExecutionError,
+  SCRIPT_TASK_HOST_REQUIRED_ERROR,
+} from '../script-task-policy.js';
 
 const tasksRoutes = new Hono<{ Variables: Variables }>();
 
-/**
- * 防止共享工作区里 member A 改 / 跑 / 删 member B 的任务。admin 例外、
- * 历史 task.created_by=null 的也放行（兼容老数据；管理员可视情况手动迁移）。
- * 返回 null = 通过；返回 Response = 404（统一伪装为 not_found，避免泄漏存在性）。
- */
-function denyForeignTask(c: any, existing: { created_by?: string | null }, authUser: AuthUser): Response | null {
-  if (authUser.role === 'admin') return null;
-  if (!existing.created_by) return null; // legacy task without owner — admin-only effectively
-  if (existing.created_by === authUser.id) return null;
-  return c.json({ error: 'Task not found' }, 404);
+function canViewTask(task: ScheduledTask, authUser: AuthUser): boolean {
+  if (task.execution_mode === 'host' && authUser.role !== 'admin') return false;
+  const group = getRegisteredGroup(task.chat_jid);
+  if (!group) return authUser.role === 'admin';
+  return (
+    canAccessGroup(
+      { id: authUser.id, role: authUser.role },
+      { ...group, jid: task.chat_jid },
+    ) &&
+    (!isHostExecutionGroup(group) || hasHostExecutionPermission(authUser))
+  );
+}
+
+function taskPermissions(task: ScheduledTask, authUser: AuthUser) {
+  const isAdmin = authUser.role === 'admin';
+  const canManage = canViewTask(task, authUser);
+  const canOperateExecution =
+    canManage && (task.execution_type !== 'script' || isAdmin);
+  const executionBlockedReason = getScriptTaskHostExecutionError(
+    task,
+    getAllRegisteredGroups(),
+  );
+  const activeRun = getActiveTaskRunForTask(task.id);
+  return {
+    can_edit: canManage && !task.deleted_at && task.status !== 'parsing',
+    can_run:
+      canOperateExecution &&
+      !executionBlockedReason &&
+      !task.deleted_at &&
+      task.status !== 'parsing',
+    can_pause: canManage && !task.deleted_at,
+    can_stop: canOperateExecution && !!activeRun,
+    can_delete: canOperateExecution && !task.deleted_at,
+    can_restore:
+      canOperateExecution && !executionBlockedReason && !!task.deleted_at,
+    execution_scope:
+      task.execution_mode === 'host'
+        ? ('workspace_host' as const)
+        : ('workspace_container' as const),
+    risk_level:
+      task.execution_type === 'script'
+        ? ('high' as const)
+        : ('normal' as const),
+    execution_blocked_reason: executionBlockedReason,
+    is_admin: isAdmin,
+  };
+}
+
+function revisionConflict(c: Context, task: ScheduledTask) {
+  return c.json(
+    {
+      error: '任务已被其他页面或 Agent 修改，请刷新后重试。',
+      code: 'TASK_REVISION_CONFLICT',
+      current_task: task,
+    },
+    409,
+  );
 }
 
 // --- Routes ---
@@ -54,22 +115,26 @@ function denyForeignTask(c: any, existing: { created_by?: string | null }, authU
 tasksRoutes.get('/', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const allGroups = getAllRegisteredGroups();
-  const tasks = getAllTasks().filter((task) => {
-    // Host-mode tasks are only visible to admin
-    if (task.execution_mode === 'host' && authUser.role !== 'admin') {
-      return false;
-    }
-    const group = allGroups[task.chat_jid];
-    // Conservative: if group can't be resolved, only admin can see (may be orphaned task)
-    if (!group) return authUser.role === 'admin';
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid: task.chat_jid }))
-      return false;
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser))
-      return false;
-    return true;
+  const includeDeleted = c.req.query('include_deleted') === '1';
+  const taskDefinitions = includeDeleted
+    ? [...getAllTasks(), ...getDeletedTasks()]
+    : getAllTasks();
+  const visibleDefinitions = taskDefinitions.filter((task) =>
+    canViewTask(task, authUser),
+  );
+  const tasks = visibleDefinitions.map((task) => {
+    const recentRuns = getMergedTaskRunHistory(task.id, 1);
+    return {
+      ...task,
+      current_run: getActiveTaskRunForTask(task.id) ?? null,
+      last_run_summary: recentRuns[0] ?? null,
+      permissions: taskPermissions(task, authUser),
+    };
   });
   const visibleTaskIds = new Set(tasks.map((t) => t.id));
-  const filteredRunningIds = getRunningTaskIds().filter((id) => visibleTaskIds.has(id));
+  const filteredRunningIds = getRunningTaskIds().filter((id) =>
+    visibleTaskIds.has(id),
+  );
 
   // Build jid → name mapping for all registered groups (including IM channels).
   // Mirror the visibility rule used by GET /api/groups (src/routes/groups.ts:190-192):
@@ -79,8 +144,15 @@ tasksRoutes.get('/', authMiddleware, async (c) => {
   // write; this filter is purely for surface consistency.
   const groupNames: Record<string, string> = {};
   for (const [jid, group] of Object.entries(allGroups)) {
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) continue;
-    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser)) continue;
+    if (
+      !canAccessGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid },
+      )
+    )
+      continue;
+    if (isHostExecutionGroup(group) && !hasHostExecutionPermission(authUser))
+      continue;
     groupNames[jid] = group.name || jid;
   }
 
@@ -187,47 +259,57 @@ tasksRoutes.post('/', authMiddleware, async (c) => {
   } else {
     taskExecutionMode = sourceIsHost ? 'host' : 'container';
   }
+  if (execType === 'script' && taskExecutionMode !== 'host') {
+    return c.json({ error: SCRIPT_TASK_HOST_REQUIRED_ERROR }, 400);
+  }
 
   const taskId = crypto.randomUUID();
   const now = new Date().toISOString();
 
+  const taskCap = getSystemSettings().maxTasksPerUser;
+
   let nextRun: string;
-  if (schedule_type === 'cron') {
-    try {
-      const cronNext = CronExpressionParser.parse(schedule_value, { tz: TIMEZONE })
-        .next()
-        .toISOString();
-      if (!cronNext) {
-        return c.json({ error: 'Cron expression produced no next run time' }, 400);
-      }
-      nextRun = cronNext;
-    } catch {
-      return c.json({ error: 'Invalid cron expression' }, 400);
-    }
-  } else if (schedule_type === 'interval') {
-    nextRun = new Date(Date.now() + Number(schedule_value)).toISOString();
-  } else {
-    // once — use the target time from schedule_value
-    nextRun = new Date(schedule_value).toISOString();
+  try {
+    nextRun = computeNextRunForSchedule(schedule_type, schedule_value);
+  } catch (err) {
+    return c.json(
+      {
+        error: err instanceof Error ? err.message : 'Invalid schedule',
+      },
+      400,
+    );
   }
 
-  createTask({
-    id: taskId,
-    group_folder: groupFolder,
-    chat_jid: chatJid,
-    prompt: prompt || '',
-    schedule_type,
-    schedule_value,
-    context_mode: validation.data.context_mode || 'group',
-    execution_type: execType,
-    execution_mode: taskExecutionMode,
-    script_command: script_command ?? null,
-    next_run: nextRun,
-    status: 'active',
-    created_at: now,
-    created_by: authUser.id,
-    notify_channels: notify_channels ?? null,
-  });
+  const creation = createTaskWithinOwnerLimit(
+    {
+      id: taskId,
+      group_folder: groupFolder,
+      chat_jid: chatJid,
+      prompt: prompt || '',
+      schedule_type,
+      schedule_value,
+      context_mode: validation.data.context_mode || 'isolated',
+      execution_type: execType,
+      execution_mode: taskExecutionMode,
+      script_command: script_command ?? null,
+      next_run: nextRun,
+      status: 'active',
+      created_at: now,
+      created_by: authUser.id,
+      notify_channels: notify_channels ?? null,
+    },
+    taskCap,
+  );
+  if (creation.status === 'limit_reached') {
+    return c.json(
+      {
+        error: `定时任务数量已达上限（${creation.limit}）。请先删除不再需要的任务。`,
+        code: 'TASK_LIMIT_REACHED',
+      },
+      409,
+    );
+  }
+  notifyTaskSchedulerChanged();
 
   return c.json({ success: true, taskId });
 });
@@ -252,13 +334,31 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
       );
     }
   }
-  {
-    const denial = denyForeignTask(c, existing, authUser);
-    if (denial) return denial;
-  }
   const body = await c.req.json().catch(() => ({}));
+  const rawExpectedRevision = (body as Record<string, unknown>)
+    .expected_revision;
+  const expectedRevision =
+    typeof rawExpectedRevision === 'number' &&
+    Number.isInteger(rawExpectedRevision) &&
+    rawExpectedRevision > 0
+      ? rawExpectedRevision
+      : null;
+  if (expectedRevision === null) {
+    return c.json(
+      {
+        error: 'expected_revision is required. Reload the task and retry.',
+        code: 'TASK_REVISION_REQUIRED',
+        current_task: existing,
+      },
+      428,
+    );
+  }
+  const { expected_revision: _expectedRevision, ...patchBody } = body as Record<
+    string,
+    unknown
+  >;
 
-  const validation = TaskPatchSchema.safeParse(body);
+  const validation = TaskPatchSchema.safeParse(patchBody);
   if (!validation.success) {
     return c.json(
       { error: 'Invalid request body', details: validation.error.format() },
@@ -266,11 +366,49 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     );
   }
 
+  if (existing.status === 'parsing') {
+    const requestedFields = Object.entries(validation.data).filter(
+      ([, value]) => value !== undefined,
+    );
+    const onlyPause =
+      requestedFields.length === 1 && validation.data.status === 'paused';
+    if (!onlyPause) {
+      return c.json(
+        {
+          error: '任务正在解析中；可先暂停解析，再修改配置。',
+          code: 'TASK_STILL_PARSING',
+          current_task: existing,
+        },
+        409,
+      );
+    }
+  }
+
+  if (getRunningTaskIds().includes(id)) {
+    const unsafeWhileRunning: Array<keyof typeof validation.data> = [
+      'chat_jid',
+      'prompt',
+      'schedule_type',
+      'schedule_value',
+      'context_mode',
+      'execution_type',
+      'execution_mode',
+      'script_command',
+      'next_run',
+    ];
+    if (
+      unsafeWhileRunning.some((field) => validation.data[field] !== undefined)
+    ) {
+      return c.json(
+        { error: '任务正在运行中，请等待本次执行完成后再修改配置。' },
+        409,
+      );
+    }
+  }
+
   // Only admin can create/modify script tasks
   const isScriptTask =
-    validation.data.execution_type === 'script' ||
-    (existing.execution_type === 'script' &&
-      validation.data.script_command !== undefined);
+    (validation.data.execution_type ?? existing.execution_type) === 'script';
   if (isScriptTask && authUser.role !== 'admin') {
     return c.json({ error: '只有管理员可以创建或修改脚本类型任务' }, 403);
   }
@@ -281,18 +419,26 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
   }
 
   // Validate chat_jid if being changed
-  const patchData = { ...validation.data } as typeof validation.data & { group_folder?: string };
+  const patchData = { ...validation.data } as typeof validation.data & {
+    group_folder?: string;
+    delivery_route_jid?: string;
+  };
   let effectiveTargetGroup: ReturnType<typeof getRegisteredGroup> = group;
   if (validation.data.chat_jid !== undefined) {
     const targetGroup = getRegisteredGroup(validation.data.chat_jid);
     if (!targetGroup) {
       return c.json({ error: '目标群组不存在' }, 404);
     }
-    if (!canAccessGroup({ id: authUser.id, role: authUser.role }, targetGroup)) {
+    if (
+      !canAccessGroup({ id: authUser.id, role: authUser.role }, targetGroup)
+    ) {
       return c.json({ error: '无权访问目标群组' }, 403);
     }
     // Keep group_folder in sync with chat_jid
     patchData.group_folder = targetGroup.folder;
+    // A Web edit has no thread-scoped source context. Rebind delivery to the
+    // selected workspace/chat itself instead of retaining the previous route.
+    patchData.delivery_route_jid = validation.data.chat_jid;
     effectiveTargetGroup = targetGroup;
   }
 
@@ -316,6 +462,26 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
     );
   }
 
+  // Validate the final definition, not only the fields present in this PATCH.
+  // Otherwise changing agent→script without a command (or clearing the current
+  // command/prompt) persists a task that can only fail at runtime.
+  const finalExecutionType =
+    patchData.execution_type ?? existing.execution_type;
+  const finalPrompt = patchData.prompt ?? existing.prompt;
+  const finalScriptCommand =
+    patchData.script_command !== undefined
+      ? patchData.script_command
+      : existing.script_command;
+  if (finalExecutionType === 'agent' && !finalPrompt.trim()) {
+    return c.json({ error: 'Agent 模式下 prompt 不能为空。' }, 400);
+  }
+  if (finalExecutionType === 'script' && !finalScriptCommand?.trim()) {
+    return c.json({ error: '脚本模式下 script_command 不能为空。' }, 400);
+  }
+  if (finalExecutionType === 'script' && finalExecutionMode !== 'host') {
+    return c.json({ error: SCRIPT_TASK_HOST_REQUIRED_ERROR }, 400);
+  }
+
   // Auto-recalculate next_run when the schedule changes (avoid pulling
   // cron-parser into the frontend), OR when resuming a task whose next_run was
   // cleared. A recurring task that couldn't compute a next run is paused with
@@ -326,18 +492,13 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
   const scheduleChanged =
     patchData.schedule_type !== undefined ||
     patchData.schedule_value !== undefined;
-  // Only recompute on resume for a RECURRING task whose next_run was cleared and
-  // when the caller didn't supply an explicit next_run:
-  //  - exclude 'once' so a completed once-task (status='completed', next_run=NULL,
-  //    schedule_value = its original PAST timestamp) can't be resurrected and
-  //    immediately re-fired by a bare {status:'active'} PATCH;
-  //  - honor a caller-supplied next_run instead of recomputing (and 400-ing) from
-  //    a possibly-corrupt schedule_value.
+  // Rebuild a missing cursor when resuming. This includes future one-shot tasks
+  // restored from soft deletion; restore deliberately clears next_run and leaves
+  // the definition paused until the user explicitly enables it.
   const resumingWithoutNextRun =
     patchData.status === 'active' &&
     existing.status !== 'active' &&
     existing.next_run == null &&
-    existing.schedule_type !== 'once' &&
     patchData.next_run === undefined;
   // A completed once-task can't be "resumed": its schedule is a past one-shot
   // timestamp. Re-activating it would either re-fire the one-shot action or
@@ -355,46 +516,48 @@ tasksRoutes.patch('/:id', authMiddleware, async (c) => {
       400,
     );
   }
-  if (scheduleChanged || resumingWithoutNextRun) {
-    const schedType = patchData.schedule_type ?? existing.schedule_type;
-    const schedValue = patchData.schedule_value ?? existing.schedule_value;
+  const schedType = patchData.schedule_type ?? existing.schedule_type;
+  const schedValue = patchData.schedule_value ?? existing.schedule_value;
+  const enablingOnce =
+    schedType === 'once' &&
+    (patchData.status === 'active' ||
+      (scheduleChanged && existing.status === 'active'));
+  if (scheduleChanged || resumingWithoutNextRun || enablingOnce) {
     try {
-      if (schedType === 'cron') {
-        patchData.next_run = CronExpressionParser.parse(schedValue, { tz: TIMEZONE })
-          .next()
-          .toISOString() || new Date().toISOString();
-      } else if (schedType === 'interval') {
-        // Number() not parseInt(): parseInt('1e16',10) === 1 silently truncates
-        // and the patch ends up with a 1ms interval. Same upper bound as create.
-        const ms = Number(schedValue);
-        if (!Number.isFinite(ms) || ms <= 0) {
-          return c.json({ error: 'Invalid interval value' }, 400);
-        }
-        const MAX_INTERVAL_MS = 365 * 24 * 60 * 60 * 1000;
-        if (ms > MAX_INTERVAL_MS) {
-          return c.json(
-            {
-              error: `Interval exceeds maximum (${MAX_INTERVAL_MS} ms = 1 year). Use cron for longer schedules.`,
-            },
-            400,
-          );
-        }
-        patchData.next_run = new Date(Date.now() + ms).toISOString();
-      } else if (schedType === 'once') {
-        const ts = Date.parse(schedValue);
-        if (isNaN(ts)) {
-          return c.json({ error: 'Invalid once schedule value' }, 400);
-        }
-        patchData.next_run = new Date(ts).toISOString();
+      // Keep the existing one-year REST limit while sharing the scheduler's
+      // canonical cron/interval frequency validation.
+      if (
+        schedType === 'interval' &&
+        Number(schedValue) > 365 * 24 * 60 * 60 * 1000
+      ) {
+        throw new Error('Interval exceeds maximum (1 year)');
       }
-    } catch {
-      return c.json({ error: 'Invalid schedule value for the given schedule type' }, 400);
+      patchData.next_run = enablingOnce
+        ? computeNextRunForTaskResume(schedType, schedValue)
+        : computeNextRunForSchedule(schedType, schedValue);
+    } catch (err) {
+      return c.json(
+        {
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Invalid schedule value for the given schedule type',
+        },
+        400,
+      );
     }
   }
 
-  updateTask(id, patchData);
+  const mutation = updateTaskWithRevision(id, expectedRevision, patchData);
+  if (mutation.status === 'not_found') {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  if (mutation.status === 'conflict') {
+    return revisionConflict(c, mutation.task);
+  }
+  notifyTaskSchedulerChanged();
 
-  return c.json({ success: true });
+  return c.json({ success: true, task: mutation.task });
 });
 
 tasksRoutes.delete('/:id', authMiddleware, (c) => {
@@ -417,47 +580,215 @@ tasksRoutes.delete('/:id', authMiddleware, (c) => {
       );
     }
   }
-  {
-    const denial = denyForeignTask(c, existing, authUser);
-    if (denial) return denial;
-  }
   // Only admin can delete script tasks
   if (existing.execution_type === 'script' && authUser.role !== 'admin') {
     return c.json({ error: '只有管理员可以删除脚本类型任务' }, 403);
   }
 
-  // Prevent deleting a running task
-  if (getRunningTaskIds().includes(id)) {
-    return c.json({ error: '任务正在运行中，请先等待完成或停止任务' }, 409);
-  }
-
-  // Clean up dedicated workspace if exists
-  if (existing.workspace_jid && existing.workspace_folder) {
-    const wsGroup = getRegisteredGroup(existing.workspace_jid);
-    if (wsGroup) {
-      deleteGroupData(existing.workspace_jid, existing.workspace_folder);
-    }
-    // Remove all flow artifacts (groups/, sessions/, ipc/, env/, memory/)
-    removeFlowArtifacts(existing.workspace_folder);
-    const deps = getWebDeps();
-    if (deps) {
-      delete deps.getRegisteredGroups()[existing.workspace_jid];
-    }
-    logger.info(
+  const activeRun = getActiveTaskRunForTask(id);
+  if (!activeRun && getRunningTaskIds().includes(id)) {
+    return c.json(
       {
-        taskId: id,
-        workspaceJid: existing.workspace_jid,
-        workspaceFolder: existing.workspace_folder,
+        error: '任务正在排队或运行中，请先停止当前运行再删除。',
+        code: 'TASK_HAS_ACTIVE_RUN',
+        current_run: activeRun ?? null,
       },
-      'Task workspace deleted',
+      409,
     );
   }
 
-  deleteTask(id);
-  return c.json({ success: true });
+  const rawRevision = Number(c.req.query('expected_revision'));
+  const expectedRevision =
+    Number.isInteger(rawRevision) && rawRevision > 0 ? rawRevision : null;
+  if (expectedRevision === null) {
+    return c.json(
+      {
+        error: 'expected_revision is required. Reload the task and retry.',
+        code: 'TASK_REVISION_REQUIRED',
+        current_task: existing,
+      },
+      428,
+    );
+  }
+  const mutation = softDeleteTaskWithRevision(id, expectedRevision);
+  if (mutation.status === 'not_found') {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  if (mutation.status === 'conflict') {
+    return revisionConflict(c, mutation.task);
+  }
+  if (mutation.status === 'active_run') {
+    return c.json(
+      {
+        error: '任务正在排队或运行中，请先停止当前运行再删除。',
+        code: 'TASK_HAS_ACTIVE_RUN',
+        current_run: mutation.run,
+      },
+      409,
+    );
+  }
+  notifyTaskSchedulerChanged();
+  return c.json({ success: true, task: mutation.task });
 });
 
-tasksRoutes.post('/:id/run', authMiddleware, (c) => {
+tasksRoutes.post('/:id/restore', authMiddleware, async (c) => {
+  const id = c.req.param('id');
+  const existing = getTaskById(id);
+  if (!existing || !existing.deleted_at) {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  const authUser = c.get('user') as AuthUser;
+  if (!canViewTask(existing, authUser)) {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  if (existing.execution_type === 'script' && authUser.role !== 'admin') {
+    return c.json({ error: '只有管理员可以恢复脚本类型任务' }, 403);
+  }
+  const restorePolicyError = getScriptTaskHostExecutionError(
+    existing,
+    getAllRegisteredGroups(),
+  );
+  if (restorePolicyError) {
+    return c.json({ error: restorePolicyError }, 400);
+  }
+  const body = (await c.req.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  const rawRevision = body.expected_revision;
+  const expectedRevision =
+    typeof rawRevision === 'number' &&
+    Number.isInteger(rawRevision) &&
+    rawRevision > 0
+      ? rawRevision
+      : null;
+  if (expectedRevision === null) {
+    return c.json(
+      {
+        error: 'expected_revision is required. Reload the task and retry.',
+        code: 'TASK_REVISION_REQUIRED',
+        current_task: existing,
+      },
+      428,
+    );
+  }
+  const mutation = restoreTaskWithRevision(
+    id,
+    expectedRevision,
+    getSystemSettings().maxTasksPerUser,
+  );
+  if (mutation.status === 'not_found') {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  if (mutation.status === 'conflict') {
+    return revisionConflict(c, mutation.task);
+  }
+  if (mutation.status === 'limit_reached') {
+    return c.json(
+      {
+        error: `定时任务数量已达上限（${mutation.limit}）。请先删除不再需要的任务。`,
+        code: 'TASK_LIMIT_REACHED',
+      },
+      409,
+    );
+  }
+  notifyTaskSchedulerChanged();
+  return c.json({ success: true, task: mutation.task });
+});
+
+tasksRoutes.post('/:id/runs', authMiddleware, async (c) => {
+  const id = c.req.param('id');
+  const existing = getTaskById(id);
+  if (!existing || existing.deleted_at) {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  const authUser = c.get('user') as AuthUser;
+  if (!canViewTask(existing, authUser)) {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  if (existing.execution_type === 'script' && authUser.role !== 'admin') {
+    return c.json({ error: '只有管理员可以运行脚本类型任务' }, 403);
+  }
+  const runPolicyError = getScriptTaskHostExecutionError(
+    existing,
+    getAllRegisteredGroups(),
+  );
+  if (runPolicyError) {
+    updateTaskWithRevision(existing.id, existing.revision, {
+      status: 'paused',
+      next_run: null,
+    });
+    notifyTaskSchedulerChanged();
+    return c.json({ error: runPolicyError }, 400);
+  }
+  const body = (await c.req.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  const idempotencyKey =
+    typeof body.idempotency_key === 'string' && body.idempotency_key.trim()
+      ? body.idempotency_key.trim().slice(0, 200)
+      : crypto.randomUUID();
+  const deps = getWebDeps();
+  if (!deps?.triggerTaskRun) {
+    return c.json({ error: 'Scheduler not available' }, 503);
+  }
+  const result = deps.triggerTaskRun(id, idempotencyKey);
+  if (!result.success) {
+    return c.json({ error: result.error, runId: result.runId }, 409);
+  }
+  const run = result.runId ? getTaskRunById(result.runId) : undefined;
+  return c.json({ success: true, runId: result.runId, run }, 202);
+});
+
+tasksRoutes.get('/:id/runs', authMiddleware, (c) => {
+  const id = c.req.param('id');
+  const existing = getTaskById(id);
+  if (!existing) return c.json({ error: 'Task not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canViewTask(existing, authUser)) {
+    return c.json({ error: 'Task not found' }, 404);
+  }
+  const limitRaw = Number.parseInt(c.req.query('limit') || '20', 10);
+  const limit = Math.min(
+    Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 20,
+    200,
+  );
+  return c.json({ runs: getMergedTaskRunHistory(id, limit) });
+});
+
+tasksRoutes.get('/runs/:runId', authMiddleware, (c) => {
+  const run = getTaskRunById(c.req.param('runId'));
+  if (!run) return c.json({ error: 'Task run not found' }, 404);
+  const task = getTaskById(run.task_id);
+  const authUser = c.get('user') as AuthUser;
+  if (!task || !canViewTask(task, authUser)) {
+    return c.json({ error: 'Task run not found' }, 404);
+  }
+  return c.json({ run });
+});
+
+tasksRoutes.post('/runs/:runId/cancel', authMiddleware, (c) => {
+  const run = getTaskRunById(c.req.param('runId'));
+  if (!run) return c.json({ error: 'Task run not found' }, 404);
+  const task = getTaskById(run.task_id);
+  const authUser = c.get('user') as AuthUser;
+  if (!task || !canViewTask(task, authUser)) {
+    return c.json({ error: 'Task run not found' }, 404);
+  }
+  if (task.execution_type === 'script' && authUser.role !== 'admin') {
+    return c.json({ error: '只有管理员可以停止脚本任务' }, 403);
+  }
+  const deps = getWebDeps();
+  if (!deps?.cancelTaskRun) {
+    return c.json({ error: 'Scheduler not available' }, 503);
+  }
+  const result = deps.cancelTaskRun(run.id);
+  if (!result.success) return c.json({ error: result.error }, 409);
+  return c.json({ success: true, run: getTaskRunById(run.id) });
+});
+
+tasksRoutes.post('/:id/run', authMiddleware, async (c) => {
   const id = c.req.param('id');
   const existing = getTaskById(id);
   if (!existing) return c.json({ error: 'Task not found' }, 404);
@@ -477,24 +808,44 @@ tasksRoutes.post('/:id/run', authMiddleware, (c) => {
       );
     }
   }
-  {
-    const denial = denyForeignTask(c, existing, authUser);
-    if (denial) return denial;
-  }
-
   // Only admin can run script tasks
   if (existing.execution_type === 'script' && authUser.role !== 'admin') {
     return c.json({ error: '只有管理员可以运行脚本类型任务' }, 403);
+  }
+  const legacyRunPolicyError = getScriptTaskHostExecutionError(
+    existing,
+    getAllRegisteredGroups(),
+  );
+  if (legacyRunPolicyError) {
+    updateTaskWithRevision(existing.id, existing.revision, {
+      status: 'paused',
+      next_run: null,
+    });
+    notifyTaskSchedulerChanged();
+    return c.json({ error: legacyRunPolicyError }, 400);
   }
 
   const deps = getWebDeps();
   if (!deps?.triggerTaskRun)
     return c.json({ error: 'Scheduler not available' }, 503);
 
-  const result = deps.triggerTaskRun(id);
-  if (!result.success) return c.json({ error: result.error }, 409);
+  const body = (await c.req.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  const suppliedKey =
+    c.req.header('Idempotency-Key') ||
+    (typeof body.idempotency_key === 'string' ? body.idempotency_key : '');
+  // Requests from legacy clients remain compatible; upgraded clients can
+  // safely retry by reusing either the header or body key.
+  const idempotencyKey =
+    suppliedKey.trim().slice(0, 200) || crypto.randomUUID();
+  const result = deps.triggerTaskRun(id, idempotencyKey);
+  if (!result.success) {
+    return c.json({ error: result.error, runId: result.runId }, 409);
+  }
 
-  return c.json({ success: true });
+  return c.json({ success: true, runId: result.runId, idempotencyKey });
 });
 
 tasksRoutes.get('/:id/logs', authMiddleware, (c) => {
@@ -516,12 +867,6 @@ tasksRoutes.get('/:id/logs', authMiddleware, (c) => {
         403,
       );
     }
-  }
-  // 与 PATCH/DELETE/RUN 对齐：shared workspace 中 member A 不应能读
-  // member B 的任务日志（含 prompt、stderr、tool 输出）。
-  {
-    const denial = denyForeignTask(c, existing, authUser);
-    if (denial) return denial;
   }
   const limitRaw = parseInt(c.req.query('limit') || '20', 10);
   const limit = Math.min(
@@ -549,7 +894,7 @@ function buildParsePrompt(description: string): string {
   - cron 类型: cron 表达式（推荐 5 段：分 时 日 月 周，也支持 6 段含秒）
   - interval 类型: 毫秒数字符串（如 "3600000" 表示 1 小时）
   - once 类型: ISO 8601 日期时间字符串
-- "context_mode": "group" | "isolated" — 上下文模式（大多数情况推荐 "group"）
+- "context_mode": "group" | "isolated" — 上下文模式（默认推荐 "isolated"，表示工作区内独立任务会话，不影响主会话）
 - "summary": string — 用一句话解释你的理解（中文）
 
 注意：
@@ -572,14 +917,22 @@ function buildParsePrompt(description: string): string {
 function parseAiResult(
   result: string,
   description: string,
-): { prompt: string; schedule_type: string; schedule_value: string; summary: string } | null {
+): {
+  prompt: string;
+  schedule_type: string;
+  schedule_value: string;
+  summary: string;
+} | null {
   try {
     let jsonStr = result;
     const fenced = result.match(/```(?:json)?\s*([\s\S]*?)```/);
     if (fenced) jsonStr = fenced[1].trim();
     const parsed = JSON.parse(jsonStr);
     return {
-      prompt: parsed.prompt || description,
+      prompt:
+        typeof parsed.prompt === 'string' && parsed.prompt
+          ? parsed.prompt
+          : description,
       schedule_type: parsed.schedule_type || 'cron',
       schedule_value: parsed.schedule_value || '',
       summary: parsed.summary || '',
@@ -595,9 +948,19 @@ function parseAiResult(
 tasksRoutes.post('/ai', authMiddleware, async (c) => {
   const authUser = c.get('user') as AuthUser;
   const body = await c.req.json().catch(() => ({}));
-  const description = typeof body.description === 'string' ? body.description.trim() : '';
+  const description =
+    typeof body.description === 'string' ? body.description.trim() : '';
   if (!description) {
     return c.json({ error: '请输入任务描述' }, 400);
+  }
+  if (description.length > MAX_TASK_PROMPT_LENGTH) {
+    return c.json(
+      {
+        error: `任务描述不能超过 ${MAX_TASK_PROMPT_LENGTH} 个字符`,
+        code: 'TASK_PROMPT_TOO_LONG',
+      },
+      400,
+    );
   }
   const notifyChannels: string[] | null = body.notify_channels ?? null;
 
@@ -651,26 +1014,62 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
     ? 'host'
     : 'container';
 
-  // Create task immediately with 'parsing' status and description as prompt
-  createTask({
-    id: taskId,
-    group_folder: groupFolder,
-    chat_jid: chatJid,
-    prompt: description,
-    schedule_type: 'cron',
-    schedule_value: '0 0 * * *', // placeholder, will be updated after parsing
-    context_mode: requestedContextMode ?? 'group',
-    execution_type: 'agent',
-    execution_mode: taskExecutionMode,
-    script_command: null,
-    next_run: null,
-    status: 'parsing',
-    created_at: now,
-    created_by: authUser.id,
-    notify_channels: notifyChannels,
-  });
+  // Create task immediately with 'parsing' status and description as prompt.
+  // AI creation is the default UI path, so it must share the same atomic
+  // capacity boundary as manual REST and Agent/MCP creation.
+  const creation = createTaskWithinOwnerLimit(
+    {
+      id: taskId,
+      group_folder: groupFolder,
+      chat_jid: chatJid,
+      prompt: description,
+      schedule_type: 'cron',
+      schedule_value: '0 0 * * *', // placeholder, will be updated after parsing
+      context_mode: requestedContextMode ?? 'isolated',
+      execution_type: 'agent',
+      execution_mode: taskExecutionMode,
+      script_command: null,
+      next_run: null,
+      status: 'parsing',
+      created_at: now,
+      created_by: authUser.id,
+      notify_channels: notifyChannels,
+    },
+    getSystemSettings().maxTasksPerUser,
+  );
+  if (creation.status === 'limit_reached') {
+    return c.json(
+      {
+        error: `定时任务数量已达上限（${creation.limit}）。请先删除不再需要的任务。`,
+        code: 'TASK_LIMIT_REACHED',
+      },
+      409,
+    );
+  }
+  const parsingRevision = getTaskById(taskId)?.revision ?? 1;
 
-  logger.info({ taskId, description: description.slice(0, 80) }, 'AI task created, parsing in background');
+  const updateParsedTask = (
+    updates: Parameters<typeof updateTaskWithRevision>[2],
+  ): boolean => {
+    const mutation = updateTaskWithRevision(taskId, parsingRevision, updates);
+    if (mutation.status === 'updated') return true;
+    if (mutation.status === 'conflict') {
+      logger.info(
+        {
+          taskId,
+          expectedRevision: parsingRevision,
+          currentRevision: mutation.task.revision,
+        },
+        'AI task parse result discarded because the task was edited',
+      );
+    }
+    return false;
+  };
+
+  logger.info(
+    { taskId, description: description.slice(0, 80) },
+    'AI task created, parsing in background',
+  );
 
   // Background: parse with SDK and update task
   void (async () => {
@@ -680,9 +1079,7 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
       const result = await sdkQuery(parsePrompt, { model, timeout: 60_000 });
 
       if (!result) {
-        const cur = getTaskById(taskId);
-        if (!cur || cur.status !== 'parsing') return;
-        updateTask(taskId, {
+        updateParsedTask({
           status: 'paused',
           prompt: description,
         });
@@ -692,62 +1089,81 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
 
       const parsed = parseAiResult(result, description);
       if (!parsed || !parsed.schedule_value) {
-        const cur = getTaskById(taskId);
-        if (!cur || cur.status !== 'parsing') return;
-        updateTask(taskId, {
+        updateParsedTask({
           status: 'paused',
           prompt: description,
         });
         logger.warn({ taskId }, 'AI parse result invalid, task paused');
         return;
       }
-
-      // Compute next_run from parsed schedule
-      let nextRun: string | null = null;
-      try {
-        if (parsed.schedule_type === 'cron') {
-          nextRun = CronExpressionParser.parse(parsed.schedule_value, { tz: TIMEZONE })
-            .next()
-            .toISOString();
-        } else if (parsed.schedule_type === 'interval') {
-          nextRun = new Date(Date.now() + Number(parsed.schedule_value)).toISOString();
-        } else {
-          nextRun = new Date(parsed.schedule_value).toISOString();
-        }
-      } catch {
-        // Invalid schedule, keep paused
-        const cur = getTaskById(taskId);
-        if (!cur || cur.status !== 'parsing') return;
-        updateTask(taskId, {
+      if (parsed.prompt.length > MAX_TASK_PROMPT_LENGTH) {
+        updateParsedTask({
           status: 'paused',
-          prompt: parsed.prompt,
+          prompt: description,
         });
-        logger.warn({ taskId, scheduleValue: parsed.schedule_value }, 'AI parsed schedule invalid, task paused');
+        logger.warn(
+          {
+            taskId,
+            promptLength: parsed.prompt.length,
+            maxPromptLength: MAX_TASK_PROMPT_LENGTH,
+          },
+          'AI parsed prompt exceeded the task prompt limit; task paused',
+        );
         return;
       }
 
-      const cur = getTaskById(taskId);
-      if (!cur || cur.status !== 'parsing') return;
-      updateTask(taskId, {
-        prompt: parsed.prompt,
-        schedule_type: parsed.schedule_type as 'cron' | 'interval' | 'once',
-        schedule_value: parsed.schedule_value,
-        next_run: nextRun,
-        status: 'active',
-      });
+      // Compute next_run using the same validation as REST/MCP. This rejects
+      // sub-minute cron schedules before the task can become active.
+      let nextRun: string | null = null;
+      try {
+        if (!['cron', 'interval', 'once'].includes(parsed.schedule_type)) {
+          throw new Error('Invalid schedule type');
+        }
+        nextRun = computeNextRunForSchedule(
+          parsed.schedule_type as 'cron' | 'interval' | 'once',
+          parsed.schedule_value,
+        );
+      } catch {
+        // Invalid schedule, keep paused
+        updateParsedTask({
+          status: 'paused',
+          prompt: parsed.prompt,
+        });
+        logger.warn(
+          { taskId, scheduleValue: parsed.schedule_value },
+          'AI parsed schedule invalid, task paused',
+        );
+        return;
+      }
+
+      if (
+        !updateParsedTask({
+          prompt: parsed.prompt,
+          schedule_type: parsed.schedule_type as 'cron' | 'interval' | 'once',
+          schedule_value: parsed.schedule_value,
+          next_run: nextRun,
+          status: 'active',
+        })
+      ) {
+        return;
+      }
+      notifyTaskSchedulerChanged();
 
       logger.info(
-        { taskId, scheduleType: parsed.schedule_type, scheduleValue: parsed.schedule_value },
+        {
+          taskId,
+          scheduleType: parsed.schedule_type,
+          scheduleValue: parsed.schedule_value,
+        },
         'AI task parse complete, activated',
       );
     } catch (err) {
       logger.error({ taskId, err }, 'AI task background parse failed');
-      const cur = getTaskById(taskId);
-      if (cur && cur.status === 'parsing') {
-        updateTask(taskId, { status: 'paused' });
-      }
+      updateParsedTask({ status: 'paused' });
     }
-  })().catch((err) => logger.error({ taskId, err }, 'Unhandled AI task parse error'));
+  })().catch((err) =>
+    logger.error({ taskId, err }, 'Unhandled AI task parse error'),
+  );
 
   return c.json({ success: true, taskId });
 });
@@ -757,14 +1173,18 @@ tasksRoutes.post('/ai', authMiddleware, async (c) => {
  */
 tasksRoutes.post('/parse', authMiddleware, async (c) => {
   const body = await c.req.json().catch(() => ({}));
-  const description = typeof body.description === 'string' ? body.description.trim() : '';
+  const description =
+    typeof body.description === 'string' ? body.description.trim() : '';
   if (!description) {
     return c.json({ error: '请输入任务描述' }, 400);
   }
 
   try {
     const model = process.env.RECALL_MODEL || undefined;
-    const result = await sdkQuery(buildParsePrompt(description), { model, timeout: 30_000 });
+    const result = await sdkQuery(buildParsePrompt(description), {
+      model,
+      timeout: 30_000,
+    });
 
     if (!result) {
       return c.json({ error: 'AI 解析失败，请重试或切换到手动模式' }, 502);

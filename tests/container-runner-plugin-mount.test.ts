@@ -19,7 +19,11 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 const SHARED_TMP =
   process.env.HAPPYCLAW_TEST_DATA_DIR ??
   (() => {
-    const d = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-cr-mount-'));
+    // macOS 的 os.tmpdir() 是 /var → /private/var 符号链接，而实现侧对
+    // externalClaudeDir 做了 realpathSync。fixture 先展开，断言才能对齐。
+    const d = fs.realpathSync(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-cr-mount-')),
+    );
     process.env.HAPPYCLAW_TEST_DATA_DIR = d;
     return d;
   })();
@@ -57,7 +61,8 @@ const catalog = await import('../src/plugin-catalog.js');
 const utils = await import('../src/plugin-utils.js');
 const materializer = await import('../src/plugin-materializer.js');
 
-const { buildVolumeMounts, prepareHostPlugins } = containerRunner;
+const { buildVolumeMounts, prepareHostPlugins, replaceHostMcpServersEnv } =
+  containerRunner;
 const { writeCatalogIndex, getCatalogSnapshotDir } = catalog;
 const { CONTAINER_PLUGINS_PATH } = utils;
 const { getUserRuntimeRoot, getUserPluginRuntimeDir } = materializer;
@@ -171,7 +176,11 @@ describe('buildVolumeMounts — Claude Code plugins runtime mount', () => {
       },
     });
 
-    const mounts = buildVolumeMounts(fakeGroup('grp-x', USER) as any, false, true);
+    const mounts = buildVolumeMounts(
+      fakeGroup('grp-x', USER) as any,
+      false,
+      true,
+    );
 
     const pluginMount = mounts.find(
       (m) => m.containerPath === CONTAINER_PLUGINS_PATH,
@@ -192,7 +201,11 @@ describe('buildVolumeMounts — Claude Code plugins runtime mount', () => {
     // The runtime root is created on demand so the bind-mount target exists
     // even for users who haven't enabled anything yet. The mount is a no-op
     // for the CLI (no .claude-plugin/plugin.json under it), but still present.
-    const mounts = buildVolumeMounts(fakeGroup('grp-x', USER) as any, false, true);
+    const mounts = buildVolumeMounts(
+      fakeGroup('grp-x', USER) as any,
+      false,
+      true,
+    );
     const pluginMount = mounts.find(
       (m) => m.containerPath === CONTAINER_PLUGINS_PATH,
     );
@@ -206,10 +219,31 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
   test('admin-owned container mounts external CLAUDE.md, rules, and skills', () => {
     const external = path.join(tmpDataDir, 'external-claude');
     fs.mkdirSync(path.join(external, 'rules'), { recursive: true });
-    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), { recursive: true });
+    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), {
+      recursive: true,
+    });
     fs.writeFileSync(path.join(external, 'CLAUDE.md'), '# admin');
     fs.writeFileSync(path.join(external, 'rules', 'r.md'), '# rule');
-    fs.writeFileSync(path.join(external, 'skills', 'admin-skill', 'SKILL.md'), '# skill');
+    fs.mkdirSync(path.join(external, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(external, 'agents', 'researcher.md'), '# agent');
+    fs.mkdirSync(path.join(external, 'commands'), { recursive: true });
+    fs.writeFileSync(path.join(external, 'commands', 'review.md'), '# command');
+    fs.writeFileSync(
+      path.join(external, 'settings.json'),
+      JSON.stringify({
+        env: { FROM_HOST: 'yes' },
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'true' }] }] },
+        mcpServers: { hostMcp: { command: 'host-mcp' } },
+      }),
+    );
+    fs.writeFileSync(
+      path.join(external, 'settings.local.json'),
+      JSON.stringify({ env: { FROM_LOCAL: 'yes' }, model: 'opus' }),
+    );
+    fs.writeFileSync(
+      path.join(external, 'skills', 'admin-skill', 'SKILL.md'),
+      '# skill',
+    );
     writeSystemSettings({ externalClaudeDir: external });
 
     const mounts = buildVolumeMounts(
@@ -218,29 +252,178 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
       true,
       undefined,
       'main',
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      {
+        id: 'host-context-agent',
+        name: 'Host Context Agent',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          context: { source: 'host_claude' },
+          skills: { mode: 'inherit', ids: [] },
+          mcp: { mode: 'inherit', ids: [] },
+        },
+      } as any,
     );
 
     expect(mounts).toContainEqual({
       hostPath: path.join(external, 'CLAUDE.md'),
-      containerPath: '/workspace/CLAUDE.md',
+      containerPath: '/home/node/.claude/CLAUDE.md',
       readonly: true,
     });
     expect(mounts).toContainEqual({
       hostPath: path.join(external, 'rules'),
-      containerPath: '/workspace/.claude/rules',
+      containerPath: '/home/node/.claude/rules',
       readonly: true,
     });
     expect(mounts).toContainEqual({
-      hostPath: path.join(external, 'skills'),
-      containerPath: '/workspace/external-skills',
+      hostPath: path.join(external, 'agents'),
+      containerPath: '/home/node/.claude/agents',
       readonly: true,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: path.join(external, 'commands'),
+      containerPath: '/home/node/.claude/commands',
+      readonly: true,
+    });
+    expect(mounts).toContainEqual({
+      hostPath: path.join(external, 'skills', 'admin-skill'),
+      containerPath: '/workspace/effective-skills/admin-skill',
+      readonly: true,
+    });
+    const sessionSettings = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          tmpDataDir,
+          'sessions',
+          'admin-workspace',
+          '.claude',
+          'settings.json',
+        ),
+        'utf8',
+      ),
+    );
+    expect(sessionSettings).toMatchObject({
+      model: 'opus',
+      env: {
+        FROM_HOST: 'yes',
+        FROM_LOCAL: 'yes',
+        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0',
+      },
+      hooks: { Stop: expect.any(Array) },
+      mcpServers: { hostMcp: { command: 'host-mcp' } },
+    });
+  });
+
+  test('reusing a session removes native settings and capability mounts after host context is disabled', () => {
+    const external = path.join(tmpDataDir, 'switchable-external-claude');
+    fs.mkdirSync(path.join(external, 'commands'), { recursive: true });
+    fs.writeFileSync(path.join(external, 'commands', 'native.md'), '# native');
+    fs.writeFileSync(
+      path.join(external, 'settings.json'),
+      JSON.stringify({
+        model: 'opus',
+        env: { NATIVE_ONLY: '1' },
+        hooks: { Stop: [{ hooks: [{ type: 'command', command: 'true' }] }] },
+      }),
+    );
+    writeSystemSettings({ externalClaudeDir: external });
+    const group = fakeGroup('switch-context', 'admin') as any;
+    const profile = (source: 'host_claude' | 'managed') =>
+      ({
+        id: `profile-${source}`,
+        name: source,
+        version: 1,
+        identityHash: source,
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          context: { source },
+          skills: {
+            mode: 'disabled',
+            ids: [],
+            host: { mode: 'disabled', ids: [] },
+          },
+          mcp: { mode: 'disabled', ids: [] },
+        },
+      }) as any;
+
+    const inheritedMounts = buildVolumeMounts(
+      group,
+      false,
+      true,
+      undefined,
+      'main',
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      profile('host_claude'),
+    );
+    expect(inheritedMounts).toContainEqual({
+      hostPath: path.join(external, 'commands'),
+      containerPath: '/home/node/.claude/commands',
+      readonly: true,
+    });
+    const settingsFile = path.join(
+      tmpDataDir,
+      'sessions',
+      group.folder,
+      '.claude',
+      'settings.json',
+    );
+    expect(JSON.parse(fs.readFileSync(settingsFile, 'utf8'))).toMatchObject({
+      model: 'opus',
+      env: { NATIVE_ONLY: '1' },
+      hooks: { Stop: expect.any(Array) },
+    });
+
+    const managedMounts = buildVolumeMounts(
+      group,
+      false,
+      true,
+      undefined,
+      'main',
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      profile('managed'),
+    );
+    expect(
+      managedMounts.some(
+        (mount) => mount.containerPath === '/home/node/.claude/commands',
+      ),
+    ).toBe(false);
+    const managedSettings = JSON.parse(
+      fs.readFileSync(settingsFile, 'utf8'),
+    ) as Record<string, unknown>;
+    expect(managedSettings).not.toHaveProperty('model');
+    expect(managedSettings).not.toHaveProperty('hooks');
+    expect(managedSettings.env).not.toHaveProperty('NATIVE_ONLY');
+    expect(managedSettings).toMatchObject({
+      env: { CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '0' },
+      mcpServers: {},
     });
   });
 
   test('ordinary user container does not mount admin external triad', () => {
     const external = path.join(tmpDataDir, 'external-claude');
     fs.mkdirSync(path.join(external, 'rules'), { recursive: true });
-    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), { recursive: true });
+    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), {
+      recursive: true,
+    });
     fs.writeFileSync(path.join(external, 'CLAUDE.md'), '# admin');
     writeSystemSettings({ externalClaudeDir: external });
 
@@ -252,9 +435,590 @@ describe('buildVolumeMounts — Claude triad inheritance', () => {
       'alice-home',
     );
 
-    expect(mounts.some((m) => m.containerPath === '/workspace/CLAUDE.md')).toBe(false);
-    expect(mounts.some((m) => m.containerPath === '/workspace/.claude/rules')).toBe(false);
-    expect(mounts.some((m) => m.containerPath === '/workspace/external-skills')).toBe(false);
+    expect(mounts.some((m) => m.containerPath === '/workspace/CLAUDE.md')).toBe(
+      false,
+    );
+    expect(
+      mounts.some((m) => m.containerPath === '/workspace/.claude/rules'),
+    ).toBe(false);
+    expect(
+      mounts.some((m) => m.containerPath === '/workspace/external-skills'),
+    ).toBe(false);
+  });
+
+  test('admin managed Agent does not mount host triad without context opt-in', () => {
+    const external = path.join(tmpDataDir, 'external-claude');
+    fs.mkdirSync(path.join(external, 'skills', 'admin-skill'), {
+      recursive: true,
+    });
+    fs.writeFileSync(path.join(external, 'CLAUDE.md'), '# admin');
+    writeSystemSettings({ externalClaudeDir: external });
+
+    const mounts = buildVolumeMounts(
+      fakeGroup('admin-workspace', 'admin') as any,
+      false,
+      true,
+      undefined,
+      'main',
+    );
+
+    expect(
+      mounts.some((mount) => mount.containerPath === '/workspace/CLAUDE.md'),
+    ).toBe(false);
+    expect(
+      mounts.some(
+        (mount) => mount.containerPath === '/workspace/external-skills',
+      ),
+    ).toBe(false);
+    expect(
+      mounts.some(
+        (mount) => mount.containerPath === '/workspace/project-skills',
+      ),
+    ).toBe(false);
+    expect(
+      mounts.some((mount) => mount.containerPath === '/workspace/user-skills'),
+    ).toBe(false);
+  });
+});
+
+describe('buildVolumeMounts — AgentProfile runtime policy', () => {
+  test('does not write retired Agent tool restrictions into the container env', () => {
+    buildVolumeMounts(
+      fakeGroup('grp-policy-tools', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      {
+        id: 'agent-profile-policy',
+        name: 'Policy Agent',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          skills: { mode: 'inherit', ids: [] },
+          mcp: { mode: 'inherit', ids: [] },
+        },
+      },
+    );
+
+    const envFile = path.join(tmpDataDir, 'env', 'grp-policy-tools', 'env');
+    const envContent = fs.readFileSync(envFile, 'utf-8');
+    expect(envContent).not.toContain('HAPPYCLAW_AGENT_DISALLOWED_TOOLS=');
+    expect(envContent).not.toContain('HAPPYCLAW_AGENT_TOOL_POLICY=');
+  });
+
+  test('custom skills policy exposes only selected user skills', () => {
+    const sourceRoot = path.join(tmpDataDir, 'skills', USER);
+    fs.mkdirSync(path.join(sourceRoot, 'review'), { recursive: true });
+    fs.mkdirSync(path.join(sourceRoot, 'research'), { recursive: true });
+    fs.writeFileSync(path.join(sourceRoot, 'review', 'SKILL.md'), '# review');
+    fs.writeFileSync(
+      path.join(sourceRoot, 'research', 'SKILL.md'),
+      '# research',
+    );
+
+    const mounts = buildVolumeMounts(
+      fakeGroup('grp-policy-skills', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      {
+        id: 'agent-profile-skills',
+        name: 'Skills Agent',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          skills: { mode: 'custom', ids: ['review'] },
+          mcp: { mode: 'inherit', ids: [] },
+        },
+      },
+    );
+
+    expect(
+      mounts.find(
+        (mount) => mount.containerPath === '/workspace/effective-skills/review',
+      ),
+    ).toMatchObject({
+      hostPath: path.join(sourceRoot, 'review'),
+      readonly: true,
+    });
+    expect(
+      mounts.some(
+        (mount) =>
+          mount.containerPath === '/workspace/effective-skills/research',
+      ),
+    ).toBe(false);
+  });
+
+  test('container startup quarantines a persistent session Skill ghost', () => {
+    const sourceRoot = path.join(tmpDataDir, 'skills', USER);
+    fs.mkdirSync(path.join(sourceRoot, 'selected'), { recursive: true });
+    fs.writeFileSync(
+      path.join(sourceRoot, 'selected', 'SKILL.md'),
+      '# selected',
+    );
+    const folder = 'grp-session-ghost';
+    const sessionClaudeDir = path.join(
+      tmpDataDir,
+      'sessions',
+      folder,
+      '.claude',
+    );
+    fs.mkdirSync(path.join(sessionClaudeDir, 'skills', 'ghost'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(sessionClaudeDir, 'skills', 'ghost', 'SKILL.md'),
+      '# ghost',
+    );
+
+    const mounts = buildVolumeMounts(
+      fakeGroup(folder, USER) as any,
+      false,
+      true,
+    );
+
+    expect(fs.existsSync(path.join(sessionClaudeDir, 'skills', 'ghost'))).toBe(
+      false,
+    );
+    const quarantined = fs
+      .readdirSync(path.join(sessionClaudeDir, 'orphaned-skills'))
+      .flatMap((timestamp) =>
+        fs.readdirSync(
+          path.join(sessionClaudeDir, 'orphaned-skills', timestamp),
+        ),
+      );
+    expect(quarantined).toContain('ghost');
+    expect(
+      mounts.find(
+        (mount) =>
+          mount.containerPath === '/workspace/effective-skills/selected',
+      ),
+    ).toMatchObject({ hostPath: path.join(sourceRoot, 'selected') });
+  });
+
+  test('custom Skill profiles expose only the selected per-Skill mount', () => {
+    const sourceRoot = path.join(tmpDataDir, 'skills', USER);
+    fs.mkdirSync(path.join(sourceRoot, 'review'), { recursive: true });
+    fs.writeFileSync(path.join(sourceRoot, 'review', 'SKILL.md'), '# review');
+
+    const profile = (version: number) => ({
+      id: 'agent-profile-skills-versioned',
+      name: 'Skills Agent',
+      version,
+      identityHash: `hash-${version}`,
+      identityPrompt: '',
+      includeClaudePreset: true,
+      runtimePolicy: {
+        skills: { mode: 'custom' as const, ids: ['review'] },
+        mcp: { mode: 'inherit' as const, ids: [] },
+      },
+    });
+
+    const v1Mounts = buildVolumeMounts(
+      fakeGroup('grp-policy-skills-v1', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      profile(1),
+    );
+    const v2Mounts = buildVolumeMounts(
+      fakeGroup('grp-policy-skills-v2', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      profile(2),
+    );
+    for (const mounts of [v1Mounts, v2Mounts]) {
+      expect(
+        mounts.find(
+          (mount) =>
+            mount.containerPath === '/workspace/effective-skills/review',
+        ),
+      ).toMatchObject({ hostPath: path.join(sourceRoot, 'review') });
+      expect(
+        mounts.some(
+          (mount) => mount.containerPath === '/workspace/user-skills',
+        ),
+      ).toBe(false);
+    }
+  });
+
+  test('custom skill policy fails closed when a selected skill is deleted', () => {
+    const sourceRoot = path.join(tmpDataDir, 'skills', USER);
+    const skillDir = path.join(sourceRoot, 'review');
+    fs.mkdirSync(skillDir, { recursive: true });
+    fs.writeFileSync(path.join(skillDir, 'SKILL.md'), '# review');
+    const profile = {
+      id: 'agent-profile-deleted-skill',
+      name: 'Skills Agent',
+      version: 1,
+      identityHash: 'hash',
+      identityPrompt: '',
+      includeClaudePreset: true,
+      runtimePolicy: {
+        skills: { mode: 'custom' as const, ids: ['review'] },
+        mcp: { mode: 'inherit' as const, ids: [] },
+      },
+    };
+
+    buildVolumeMounts(
+      fakeGroup('grp-policy-skill-before-delete', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      profile,
+    );
+    fs.unlinkSync(path.join(skillDir, 'SKILL.md'));
+
+    expect(() =>
+      buildVolumeMounts(
+        fakeGroup('grp-policy-skill-after-delete', USER) as any,
+        false,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined, // modelOverride
+        undefined, // codexAuthMaterial
+        undefined, // grokAuthMaterial
+        undefined,
+        profile,
+      ),
+    ).toThrow(
+      'AgentProfile agent-profile-deleted-skill requires unavailable skill definition review/SKILL.md',
+    );
+  });
+
+  test('custom managed MCP is additive to project MCP and excludes unselected managed servers', () => {
+    const mcpDir = path.join(tmpDataDir, 'mcp-servers', USER);
+    fs.mkdirSync(mcpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(mcpDir, 'servers.json'),
+      JSON.stringify({
+        servers: {
+          github: { enabled: true, command: 'github-mcp' },
+          slack: { enabled: true, command: 'slack-mcp' },
+        },
+      }),
+    );
+    const systemMcpDir = path.join(tmpDataDir, 'mcp-servers', 'system');
+    fs.mkdirSync(systemMcpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(systemMcpDir, 'servers.json'),
+      JSON.stringify({
+        servers: {
+          platform: {
+            enabled: true,
+            command: 'platform-mcp',
+            memberAccess: 'shared',
+          },
+        },
+      }),
+    );
+    const workspaceDir = path.join(tmpDataDir, 'groups', 'grp-policy-mcp');
+    fs.mkdirSync(workspaceDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(workspaceDir, '.mcp.json'),
+      JSON.stringify({
+        mcpServers: { projectDb: { command: 'project-db-mcp' } },
+      }),
+    );
+
+    buildVolumeMounts(
+      fakeGroup('grp-policy-mcp', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      {
+        id: 'agent-profile-mcp',
+        name: 'MCP Agent',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          skills: { mode: 'inherit', ids: [] },
+          mcp: { mode: 'custom', ids: ['github'] },
+        },
+      },
+    );
+
+    const settingsFile = path.join(
+      tmpDataDir,
+      'sessions',
+      'grp-policy-mcp',
+      '.claude',
+      'settings.json',
+    );
+    const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8')) as {
+      mcpServers?: Record<string, unknown>;
+    };
+    expect(Object.keys(settings.mcpServers ?? {}).sort()).toEqual([
+      'github',
+      'projectDb',
+    ]);
+    expect(settings.mcpServers).not.toHaveProperty('slack');
+    const envFile = path.join(tmpDataDir, 'env', 'grp-policy-mcp', 'env');
+    expect(fs.readFileSync(envFile, 'utf8')).toContain(
+      "HAPPYCLAW_AGENT_MCP_POLICY='custom'",
+    );
+  });
+
+  test('host_claude always includes every host Skill and MCP while managed custom selection stays additive', () => {
+    const external = path.join(tmpDataDir, 'native-claude');
+    writeSystemSettings({ externalClaudeDir: external });
+    fs.mkdirSync(path.join(external, 'skills', 'native-a'), {
+      recursive: true,
+    });
+    fs.mkdirSync(path.join(external, 'skills', 'native-b'), {
+      recursive: true,
+    });
+    fs.writeFileSync(
+      path.join(external, 'skills', 'native-a', 'SKILL.md'),
+      '# native a',
+    );
+    fs.writeFileSync(
+      path.join(external, 'skills', 'native-b', 'SKILL.md'),
+      '# native b',
+    );
+    fs.writeFileSync(
+      path.join(external, 'settings.json'),
+      JSON.stringify({
+        mcpServers: {
+          nativeA: { command: 'native-a' },
+          nativeB: { command: 'native-b' },
+        },
+      }),
+    );
+    const managedSkills = path.join(tmpDataDir, 'skills', USER);
+    for (const id of ['managed-a', 'managed-b']) {
+      fs.mkdirSync(path.join(managedSkills, id), { recursive: true });
+      fs.writeFileSync(path.join(managedSkills, id, 'SKILL.md'), `# ${id}`);
+    }
+    const mcpDir = path.join(tmpDataDir, 'mcp-servers', USER);
+    fs.mkdirSync(mcpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(mcpDir, 'servers.json'),
+      JSON.stringify({
+        servers: {
+          managedA: { enabled: true, command: 'managed-a' },
+          managedB: { enabled: true, command: 'managed-b' },
+        },
+      }),
+    );
+    const systemMcpDir = path.join(tmpDataDir, 'mcp-servers', 'system');
+    fs.mkdirSync(systemMcpDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(systemMcpDir, 'servers.json'),
+      JSON.stringify({
+        servers: {
+          platform: {
+            enabled: true,
+            command: 'platform-mcp',
+            memberAccess: 'shared',
+          },
+        },
+      }),
+    );
+
+    const group = fakeGroup('grp-host-additive', USER) as any;
+    const mounts = buildVolumeMounts(
+      group,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      {
+        id: 'host-additive-profile',
+        name: 'Host additive',
+        version: 1,
+        identityHash: 'hash',
+        identityPrompt: '',
+        includeClaudePreset: true,
+        runtimePolicy: {
+          context: {
+            source: 'host_claude',
+            auto_compact_window: 0,
+            auto_compact_percentage: 0,
+          },
+          skills: { mode: 'custom', ids: ['managed-a'] },
+          mcp: {
+            mode: 'custom',
+            ids: ['system:platform', 'managedA'],
+          },
+        },
+      },
+    );
+
+    for (const id of ['native-a', 'native-b', 'managed-a']) {
+      expect(
+        mounts.find(
+          (mount) =>
+            mount.containerPath === `/workspace/effective-skills/${id}`,
+        ),
+      ).toBeTruthy();
+    }
+    expect(
+      mounts.some(
+        (mount) =>
+          mount.containerPath === '/workspace/effective-skills/managed-b',
+      ),
+    ).toBe(false);
+    const settings = JSON.parse(
+      fs.readFileSync(
+        path.join(
+          tmpDataDir,
+          'sessions',
+          group.folder,
+          '.claude',
+          'settings.json',
+        ),
+        'utf8',
+      ),
+    );
+    expect(Object.keys(settings.mcpServers).sort()).toEqual([
+      'managedA',
+      'nativeA',
+      'nativeB',
+      'platform',
+    ]);
+  });
+
+  test('host MCP env replaces inherited servers and clears disabled policy', () => {
+    const env = {
+      HAPPYCLAW_USER_MCP_SERVERS_JSON: JSON.stringify({ stale: {} }),
+      KEEP_ME: 'yes',
+    };
+
+    replaceHostMcpServersEnv(env, { github: { command: 'github-mcp' } });
+    expect(JSON.parse(env.HAPPYCLAW_USER_MCP_SERVERS_JSON)).toEqual({
+      github: { command: 'github-mcp' },
+    });
+    expect(env.KEEP_ME).toBe('yes');
+
+    replaceHostMcpServersEnv(env, {});
+    expect(env.HAPPYCLAW_USER_MCP_SERVERS_JSON).toBeUndefined();
+    expect(env.KEEP_ME).toBe('yes');
+  });
+
+  test('custom MCP policy fails closed when a selected server is disabled', () => {
+    const mcpDir = path.join(tmpDataDir, 'mcp-servers', USER);
+    fs.mkdirSync(mcpDir, { recursive: true });
+    const serversFile = path.join(mcpDir, 'servers.json');
+    fs.writeFileSync(
+      serversFile,
+      JSON.stringify({
+        servers: {
+          github: { enabled: true, command: 'github-mcp' },
+        },
+      }),
+    );
+    const profile = {
+      id: 'agent-profile-disabled-mcp',
+      name: 'MCP Agent',
+      version: 1,
+      identityHash: 'hash',
+      identityPrompt: '',
+      includeClaudePreset: true,
+      runtimePolicy: {
+        skills: { mode: 'inherit' as const, ids: [] },
+        mcp: { mode: 'custom' as const, ids: ['github'] },
+      },
+    };
+    buildVolumeMounts(
+      fakeGroup('grp-policy-mcp-before-disable', USER) as any,
+      false,
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined, // modelOverride
+      undefined, // codexAuthMaterial
+      undefined, // grokAuthMaterial
+      undefined,
+      profile,
+    );
+    fs.writeFileSync(
+      serversFile,
+      JSON.stringify({
+        servers: {
+          github: { enabled: false, command: 'github-mcp' },
+        },
+      }),
+    );
+
+    expect(() =>
+      buildVolumeMounts(
+        fakeGroup('grp-policy-mcp-after-disable', USER) as any,
+        false,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined, // modelOverride
+        undefined, // codexAuthMaterial
+        undefined, // grokAuthMaterial
+        undefined,
+        profile,
+      ),
+    ).toThrow(
+      'AgentProfile agent-profile-disabled-mcp requires unavailable MCP server(s): github',
+    );
   });
 });
 

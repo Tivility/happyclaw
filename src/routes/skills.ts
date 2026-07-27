@@ -10,8 +10,29 @@ import type { Variables } from '../web-context.js';
 import type { AuthUser } from '../types.js';
 import { authMiddleware } from '../middleware/auth.js';
 import { DATA_DIR } from '../config.js';
+import { listAgentProfilesForUser } from '../db.js';
+import {
+  userCapabilityLockKey,
+  withCapabilityScopeLocks,
+} from '../capability-lock.js';
+import {
+  CapabilityRuntimeCommitError,
+  mutateCapabilityAroundRuntimeQuiesce,
+  repairCapabilityRuntimeSafetyBlock,
+} from '../capability-runtime-mutation.js';
+import { WorkspaceRuntimeQuiesceError } from '../agent-profile-runtime.js';
 import { getEffectiveExternalDir } from '../runtime-config.js';
 import { validateSafeHttpsUrl } from '../url-safety.js';
+import {
+  skillArchiveUploadBodyLimit,
+  SKILL_ARCHIVE_MAX_FILE_BYTES,
+} from '../http-upload-policy.js';
+import {
+  importSkillsFromGit,
+  importSkillsFromZip,
+  installSkillDirectoriesTransactionally,
+  runCommandWithDirectoryQuota,
+} from '../skill-import-service.js';
 import {
   parseFrontmatter,
   validateSkillId,
@@ -19,9 +40,17 @@ import {
   listFiles,
   scanSkillDirectory,
 } from '../skill-utils.js';
+import { resolveEffectiveSkills } from '../effective-skill-resolver.js';
 
 const execFileAsync = promisify(execFile);
-let skillInstallLock: Promise<void> = Promise.resolve();
+const MAX_SKILL_INSTALL_BYTES = 64 * 1024 * 1024;
+
+interface SkillMutationLockState {
+  tail: Promise<void>;
+  references: number;
+}
+
+const skillMutationLocks = new Map<string, SkillMutationLockState>();
 
 const skillsRoutes = new Hono<{ Variables: Variables }>();
 
@@ -32,9 +61,18 @@ interface Skill {
   name: string;
   description: string;
   source: 'user' | 'project' | 'external';
+  sourceKey: string;
+  conflictSources: Array<'user' | 'project' | 'external'>;
+  /** The highest-precedence enabled definition, or null when none are enabled. */
+  effectiveSource: 'user' | 'project' | 'external' | null;
+  effective: boolean;
+  readonly: boolean;
   enabled: boolean;
   packageName?: string;
   installedAt?: string;
+  installSource?: string;
+  sourceUrl?: string;
+  version?: string;
   userInvocable: boolean;
   allowedTools: string[];
   argumentHint: string | null;
@@ -50,9 +88,11 @@ interface SkillsManifest {
   skills: Record<
     string,
     {
-      packageName: string;
+      packageName?: string;
       installedAt: string;
       source: string;
+      sourceUrl?: string;
+      version?: string;
     }
   >;
 }
@@ -92,7 +132,13 @@ function readSkillsManifest(userId: string): SkillsManifest {
 function writeSkillsManifest(userId: string, manifest: SkillsManifest): void {
   const manifestPath = getSkillsManifestPath(userId);
   fs.mkdirSync(path.dirname(manifestPath), { recursive: true });
-  fs.writeFileSync(manifestPath, JSON.stringify(manifest, null, 2));
+  const temporaryPath = `${manifestPath}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(manifest, null, 2));
+    fs.renameSync(temporaryPath, manifestPath);
+  } finally {
+    fs.rmSync(temporaryPath, { force: true });
+  }
 }
 
 /**
@@ -116,6 +162,30 @@ function updateSkillsManifest(
   writeSkillsManifest(userId, manifest);
 }
 
+function recordImportedSkills(
+  userId: string,
+  installedSkillIds: string[],
+  metadata: Omit<SkillsManifest['skills'][string], 'installedAt'>,
+): void {
+  const manifest = readSkillsManifest(userId);
+  const installedAt = new Date().toISOString();
+  for (const id of installedSkillIds) {
+    manifest.skills[id] = { ...metadata, installedAt };
+  }
+  writeSkillsManifest(userId, manifest);
+}
+
+function applyManifestMetadata(
+  skill: Skill,
+  meta: SkillsManifest['skills'][string],
+): void {
+  skill.packageName = meta.packageName;
+  skill.installedAt = meta.installedAt;
+  skill.installSource = meta.source;
+  skill.sourceUrl = meta.sourceUrl;
+  skill.version = meta.version;
+}
+
 /**
  * Remove a skill from the manifest when it is deleted.
  */
@@ -131,7 +201,23 @@ function removeFromSkillsManifest(userId: string, skillId: string): void {
 // are imported from '../skill-utils.js'
 
 function scanDirectory(rootDir: string, source: 'user' | 'project'): Skill[] {
-  return scanSkillDirectory(rootDir, source) as Skill[];
+  return (
+    scanSkillDirectory(rootDir, source) as Omit<
+      Skill,
+      | 'sourceKey'
+      | 'conflictSources'
+      | 'effectiveSource'
+      | 'effective'
+      | 'readonly'
+    >[]
+  ).map((skill) => ({
+    ...skill,
+    sourceKey: `${source}:${skill.id}`,
+    conflictSources: [],
+    effectiveSource: null,
+    effective: false,
+    readonly: source !== 'user',
+  }));
 }
 
 function discoverSkills(userId: string, userRole?: string): Skill[] {
@@ -145,7 +231,9 @@ function discoverSkills(userId: string, userRole?: string): Skill[] {
     if (fs.existsSync(extSkillsDir)) {
       const scanned = scanDirectory(extSkillsDir, 'project');
       for (const s of scanned) {
-        (s as any).source = 'external';
+        s.source = 'external';
+        s.sourceKey = `external:${s.id}`;
+        s.readonly = true;
       }
       externalSkills.push(...scanned);
     }
@@ -157,27 +245,68 @@ function discoverSkills(userId: string, userRole?: string): Skill[] {
   for (const skill of userSkills) {
     const meta = skillsManifest.skills[skill.id];
     if (meta) {
-      skill.packageName = meta.packageName;
-      skill.installedAt = meta.installedAt;
+      applyManifestMetadata(skill, meta);
     }
   }
 
-  // 按优先级去重（user > project > external），同 ID 高优先级覆盖低优先级
-  const seen = new Set<string>();
-  const result: Skill[] = [];
-  for (const skill of [...userSkills, ...projectSkills, ...externalSkills]) {
-    if (!seen.has(skill.id)) {
-      seen.add(skill.id);
-      result.push(skill);
-    }
+  // Preserve every source instead of silently dropping name collisions.
+  // Runtime order is host → project → managed-user. Disabled definitions
+  // remain inspectable, but cannot shadow an enabled lower-precedence source.
+  const result = [...externalSkills, ...projectSkills, ...userSkills];
+  const effectiveManifest = resolveEffectiveSkills({
+    layers: [
+      ...(userRole === 'admin'
+        ? [
+            {
+              source: 'host' as const,
+              root: path.join(getEffectiveExternalDir(), 'skills'),
+            },
+          ]
+        : []),
+      { source: 'project', root: getProjectSkillsDir() },
+      { source: 'managed', root: getUserSkillsDir(userId) },
+    ],
+    managedPolicy: { mode: 'inherit' },
+  });
+  const selectedById = new Map(
+    effectiveManifest.selected.map((skill) => [skill.id, skill]),
+  );
+  const sourcesById = new Map<string, Skill['source'][]>();
+  for (const skill of result) {
+    const sources = sourcesById.get(skill.id) ?? [];
+    sources.push(skill.source);
+    sourcesById.set(skill.id, sources);
+  }
+  for (const skill of result) {
+    const sources = sourcesById.get(skill.id) ?? [];
+    skill.conflictSources = sources.filter((source) => source !== skill.source);
+    const effective = selectedById.get(skill.id);
+    const effectiveSource =
+      effective?.source === 'managed'
+        ? 'user'
+        : effective?.source === 'host'
+          ? 'external'
+          : effective?.source === 'project'
+            ? 'project'
+            : null;
+    skill.effectiveSource = effectiveSource;
+    skill.effective = effectiveSource === skill.source && skill.enabled;
   }
   return result;
 }
 
-function getSkillDetail(skillId: string, userId: string, userRole?: string): SkillDetail | null {
+function getSkillDetail(
+  skillId: string,
+  userId: string,
+  userRole?: string,
+  requestedSource?: string,
+): SkillDetail | null {
   if (!validateSkillId(skillId)) return null;
 
-  const searchDirs: Array<{ rootDir: string; source: 'user' | 'project' | 'external' }> = [
+  let searchDirs: Array<{
+    rootDir: string;
+    source: 'user' | 'project' | 'external';
+  }> = [
     { rootDir: getUserSkillsDir(userId), source: 'user' },
     { rootDir: getProjectSkillsDir(), source: 'project' },
   ];
@@ -186,6 +315,10 @@ function getSkillDetail(skillId: string, userId: string, userRole?: string): Ski
     if (fs.existsSync(extSkillsDir)) {
       searchDirs.push({ rootDir: extSkillsDir, source: 'external' });
     }
+  }
+  if (requestedSource) {
+    if (!['user', 'project', 'external'].includes(requestedSource)) return null;
+    searchDirs = searchDirs.filter(({ source }) => source === requestedSource);
   }
 
   const skillsManifest = readSkillsManifest(userId);
@@ -217,11 +350,19 @@ function getSkillDetail(skillId: string, userId: string, userRole?: string): Ski
       const frontmatter = parseFrontmatter(content);
       const stats = fs.statSync(skillDir);
 
+      const discovered = discoverSkills(userId, userRole).find(
+        (candidate) => candidate.id === skillId && candidate.source === source,
+      );
       const detail: SkillDetail = {
         id: skillId,
         name: frontmatter.name || skillId,
         description: frontmatter.description || '',
         source,
+        sourceKey: `${source}:${skillId}`,
+        conflictSources: discovered?.conflictSources ?? [],
+        effectiveSource: discovered?.effectiveSource ?? null,
+        effective: discovered?.effective ?? false,
+        readonly: source !== 'user',
         enabled,
         userInvocable:
           frontmatter['user-invocable'] === undefined
@@ -239,8 +380,7 @@ function getSkillDetail(skillId: string, userId: string, userRole?: string): Ski
       if (source === 'user') {
         const meta = skillsManifest.skills[skillId];
         if (meta) {
-          detail.packageName = meta.packageName;
-          detail.installedAt = meta.installedAt;
+          applyManifestMetadata(detail, meta);
         }
       }
 
@@ -332,25 +472,6 @@ function findModifiedEntries(dir: string, afterMs: number): string[] {
     // ignore
   }
   return result;
-}
-
-/**
- * Copy a skill entry (directory or symlink target) to dest.
- * Resolves symlinks and copies the real content so the copy is self-contained.
- */
-function copySkillToUser(src: string, dest: string): void {
-  // Resolve symlink to get the real directory
-  let realSrc = src;
-  try {
-    const lstat = fs.lstatSync(src);
-    if (lstat.isSymbolicLink()) {
-      realSrc = fs.realpathSync(src);
-    }
-  } catch {
-    // use src as-is
-  }
-
-  fs.cpSync(realSrc, dest, { recursive: true });
 }
 
 // --- Search cache (LRU, 5min TTL, max 100 entries) ---
@@ -490,19 +611,74 @@ async function fetchSkillMdFromGitHub(
   return null;
 }
 
-async function withSkillInstallLock<T>(fn: () => Promise<T>): Promise<T> {
-  const previous = skillInstallLock.catch(() => undefined);
+async function withPrivateUserSkillMutationLock<T>(
+  userId: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  let state = skillMutationLocks.get(userId);
+  if (!state) {
+    state = { tail: Promise.resolve(), references: 0 };
+    skillMutationLocks.set(userId, state);
+  }
+  state.references += 1;
+  const previous = state.tail.catch(() => undefined);
   let release: () => void = () => undefined;
   const current = new Promise<void>((resolve) => {
     release = resolve;
   });
-  skillInstallLock = previous.then(() => current);
+  state.tail = previous.then(() => current);
   await previous;
   try {
     return await fn();
   } finally {
     release();
+    state.references -= 1;
+    if (state.references === 0 && skillMutationLocks.get(userId) === state) {
+      skillMutationLocks.delete(userId);
+    }
   }
+}
+
+async function withUserSkillMutationLock<T>(
+  userId: string,
+  fn: () => Promise<T> | T,
+): Promise<T> {
+  return withCapabilityScopeLocks([userCapabilityLockKey(userId)], () =>
+    withPrivateUserSkillMutationLock(userId, fn),
+  );
+}
+
+async function withUserSkillRuntimeMutation<T>(
+  userId: string,
+  ids: string[] | undefined,
+  reason: string,
+  mutation: () => Promise<T> | T,
+): Promise<{ value: T; invalidatedRuntimeJids: number }> {
+  return withUserSkillMutationLock(userId, async () => {
+    const impact = { kind: 'skills' as const, ownerUserId: userId, ids };
+    await repairCapabilityRuntimeSafetyBlock(impact, reason);
+    return mutateCapabilityAroundRuntimeQuiesce(impact, reason, mutation);
+  });
+}
+
+function skillRuntimeMutationFailure(error: unknown, action: string) {
+  if (error instanceof WorkspaceRuntimeQuiesceError) {
+    return {
+      error: error.persisted
+        ? `${action} was saved, but runtime cleanup failed; retry the request`
+        : `Failed to stop affected workspaces; ${action} was not saved`,
+      persisted: error.persisted,
+      retryable: true,
+    };
+  }
+  if (error instanceof CapabilityRuntimeCommitError) {
+    return {
+      error: `${action} has an uncertain commit outcome; retry the request to finish fail-closed cleanup`,
+      persisted: 'unknown',
+      retryable: true,
+    };
+  }
+  return null;
 }
 
 // --- Routes ---
@@ -588,11 +764,148 @@ skillsRoutes.get('/search/detail', authMiddleware, async (c) => {
   return c.json({ detail: null });
 });
 
+skillsRoutes.post('/import/git', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  const body = (await c.req.json().catch(() => ({}))) as Record<
+    string,
+    unknown
+  >;
+  const url = typeof body.url === 'string' ? body.url.trim() : '';
+  const ref = typeof body.ref === 'string' ? body.ref.trim() : undefined;
+  const subdirectory =
+    typeof body.subdirectory === 'string'
+      ? body.subdirectory.trim()
+      : undefined;
+  if (!url) return c.json({ error: 'Git URL is required' }, 400);
+
+  try {
+    const runtimeResult = await withUserSkillRuntimeMutation(
+      authUser.id,
+      undefined,
+      'Git Skill import changed managed capabilities',
+      async () => {
+        try {
+          return {
+            result: await importSkillsFromGit({
+              url,
+              ref: ref || undefined,
+              subdirectory: subdirectory || undefined,
+              targetRoot: getUserSkillsDir(authUser.id),
+              replace: body.replace === true,
+              commit: (imported) =>
+                recordImportedSkills(authUser.id, imported.installed, {
+                  source: 'git',
+                  sourceUrl: imported.sourceUrl,
+                  version: imported.version,
+                }),
+            }),
+          };
+        } catch (error) {
+          // Import validation/conflict errors are transactional and therefore
+          // safe to return after the runner snapshot has been quiesced.
+          return { error };
+        }
+      },
+    );
+    if ('error' in runtimeResult.value) throw runtimeResult.value.error;
+    return c.json({
+      success: true,
+      ...runtimeResult.value.result,
+      invalidated_runtime_jids: runtimeResult.invalidatedRuntimeJids,
+    });
+  } catch (error) {
+    const runtimeFailure = skillRuntimeMutationFailure(
+      error,
+      'Git Skill import',
+    );
+    if (runtimeFailure) return c.json(runtimeFailure, 503);
+    const message =
+      error instanceof Error ? error.message : 'Git import failed';
+    return c.json(
+      { error: message },
+      message.startsWith('Skill already exists:') ? 409 : 400,
+    );
+  }
+});
+
+skillsRoutes.post(
+  '/import/archive',
+  authMiddleware,
+  skillArchiveUploadBodyLimit,
+  async (c) => {
+    const authUser = c.get('user') as AuthUser;
+    let formData: FormData;
+    try {
+      formData = await c.req.formData();
+    } catch {
+      return c.json({ error: 'A multipart ZIP archive is required' }, 400);
+    }
+    const archive = formData.get('archive');
+    if (
+      !(archive instanceof File) ||
+      !archive.name.toLowerCase().endsWith('.zip')
+    ) {
+      return c.json({ error: 'archive must be a ZIP file' }, 400);
+    }
+    if (archive.size > SKILL_ARCHIVE_MAX_FILE_BYTES) {
+      return c.json({ error: 'ZIP archive is too large (max 10MB)' }, 413);
+    }
+    try {
+      const runtimeResult = await withUserSkillRuntimeMutation(
+        authUser.id,
+        undefined,
+        'ZIP Skill import changed managed capabilities',
+        async () => {
+          try {
+            return {
+              result: await importSkillsFromZip({
+                archive: Buffer.from(await archive.arrayBuffer()),
+                archiveName: archive.name,
+                targetRoot: getUserSkillsDir(authUser.id),
+                replace: formData.get('replace') === 'true',
+                commit: (imported) =>
+                  recordImportedSkills(authUser.id, imported.installed, {
+                    source: 'zip',
+                    sourceUrl: imported.sourceUrl,
+                  }),
+              }),
+            };
+          } catch (error) {
+            return { error };
+          }
+        },
+      );
+      if ('error' in runtimeResult.value) throw runtimeResult.value.error;
+      return c.json({
+        success: true,
+        ...runtimeResult.value.result,
+        invalidated_runtime_jids: runtimeResult.invalidatedRuntimeJids,
+      });
+    } catch (error) {
+      const runtimeFailure = skillRuntimeMutationFailure(
+        error,
+        'ZIP Skill import',
+      );
+      if (runtimeFailure) return c.json(runtimeFailure, 503);
+      const message =
+        error instanceof Error ? error.message : 'ZIP import failed';
+      return c.json(
+        { error: message },
+        message.startsWith('Skill already exists:') ? 409 : 400,
+      );
+    }
+  },
+);
 
 skillsRoutes.get('/:id', authMiddleware, (c) => {
   const id = c.req.param('id');
   const authUser = c.get('user') as AuthUser;
-  const skill = getSkillDetail(id, authUser.id, authUser.role);
+  const skill = getSkillDetail(
+    id,
+    authUser.id,
+    authUser.role,
+    c.req.query('source'),
+  );
 
   if (!skill) {
     return c.json({ error: 'Skill not found' }, 404);
@@ -600,6 +913,23 @@ skillsRoutes.get('/:id', authMiddleware, (c) => {
 
   return c.json({ skill });
 });
+
+function referencedByCustomSkillProfiles(
+  userId: string,
+  skillIds: Iterable<string>,
+): Array<{ id: string; name: string; skillIds: string[] }> {
+  const candidates = new Set(skillIds);
+  return listAgentProfilesForUser(userId)
+    .filter((profile) => profile.runtime_policy.skills.mode === 'custom')
+    .map((profile) => ({
+      id: profile.id,
+      name: profile.name,
+      skillIds: profile.runtime_policy.skills.ids.filter((id) =>
+        candidates.has(id),
+      ),
+    }))
+    .filter((profile) => profile.skillIds.length > 0);
+}
 
 // Toggle enable/disable for user-level skills via SKILL.md ↔ SKILL.md.disabled rename.
 // Project-level skills are read-only.
@@ -616,49 +946,100 @@ skillsRoutes.patch('/:id', authMiddleware, async (c) => {
 
   if (!validateSkillId(id)) return c.json({ error: 'Invalid skill ID' }, 400);
 
-  const userDir = getUserSkillsDir(authUser.id);
-  const skillDir = path.join(userDir, id);
+  return withUserSkillMutationLock(authUser.id, async () => {
+    const userDir = getUserSkillsDir(authUser.id);
+    const skillDir = path.join(userDir, id);
 
-  if (!fs.existsSync(skillDir)) {
-    return c.json(
-      { error: 'Skill not found or is not a user-level skill' },
-      404,
+    if (!fs.existsSync(skillDir)) {
+      return c.json(
+        { error: 'Skill not found or is not a user-level skill' },
+        404,
+      );
+    }
+    if (!enabled) {
+      const referencedByProfiles = referencedByCustomSkillProfiles(
+        authUser.id,
+        [id],
+      );
+      if (referencedByProfiles.length > 0) {
+        return c.json(
+          {
+            error: 'Skill is selected by one or more Agents',
+            referencedByProfiles,
+          },
+          409,
+        );
+      }
+    }
+    if (!validateSkillPath(userDir, skillDir)) {
+      return c.json({ error: 'Invalid skill path' }, 400);
+    }
+
+    const srcPath = path.join(
+      skillDir,
+      enabled ? 'SKILL.md.disabled' : 'SKILL.md',
     );
-  }
-  if (!validateSkillPath(userDir, skillDir)) {
-    return c.json({ error: 'Invalid skill path' }, 400);
-  }
-
-  const srcPath = path.join(
-    skillDir,
-    enabled ? 'SKILL.md.disabled' : 'SKILL.md',
-  );
-  const dstPath = path.join(
-    skillDir,
-    enabled ? 'SKILL.md' : 'SKILL.md.disabled',
-  );
-
-  if (!fs.existsSync(srcPath)) {
-    return c.json(
-      { error: 'Skill not found or already in desired state' },
-      404,
+    const dstPath = path.join(
+      skillDir,
+      enabled ? 'SKILL.md' : 'SKILL.md.disabled',
     );
-  }
 
-  fs.renameSync(srcPath, dstPath);
-  return c.json({ success: true });
+    if (!fs.existsSync(srcPath)) {
+      return c.json(
+        { error: 'Skill not found or already in desired state' },
+        404,
+      );
+    }
+
+    const impact = {
+      kind: 'skills' as const,
+      ownerUserId: authUser.id,
+      ids: [id],
+    };
+    try {
+      await repairCapabilityRuntimeSafetyBlock(
+        impact,
+        `Skill ${id} toggle cleanup`,
+      );
+      const result = await mutateCapabilityAroundRuntimeQuiesce(
+        impact,
+        `Skill ${id} ${enabled ? 'enabled' : 'disabled'}`,
+        () => fs.renameSync(srcPath, dstPath),
+      );
+      return c.json({
+        success: true,
+        invalidated_runtime_jids: result.invalidatedRuntimeJids,
+      });
+    } catch (error) {
+      const failure = skillRuntimeMutationFailure(error, 'Skill toggle');
+      if (failure) return c.json(failure, 503);
+      throw error;
+    }
+  });
 });
 
 /**
  * Delete a user-level skill by ID.
  * Reusable by both the HTTP route and IPC handler.
  */
-function deleteSkillForUser(
+function deleteSkillForUserUnlocked(
   userId: string,
   skillId: string,
 ): { success: boolean; error?: string } {
   if (!validateSkillId(skillId)) {
     return { success: false, error: 'Invalid skill ID' };
+  }
+
+  const referencedByProfiles = referencedByCustomSkillProfiles(userId, [
+    skillId,
+  ]);
+  if (referencedByProfiles.length > 0) {
+    return {
+      success: false,
+      error: `Skill is selected by Agent(s): ${referencedByProfiles
+        .map((profile) => profile.name)
+        .join(', ')}`,
+    };
   }
 
   const userDir = getUserSkillsDir(userId);
@@ -675,11 +1056,27 @@ function deleteSkillForUser(
     return { success: false, error: 'Invalid skill path' };
   }
 
+  const backupDir = path.join(
+    userDir,
+    `.delete-${skillId}-${process.pid}-${Date.now()}`,
+  );
+  const previousManifest = readSkillsManifest(userId);
   try {
-    fs.rmSync(skillDir, { recursive: true, force: true });
-    removeFromSkillsManifest(userId, skillId);
+    fs.renameSync(skillDir, backupDir);
+    const nextManifest = structuredClone(previousManifest);
+    delete nextManifest.skills[skillId];
+    writeSkillsManifest(userId, nextManifest);
+    fs.rmSync(backupDir, { recursive: true, force: true });
     return { success: true };
   } catch (error) {
+    try {
+      if (fs.existsSync(backupDir) && !fs.existsSync(skillDir)) {
+        fs.renameSync(backupDir, skillDir);
+      }
+      writeSkillsManifest(userId, previousManifest);
+    } catch {
+      // Preserve the original error; a leftover hidden backup remains recoverable.
+    }
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Unknown error',
@@ -687,45 +1084,198 @@ function deleteSkillForUser(
   }
 }
 
-// 批量删除所有用户级技能（清理旧的同步副本）
-skillsRoutes.delete('/user-all', authMiddleware, (c) => {
-  const authUser = c.get('user') as AuthUser;
-  const userDir = getUserSkillsDir(authUser.id);
-  let deleted = 0;
-  try {
-    if (fs.existsSync(userDir)) {
-      for (const entry of fs.readdirSync(userDir, { withFileTypes: true })) {
-        if (entry.name.startsWith('.')) continue;
-        const p = path.join(userDir, entry.name);
-        try {
-          fs.rmSync(p, { recursive: true, force: true });
-          deleted++;
-        } catch { /* ignore */ }
-      }
-    }
-  } catch {
-    return c.json({ error: 'Failed to delete user skills' }, 500);
+async function deleteSkillForUser(
+  userId: string,
+  skillId: string,
+): Promise<{
+  success: boolean;
+  error?: string;
+  retryable?: boolean;
+  invalidatedRuntimeJids?: number;
+}> {
+  if (!validateSkillId(skillId)) {
+    return { success: false, error: 'Invalid skill ID' };
   }
-  return c.json({ success: true, deleted });
+  return withUserSkillMutationLock(userId, async () => {
+    const impact = {
+      kind: 'skills' as const,
+      ownerUserId: userId,
+      ids: [skillId],
+    };
+    let repairedRuntimeJids = 0;
+    try {
+      repairedRuntimeJids = await repairCapabilityRuntimeSafetyBlock(
+        impact,
+        `Skill ${skillId} deletion cleanup`,
+      );
+    } catch (error) {
+      const failure = skillRuntimeMutationFailure(error, 'Skill deletion');
+      return {
+        success: false,
+        error: failure?.error ?? 'Failed to repair Skill runtime cleanup',
+        retryable: failure?.retryable ?? true,
+      };
+    }
+
+    const userDir = getUserSkillsDir(userId);
+    const skillDir = path.join(userDir, skillId);
+    if (!fs.existsSync(skillDir)) {
+      if (repairedRuntimeJids > 0) {
+        return {
+          success: true,
+          invalidatedRuntimeJids: repairedRuntimeJids,
+        };
+      }
+      return {
+        success: false,
+        error: 'Skill not found or is a project-level skill',
+      };
+    }
+    const referencedByProfiles = referencedByCustomSkillProfiles(userId, [
+      skillId,
+    ]);
+    if (referencedByProfiles.length > 0) {
+      return {
+        success: false,
+        error: `Skill is selected by Agent(s): ${referencedByProfiles
+          .map((profile) => profile.name)
+          .join(', ')}`,
+      };
+    }
+    if (!validateSkillPath(userDir, skillDir)) {
+      return { success: false, error: 'Invalid skill path' };
+    }
+
+    try {
+      const result = await mutateCapabilityAroundRuntimeQuiesce(
+        impact,
+        `Skill ${skillId} deleted`,
+        () => deleteSkillForUserUnlocked(userId, skillId),
+      );
+      return {
+        ...result.value,
+        invalidatedRuntimeJids: result.invalidatedRuntimeJids,
+      };
+    } catch (error) {
+      const failure = skillRuntimeMutationFailure(error, 'Skill deletion');
+      return {
+        success: false,
+        error: failure?.error ?? 'Failed to delete Skill safely',
+        retryable: failure?.retryable ?? true,
+      };
+    }
+  });
+}
+
+// 批量删除所有用户级技能（清理旧的同步副本）
+skillsRoutes.delete('/user-all', authMiddleware, async (c) => {
+  const authUser = c.get('user') as AuthUser;
+  return withUserSkillMutationLock(authUser.id, async () => {
+    const userDir = getUserSkillsDir(authUser.id);
+    const installedIds = fs.existsSync(userDir)
+      ? fs
+          .readdirSync(userDir, { withFileTypes: true })
+          .filter((entry) => !entry.name.startsWith('.'))
+          .map((entry) => entry.name)
+      : [];
+    const referencedByProfiles = referencedByCustomSkillProfiles(
+      authUser.id,
+      installedIds,
+    );
+    if (referencedByProfiles.length > 0) {
+      return c.json(
+        {
+          error: 'One or more Skills are selected by Agents',
+          referencedByProfiles,
+        },
+        409,
+      );
+    }
+    try {
+      const impact = {
+        kind: 'skills' as const,
+        ownerUserId: authUser.id,
+        ids: installedIds,
+      };
+      await repairCapabilityRuntimeSafetyBlock(
+        impact,
+        'Bulk Skill deletion cleanup',
+      );
+      const result = await mutateCapabilityAroundRuntimeQuiesce(
+        impact,
+        'All managed user Skills deleted',
+        () => {
+          const previousManifest = readSkillsManifest(authUser.id);
+          const transactionDir = path.join(
+            userDir,
+            `.delete-all-${process.pid}-${Date.now()}`,
+          );
+          const moved: Array<{ source: string; backup: string }> = [];
+          try {
+            fs.mkdirSync(transactionDir, { recursive: true });
+            for (const entry of fs.readdirSync(userDir, {
+              withFileTypes: true,
+            })) {
+              if (entry.name.startsWith('.')) continue;
+              const source = path.join(userDir, entry.name);
+              const backup = path.join(transactionDir, entry.name);
+              fs.renameSync(source, backup);
+              moved.push({ source, backup });
+            }
+            writeSkillsManifest(authUser.id, { skills: {} });
+            fs.rmSync(transactionDir, { recursive: true, force: true });
+            return { success: true as const, deleted: moved.length };
+          } catch {
+            for (const { source, backup } of moved.reverse()) {
+              if (fs.existsSync(backup) && !fs.existsSync(source)) {
+                fs.renameSync(backup, source);
+              }
+            }
+            writeSkillsManifest(authUser.id, previousManifest);
+            fs.rmSync(transactionDir, { recursive: true, force: true });
+            return { success: false as const };
+          }
+        },
+      );
+      if (!result.value.success) {
+        return c.json({ error: 'Failed to delete user skills' }, 500);
+      }
+      return c.json({
+        success: true,
+        deleted: result.value.deleted,
+        invalidated_runtime_jids: result.invalidatedRuntimeJids,
+      });
+    } catch (error) {
+      const failure = skillRuntimeMutationFailure(error, 'Bulk Skill deletion');
+      if (failure) return c.json(failure, 503);
+      throw error;
+    }
+  });
 });
 
 skillsRoutes.delete('/:id', authMiddleware, async (c) => {
   const id = c.req.param('id');
   const authUser = c.get('user') as AuthUser;
-  const result = deleteSkillForUser(authUser.id, id);
+  const result = await deleteSkillForUser(authUser.id, id);
 
   if (!result.success) {
-    const status =
-      result.error === 'Invalid skill ID' ||
-      result.error === 'Invalid skill path'
+    const status = result.retryable
+      ? 503
+      : result.error === 'Invalid skill ID' ||
+          result.error === 'Invalid skill path'
         ? 400
         : result.error?.includes('not found')
           ? 404
-          : 500;
+          : result.error?.startsWith('Skill is selected by Agent(s):')
+            ? 409
+            : 500;
     return c.json({ error: result.error }, status);
   }
 
-  return c.json({ success: true });
+  return c.json({
+    success: true,
+    invalidated_runtime_jids: result.invalidatedRuntimeJids ?? 0,
+  });
 });
 
 /**
@@ -734,7 +1284,7 @@ skillsRoutes.delete('/:id', authMiddleware, async (c) => {
  * the real ~/.claude/skills, eliminating race conditions across concurrent installs.
  * Reusable by both the HTTP route and IPC handler.
  */
-async function installSkillForUser(
+async function installSkillForUserUnlocked(
   userId: string,
   pkg: string,
 ): Promise<{ success: boolean; installed?: string[]; error?: string }> {
@@ -760,14 +1310,24 @@ async function installSkillForUser(
   fs.mkdirSync(tempSkillsDir, { recursive: true });
 
   try {
-    await execFileAsync(
-      'npx',
-      ['-y', 'skills', 'add', pkg, '--global', '--yes', '-a', 'claude-code'],
-      {
-        timeout: 60_000,
-        env: { ...process.env, HOME: tempHome },
-      },
-    );
+    await runCommandWithDirectoryQuota({
+      command: 'npx',
+      args: [
+        '-y',
+        'skills',
+        'add',
+        pkg,
+        '--global',
+        '--yes',
+        '-a',
+        'claude-code',
+      ],
+      watchDir: tempHome,
+      maxBytes: MAX_SKILL_INSTALL_BYTES,
+      timeoutMs: 60_000,
+      label: 'Skill package installation',
+      env: { ...process.env, HOME: tempHome },
+    });
 
     // Discover all skill directories installed into the temp location
     const installedEntries: string[] = [];
@@ -788,21 +1348,17 @@ async function installSkillForUser(
       };
     }
 
-    // Copy resolved skill content to per-user directory
+    // Install all directories and their manifest metadata as one transaction.
     const userDir = getUserSkillsDir(userId);
-    fs.mkdirSync(userDir, { recursive: true });
-
-    for (const name of installedEntries) {
-      const src = path.join(tempSkillsDir, name);
-      const dest = path.join(userDir, name);
-      if (fs.existsSync(dest)) {
-        fs.rmSync(dest, { recursive: true, force: true });
-      }
-      copySkillToUser(src, dest);
-    }
-
-    // Write manifest metadata
-    updateSkillsManifest(userId, pkg, installedEntries);
+    installSkillDirectoriesTransactionally(
+      installedEntries.map((id) => ({
+        id,
+        dir: fs.realpathSync(path.join(tempSkillsDir, id)),
+      })),
+      userDir,
+      true,
+      (installedIds) => updateSkillsManifest(userId, pkg, installedIds),
+    );
 
     return { success: true, installed: installedEntries };
   } catch (error) {
@@ -817,6 +1373,37 @@ async function installSkillForUser(
     } catch {
       /* ignore cleanup errors */
     }
+  }
+}
+
+async function installSkillForUser(
+  userId: string,
+  pkg: string,
+): Promise<{
+  success: boolean;
+  installed?: string[];
+  error?: string;
+  retryable?: boolean;
+  invalidatedRuntimeJids?: number;
+}> {
+  try {
+    const result = await withUserSkillRuntimeMutation(
+      userId,
+      undefined,
+      'Skill package installation changed managed capabilities',
+      () => installSkillForUserUnlocked(userId, pkg),
+    );
+    return {
+      ...result.value,
+      invalidatedRuntimeJids: result.invalidatedRuntimeJids,
+    };
+  } catch (error) {
+    const failure = skillRuntimeMutationFailure(error, 'Skill installation');
+    return {
+      success: false,
+      error: failure?.error ?? 'Failed to install Skill safely',
+      retryable: failure?.retryable ?? true,
+    };
   }
 }
 
@@ -838,11 +1425,19 @@ skillsRoutes.post('/install', authMiddleware, async (c) => {
   if (!result.success) {
     return c.json(
       { error: 'Failed to install skill', details: result.error },
-      result.error === 'Invalid package name format' ? 400 : 500,
+      result.retryable
+        ? 503
+        : result.error === 'Invalid package name format'
+          ? 400
+          : 500,
     );
   }
 
-  return c.json({ success: true, installed: result.installed });
+  return c.json({
+    success: true,
+    installed: result.installed,
+    invalidated_runtime_jids: result.invalidatedRuntimeJids ?? 0,
+  });
 });
 
 // Reinstall a skill by its ID — requires the skill to have a packageName in the manifest.
@@ -854,114 +1449,174 @@ skillsRoutes.post('/:id/reinstall', authMiddleware, async (c) => {
     return c.json({ error: 'Invalid skill ID' }, 400);
   }
 
-  const manifest = readSkillsManifest(authUser.id);
-  const meta = manifest.skills[id];
-  if (!meta?.packageName) {
-    return c.json(
-      { error: 'Skill has no package info — cannot reinstall' },
-      400,
-    );
-  }
-
-  // A package can install MULTIPLE sibling skills, and installSkillForUser
-  // rewrites EVERY skill dir the package ships (it rm's each destination before
-  // copying). Backing up only `id` would let a failed reinstall permanently
-  // destroy the live siblings it deleted. So back up every skill that shares
-  // this packageName (including `id`) and restore them all on failure.
-  const userDir = getUserSkillsDir(authUser.id);
-  const siblingIds = Object.keys(manifest.skills).filter(
-    (sid) => manifest.skills[sid]?.packageName === meta.packageName,
-  );
-  if (!siblingIds.includes(id)) siblingIds.push(id);
-
-  for (const sid of siblingIds) {
-    if (!validateSkillPath(userDir, path.join(userDir, sid))) {
-      return c.json({ error: 'Invalid skill path' }, 400);
-    }
-  }
-
-  type SkillBackup = {
-    sid: string;
-    dir: string;
-    // null when the sibling had a manifest entry but no on-disk dir (desync):
-    // there is nothing to rename back, only the manifest entry to restore.
-    backupDir: string | null;
-    meta: SkillsManifest['skills'][string];
-  };
-  const backups: SkillBackup[] = [];
-  // Restore every backed-up sibling (dir + manifest entry). Best-effort: a
-  // failure here leaves the *.reinstall-bak dir on disk for manual recovery.
-  const restoreBackups = (): void => {
-    for (const b of backups) {
-      try {
-        if (b.backupDir) {
-          fs.rmSync(b.dir, { recursive: true, force: true }); // clear partial install
-          fs.renameSync(b.backupDir, b.dir);
-        }
-        const m = readSkillsManifest(authUser.id);
-        m.skills[b.sid] = b.meta;
-        writeSkillsManifest(authUser.id, m);
-      } catch {
-        /* best-effort rollback */
-      }
-    }
-  };
-
-  // Back up each sibling dir (rename, don't delete) so a failed reinstall can
-  // roll back instead of permanently destroying the user's skills. The manifest
-  // entry is recorded for backup whenever it exists — even if its dir is already
-  // missing (manifest/dir desync) — so removeFromSkillsManifest below is always
-  // recoverable on a failed reinstall.
-  try {
-    for (const sid of siblingIds) {
-      const entry = manifest.skills[sid];
-      const dir = path.join(userDir, sid);
-      const backupDir = `${dir}.reinstall-bak`;
-      let savedBackupDir: string | null = null;
-      if (fs.existsSync(dir)) {
-        fs.rmSync(backupDir, { recursive: true, force: true }); // clear stale backup
-        fs.renameSync(dir, backupDir);
-        savedBackupDir = backupDir;
-      }
-      if (entry) backups.push({ sid, dir, backupDir: savedBackupDir, meta: entry });
-      removeFromSkillsManifest(authUser.id, sid);
-    }
-  } catch (err) {
-    restoreBackups();
-    return c.json(
-      {
-        error: 'Failed to back up old skill',
-        details: err instanceof Error ? err.message : 'Unknown error',
-      },
-      500,
-    );
-  }
-
-  const installResult = await installSkillForUser(
-    authUser.id,
-    meta.packageName,
-  );
-  if (!installResult.success) {
-    // Roll back: restoreBackups removes any partial install dirs and restores
-    // every sibling so nothing is lost.
-    restoreBackups();
-    return c.json(
-      { error: 'Failed to reinstall skill', details: installResult.error },
-      500,
-    );
-  }
-
-  // Success — drop all backups (skip entries that had no on-disk dir to back up).
-  for (const b of backups) {
-    if (!b.backupDir) continue;
+  return withUserSkillMutationLock(authUser.id, async () => {
+    const impact = {
+      kind: 'skills' as const,
+      ownerUserId: authUser.id,
+      // A package reinstall can add/remove sibling Skills across versions, so
+      // conservatively invalidate every Agent that consumes managed Skills.
+      ids: undefined,
+    };
     try {
-      fs.rmSync(b.backupDir, { recursive: true, force: true });
-    } catch {
-      /* leftover backup is harmless */
+      await repairCapabilityRuntimeSafetyBlock(
+        impact,
+        `Skill ${id} reinstall cleanup`,
+      );
+    } catch (error) {
+      const failure = skillRuntimeMutationFailure(error, 'Skill reinstall');
+      if (failure) return c.json(failure, 503);
+      throw error;
     }
-  }
 
-  return c.json({ success: true, installed: installResult.installed });
+    const manifest = readSkillsManifest(authUser.id);
+    const meta = manifest.skills[id];
+    if (!meta?.packageName) {
+      return c.json(
+        { error: 'Skill has no package info — cannot reinstall' },
+        400,
+      );
+    }
+    const packageName = meta.packageName;
+
+    // A package can install MULTIPLE sibling skills, and installSkillForUser
+    // rewrites EVERY skill dir the package ships (it rm's each destination before
+    // copying). Backing up only `id` would let a failed reinstall permanently
+    // destroy the live siblings it deleted. So back up every skill that shares
+    // this packageName (including `id`) and restore them all on failure.
+    const userDir = getUserSkillsDir(authUser.id);
+    const siblingIds = Object.keys(manifest.skills).filter(
+      (sid) => manifest.skills[sid]?.packageName === packageName,
+    );
+    if (!siblingIds.includes(id)) siblingIds.push(id);
+
+    for (const sid of siblingIds) {
+      if (!validateSkillPath(userDir, path.join(userDir, sid))) {
+        return c.json({ error: 'Invalid skill path' }, 400);
+      }
+    }
+
+    type SkillBackup = {
+      sid: string;
+      dir: string;
+      // null when the sibling had a manifest entry but no on-disk dir (desync):
+      // there is nothing to rename back, only the manifest entry to restore.
+      backupDir: string | null;
+      meta: SkillsManifest['skills'][string];
+    };
+    const backups: SkillBackup[] = [];
+    // Restore every backed-up sibling (dir + manifest entry). Best-effort: a
+    // failure here leaves the *.reinstall-bak dir on disk for manual recovery.
+    const restoreBackups = (): boolean => {
+      let restored = true;
+      for (const b of backups) {
+        try {
+          if (b.backupDir) {
+            fs.rmSync(b.dir, { recursive: true, force: true }); // clear partial install
+            fs.renameSync(b.backupDir, b.dir);
+          }
+          const m = readSkillsManifest(authUser.id);
+          m.skills[b.sid] = b.meta;
+          writeSkillsManifest(authUser.id, m);
+        } catch {
+          restored = false;
+        }
+      }
+      return restored;
+    };
+
+    try {
+      const runtimeResult = await mutateCapabilityAroundRuntimeQuiesce(
+        impact,
+        `Skill package ${packageName} reinstalled`,
+        async () => {
+          // Back up each sibling dir (rename, don't delete) so a failed
+          // reinstall can roll back instead of destroying live Skills.
+          try {
+            for (const sid of siblingIds) {
+              const entry = manifest.skills[sid];
+              const dir = path.join(userDir, sid);
+              const backupDir = `${dir}.reinstall-bak`;
+              let savedBackupDir: string | null = null;
+              if (fs.existsSync(dir)) {
+                fs.rmSync(backupDir, { recursive: true, force: true });
+                fs.renameSync(dir, backupDir);
+                savedBackupDir = backupDir;
+              }
+              if (entry) {
+                backups.push({
+                  sid,
+                  dir,
+                  backupDir: savedBackupDir,
+                  meta: entry,
+                });
+              }
+              removeFromSkillsManifest(authUser.id, sid);
+            }
+          } catch (error) {
+            if (!restoreBackups()) {
+              throw new Error('Failed to roll back Skill reinstall backup');
+            }
+            return {
+              success: false as const,
+              error: 'Failed to back up old skill',
+              details: error instanceof Error ? error.message : 'Unknown error',
+            };
+          }
+
+          const installResult = await installSkillForUserUnlocked(
+            authUser.id,
+            packageName,
+          );
+          if (!installResult.success) {
+            if (!restoreBackups()) {
+              throw new Error(
+                'Failed to roll back unsuccessful Skill reinstall',
+              );
+            }
+            return {
+              success: false as const,
+              error: 'Failed to reinstall skill',
+              details: installResult.error,
+            };
+          }
+
+          // Success — drop backups. A leftover hidden backup is harmless and
+          // remains available for manual recovery if removal fails.
+          for (const b of backups) {
+            if (!b.backupDir) continue;
+            try {
+              fs.rmSync(b.backupDir, { recursive: true, force: true });
+            } catch {
+              /* retain recoverable backup */
+            }
+          }
+          return {
+            success: true as const,
+            installed: installResult.installed,
+          };
+        },
+      );
+
+      if (!runtimeResult.value.success) {
+        return c.json(
+          {
+            error: runtimeResult.value.error,
+            details: runtimeResult.value.details,
+          },
+          500,
+        );
+      }
+      return c.json({
+        success: true,
+        installed: runtimeResult.value.installed,
+        invalidated_runtime_jids: runtimeResult.invalidatedRuntimeJids,
+      });
+    } catch (error) {
+      const failure = skillRuntimeMutationFailure(error, 'Skill reinstall');
+      if (failure) return c.json(failure, 503);
+      throw error;
+    }
+  });
 });
 
 export { getUserSkillsDir, installSkillForUser, deleteSkillForUser };

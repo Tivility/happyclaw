@@ -123,6 +123,19 @@ async function loadContainerRunner(tmpDir: string) {
         args: ['user-tool.js'],
       },
     }),
+      // 分层 MCP（system/user）：容器最终的 mcpServers 由 resolveManagedMcpPolicy
+      // 从 layers 解析，不是直接用 loadUserMcpServers。mock 必须反映这条真实
+      // 链路，否则用户配置的 server 进不了容器。
+      loadManagedMcpLayers: () => ({
+        system: {},
+        user: { userTool: { command: 'node', args: ['user-tool.js'] } },
+        manifestHash: 'test-hash',
+        ids: ['user:userTool'],
+      }),
+      resolveManagedMcpPolicy: (layers: any, policy: any) =>
+        policy?.mode === 'disabled'
+          ? { servers: {}, missing: [] }
+          : { servers: { ...layers.system, ...layers.user }, missing: [] },
   }));
 
   vi.doMock('../src/mount-security.js', () => ({

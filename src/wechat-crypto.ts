@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { fetch as undiciFetch, type Dispatcher } from 'undici';
 
 import { logger } from './logger.js';
 
@@ -79,17 +80,22 @@ export async function downloadAndDecryptMedia(
   encryptQueryParam: string,
   aesKeyBase64: string,
   cdnBaseUrl?: string,
+  dispatcher?: Dispatcher,
 ): Promise<Buffer> {
   const url = buildCdnDownloadUrl(encryptQueryParam, cdnBaseUrl);
   const key = parseAesKey(aesKeyBase64);
 
-  logger.debug({ url: url.slice(0, 120) }, 'Downloading encrypted media from CDN');
+  logger.debug(
+    { url: url.slice(0, 120) },
+    'Downloading encrypted media from CDN',
+  );
 
-  const resp = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+  const resp = await undiciFetch(url, {
+    signal: AbortSignal.timeout(60_000),
+    dispatcher,
+  });
   if (!resp.ok) {
-    throw new Error(
-      `CDN download failed: ${resp.status} ${resp.statusText}`,
-    );
+    throw new Error(`CDN download failed: ${resp.status} ${resp.statusText}`);
   }
 
   const ciphertext = Buffer.from(await resp.arrayBuffer());
@@ -103,6 +109,7 @@ export async function uploadBufferToCdn(params: {
   filekey: string;
   cdnBaseUrl?: string;
   aeskey: Buffer;
+  dispatcher?: Dispatcher;
 }): Promise<{ downloadParam: string }> {
   const encrypted = encryptAesEcb(params.buf, params.aeskey);
   const url = buildCdnUploadUrl({
@@ -114,24 +121,21 @@ export async function uploadBufferToCdn(params: {
   let lastError: Error | undefined;
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const resp = await fetch(url, {
+      const resp = await undiciFetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/octet-stream' },
         body: new Uint8Array(encrypted),
         signal: AbortSignal.timeout(120_000),
+        dispatcher: params.dispatcher,
       });
 
       if (!resp.ok) {
-        throw new Error(
-          `CDN upload failed: ${resp.status} ${resp.statusText}`,
-        );
+        throw new Error(`CDN upload failed: ${resp.status} ${resp.statusText}`);
       }
 
       const downloadParam = resp.headers.get('x-encrypted-param');
       if (!downloadParam) {
-        throw new Error(
-          'CDN upload response missing x-encrypted-param header',
-        );
+        throw new Error('CDN upload response missing x-encrypted-param header');
       }
 
       return { downloadParam };
@@ -166,6 +170,7 @@ export async function getUploadUrl(params: {
   rawfilemd5: string;
   filesize: number;
   aeskey: string;
+  dispatcher?: Dispatcher;
 }): Promise<{ uploadParam: string }> {
   const url = `${params.baseUrl}/ilink/bot/getuploadurl`;
   const body = {
@@ -181,7 +186,7 @@ export async function getUploadUrl(params: {
   };
 
   const xWechatUin = crypto.randomBytes(16).toString('base64');
-  const resp = await fetch(url, {
+  const resp = await undiciFetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -193,6 +198,7 @@ export async function getUploadUrl(params: {
     },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(15_000),
+    dispatcher: params.dispatcher,
   });
 
   if (!resp.ok) {
@@ -231,6 +237,7 @@ export async function uploadMediaBuffer(params: {
   token: string;
   cdnBaseUrl?: string;
   mediaType: number;
+  dispatcher?: Dispatcher;
 }): Promise<UploadMediaResult> {
   const { buf } = params;
   const rawsize = buf.length;
@@ -253,6 +260,7 @@ export async function uploadMediaBuffer(params: {
     rawfilemd5,
     filesize,
     aeskey: aeskeyHex,
+    dispatcher: params.dispatcher,
   });
 
   const { downloadParam } = await uploadBufferToCdn({
@@ -261,6 +269,7 @@ export async function uploadMediaBuffer(params: {
     filekey,
     cdnBaseUrl: params.cdnBaseUrl,
     aeskey: aeskeyBuf,
+    dispatcher: params.dispatcher,
   });
 
   // All media types (image/file/voice/video) use base64(hex-string ASCII
@@ -284,6 +293,7 @@ export async function uploadMediaFile(params: {
   token: string;
   cdnBaseUrl?: string;
   mediaType: number;
+  dispatcher?: Dispatcher;
 }): Promise<UploadMediaResult> {
   const buf = await fs.promises.readFile(params.filePath);
   return uploadMediaBuffer({
@@ -294,5 +304,6 @@ export async function uploadMediaFile(params: {
     token: params.token,
     cdnBaseUrl: params.cdnBaseUrl,
     mediaType: params.mediaType,
+    dispatcher: params.dispatcher,
   });
 }

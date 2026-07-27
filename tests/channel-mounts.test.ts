@@ -76,7 +76,7 @@ describe('migrateTargetMainJidToChannelMounts', () => {
     expect(migrated).toBe(1);
     expect(skipped).toEqual([]);
 
-    const mount = db.getChannelMount('feishu:G1')!;
+    const mount = db.getAgentChannelMountView('feishu:G1')!;
     // The mount records the *execution* target, not the registration folder.
     expect(mount.workspaceJid).toBe('web:wsA');
     expect(mount.workspaceFolder).toBe('flow-a');
@@ -91,9 +91,9 @@ describe('migrateTargetMainJidToChannelMounts', () => {
     }
     db.migrateTargetMainJidToChannelMounts();
 
-    expect(db.getChannelMount('feishu:oc_x')?.channelType).toBe('feishu');
-    expect(db.getChannelMount('qq:c2c:abc')?.channelType).toBe('qq');
-    expect(db.getChannelMount('wechat:o9cq@im.wechat')?.channelType).toBe('wechat');
+    expect(db.getAgentChannelMountView('feishu:oc_x')?.channelType).toBe('feishu');
+    expect(db.getAgentChannelMountView('qq:c2c:abc')?.channelType).toBe('qq');
+    expect(db.getAgentChannelMountView('wechat:o9cq@im.wechat')?.channelType).toBe('wechat');
   });
 
   test('a dangling target is skipped with a reason, never guessed at', () => {
@@ -108,13 +108,13 @@ describe('migrateTargetMainJidToChannelMounts', () => {
     expect(skipped).toHaveLength(1);
     expect(skipped[0].jid).toBe('feishu:DANGLE');
     expect(skipped[0].reason).toContain('web:deleted');
-    expect(db.getChannelMount('feishu:DANGLE')).toBeNull();
+    expect(db.getAgentChannelMountView('feishu:DANGLE')).toBeNull();
   });
 
   test('unbound groups are not mounted', () => {
     addGroup('web:main', 'main', { is_home: true, created_by: 'u1' });
     db.migrateTargetMainJidToChannelMounts();
-    expect(db.getChannelMount('web:main')).toBeNull();
+    expect(db.getAgentChannelMountView('web:main')).toBeNull();
   });
 
   test('re-running converges instead of duplicating', () => {
@@ -135,8 +135,8 @@ describe('migrateTargetMainJidToChannelMounts', () => {
     addGroup('feishu:G1', 'main', { created_by: 'u1', target_main_jid: 'web:wsB' });
     db.migrateTargetMainJidToChannelMounts();
 
-    expect(db.getChannelMount('feishu:G1')?.workspaceJid).toBe('web:wsB');
-    expect(db.getChannelMount('feishu:G1')?.workspaceFolder).toBe('flow-b');
+    expect(db.getAgentChannelMountView('feishu:G1')?.workspaceJid).toBe('web:wsB');
+    expect(db.getAgentChannelMountView('feishu:G1')?.workspaceFolder).toBe('flow-b');
   });
 
   test('target_main_jid is left in place — migration is additive', () => {
@@ -166,7 +166,11 @@ describe('reconcileChannelMounts is the M5 acceptance gate', () => {
   test('fails when a binding has no mount', () => {
     addGroup('web:wsA', 'flow-a', { created_by: 'u1' });
     addGroup('feishu:G1', 'main', { created_by: 'u1', target_main_jid: 'web:wsA' });
-    // Bound but never migrated.
+    // upstream 在 setRegisteredGroup 里加了 channel_mounts → agent_channel_mounts
+    // 的自动镜像（syncAgentChannelMountsForWorkspaceJid），所以「绑定了但从未
+    // 迁移」这个前提不再能靠"不调用迁移"构造出来 —— 挂载在注册时就有了。
+    // 直接删掉挂载来还原这个场景，reconcile 的语义（绑定必须有对应挂载）不变。
+    db.deleteAgentChannelMountView('feishu:G1');
     const recon = db.reconcileChannelMounts();
     expect(recon.ok).toBe(false);
     expect(recon.problems.join(' ')).toContain('missing mount for feishu:G1');

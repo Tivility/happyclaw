@@ -16,19 +16,32 @@ import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 import { formatIsoLocal } from './utils.js';
+import {
+  normalizeChannelTurnContext,
+  type ChannelTurnContext,
+} from './types.js';
 
 /** Context required by MCP tools. Passed at construction time. */
 export interface McpContext {
   chatJid: string;
+  /** Mutable, credential-free context for the current input turn. */
+  channelContext?: ChannelTurnContext;
   groupFolder: string;
   isHome: boolean;
   isAdminHome: boolean;
+  /** Whether this runtime is an interactive session of the main HappyClaw. */
+  agentBuilderEnabled: boolean;
+  /** Public reply contract selected by the workspace. */
+  interactionMode?: 'assistant' | 'proactive';
   isScheduledTask?: boolean;
   /** Mutable: set when the current IPC turn was triggered by a task prompt.
    * Cleared between turns by the agent-runner main loop so that regular
    * follow-up messages aren't misattributed to the prior task. */
   currentTaskId?: string | null;
-  privacyMode?: boolean;
+  /** Mutable correlation id for the user input currently being answered.
+   * Cold starts use the triggering message id; IPC turns use the host-issued
+   * delivery id from their receipt. */
+  currentInputTurnId?: string | null;
   workspaceIpc: string;
   workspaceGroup: string;
   workspaceGlobal: string;
@@ -37,9 +50,6 @@ export interface McpContext {
   inputContextHash?: string | null;
   workspaceInstructionHash?: string | null;
   softInjectionReason?: string | null;
-  // 禁用 HappyClaw 的 memory MCP 工具（memory_append/search/get），
-  // 让 Agent 完全按用户本机 ~/.claude/ 下的 Playbook 约定管理记忆
-  disableMemoryLayer?: boolean;
 }
 
 type ToolInputSchema = Record<string, z.ZodTypeAny>;
@@ -76,8 +86,14 @@ function writeIpcFile(dir: string, data: object): string {
     fs.renameSync(tempPath, filepath);
   } catch (err) {
     // Clean up temp file on failure
-    try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
-    throw new Error(`IPC 写入失败 (${dir}): ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `IPC 写入失败 (${dir}): ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
   return filename;
 }
@@ -92,10 +108,12 @@ async function pollIpcResult(
   data: Record<string, unknown> & { requestId: string },
   resultFilePrefix: string,
   timeoutMs: number = 30_000,
+  resultDir: string = dir,
 ): Promise<Record<string, unknown>> {
   const resultFileName = `${resultFilePrefix}_${data.requestId}.json`;
-  const resultFilePath = path.join(dir, resultFileName);
+  const resultFilePath = path.join(resultDir, resultFileName);
 
+  fs.mkdirSync(resultDir, { recursive: true });
   writeIpcFile(dir, data);
 
   const pollInterval = 500;
@@ -211,12 +229,19 @@ export function buildSendMessageData(
     groupFolder: ctx.groupFolder,
     timestamp: new Date().toISOString(),
     ...extras,
+    // Freeze the public delivery contract at IPC write time. The host must not
+    // reinterpret an already-written side effect after a workspace mode change.
+    interactionMode:
+      ctx.interactionMode === 'proactive' ? 'proactive' : 'assistant',
   };
   if (ctx.isScheduledTask) {
     data.isScheduledTask = true;
   }
   if (ctx.currentTaskId) {
     data.taskId = ctx.currentTaskId;
+  }
+  if (ctx.currentInputTurnId) {
+    data.inputTurnId = ctx.currentInputTurnId;
   }
   return data;
 }
@@ -231,30 +256,340 @@ export function createMcpToolCatalog(
   ctx: McpContext,
 ): RuntimeNeutralMcpToolDefinition<any>[] {
   const MESSAGES_DIR = path.join(ctx.workspaceIpc, 'messages');
+  const MESSAGE_RESULTS_DIR = path.join(ctx.workspaceIpc, 'message-results');
   const TASKS_DIR = path.join(ctx.workspaceIpc, 'tasks');
   const hasCrossGroupAccess = ctx.isAdminHome;
   const toRelativePath = createToRelativePath(ctx);
 
+  /**
+   * Must stay in step with `usesProactiveInteractiveContract()` in
+   * container/agent-runner/src/index.ts, which selects the system prompt.
+   *
+   * A message-triggered task run gets the task delivery contract, not the
+   * interactive Proactive one. The tool descriptions here checked only
+   * `isScheduledTask`, so such a run was told two different things at once: the
+   * prompt said "send one complete result when the task is done" while the tool
+   * said "call me zero, one, or many times".
+   */
+  const usesProactiveInteractiveContract =
+    ctx.interactionMode === 'proactive' &&
+    !ctx.isScheduledTask &&
+    !ctx.currentTaskId;
+
+  const currentChannelContext = (): ChannelTurnContext | undefined =>
+    normalizeChannelTurnContext(ctx.channelContext, ctx.chatJid);
+
+  const callFeishuCapability = async (
+    operation: string,
+    params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const channelContext = currentChannelContext();
+    if (channelContext?.provider !== 'feishu') {
+      throw new Error(
+        `Feishu capability is unavailable for the current ${channelContext?.provider || 'unknown'} turn.`,
+      );
+    }
+    if (!ctx.currentInputTurnId) {
+      throw new Error(
+        'Feishu capability requires a current input turn correlation id.',
+      );
+    }
+    const requestId = newRequestId();
+    const result = await pollIpcResult(
+      TASKS_DIR,
+      {
+        type: 'feishu_capability',
+        operation,
+        requestId,
+        chatJid: ctx.chatJid,
+        inputTurnId: ctx.currentInputTurnId,
+        params,
+        timestamp: new Date().toISOString(),
+      },
+      'feishu_capability_result',
+      120_000,
+    );
+    if (!result.success) {
+      throw new Error(
+        typeof result.error === 'string'
+          ? result.error
+          : `Feishu ${operation} failed.`,
+      );
+    }
+    return result;
+  };
+
+  const feishuResult = (result: Record<string, unknown>) => ({
+    content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
+  });
+
+  const callAgentBuilder = async (
+    type: string,
+    payload: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> => {
+    const requestId = newRequestId();
+    const result = await pollIpcResult(
+      TASKS_DIR,
+      {
+        type,
+        ...payload,
+        requestId,
+        chatJid: ctx.chatJid,
+        isScheduledTask: ctx.isScheduledTask || undefined,
+        timestamp: new Date().toISOString(),
+      },
+      `${type}_result`,
+      120_000,
+    );
+    if (!result.success) {
+      throw new Error(
+        typeof result.error === 'string'
+          ? result.error
+          : 'Agent Builder request failed',
+      );
+    }
+    return result;
+  };
+
   const tools: RuntimeNeutralMcpToolDefinition<any>[] = [
+    // --- current channel context ---
+    defineTool(
+      'get_channel_context',
+      'Return the host-verified, credential-free channel context for the current input turn: provider, bound Bot/account identity, chat/thread/message IDs, sender IDs, workspace/session identity, and available capabilities. Call this before channel-specific operations instead of guessing IDs.',
+      {},
+      async () => {
+        const channelContext = currentChannelContext();
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: JSON.stringify(
+                channelContext ?? {
+                  provider: 'unknown',
+                  sourceJid: ctx.chatJid,
+                  capabilities: [],
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      },
+    ),
+
+    // --- Feishu Bot capability broker ---
+    defineTool(
+      'feishu_get_chat',
+      'Get metadata for the current Feishu chat using the Bot account bound to this input turn. The host selects the account and chat; do not guess either.',
+      {},
+      async () => feishuResult(await callFeishuCapability('get_chat', {})),
+    ),
+    defineTool(
+      'feishu_list_members',
+      'List members of the current Feishu chat as the Bot bound to this input turn.',
+      {
+        page_size: z.number().int().min(1).max(100).optional().default(50),
+        page_token: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('list_members', {
+            pageSize: args.page_size,
+            pageToken: args.page_token,
+          }),
+        ),
+    ),
+    defineTool(
+      'feishu_get_user',
+      'Get the sender of the current Feishu input turn using the current bound Bot. The host fixes the target to the verified sender; no arbitrary user ID is accepted.',
+      {},
+      async () => feishuResult(await callFeishuCapability('get_user', {})),
+    ),
+    defineTool(
+      'feishu_get_history',
+      'Read recent messages from the current Feishu chat/thread using the current bound Bot.',
+      {
+        page_size: z.number().int().min(1).max(50).optional().default(20),
+        page_token: z.string().optional(),
+        start_time: z.string().optional(),
+        end_time: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('get_history', {
+            pageSize: args.page_size,
+            pageToken: args.page_token,
+            startTime: args.start_time,
+            endTime: args.end_time,
+          }),
+        ),
+    ),
+    defineTool(
+      'feishu_send_card',
+      'Send an interactive Feishu card to the current chat/thread as the Bot bound to this turn. The host locks the destination to the current context.',
+      {
+        card: z.record(z.string(), z.unknown()),
+        reply_to_message_id: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('send_card', {
+            card: args.card,
+            replyToMessageId: args.reply_to_message_id,
+          }),
+        ),
+    ),
+    defineTool(
+      'feishu_add_reaction',
+      'Add a reaction to a Feishu message as the Bot bound to this turn. Omit message_id to target the triggering message.',
+      {
+        emoji_type: z.string().min(1),
+        message_id: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('add_reaction', {
+            emojiType: args.emoji_type,
+            messageId: args.message_id,
+          }),
+        ),
+    ),
+    defineTool(
+      'feishu_remove_reaction',
+      'Remove a reaction previously created by the current Feishu Bot.',
+      {
+        reaction_id: z.string().min(1),
+        message_id: z.string().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('remove_reaction', {
+            reactionId: args.reaction_id,
+            messageId: args.message_id,
+          }),
+        ),
+    ),
+    defineTool(
+      'feishu_edit_message',
+      'Edit a text message previously sent by the current Feishu Bot.',
+      {
+        message_id: z.string().min(1),
+        text: z.string(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('edit_message', {
+            messageId: args.message_id,
+            text: args.text,
+          }),
+        ),
+    ),
+    defineTool(
+      'feishu_recall_message',
+      'Recall a message previously sent by the current Feishu Bot.',
+      { message_id: z.string().min(1) },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('recall_message', {
+            messageId: args.message_id,
+          }),
+        ),
+    ),
+    defineTool(
+      'feishu_api_request',
+      'Call a host-allowlisted Feishu OpenAPI endpoint as the Bot bound to the current input turn. Prefer typed feishu_* tools when available. Tokens and app secrets are never returned.',
+      {
+        method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
+        path: z
+          .string()
+          .startsWith('/open-apis/')
+          .describe('Absolute Feishu OpenAPI path beginning with /open-apis/'),
+        query: z.record(z.string(), z.unknown()).optional(),
+        body: z.unknown().optional(),
+      },
+      async (args) =>
+        feishuResult(
+          await callFeishuCapability('api_request', {
+            method: args.method,
+            path: args.path,
+            query: args.query,
+            body: args.body,
+          }),
+        ),
+    ),
+
     // --- send_message ---
     defineTool(
       'send_message',
-      "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate with the user or group.",
-      { text: z.string().describe('The message text to send') },
+      usesProactiveInteractiveContract
+        ? 'Send one user-visible message now. The Workspace uses Proactive reply mode: every call creates an independent native chat message immediately, and your normal SDK final text is not published. You may call this tool zero, one, or many times and continue working after each successful send. A delivery error is authoritative: do not sleep and retry, switch to a card, or call a raw channel API as a fallback.'
+        : "Publish text through HappyClaw's turn-owned delivery coordinator. In an interactive user turn, delivery_role=progress updates the existing reply status and delivery_role=final stages the primary answer on the existing card; neither creates a second text reply. Use delivery_role=separate only when the user explicitly requested another message. Scheduled/background tasks always deliver separately because their normal SDK final is not published.",
+      {
+        // Trim/min-length at the schema layer: the host guard is `!data.text`,
+        // which a whitespace-only string passes, so it reached the chat as an
+        // empty message.
+        text: z.string().trim().min(1).describe('The message text to publish'),
+        delivery_role: z
+          .enum(['progress', 'final', 'separate'])
+          .optional()
+          .describe(
+            usesProactiveInteractiveContract
+              ? 'Ignored in Proactive reply mode: every call is delivered as an independent native message.'
+              : 'progress updates the active reply, final stages its answer, separate creates an additional message. Defaults to final for interactive turns and separate for scheduled tasks.',
+          ),
+      },
       async (args) => {
+        const deliveryRole = ctx.isScheduledTask
+          ? 'separate'
+          : ctx.interactionMode === 'proactive'
+            ? 'separate'
+            : (args.delivery_role ?? 'final');
         const data = buildSendMessageData(ctx, {
           type: 'message',
           text: args.text,
+          deliveryRole,
+          ...(usesProactiveInteractiveContract
+            ? { presentation: 'native' }
+            : {}),
+          requestId: newRequestId(),
         });
-        writeIpcFile(MESSAGES_DIR, data);
-        return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+        const result = await pollIpcResult(
+          MESSAGES_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_message_result',
+          120_000,
+          MESSAGE_RESULTS_DIR,
+        );
+        if (!result.success) {
+          throw new Error(
+            typeof result.error === 'string'
+              ? result.error
+              : 'Message delivery failed.',
+          );
+        }
+        const disposition =
+          typeof result.disposition === 'string'
+            ? result.disposition
+            : 'delivered_separately';
+        const acknowledgement =
+          disposition === 'staged_progress'
+            ? 'Progress updated on the active reply.'
+            : disposition === 'staged_final'
+              ? 'Final answer staged on the active reply; return the same answer normally so the SDK Result can finalize it.'
+              : usesProactiveInteractiveContract
+                ? 'Message delivered. If this completes the thought, end the turn now. Send again only for new, non-redundant content; never repeat this message in SDK final text.'
+                : 'Message sent separately.';
+        return {
+          content: [{ type: 'text' as const, text: acknowledgement }],
+        };
       },
     ),
 
     // --- send_image ---
     defineTool(
       'send_image',
-      'Send an image file from the workspace to the user via IM. Supports PNG/JPEG/GIF/WebP. Optional caption.',
+      'Send an image file from the workspace to the current native IM conversation. Supports PNG/JPEG/GIF/WebP/TIFF/BMP, with a 10MB runner-side limit. Optional caption.',
       {
         file_path: z
           .string()
@@ -308,7 +643,7 @@ export function createMcpToolCatalog(
           };
         }
 
-        // Read file and check size (10MB limit for both Feishu and Telegram)
+        // Read file and enforce the runner-side limit shared by every IM provider.
         const stat = fs.statSync(resolved);
         if (stat.size > 10 * 1024 * 1024) {
           return {
@@ -352,11 +687,26 @@ export function createMcpToolCatalog(
         const data = buildSendMessageData(ctx, {
           type: 'image',
           imageBase64: base64,
+          filePath: path.relative(ctx.workspaceGroup, resolved),
           mimeType,
           caption: args.caption || undefined,
           fileName: path.basename(resolved),
+          requestId: newRequestId(),
         });
-        writeIpcFile(MESSAGES_DIR, data);
+        const delivery = await pollIpcResult(
+          MESSAGES_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_message_result',
+          120_000,
+          MESSAGE_RESULTS_DIR,
+        );
+        if (!delivery.success) {
+          throw new Error(
+            typeof delivery.error === 'string'
+              ? delivery.error
+              : 'Image delivery failed.',
+          );
+        }
         return {
           content: [
             {
@@ -371,8 +721,8 @@ export function createMcpToolCatalog(
     // --- send_file ---
     defineTool(
       'send_file',
-      `Send a file to the current chat (the user you're talking to) via IM (Feishu/Telegram/DingTalk/QQ/Discord). The file path is relative to the workspace/group directory.
-Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
+      `Send a file to the current native IM conversation through its bound account (Feishu/Telegram/DingTalk/QQ/Discord/WeChat/WhatsApp). The file path must stay inside the workspace/group directory.
+The actual file types and size limit are enforced by the selected provider.`,
       {
         filePath: z
           .string()
@@ -451,19 +801,30 @@ Supports: PDF, DOC, XLS, PPT, MP4, ZIP, SO, etc. Max file size: 30MB.`,
           };
         }
 
-        const data = {
+        const data = buildSendMessageData(ctx, {
           type: 'send_file',
-          chatJid: ctx.chatJid,
           filePath: relativePath,
           fileName: args.fileName,
-          timestamp: new Date().toISOString(),
-        };
-        writeIpcFile(TASKS_DIR, data);
+          requestId: newRequestId(),
+        });
+        const delivery = await pollIpcResult(
+          TASKS_DIR,
+          data as Record<string, unknown> & { requestId: string },
+          'send_file_result',
+          120_000,
+        );
+        if (!delivery.success) {
+          throw new Error(
+            typeof delivery.error === 'string'
+              ? delivery.error
+              : 'File delivery failed.',
+          );
+        }
         return {
           content: [
             {
               type: 'text' as const,
-              text: `Sending file "${args.fileName}"...`,
+              text: `File sent: ${args.fileName}`,
             },
           ],
         };
@@ -482,11 +843,11 @@ EXECUTION TYPE:
 EXECUTION MODE:
 \u2022 "host": Task runs directly on the host machine. Admin only.
 \u2022 "container" (default for non-admin): Task runs in a Docker container.
-Each agent task automatically gets its own dedicated workspace.
+Each agent task runs in its source workspace (same files, mounts, skills, and Agent profile).
 
 CONTEXT MODE (agent mode only) - Choose based on task type:
 \u2022 "group": Task runs in the group's conversation context, with access to chat history.
-\u2022 "isolated": Task runs in a fresh session with no conversation history.
+\u2022 "isolated": Each trigger gets a fresh, independent session inside the source workspace. The session and virtual task chat are removed after that run.
 
 MESSAGING BEHAVIOR - The task output is sent to the user or group.
 \u2022 Agent mode: output is sent via MCP tool or stdout. Use <internal> tags to suppress.
@@ -535,9 +896,9 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           ),
         context_mode: z
           .enum(['group', 'isolated'])
-          .default('group')
+          .default('isolated')
           .describe(
-            '(agent mode only) group=runs with persistent workspace context (recommended), isolated=fresh session each time',
+            '(agent mode only) isolated=fresh session each time (default), group=runs with persistent workspace context',
           ),
         target_group_jid: z
           .string()
@@ -587,7 +948,12 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         // Validate schedule_value before writing IPC
         if (args.schedule_type === 'cron') {
           try {
-            CronExpressionParser.parse(args.schedule_value, { tz: process.env.TZ || 'Asia/Shanghai' });
+            const interval = CronExpressionParser.parse(args.schedule_value, {
+              tz: process.env.TZ || 'Asia/Shanghai',
+            });
+            if (interval.fields.second.values.length !== 1) {
+              throw new Error('Cron frequency must be at least 60 seconds');
+            }
           } catch {
             return {
               content: [
@@ -600,13 +966,13 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
             };
           }
         } else if (args.schedule_type === 'interval') {
-          const ms = parseInt(args.schedule_value, 10);
-          if (isNaN(ms) || ms <= 0) {
+          const ms = Number(args.schedule_value);
+          if (!Number.isFinite(ms) || ms < 60_000) {
             return {
               content: [
                 {
                   type: 'text' as const,
-                  text: `Invalid interval: "${args.schedule_value}". Must be positive milliseconds (e.g., "300000" for 5 min).`,
+                  text: `Invalid interval: "${args.schedule_value}". Must be at least 60000 milliseconds (e.g., "300000" for 5 min).`,
                 },
               ],
               isError: true,
@@ -638,7 +1004,9 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           prompt: args.prompt || '',
           schedule_type: args.schedule_type,
           schedule_value: args.schedule_value,
-          context_mode: args.context_mode || 'group',
+          // 与 schema 的 .default('isolated') 保持一致：定时任务默认隔离上下文，
+          // 不污染主会话。这里若回落 'group'，schema 默认值就形同虚设。
+          context_mode: args.context_mode || 'isolated',
           execution_type: execType,
           targetJid,
           createdBy: ctx.groupFolder,
@@ -653,7 +1021,11 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
         const modeLabel = execType === 'script' ? 'script' : 'agent';
         // 改为阻塞确认：等主进程真正落库后回执，避免 fire-and-forget 的“报成功但没建成”。
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'schedule_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'schedule_task_result',
+          );
           if (!result.success) {
             return {
               content: [
@@ -697,8 +1069,15 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     defineTool(
       'list_tasks',
       "List all scheduled tasks. From admin home: shows all tasks. From other groups: shows only that group's tasks.",
-      {},
-      async () => {
+      {
+        include_deleted: z
+          .boolean()
+          .default(false)
+          .describe(
+            'Include soft-deleted tasks so they can be inspected/restored',
+          ),
+      },
+      async (args) => {
         const requestId = newRequestId();
         try {
           const result = await pollIpcResult(
@@ -708,6 +1087,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
               requestId,
               groupFolder: ctx.groupFolder,
               isAdminHome: hasCrossGroupAccess,
+              includeDeleted: args.include_deleted,
               timestamp: new Date().toISOString(),
             },
             'list_tasks_result',
@@ -729,7 +1109,10 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
             schedule_type: string;
             schedule_value: string;
             status: string;
-            next_run: string;
+            next_run: string | null;
+            revision: number;
+            current_run?: { id: string; status: string } | null;
+            deleted_at?: string | null;
           }>;
           if (tasks.length === 0) {
             return {
@@ -741,7 +1124,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           const formatted = tasks
             .map(
               (t) =>
-                `- [${t.id}] ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.status}, next: ${formatIsoLocal(t.next_run)}`,
+                `- [${t.id}] rev=${t.revision}${t.deleted_at ? ' [deleted]' : ''} ${t.prompt.slice(0, 50)}... (${t.schedule_type}: ${t.schedule_value}) - ${t.current_run?.status || t.status}, next: ${t.next_run ? formatIsoLocal(t.next_run) : '-'}`,
             )
             .join('\n');
           return {
@@ -766,29 +1149,55 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     // --- pause_task ---
     defineTool(
       'pause_task',
-      'Pause a scheduled task. It will not run until resumed.',
-      { task_id: z.string().describe('The task ID to pause') },
+      'Pause future scheduled occurrences. A currently running occurrence continues; use stop_task_run to stop it.',
+      {
+        task_id: z.string().describe('The task ID to pause'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'pause_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'pause_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'pause_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to pause task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to pause task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} paused.` }] };
+          return {
+            content: [
+              { type: 'text' as const, text: `Task ${args.task_id} paused.` },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for pause confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for pause confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -799,28 +1208,54 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     defineTool(
       'resume_task',
       'Resume a paused task.',
-      { task_id: z.string().describe('The task ID to resume') },
+      {
+        task_id: z.string().describe('The task ID to resume'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'resume_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'resume_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'resume_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to resume task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to resume task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} resumed.` }] };
+          return {
+            content: [
+              { type: 'text' as const, text: `Task ${args.task_id} resumed.` },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for resume confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for resume confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -830,29 +1265,58 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     // --- cancel_task ---
     defineTool(
       'cancel_task',
-      'Cancel and delete a scheduled task.',
-      { task_id: z.string().describe('The task ID to cancel') },
+      'Soft-delete a scheduled task. Future runs stop, but run history is retained.',
+      {
+        task_id: z.string().describe('The task ID to delete'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe('Revision returned by list_tasks'),
+      },
       async (args) => {
         const data = {
           type: 'cancel_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'cancel_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'cancel_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to cancel task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to cancel task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} cancelled and deleted.` }] };
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task ${args.task_id} deleted. Its run history is retained.`,
+              },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for cancel confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for cancel confirmation for task ${args.task_id}.`,
+              },
+            ],
             isError: true,
           };
         }
@@ -860,27 +1324,62 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     ),
 
     // --- update_task ---
-    tool(
+    defineTool(
       'update_task',
       `Update an existing scheduled task IN PLACE. Strongly PREFER this over cancel_task + schedule_task when modifying an existing task: delete-then-recreate risks leaving a duplicate (if the delete silently fails) or losing the task entirely. Only the fields you pass are changed; omit a field to keep its current value.`,
       {
         task_id: z.string().describe('The task ID to update'),
-        prompt: z.string().optional().describe('New action/instructions for the task (agent mode)'),
-        schedule_type: z.enum(['cron', 'interval', 'once']).optional().describe('New schedule type. If you change this you MUST also pass schedule_value.'),
+        expected_revision: z
+          .number()
+          .int()
+          .positive()
+          .describe(
+            'Revision returned by list_tasks. The update is rejected if the task changed since it was listed.',
+          ),
+        prompt: z
+          .string()
+          .optional()
+          .describe('New action/instructions for the task (agent mode)'),
+        schedule_type: z
+          .enum(['cron', 'interval', 'once'])
+          .optional()
+          .describe(
+            'New schedule type. If you change this you MUST also pass schedule_value.',
+          ),
         schedule_value: z
           .string()
           .optional()
-          .describe('New schedule value (LOCAL time): cron expr | interval ms | once "2026-02-01T15:30:00" (no Z).'),
-        context_mode: z.enum(['group', 'isolated']).optional().describe('New context mode (agent mode)'),
-        execution_type: z.enum(['agent', 'script']).optional().describe('New execution type (script is admin only)'),
-        script_command: z.string().max(4096).optional().describe('New shell command (script mode)'),
-        execution_mode: z.enum(['host', 'container']).optional().describe('New execution mode (host is admin only)'),
+          .describe(
+            'New schedule value (LOCAL time): cron expr | interval ms | once "2026-02-01T15:30:00" (no Z).',
+          ),
+        context_mode: z
+          .enum(['group', 'isolated'])
+          .optional()
+          .describe('New context mode (agent mode)'),
+        execution_type: z
+          .enum(['agent', 'script'])
+          .optional()
+          .describe('New execution type (script is admin only)'),
+        script_command: z
+          .string()
+          .max(4096)
+          .optional()
+          .describe('New shell command (script mode)'),
+        execution_mode: z
+          .enum(['host', 'container'])
+          .optional()
+          .describe('New execution mode (host is admin only)'),
       },
       async (args) => {
         // 改 schedule_type 必须同时给 schedule_value，否则主进程无法据新类型重算 next_run。
         if (args.schedule_type && !args.schedule_value) {
           return {
-            content: [{ type: 'text' as const, text: 'When changing schedule_type you must also provide a matching schedule_value.' }],
+            content: [
+              {
+                type: 'text' as const,
+                text: 'When changing schedule_type you must also provide a matching schedule_value.',
+              },
+            ],
             isError: true,
           };
         }
@@ -888,26 +1387,308 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
           type: 'update_task',
           requestId: newRequestId(),
           taskId: args.task_id,
+          expectedRevision: args.expected_revision,
           groupFolder: ctx.groupFolder,
           isMain: hasCrossGroupAccess,
           timestamp: new Date().toISOString(),
         };
-        for (const k of ['prompt', 'schedule_type', 'schedule_value', 'context_mode', 'execution_type', 'script_command', 'execution_mode'] as const) {
+        for (const k of [
+          'prompt',
+          'schedule_type',
+          'schedule_value',
+          'context_mode',
+          'execution_type',
+          'script_command',
+          'execution_mode',
+        ] as const) {
           if (args[k] !== undefined) data[k] = args[k];
         }
         try {
-          const result = await pollIpcResult(TASKS_DIR, data, 'update_task_result');
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            data,
+            'update_task_result',
+          );
           if (!result.success) {
             return {
-              content: [{ type: 'text' as const, text: `Failed to update task ${args.task_id}: ${result.error || 'Unknown error'}` }],
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to update task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
               isError: true,
             };
           }
-          const nextRun = result.nextRun ? ` 下次触发：${formatIsoLocal(result.nextRun as string)}` : '';
-          return { content: [{ type: 'text' as const, text: `Task ${args.task_id} updated.${nextRun}` }] };
+          const nextRun = result.nextRun
+            ? ` 下次触发：${formatIsoLocal(result.nextRun as string)}`
+            : '';
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task ${args.task_id} updated.${nextRun}`,
+              },
+            ],
+          };
         } catch {
           return {
-            content: [{ type: 'text' as const, text: `Timeout waiting for update confirmation for task ${args.task_id}.` }],
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for update confirmation for task ${args.task_id}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- run_task_now ---
+    defineTool(
+      'run_task_now',
+      'Run a scheduled task once now without changing its future schedule. A paused task stays paused.',
+      {
+        task_id: z.string().describe('The task ID to run'),
+        idempotency_key: z
+          .string()
+          .optional()
+          .describe(
+            'Stable retry key; reuse it when retrying an uncertain request',
+          ),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        const idempotencyKey = args.idempotency_key || requestId;
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'run_task_now',
+              requestId,
+              taskId: args.task_id,
+              idempotencyKey,
+              timestamp: new Date().toISOString(),
+            },
+            'run_task_now_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to run task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              structuredContent: {
+                success: false,
+                task_id: args.task_id,
+                error: result.error || 'Unknown error',
+                existing_run_id: result.runId ?? null,
+                idempotency_key: idempotencyKey,
+              },
+              isError: true,
+            };
+          }
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Task queued. run_id=${result.runId ?? '?'}. This one-time run does not change the future schedule.`,
+              },
+            ],
+            structuredContent: {
+              success: true,
+              task_id: args.task_id,
+              run_id: result.runId ?? null,
+              status: 'queued',
+              idempotency_key: idempotencyKey,
+            },
+          };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout while starting task ${args.task_id}. Retry with idempotency_key=${idempotencyKey} or inspect task runs first.`,
+              },
+            ],
+            structuredContent: {
+              success: false,
+              task_id: args.task_id,
+              uncertain: true,
+              idempotency_key: idempotencyKey,
+            },
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- stop_task_run ---
+    defineTool(
+      'stop_task_run',
+      'Stop one queued or running occurrence. This does not pause future scheduled runs.',
+      {
+        run_id: z
+          .string()
+          .describe('Run ID returned by run_task_now/list_task_runs'),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'stop_task_run',
+              requestId,
+              runId: args.run_id,
+              timestamp: new Date().toISOString(),
+            },
+            'stop_task_run_result',
+          );
+          return result.success
+            ? {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Run ${args.run_id} stopped. Future task schedules are unchanged.`,
+                  },
+                ],
+              }
+            : {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Failed to stop run ${args.run_id}: ${result.error || 'Unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for stop confirmation for run ${args.run_id}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- restore_task ---
+    defineTool(
+      'restore_task',
+      'Restore a soft-deleted task as paused. It will not run until explicitly resumed.',
+      {
+        task_id: z.string(),
+        expected_revision: z.number().int().positive(),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'restore_task',
+              requestId,
+              taskId: args.task_id,
+              expectedRevision: args.expected_revision,
+              timestamp: new Date().toISOString(),
+            },
+            'restore_task_result',
+          );
+          return result.success
+            ? {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Task ${args.task_id} restored as paused (revision ${result.revision ?? '?'}).`,
+                  },
+                ],
+              }
+            : {
+                content: [
+                  {
+                    type: 'text' as const,
+                    text: `Failed to restore task ${args.task_id}: ${result.error || 'Unknown error'}`,
+                  },
+                ],
+                isError: true,
+              };
+        } catch {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: `Timeout waiting for restore confirmation for task ${args.task_id}.`,
+              },
+            ],
+            isError: true,
+          };
+        }
+      },
+    ),
+
+    // --- list_task_runs ---
+    defineTool(
+      'list_task_runs',
+      'List recent occurrences for a scheduled task, including attempts and notification state.',
+      {
+        task_id: z.string(),
+        limit: z.number().int().min(1).max(50).default(20),
+      },
+      async (args) => {
+        const requestId = newRequestId();
+        try {
+          const result = await pollIpcResult(
+            TASKS_DIR,
+            {
+              type: 'list_task_runs',
+              requestId,
+              taskId: args.task_id,
+              limit: args.limit,
+              timestamp: new Date().toISOString(),
+            },
+            'list_task_runs_result',
+          );
+          if (!result.success) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `Failed to list runs: ${result.error || 'Unknown error'}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          const runs = (result.runs || []) as Array<Record<string, unknown>>;
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text:
+                  runs.length === 0
+                    ? 'No task runs found.'
+                    : runs
+                        .map(
+                          (run) =>
+                            `- [${String(run.id)}] ${String(run.status)} trigger=${String(run.trigger_type)} attempt=${String(run.attempt)} scheduled=${formatIsoLocal(String(run.scheduled_for))} notification=${String(run.notification_status)}`,
+                        )
+                        .join('\n'),
+              },
+            ],
+          };
+        } catch {
+          return {
+            content: [
+              { type: 'text' as const, text: 'Timeout listing task runs.' },
+            ],
             isError: true,
           };
         }
@@ -976,7 +1757,7 @@ You can optionally specify execution_mode: "container" (default, isolated Docker
     ),
 
     // --- discord_get_history ---
-    tool(
+    defineTool(
       'discord_get_history',
       `Fetch recent messages from the current Discord channel or DM. Only works when the current chat is a Discord channel.
 Returns up to 100 messages per call (default 50), ordered oldest-first. Use "before" with a message ID to paginate older messages.`,
@@ -1046,7 +1827,10 @@ Returns up to 100 messages per call (default 50), ordered oldest-first. Use "bef
           if (messages.length === 0) {
             return {
               content: [
-                { type: 'text' as const, text: 'No messages found in this channel.' },
+                {
+                  type: 'text' as const,
+                  text: 'No messages found in this channel.',
+                },
               ],
             };
           }
@@ -1085,7 +1869,7 @@ Returns up to 100 messages per call (default 50), ordered oldest-first. Use "bef
     ),
 
     // --- discord_get_channel_info ---
-    tool(
+    defineTool(
       'discord_get_channel_info',
       `Get metadata for the current Discord channel: name, type (guild_text/dm/etc), topic, NSFW flag, parent (category) ID, and guild ID.
 Only works when the current chat is a Discord channel.`,
@@ -1148,7 +1932,7 @@ Only works when the current chat is a Discord channel.`,
     ),
 
     // --- discord_get_server_info ---
-    tool(
+    defineTool(
       'discord_get_server_info',
       `Get metadata for the Discord server (guild) the current channel belongs to: name, description, owner ID, member count, icon URL.
 Returns null if the current chat is a DM (DMs do not belong to a server). Only works when the current chat is a Discord channel.`,
@@ -1220,6 +2004,201 @@ Returns null if the current chat is a DM (DMs do not belong to a server). Only w
       },
     ),
   ];
+
+  // Agent Builder follows the effective top-level AgentProfile, not the
+  // workspace type. The host independently revalidates every operation.
+  if (ctx.agentBuilderEnabled) {
+    const capabilityPolicySchema = z.object({
+      mode: z.enum(['inherit', 'custom', 'disabled']),
+      ids: z.array(z.string()).max(100),
+    });
+    const skillsPolicySchema = capabilityPolicySchema.extend({
+      host: capabilityPolicySchema.optional(),
+    });
+    const requiredPromptSection = (description: string) =>
+      z
+        .string()
+        .max(20_000)
+        .refine((value) => value.trim().length > 0, description)
+        .describe(description);
+    const agentDefinitionSchema = z.object({
+      name: z.string().min(1).max(80),
+      prompt_schema_version: z.literal(2).optional().default(2),
+      identity_prompt: requiredPromptSection(
+        'Required IDENTITY: a concise role, core mission, and capability boundary. Do not put workflows, command examples, or tool instructions here.',
+      ),
+      soul_prompt: z
+        .string()
+        .max(20_000)
+        .optional()
+        .default('')
+        .describe(
+          'Optional SOUL: durable values, judgment principles, temperament, and communication style. May be empty for a purely mechanical Agent.',
+        ),
+      agents_prompt: requiredPromptSection(
+        'Required AGENTS: executable workflows, inputs, outputs, defaults, branches, refusal rules, and failure handling.',
+      ),
+      tools_prompt: z
+        .string()
+        .max(20_000)
+        .optional()
+        .default('')
+        .describe(
+          'Optional TOOLS: how to select and use configured Skills, MCP servers, and tools, including ordering and limits. Do not copy entire Skill documents.',
+        ),
+      prompt_mode: z.enum(['append', 'replace']).optional().default('append'),
+      avatar_emoji: z.string().max(8).nullable().optional().default(null),
+      avatar_color: z
+        .string()
+        .regex(/^#[0-9a-fA-F]{6}$/)
+        .nullable()
+        .optional()
+        .default(null),
+      runtime_policy: z
+        .object({
+          context: z
+            .object({
+              source: z.enum(['managed', 'host_claude']),
+              auto_compact_window: z.number().int().min(0),
+              auto_compact_percentage: z.number().int().min(0),
+            })
+            .optional(),
+          skills: skillsPolicySchema.optional(),
+          mcp: capabilityPolicySchema.optional(),
+        })
+        .optional(),
+    });
+
+    tools.push(
+      defineTool(
+        'agent_profile_list',
+        "List the current user's top-level Agents and resumable ready drafts. Use this before editing or resuming work so you can identify the target, current version, draft ID, and draft revision. The main HappyClaw is returned for context but cannot edit itself with Agent Builder.",
+        {},
+        async () => {
+          const result = await callAgentBuilder('agent_profile_list', {});
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      defineTool(
+        'agent_profile_get',
+        'Read the complete editable definition of one top-level Agent before preparing an update.',
+        { profile_id: z.string().min(1) },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_get', {
+            profileId: args.profile_id,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      defineTool(
+        'agent_profile_draft_get',
+        'Read the complete persisted definition and assumptions of a resumable Agent draft before revising or publishing it.',
+        { draft_id: z.string().min(1) },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_draft_get', {
+            draftId: args.draft_id,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      defineTool(
+        'agent_capability_catalog',
+        'List the real user Skills and MCP references that may be selected in an Agent definition. Use this before choosing custom capability IDs; never invent IDs.',
+        {},
+        async () => {
+          const result = await callAgentBuilder('agent_capability_catalog', {});
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      defineTool(
+        'agent_profile_prepare',
+        `Create or revise a persistent Agent draft and return a structured preview. Use natural conversation to understand the user's needs first. Pass the full desired definition on every call.
+
+Keep IDENTITY concise and place operational procedures in AGENTS. IDENTITY and AGENTS are required; SOUL and TOOLS may be empty when they would add no useful information. Never put the entire Agent specification into identity_prompt.
+
+For a new Agent, omit target_agent_profile_id. For an edit, call agent_profile_get first and pass both target_agent_profile_id and expected_agent_version. To revise an existing draft, pass draft_id and expected_draft_revision.
+
+This tool never publishes. Show preview.confirmation_phrase verbatim and ask the user to send exactly that phrase in a later message.`,
+        {
+          draft_id: z.string().optional(),
+          expected_draft_revision: z.number().int().positive().optional(),
+          target_agent_profile_id: z.string().optional(),
+          expected_agent_version: z.number().int().positive().optional(),
+          definition: agentDefinitionSchema,
+          assumptions: z.array(z.string().max(500)).max(20).optional(),
+        },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_prepare', {
+            draftId: args.draft_id,
+            expectedDraftRevision: args.expected_draft_revision,
+            targetAgentProfileId: args.target_agent_profile_id,
+            expectedAgentVersion: args.expected_agent_version,
+            definition: args.definition,
+            assumptions: args.assumptions,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      defineTool(
+        'agent_profile_publish',
+        `Publish a previously prepared Agent draft. Only call this when the current persisted human message exactly equals the draft's confirmation_phrase. The host enforces the phrase, later-message boundary, and draft revision. Never treat a generic approval or your own proposal as confirmation.`,
+        {
+          draft_id: z.string().min(1),
+          expected_draft_revision: z.number().int().positive(),
+        },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_publish', {
+            draftId: args.draft_id,
+            expectedDraftRevision: args.expected_draft_revision,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+      defineTool(
+        'agent_profile_discard',
+        'Discard a prepared Agent draft without changing any published Agent.',
+        {
+          draft_id: z.string().min(1),
+          expected_draft_revision: z.number().int().positive(),
+        },
+        async (args) => {
+          const result = await callAgentBuilder('agent_profile_discard', {
+            draftId: args.draft_id,
+            expectedDraftRevision: args.expected_draft_revision,
+          });
+          return {
+            content: [
+              { type: 'text' as const, text: JSON.stringify(result, null, 2) },
+            ],
+          };
+        },
+      ),
+    );
+  }
 
   // Skill 安装/卸载仅限主容器（与 memory_* 工具一致）
   if (ctx.isHome) {
@@ -1378,9 +2357,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_append --- (only available for home containers,
-  // skipped in native Claude mode and disabled in privacy mode)
-  if (ctx.isHome && !ctx.disableMemoryLayer && !ctx.privacyMode) {
+  // --- memory_append --- (only available for home containers)
+  if (ctx.isHome) {
     tools.push(
       defineTool(
         'memory_append',
@@ -1500,8 +2478,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
     );
   }
 
-  // --- memory_search + memory_get --- (skipped in native Claude mode)
-  if (!ctx.disableMemoryLayer) {
+  // --- memory_search + memory_get ---
+  {
     tools.push(
     defineTool(
       'memory_search',
@@ -1605,8 +2583,8 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
             },
           ],
         };
-      },
-    ),
+        },
+      ),
 
     // --- memory_get ---
     defineTool(
@@ -1713,210 +2691,6 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
   );
   }
 
-    // --- Feishu channel tools (batch 3) ---
-    //
-    // Upstream routes these through a ChannelTurnContext carrying
-    // channelAccountId, which belongs to its multi-account channel_accounts
-    // model -- a model this fork deliberately did not adopt. Everything these
-    // tools actually need is already in ctx.chatJid, which encodes both the
-    // provider and the chat id (`feishu:oc_...`), so they are implemented
-    // against that instead. Same tool surface, no dependency on a table we do
-    // not have.
-    //
-    // Every call blocks on an IPC round-trip: the agent must know whether an
-    // edit or recall actually landed, since "assume it worked" is exactly how a
-    // recall silently fails to remove anything.
-    const feishuChatId = (): string => {
-      if (!ctx.chatJid.startsWith('feishu:')) {
-        throw new Error(
-          `Feishu tools are only available in a Feishu conversation (current: ${ctx.chatJid}).`,
-        );
-      }
-      return ctx.chatJid.slice('feishu:'.length);
-    };
-
-    const callFeishu = async (
-      operation: string,
-      params: Record<string, unknown>,
-    ): Promise<Record<string, unknown>> => {
-      const chatId = feishuChatId();
-      const requestId = newRequestId();
-      const result = await pollIpcResult(
-        TASKS_DIR,
-        {
-          type: 'feishu_capability',
-          operation,
-          requestId,
-          chatJid: ctx.chatJid,
-          chatId,
-          params,
-          timestamp: new Date().toISOString(),
-        },
-        'feishu_capability_result',
-        120_000,
-      );
-      if (!result.success) {
-        throw new Error(
-          typeof result.error === 'string'
-            ? result.error
-            : `Feishu ${operation} failed.`,
-        );
-      }
-      return result;
-    };
-
-    const feishuResult = (result: Record<string, unknown>) => ({
-      content: [
-        { type: 'text' as const, text: JSON.stringify(result.data ?? result, null, 2) },
-      ],
-    });
-
-    tools.push(
-      defineTool(
-        'feishu_send_card',
-        'Send an interactive Feishu card to the current chat. Pass the card JSON (schema 2.0) as `card`. Use this for structured output - buttons, columns, collapsible sections - that plain markdown cannot express.',
-        {
-          card: z
-            .record(z.string(), z.unknown())
-            .describe('Feishu interactive card JSON (schema 2.0)'),
-        },
-        async (args) => feishuResult(await callFeishu('send_card', { card: args.card })),
-      ),
-      defineTool(
-        'feishu_edit_message',
-        'Edit a message this bot previously sent in the current chat. Only the bot’s own messages can be edited, and only within the platform’s edit window.',
-        {
-          messageId: z.string().describe('Feishu message id (om_...)'),
-          text: z.string().describe('Replacement text content'),
-        },
-        async (args) =>
-          feishuResult(
-            await callFeishu('edit_message', {
-              messageId: args.messageId,
-              text: args.text,
-            }),
-          ),
-      ),
-      defineTool(
-        'feishu_recall_message',
-        'Recall (delete) a message this bot sent. Irreversible on the Feishu side - the message disappears for every participant.',
-        { messageId: z.string().describe('Feishu message id (om_...)') },
-        async (args) =>
-          feishuResult(await callFeishu('recall_message', { messageId: args.messageId })),
-      ),
-      defineTool(
-        'feishu_add_reaction',
-        'Add an emoji reaction to a message. Useful as a lightweight acknowledgement without sending a reply.',
-        {
-          messageId: z.string().describe('Feishu message id (om_...)'),
-          emojiType: z
-            .string()
-            .describe('Feishu emoji type, e.g. THUMBSUP / OK / DONE'),
-        },
-        async (args) =>
-          feishuResult(
-            await callFeishu('add_reaction', {
-              messageId: args.messageId,
-              emojiType: args.emojiType,
-            }),
-          ),
-      ),
-      defineTool(
-        'feishu_remove_reaction',
-        'Remove a reaction this bot previously added to a message.',
-        {
-          messageId: z.string().describe('Feishu message id (om_...)'),
-          reactionId: z
-            .string()
-            .describe('Reaction id returned when the reaction was created'),
-        },
-        async (args) =>
-          feishuResult(
-            await callFeishu('remove_reaction', {
-              messageId: args.messageId,
-              reactionId: args.reactionId,
-            }),
-          ),
-      ),
-      defineTool(
-        'feishu_get_chat',
-        'Get metadata for the current Feishu chat: name, description, type, owner, member count.',
-        {},
-        async () => feishuResult(await callFeishu('get_chat', {})),
-      ),
-      defineTool(
-        'feishu_list_members',
-        'List members of the current Feishu group chat.',
-        {
-          pageSize: z
-            .number()
-            .optional()
-            .describe('Members per page (default 50, max 100)'),
-          pageToken: z.string().optional().describe('Pagination token from a previous call'),
-        },
-        async (args) =>
-          feishuResult(
-            await callFeishu('list_members', {
-              pageSize: args.pageSize,
-              pageToken: args.pageToken,
-            }),
-          ),
-      ),
-      defineTool(
-        'feishu_get_user',
-        'Look up a Feishu user by open_id. Returns name, avatar and department info subject to app permissions.',
-        { openId: z.string().describe('Feishu user open_id (ou_...)') },
-        async (args) => feishuResult(await callFeishu('get_user', { openId: args.openId })),
-      ),
-      defineTool(
-        'feishu_get_history',
-        'Read recent message history from the current Feishu chat directly from the platform. Use when you need messages this workspace never received - for example anything sent before the bot joined.',
-        {
-          pageSize: z
-            .number()
-            .optional()
-            .describe('Messages per page (default 20, max 50)'),
-          pageToken: z.string().optional().describe('Pagination token from a previous call'),
-          startTime: z.string().optional().describe('Unix seconds, inclusive lower bound'),
-          endTime: z.string().optional().describe('Unix seconds, inclusive upper bound'),
-        },
-        async (args) =>
-          feishuResult(
-            await callFeishu('get_history', {
-              pageSize: args.pageSize,
-              pageToken: args.pageToken,
-              startTime: args.startTime,
-              endTime: args.endTime,
-            }),
-          ),
-      ),
-      defineTool(
-        'feishu_api_request',
-        'Call an arbitrary Feishu OpenAPI endpoint with the bot’s tenant token. Escape hatch for endpoints without a dedicated tool - prefer the specific tools above when one exists, since they validate their arguments.',
-        {
-          method: z
-            .enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
-            .describe('HTTP method'),
-          path: z
-            .string()
-            .describe('API path beginning with /open-apis/, e.g. /open-apis/im/v1/chats'),
-          body: z.record(z.string(), z.unknown()).optional().describe('JSON request body'),
-          query: z
-            .record(z.string(), z.unknown())
-            .optional()
-            .describe('Query string parameters'),
-        },
-        async (args) =>
-          feishuResult(
-            await callFeishu('api_request', {
-              method: args.method,
-              path: args.path,
-              body: args.body,
-              query: args.query,
-            }),
-          ),
-      ),
-    );
 
   return tools;
 }

@@ -8,11 +8,6 @@
  *         an IM channel — without IM delivery, /codex:status conflicts /
  *         no-active-runner notices silently disappear on Feishu/TG/QQ.
  *
- *   P2-2: agent conversation cold-start must use the latest sender as plugin
- *         runtime owner on the admin-shared web:main workspace, mirroring
- *         the active-IPC path. Without this, a second admin starting a new
- *         agent conv would expand against the first admin's plugin runtime.
- *
  *   P2-3: advanceNextPullCursorOnly must compare lex (timestamp, id) — same
  *         timestamp + later id already-processed must not regress to the
  *         earlier id (would replay an already-handled reply).
@@ -249,140 +244,6 @@ describe('sendPluginExpanderReply IM routing — #20 P1-1 fan out to IM', () => 
   });
 });
 
-// ─── P2-2: agent conv cold-start sender override on admin-shared web:main ───
-
-/**
- * Shadow of the runtime-owner resolution inserted into the agent-conversation
- * cold-start path. Mirrors the logic at src/index.ts ~line 5640 after the
- * round-11 fix and the active-IPC path at ~line 6620.
- */
-interface MockUser {
-  id: string;
-  status: 'active' | 'disabled';
-  role: 'admin' | 'member';
-}
-function resolveAgentConvColdStartOwner(args: {
-  chatJid: string;
-  isHome: boolean;
-  createdBy: string | null | undefined;
-  missedMessages: Array<{ sender: string }>;
-  getUserById: (id: string) => MockUser | null;
-}): string | null | undefined {
-  let runtimeOwner: string | null | undefined = args.createdBy;
-  if (args.chatJid === 'web:main' && args.isHome) {
-    for (let i = args.missedMessages.length - 1; i >= 0; i--) {
-      const sender = args.missedMessages[i]?.sender;
-      if (!sender || sender === 'happyclaw-agent' || sender === '__system__')
-        continue;
-      const senderUser = args.getUserById(sender);
-      if (senderUser?.status === 'active' && senderUser.role === 'admin') {
-        runtimeOwner = senderUser.id;
-        break;
-      }
-    }
-  }
-  return runtimeOwner;
-}
-
-describe('agent conv cold-start runtime owner — #20 P2-2 sender override', () => {
-  const userTable: Record<string, MockUser> = {
-    'admin-1': { id: 'admin-1', status: 'active', role: 'admin' },
-    'admin-2': { id: 'admin-2', status: 'active', role: 'admin' },
-    'admin-disabled': { id: 'admin-disabled', status: 'disabled', role: 'admin' },
-    member: { id: 'member', status: 'active', role: 'member' },
-  };
-  const lookup = (id: string) => userTable[id] ?? null;
-
-  test('web:main + is_home + last admin sender different from created_by → sender wins', () => {
-    // admin-1 was the first to materialise web:main (created_by);
-    // admin-2 is now starting a new agent conversation. Their per-user
-    // plugin runtime must be the one expanded against.
-    const owner = resolveAgentConvColdStartOwner({
-      chatJid: 'web:main',
-      isHome: true,
-      createdBy: 'admin-1',
-      missedMessages: [{ sender: 'admin-2' }],
-      getUserById: lookup,
-    });
-    expect(owner).toBe('admin-2');
-  });
-
-  test('web:main + is_home + only system messages → fall back to created_by', () => {
-    const owner = resolveAgentConvColdStartOwner({
-      chatJid: 'web:main',
-      isHome: true,
-      createdBy: 'admin-1',
-      missedMessages: [
-        { sender: 'happyclaw-agent' },
-        { sender: '__system__' },
-      ],
-      getUserById: lookup,
-    });
-    expect(owner).toBe('admin-1');
-  });
-
-  test('web:main + is_home + member sender (not admin) → fall back to created_by', () => {
-    // The admin-shared override is admin-only; non-admin senders don't claim
-    // ownership of the shared workspace (they don't have plugins enabled).
-    const owner = resolveAgentConvColdStartOwner({
-      chatJid: 'web:main',
-      isHome: true,
-      createdBy: 'admin-1',
-      missedMessages: [{ sender: 'member' }],
-      getUserById: lookup,
-    });
-    expect(owner).toBe('admin-1');
-  });
-
-  test('web:main + is_home + disabled admin sender → ignored, fall back', () => {
-    const owner = resolveAgentConvColdStartOwner({
-      chatJid: 'web:main',
-      isHome: true,
-      createdBy: 'admin-1',
-      missedMessages: [{ sender: 'admin-disabled' }],
-      getUserById: lookup,
-    });
-    expect(owner).toBe('admin-1');
-  });
-
-  test('non-web:main group → no override (single-owner home/member group)', () => {
-    const owner = resolveAgentConvColdStartOwner({
-      chatJid: 'web:home-alice',
-      isHome: true,
-      createdBy: 'alice',
-      missedMessages: [{ sender: 'random-user' }],
-      getUserById: lookup,
-    });
-    expect(owner).toBe('alice');
-  });
-
-  test('web:main but is_home=false → no override', () => {
-    const owner = resolveAgentConvColdStartOwner({
-      chatJid: 'web:main',
-      isHome: false,
-      createdBy: 'admin-1',
-      missedMessages: [{ sender: 'admin-2' }],
-      getUserById: lookup,
-    });
-    expect(owner).toBe('admin-1');
-  });
-
-  test('walks from end → picks the LATEST admin sender (not the first one)', () => {
-    const owner = resolveAgentConvColdStartOwner({
-      chatJid: 'web:main',
-      isHome: true,
-      createdBy: 'admin-1',
-      missedMessages: [
-        { sender: 'admin-2' },
-        { sender: '__system__' },
-        { sender: 'admin-1' }, // most recent → wins over admin-2
-      ],
-      getUserById: lookup,
-    });
-    expect(owner).toBe('admin-1');
-  });
-});
-
 // ─── P2-4: web hybrid expand — call expander only when active runner ────────
 
 /**
@@ -481,7 +342,10 @@ describe('web path expansion — #20 P2-4 round-12: skip expander when idle', ()
     const result = webPathRun({
       hasActiveRunner: false,
       originalContent: '/codex:status',
-      expander: () => ({ kind: 'reply', text: '请先发起对话启动工作区后重试。' }),
+      expander: () => ({
+        kind: 'reply',
+        text: '请先发起对话启动工作区后重试。',
+      }),
       spy,
     });
     expect(spy.calls).toBe(0);
@@ -494,7 +358,10 @@ describe('web path expansion — #20 P2-4 round-12: skip expander when idle', ()
     const result = webPathRun({
       hasActiveRunner: true,
       originalContent: '/codex:status',
-      expander: () => ({ kind: 'reply', text: '请先发起对话启动工作区后重试。' }),
+      expander: () => ({
+        kind: 'reply',
+        text: '请先发起对话启动工作区后重试。',
+      }),
       spy,
     });
     expect(spy.calls).toBe(1);

@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import {
   evaluateMentionGate,
+  stripLeadingBotMention,
   type MentionGateInput,
   type MentionGateMention,
 } from '../src/feishu-mention-gate.js';
@@ -33,6 +34,35 @@ describe('evaluateMentionGate', () => {
       input({ chatType: 'p2p', botOpenId: '' }),
     );
     expect(decision).toEqual({ allow: true });
+  });
+
+  test('disabled plan is a hard stop even for p2p and mentioned messages', () => {
+    expect(
+      evaluateMentionGate(
+        input({
+          chatType: 'p2p',
+          mentions: [mention(BOT_OPEN_ID)],
+          conversationPlan: {
+            disabled: true,
+            allowWithoutMention: false,
+          },
+        }),
+      ),
+    ).toEqual({ allow: false, reason: 'disabled' });
+  });
+
+  test('an active topic plan allows a follow-up without another mention', () => {
+    expect(
+      evaluateMentionGate(
+        input({
+          mentions: undefined,
+          conversationPlan: {
+            disabled: false,
+            allowWithoutMention: true,
+          },
+        }),
+      ),
+    ).toEqual({ allow: true });
   });
 
   test('未传 shouldProcessGroupMessage 时直接放行（视作"无门控"）', () => {
@@ -145,5 +175,34 @@ describe('evaluateMentionGate', () => {
       }),
     );
     expect(seen).toEqual({ chatJid: CHAT, sender: SENDER });
+  });
+});
+
+describe('stripLeadingBotMention', () => {
+  const mentions = [
+    { name: 'Happy Claw', id: { open_id: BOT_OPEN_ID } },
+    { name: 'Alice', id: { open_id: 'ou_alice' } },
+  ];
+
+  test('strips the trusted leading bot mention before an exact confirmation phrase', () => {
+    expect(
+      stripLeadingBotMention(
+        '@Happy Claw  确认发布 AGENT-A1B2C3D4',
+        BOT_OPEN_ID,
+        mentions,
+      ),
+    ).toBe('确认发布 AGENT-A1B2C3D4');
+  });
+
+  test('does not strip another user mention or a non-leading bot mention', () => {
+    expect(
+      stripLeadingBotMention('@Alice 确认发布', BOT_OPEN_ID, mentions),
+    ).toBe('@Alice 确认发布');
+    expect(
+      stripLeadingBotMention('请 @Happy Claw 确认发布', BOT_OPEN_ID, mentions),
+    ).toBe('请 @Happy Claw 确认发布');
+    expect(stripLeadingBotMention('@Happy Claw', BOT_OPEN_ID, mentions)).toBe(
+      '@Happy Claw',
+    );
   });
 });

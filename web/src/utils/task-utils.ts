@@ -3,7 +3,6 @@
  */
 
 export const INTERVAL_UNITS = [
-  { label: '秒', ms: 1_000 },
   { label: '分钟', ms: 60_000 },
   { label: '小时', ms: 3_600_000 },
   { label: '天', ms: 86_400_000 },
@@ -16,6 +15,7 @@ export const CHANNEL_OPTIONS = [
   { key: 'wechat', label: '微信' },
   { key: 'dingtalk', label: '钉钉' },
   { key: 'discord', label: 'Discord' },
+  { key: 'whatsapp', label: 'WhatsApp' },
 ] as const;
 
 /** Format interval milliseconds to human-readable string (e.g. "5 分钟"). */
@@ -25,7 +25,6 @@ export function formatInterval(ms: string | number): string {
   if (n % 86_400_000 === 0) return `${n / 86_400_000} 天`;
   if (n % 3_600_000 === 0) return `${n / 3_600_000} 小时`;
   if (n % 60_000 === 0) return `${n / 60_000} 分钟`;
-  if (n % 1_000 === 0) return `${n / 1_000} 秒`;
   return `${n} 毫秒`;
 }
 
@@ -35,10 +34,34 @@ export function decomposeInterval(ms: string): { num: string; unitMs: string } {
   if (isNaN(n) || n <= 0) return { num: '', unitMs: '60000' };
   for (let i = INTERVAL_UNITS.length - 1; i >= 0; i--) {
     if (n % INTERVAL_UNITS[i].ms === 0) {
-      return { num: String(n / INTERVAL_UNITS[i].ms), unitMs: String(INTERVAL_UNITS[i].ms) };
+      return {
+        num: String(n / INTERVAL_UNITS[i].ms),
+        unitMs: String(INTERVAL_UNITS[i].ms),
+      };
     }
   }
   return { num: String(n / 60_000), unitMs: '60000' };
+}
+
+export function formatTaskStatus(
+  status: 'active' | 'paused' | 'completed' | 'parsing',
+  isRunning = false,
+): string {
+  if (isRunning) return '执行中';
+  switch (status) {
+    case 'active':
+      return '已启用';
+    case 'parsing':
+      return 'AI 解析中';
+    case 'paused':
+      return '已暂停';
+    case 'completed':
+      return '已完成';
+  }
+}
+
+export function formatContextMode(mode: 'group' | 'isolated'): string {
+  return mode === 'isolated' ? '独立任务会话' : '主会话执行';
 }
 
 /**
@@ -59,7 +82,10 @@ export function toggleNotifyChannel(
   }
   const next = [...current, key];
   // If all connected channels selected, normalize back to null (= all)
-  if (connectedKeys.length > 0 && connectedKeys.every((c) => next.includes(c))) {
+  if (
+    connectedKeys.length > 0 &&
+    connectedKeys.every((c) => next.includes(c))
+  ) {
     return null;
   }
   return next;

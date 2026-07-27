@@ -19,7 +19,7 @@
 - 全局包安装（`pip install`、`npm install -g`）
 - Docker 容器操作（`docker run`、`docker exec`）
 - 防火墙规则变更（`iptables`、`ufw`）
-- PM2 进程管理（启动/停止/删除进程）
+- 宿主机进程管理（启动/停止/删除进程）
 - 系统服务管理（`systemctl start/stop/restart`）
 
 ### Skill / MCP 安装审查

@@ -1,29 +1,99 @@
 // Configuration management routes
 
-import { randomBytes, createHash } from 'node:crypto';
-import { spawn, execFile, type ChildProcess } from 'node:child_process';
-import { promisify } from 'node:util';
-import { Agent as HttpsAgent } from 'node:https';
-import { ProxyAgent } from 'proxy-agent';
+import {
+  randomBytes,
+  createHash,
+} from 'node:crypto';
+import {
+  spawn,
+  execFile,
+  type ChildProcess,
+} from 'node:child_process';
+import {
+  promisify,
+} from 'node:util';
+import fs from 'node:fs';
+import path from 'node:path';
+import {
+  Agent as HttpsAgent,
+} from 'node:https';
+import {
+  ProxyAgent,
+} from 'proxy-agent';
 import QRCode from 'qrcode';
-import { Hono } from 'hono';
-import { z } from 'zod';
-import { DATA_DIR, updateWeChatNoProxy } from '../config.js';
-import type { Variables } from '../web-context.js';
-import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
-import { getChannelType } from '../im-channel.js';
+import {
+  Hono,
+} from 'hono';
+import {
+  z,
+} from 'zod';
+import {
+  DATA_DIR,
+  updateWeChatNoProxy,
+} from '../config.js';
+import {
+  avatarUploadBodyLimit,
+  AVATAR_MAX_FILE_BYTES,
+} from '../http-upload-policy.js';
+import type {
+  Variables,
+} from '../web-context.js';
+import {
+  canAccessGroup,
+  canModifyGroup,
+  getWebDeps,
+} from '../web-context.js';
+import {
+  extractChatId,
+  getChannelType,
+} from '../im-channel.js';
 import {
   deleteRegisteredGroup,
   deleteChatHistory,
+  deleteAgent,
   getRegisteredGroup,
+  getAllRegisteredGroups,
   setRegisteredGroup,
   updateChatName,
   getAgent,
-  clearSenderAllowlist,
-  deleteSessionsByProviderId,
+  getAgentProfileForWorkspace,
+  getUserById,
+  logAuthEvent,
+  deleteWorkspaceSessions,
+  deleteSessionsByProviderIdAroundCommit,
+  getSession,
+  getRouterState,
+  getRouterStateByPrefix,
+  setRouterState,
+  deleteRouterState,
+  isDatabaseInitialized,
   VALID_ACTIVATION_MODES,
+  getDefaultChannelAccount,
+  getLegacyChannelAccount,
+  getChannelAccount,
+  getGroupsByTargetAgent,
+  updateAgentLastImJid,
 } from '../db.js';
-import { authMiddleware, systemConfigMiddleware } from '../middleware/auth.js';
+import {
+  channelConversationJid,
+  parseChannelAddress,
+} from '../channel-address.js';
+import {
+  isMentionActivationMode,
+} from '../feishu-conversation-policy.js';
+import {
+  normalizeLegacyOwnerMention,
+} from '../im-audience-policy.js';
+import {
+  conversationBindingPolicyError,
+  resolveChannelConversationKind,
+  type ChannelConversationKind,
+} from '../channel-conversation-kind.js';
+import {
+  adminRoleMiddleware,
+  authMiddleware,
+  systemConfigMiddleware,
+} from '../middleware/auth.js';
 import {
   ClaudeCustomEnvSchema,
   FeishuConfigSchema,
@@ -35,6 +105,7 @@ import {
   WhatsAppConfigSchema,
   RegistrationConfigSchema,
   AppearanceConfigSchema,
+  HostIntegrationSettingsSchema,
   SystemSettingsSchema,
   UnifiedProviderCreateSchema,
   UnifiedProviderPatchSchema,
@@ -54,7 +125,7 @@ import {
   createProvider,
   updateProvider,
   updateProviderSecrets,
-  toggleProvider,
+  setProviderEnabled,
   deleteProvider,
   providerToConfig,
   toPublicProvider,
@@ -72,6 +143,7 @@ import {
   saveAppearanceConfig,
   getSystemSettings,
   getEffectiveExternalDir,
+  getContainerEnvConfig,
   saveSystemSettings,
   getUserFeishuConfig,
   saveUserFeishuConfig,
@@ -89,30 +161,65 @@ import {
   saveUserWhatsAppConfig,
   updateAllSessionCredentials,
   appendImConfigAudit,
+  parseOAuthUsageBucket,
 } from '../runtime-config.js';
-import { findCodexCli, probeCodexDependencies } from '../codex-runtime.js';
+import {
+  findCodexCli,
+  probeCodexDependencies,
+} from '../codex-runtime.js';
 import type {
   ClaudeOAuthCredentials,
   CachedOAuthUsage,
   OAuthUsageResponse,
   OAuthUsageBucket,
 } from '../runtime-config.js';
-import { parseOAuthUsageBucket } from '../runtime-config.js';
-import type { AuthUser, RegisteredGroup } from '../types.js';
-import { hasPermission } from '../permissions.js';
-import { logger } from '../logger.js';
-import { testFeishuCredentials } from '../feishu-connectivity.js';
+import type {
+  ChatProbe,
+  AudienceMode,
+  AuthUser,
+  RegisteredGroup,
+} from '../types.js';
+import {
+  hasPermission,
+} from '../permissions.js';
+import {
+  logger,
+} from '../logger.js';
+import {
+  testFeishuCredentials,
+} from '../feishu-connectivity.js';
+import {
+  buildSessionMountUpdate,
+  buildDetachedWorkspaceUpdate,
+  buildWorkspaceMountUpdate,
+  commitChannelMountUpdate,
+  hasRemainingThreadMapMount,
+  hasSessionMountConflict,
+  hasWorkspaceMountConflict,
+  isNativeContextContainer,
+  restoreDefaultChannelMount,
+  type NativeContextMetadata,
+} from '../channel-mount-service.js';
 import {
   checkImChannelLimit,
   isBillingEnabled,
-  clearBillingEnabledCache,
 } from '../billing.js';
-import { providerPool } from '../provider-pool.js';
-import fs from 'fs';
-import path from 'path';
+import {
+  providerPool,
+} from '../provider-pool.js';
 
 const execFileAsync = promisify(execFile);
 
+import {
+  getClientIp,
+} from '../utils.js';
+import {
+  getWorkspaceRuntimeJids,
+  quiesceWorkspaceRunnersAroundCommit,
+  resolveEffectiveAgentProfile,
+  withAgentProfileLocks,
+  WorkspaceRuntimeQuiesceError,
+} from '../agent-profile-runtime.js';
 const configRoutes = new Hono<{ Variables: Variables }>();
 
 /**
@@ -151,6 +258,7 @@ function countOtherEnabledImChannels(
 let deps: any = null;
 export function injectConfigDeps(d: any) {
   deps = d;
+  restorePendingProviderRuntimeSafetyBlocks();
 }
 
 function createTelegramApiAgent(proxyUrl?: string): HttpsAgent | ProxyAgent {
@@ -172,6 +280,9 @@ interface ClaudeApplyResultPayload {
   stoppedCount: number;
   failedCount: number;
   clearedSessionsCount?: number;
+  /** Whether the config mutation itself was durably written. */
+  persisted?: boolean;
+  phase?: 'pre_commit' | 'post_commit';
   error?: string;
 }
 
@@ -451,6 +562,481 @@ interface ApplyOptions {
    * protocol-level fields (anthropicBaseUrl / anthropicModel) change.
    */
   clearSessionsForProviderId?: string;
+  sessionInvalidation?: {
+    modelChanged: boolean;
+    baseUrlChanged: boolean;
+  };
+}
+
+interface PendingProviderSessionInvalidation {
+  providerId: string;
+  modelChanged: boolean;
+  baseUrlChanged: boolean;
+}
+
+const PROVIDER_INVALIDATION_STATE_PREFIX =
+  'provider_session_invalidation_pending:';
+const PROVIDER_RUNTIME_SAFETY_SOURCE = 'provider-config-mutation';
+const volatilePendingProviderSessionInvalidations = new Map<
+  string,
+  PendingProviderSessionInvalidation
+>();
+
+function providerInvalidationStateKey(providerId: string): string {
+  return `${PROVIDER_INVALIDATION_STATE_PREFIX}${providerId}`;
+}
+
+function getPendingProviderSessionInvalidation(
+  providerId: string,
+): PendingProviderSessionInvalidation | undefined {
+  const raw = getRouterState(providerInvalidationStateKey(providerId));
+  const volatile = volatilePendingProviderSessionInvalidations.get(providerId);
+  let durable: PendingProviderSessionInvalidation | undefined;
+  if (raw) {
+    try {
+      const parsed = JSON.parse(
+        raw,
+      ) as Partial<PendingProviderSessionInvalidation>;
+      if (parsed.providerId === providerId) {
+        durable = {
+          providerId,
+          modelChanged: parsed.modelChanged === true,
+          baseUrlChanged: parsed.baseUrlChanged === true,
+        };
+      } else {
+        durable = {
+          providerId,
+          modelChanged: true,
+          baseUrlChanged: true,
+        };
+      }
+    } catch {
+      // A corrupt marker must remain repairable rather than becoming a
+      // permanent global gate. Conservatively replay both invalidations when
+      // this provider is next PATCHed.
+      durable = {
+        providerId,
+        modelChanged: true,
+        baseUrlChanged: true,
+      };
+    }
+  }
+  if (!durable) return volatile;
+  if (!volatile) return durable;
+  return {
+    providerId,
+    modelChanged: durable.modelChanged || volatile.modelChanged,
+    baseUrlChanged: durable.baseUrlChanged || volatile.baseUrlChanged,
+  };
+}
+
+function setPendingProviderSessionInvalidation(
+  pending: PendingProviderSessionInvalidation,
+): void {
+  const previous = getPendingProviderSessionInvalidation(pending.providerId);
+  const merged = {
+    providerId: pending.providerId,
+    modelChanged: pending.modelChanged || previous?.modelChanged === true,
+    baseUrlChanged: pending.baseUrlChanged || previous?.baseUrlChanged === true,
+  };
+  // Keep an in-process repair path even if durable state persistence fails.
+  volatilePendingProviderSessionInvalidations.set(pending.providerId, merged);
+  setRouterState(
+    providerInvalidationStateKey(pending.providerId),
+    JSON.stringify(merged),
+  );
+}
+
+function clearPendingProviderSessionInvalidation(providerId: string): void {
+  deleteRouterState(providerInvalidationStateKey(providerId));
+  volatilePendingProviderSessionInvalidations.delete(providerId);
+}
+
+function hasPendingProviderSessionInvalidations(): boolean {
+  return (
+    volatilePendingProviderSessionInvalidations.size > 0 ||
+    getRouterStateByPrefix(PROVIDER_INVALIDATION_STATE_PREFIX).length > 0
+  );
+}
+
+/**
+ * Runtime-safety blocks live in memory, while incomplete provider session
+ * invalidations are durable. Rebuild the gate when web dependencies are
+ * injected after a process restart so no stale session can resume before an
+ * exact provider PATCH repairs the pending cleanup.
+ */
+function restorePendingProviderRuntimeSafetyBlocks(): void {
+  if (!deps || !isDatabaseInitialized()) return;
+  const durableRows = getRouterStateByPrefix(
+    PROVIDER_INVALIDATION_STATE_PREFIX,
+  );
+  const configuredProviderIds = new Set(
+    getProviders().map((provider) => provider.id),
+  );
+  const pendingProviderIds = new Set([
+    ...durableRows.map((row) =>
+      row.key.slice(PROVIDER_INVALIDATION_STATE_PREFIX.length),
+    ),
+    ...volatilePendingProviderSessionInvalidations.keys(),
+  ]);
+  for (const providerId of pendingProviderIds) {
+    if (providerId && configuredProviderIds.has(providerId)) continue;
+    if (providerId) {
+      const cleanup = deleteSessionsByProviderIdAroundCommit(
+        providerId,
+        undefined,
+        () => undefined,
+      );
+      syncProviderSessionCaches(cleanup.affectedFolders);
+    }
+    deleteRouterState(providerInvalidationStateKey(providerId));
+    volatilePendingProviderSessionInvalidations.delete(providerId);
+    pendingProviderIds.delete(providerId);
+    logger.warn(
+      { providerId },
+      'Removed orphaned provider session invalidation marker during startup',
+    );
+  }
+  if (pendingProviderIds.size === 0) return;
+  const runtimeJids = Array.from(
+    new Set(
+      getClaudeRuntimeTargets().flatMap((target) =>
+        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
+      ),
+    ),
+  );
+  deps.queue.blockGroupsForRuntimeSafety(
+    runtimeJids,
+    `provider session invalidation pending after restart: ${pendingProviderIds.size}`,
+    PROVIDER_RUNTIME_SAFETY_SOURCE,
+  );
+}
+
+interface ClaudeMutationResult<T> {
+  value?: T;
+  applied: ClaudeApplyResultPayload;
+}
+
+class ClaudeConfigPersistedError<T> extends Error {
+  constructor(
+    public readonly persistedValue: T,
+    public readonly cause: unknown,
+  ) {
+    super(
+      cause instanceof Error
+        ? cause.message
+        : 'Provider configuration was persisted but a follow-up action failed',
+    );
+    this.name = 'ClaudeConfigPersistedError';
+  }
+}
+
+function runAfterProviderPersistence<T>(
+  persistedValue: T,
+  followUp: () => void,
+): T {
+  try {
+    followUp();
+    return persistedValue;
+  } catch (error) {
+    throw new ClaudeConfigPersistedError(persistedValue, error);
+  }
+}
+
+function appendClaudeConfigAuditBestEffort(
+  actor: string,
+  action: string,
+  changedFields: string[],
+  metadata?: Record<string, unknown>,
+): void {
+  try {
+    appendClaudeConfigAudit(actor, action, changedFields, metadata);
+  } catch (error) {
+    logger.error(
+      { error, actor, action },
+      'Provider configuration audit append failed after persistence',
+    );
+  }
+}
+
+let claudeConfigMutationTail: Promise<void> = Promise.resolve();
+
+async function withClaudeConfigMutationLock<T>(
+  fn: () => Promise<T>,
+): Promise<T> {
+  const previous = claudeConfigMutationTail;
+  let release!: () => void;
+  claudeConfigMutationTail = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  await previous;
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
+
+function hasWorkspaceProviderOverride(
+  folder: string,
+  invalidation?: ApplyOptions['sessionInvalidation'],
+): boolean {
+  if (!invalidation) return false;
+  const override = getContainerEnvConfig(folder);
+  // Shadowing is field-specific. Credentials do not protect a workspace from
+  // inheriting a changed global model or Base URL, and when both fields change
+  // the workspace must override both before its legacy NULL-bound session is
+  // safe to preserve.
+  const modelChangeIsShadowed =
+    !invalidation.modelChanged || !!override.anthropicModel;
+  const baseUrlChangeIsShadowed =
+    !invalidation.baseUrlChanged || !!override.anthropicBaseUrl;
+  return modelChangeIsShadowed && baseUrlChangeIsShadowed;
+}
+
+function getSafeLegacyUnboundFolders(
+  providerId: string,
+  invalidation?: ApplyOptions['sessionInvalidation'],
+): string[] {
+  if (!deps) return [];
+  const configuredProviders = getProviders();
+  if (
+    configuredProviders.length !== 1 ||
+    configuredProviders[0]?.id !== providerId
+  ) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      Object.values(
+        deps.getRegisteredGroups() as Record<string, RegisteredGroup>,
+      )
+        .map((group) => group.folder)
+        .filter(
+          (folder) => !hasWorkspaceProviderOverride(folder, invalidation),
+        ),
+    ),
+  );
+}
+
+function getProviderSessionCleanupOptions(
+  providerId: string,
+  invalidation?: ApplyOptions['sessionInvalidation'],
+): { includeUnboundFolders: string[] } {
+  return {
+    includeUnboundFolders: getSafeLegacyUnboundFolders(
+      providerId,
+      invalidation,
+    ),
+  };
+}
+
+function syncProviderSessionCaches(affectedFolders: string[]): void {
+  if (!deps) return;
+  for (const folder of affectedFolders) {
+    const remainingMainSession = getSession(folder);
+    if (remainingMainSession !== undefined) {
+      deps.sessions[folder] = remainingMainSession;
+    } else {
+      delete deps.sessions[folder];
+    }
+  }
+}
+
+function commitProviderConfigWithSessionInvalidation<T>(
+  providerId: string,
+  invalidation: ApplyOptions['sessionInvalidation'],
+  commit: () => T,
+): { value: T; clearedSessionsCount: number } {
+  const result = deleteSessionsByProviderIdAroundCommit(
+    providerId,
+    getProviderSessionCleanupOptions(providerId, invalidation),
+    commit,
+  );
+  syncProviderSessionCaches(result.affectedFolders);
+  return { value: result.value, clearedSessionsCount: result.deletedCount };
+}
+
+function getClaudeRuntimeTargets(): Array<{
+  folder: string;
+  primaryJid: string;
+}> {
+  if (!deps) return [];
+  const targets = new Map<string, { folder: string; primaryJid: string }>();
+  for (const [jid, group] of Object.entries(
+    deps.getRegisteredGroups() as Record<string, RegisteredGroup>,
+  )) {
+    if (!targets.has(group.folder)) {
+      targets.set(group.folder, { folder: group.folder, primaryJid: jid });
+    }
+  }
+  return [...targets.values()];
+}
+
+function getKnownClaudeRuntimeJids(): string[] {
+  if (!deps) return [];
+  return Array.from(
+    new Set(
+      getClaudeRuntimeTargets().flatMap((target) =>
+        getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
+      ),
+    ),
+  );
+}
+
+async function mutateClaudeConfigForAllGroups<T>(
+  actor: string,
+  metadata: Record<string, unknown> | undefined,
+  commit: () => T,
+  options?: ApplyOptions,
+): Promise<ClaudeMutationResult<T>> {
+  if (!deps) throw new Error('Server not initialized');
+
+  const targets = getClaudeRuntimeTargets();
+  const reason = String(metadata?.trigger ?? 'claude_config_apply');
+  const knownRuntimeJids = getKnownClaudeRuntimeJids();
+  try {
+    const result = await quiesceWorkspaceRunnersAroundCommit(
+      deps,
+      targets,
+      {
+        reason,
+        onPostCommitFailure: (runtimeJids) => {
+          // Establish the in-memory fail-closed gate before any durable marker
+          // I/O. Focused test fixtures may omit the optional method, while the
+          // production WebDeps queue is a concrete GroupQueue that implements
+          // it and startup restoration below requires it when pending exists.
+          deps.queue.blockGroupsForRuntimeSafety?.(
+            runtimeJids,
+            `${reason}: post-commit provider runtime cleanup failed`,
+            PROVIDER_RUNTIME_SAFETY_SOURCE,
+          );
+          if (
+            options?.clearSessionsForProviderId &&
+            options.sessionInvalidation
+          ) {
+            try {
+              setPendingProviderSessionInvalidation({
+                providerId: options.clearSessionsForProviderId,
+                ...options.sessionInvalidation,
+              });
+            } catch (error) {
+              // The volatile marker was set before SQLite persistence, so an
+              // exact retry in this process can still repair and unblock.
+              logger.error(
+                { error, providerId: options.clearSessionsForProviderId },
+                'Failed to persist pending provider session invalidation',
+              );
+            }
+          }
+        },
+      },
+      async () => {
+        let value: T;
+        let clearedSessionsCount: number | undefined;
+        try {
+          if (options?.clearSessionsForProviderId) {
+            const committed = commitProviderConfigWithSessionInvalidation(
+              options.clearSessionsForProviderId,
+              options.sessionInvalidation,
+              commit,
+            );
+            value = committed.value;
+            clearedSessionsCount = committed.clearedSessionsCount;
+          } else {
+            value = commit();
+          }
+        } catch (error) {
+          if (error instanceof ClaudeConfigPersistedError) {
+            deps.queue.blockGroupsForRuntimeSafety?.(
+              knownRuntimeJids,
+              `${reason}: provider config persisted but follow-up failed`,
+              PROVIDER_RUNTIME_SAFETY_SOURCE,
+            );
+          }
+          throw error;
+        }
+        return { value, clearedSessionsCount };
+      },
+    );
+    // A successful retry proves every runtime now observes the persisted
+    // provider config, so it may repair a fail-closed gate left by an earlier
+    // post-commit teardown failure.
+    if (options?.clearSessionsForProviderId) {
+      clearPendingProviderSessionInvalidation(
+        options.clearSessionsForProviderId,
+      );
+    }
+    if (!hasPendingProviderSessionInvalidations()) {
+      deps.queue.unblockGroupsForRuntimeSafety?.(
+        result.runtimeJids,
+        PROVIDER_RUNTIME_SAFETY_SOURCE,
+      );
+    }
+    const applied: ClaudeApplyResultPayload = {
+      success: true,
+      stoppedCount: result.runtimeJids.length,
+      failedCount: 0,
+      persisted: true,
+      ...(result.value.clearedSessionsCount !== undefined
+        ? { clearedSessionsCount: result.value.clearedSessionsCount }
+        : {}),
+    };
+    appendClaudeConfigAuditBestEffort(
+      actor,
+      'apply_to_all_flows',
+      ['queue.stopGroup'],
+      {
+        ...applied,
+        ...(metadata || {}),
+      },
+    );
+    return { value: result.value.value, applied };
+  } catch (err) {
+    if (err instanceof ClaudeConfigPersistedError) {
+      const applied: ClaudeApplyResultPayload = {
+        success: false,
+        stoppedCount: 0,
+        failedCount: 1,
+        persisted: true,
+        phase: 'post_commit',
+        error:
+          'Configuration was saved, but provider runtime cleanup did not complete safely',
+      };
+      appendClaudeConfigAuditBestEffort(
+        actor,
+        'apply_to_all_flows',
+        ['queue.stopGroup'],
+        { ...applied, ...(metadata || {}) },
+      );
+      return { value: err.persistedValue as T, applied };
+    }
+    if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+    const committed = err.committedValue as
+      | { value: T; clearedSessionsCount?: number }
+      | undefined;
+    const persisted = err.persisted;
+    const applied: ClaudeApplyResultPayload = {
+      success: false,
+      stoppedCount: 0,
+      failedCount: err.failures.length,
+      persisted,
+      phase: err.phase,
+      ...(committed?.clearedSessionsCount !== undefined
+        ? { clearedSessionsCount: committed.clearedSessionsCount }
+        : {}),
+      error: persisted
+        ? 'Configuration was saved, but one or more runtimes failed to restart safely'
+        : 'Configuration was not updated because one or more runtimes failed to stop safely',
+    };
+    appendClaudeConfigAuditBestEffort(
+      actor,
+      'apply_to_all_flows',
+      ['queue.stopGroup'],
+      { ...applied, ...(metadata || {}) },
+    );
+    return { value: committed?.value, applied };
+  }
 }
 
 async function applyClaudeConfigToAllGroups(
@@ -458,55 +1044,13 @@ async function applyClaudeConfigToAllGroups(
   metadata?: Record<string, unknown>,
   options?: ApplyOptions,
 ): Promise<ClaudeApplyResultPayload> {
-  if (!deps) {
-    throw new Error('Server not initialized');
-  }
-
-  const registeredGroups = deps.getRegisteredGroups?.() ?? {};
-  const groupJids = Object.keys(registeredGroups);
-  const results = await Promise.allSettled(
-    groupJids.map((jid) => deps.queue.stopGroup(jid)),
+  const result = await mutateClaudeConfigForAllGroups(
+    actor,
+    metadata,
+    () => undefined,
+    options,
   );
-  const failedCount = results.filter((r) => r.status === 'rejected').length;
-  const stoppedCount = groupJids.length - failedCount;
-
-  // Narrowed session cleanup: only drop sticky bindings for the provider whose
-  // protocol-level fields actually changed. Bindings to other providers stay
-  // intact so a routine update doesn't reset the entire pool. See issue #476.
-  let clearedSessionsCount: number | undefined;
-  if (options?.clearSessionsForProviderId) {
-    const { deletedCount, affectedFolders } = deleteSessionsByProviderId(
-      options.clearSessionsForProviderId,
-    );
-    clearedSessionsCount = deletedCount;
-    for (const folder of affectedFolders) {
-      delete deps.sessions[folder];
-    }
-  }
-
-  appendClaudeConfigAudit(actor, 'apply_to_all_flows', ['queue.stopGroup'], {
-    stoppedCount,
-    failedCount,
-    ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
-    ...(metadata || {}),
-  });
-
-  if (failedCount > 0) {
-    return {
-      success: false,
-      stoppedCount,
-      failedCount,
-      ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
-      error: `${failedCount} container(s) failed to stop`,
-    };
-  }
-
-  return {
-    success: true,
-    stoppedCount,
-    failedCount: 0,
-    ...(clearedSessionsCount !== undefined ? { clearedSessionsCount } : {}),
-  };
+  return result.applied;
 }
 
 // --- OAuth 常量 ---
@@ -719,61 +1263,126 @@ configRoutes.patch(
     const actor = (c.get('user') as AuthUser).username;
 
     try {
-      const previous = getProviders().find((p) => p.id === id);
-      if (!previous || previous.providerPoolId !== 'claude') {
-        return c.json({ error: 'Claude provider not found' }, 404);
-      }
-      const { enabled, ...providerPatch } = validation.data;
-      const hasProviderPatch = Object.keys(providerPatch).length > 0;
-      let updated = previous;
-      if (hasProviderPatch) {
-        updated = updateProvider(id, providerPatch);
-      }
-      const enabledChanged =
-        enabled !== undefined && updated.enabled !== enabled;
-      if (enabledChanged) {
-        updated = toggleProvider(id);
-      }
-      const changedFields = Object.keys(validation.data).map(
-        (k) => `${k}:updated`,
-      );
-      // Protocol-level fields are the ones that, if changed, can break
-      // resumption of an existing Claude session (different model framing /
-      // different signing authority for thinking blocks). Other fields
-      // (name, weight, customEnv) only affect routing or environment and are
-      // safe to apply mid-session.
-      const protocolFieldChanged = !!(
-        previous &&
-        ((validation.data.anthropicBaseUrl !== undefined &&
-          validation.data.anthropicBaseUrl !== previous.anthropicBaseUrl) ||
-          (validation.data.anthropicModel !== undefined &&
-            validation.data.anthropicModel !== previous.anthropicModel))
-      );
-      appendClaudeConfigAudit(actor, 'update_provider', [
-        `id:${id}`,
-        ...changedFields,
-        ...(protocolFieldChanged ? ['protocolFieldChanged'] : []),
-      ]);
-
-      // If this provider is enabled, or if its enabled state changed, apply to running containers.
-      let applied: ClaudeApplyResultPayload | null = null;
-      if (updated.enabled || enabledChanged) {
-        applied = await applyClaudeConfigToAllGroups(
-          actor,
-          {
-            trigger: 'provider_update',
-            providerId: id,
-            protocolFieldChanged,
-          },
-          protocolFieldChanged
-            ? { clearSessionsForProviderId: id }
-            : undefined,
+      return await withClaudeConfigMutationLock(async () => {
+        const previous = getProviders().find((p) => p.id === id);
+        if (!previous) throw new Error('未找到指定供应商');
+        // 池过滤：upstream 版没有这道检查，用 Claude 的 provider API 去改
+        // grok/codex 的 provider 会成功，并按 Claude schema 落盘——销毁其凭据。
+        if (previous.providerPoolId !== 'claude') {
+          throw new Error('Claude provider not found');
+        }
+        const changedFields = Object.keys(validation.data).map(
+          (k) => `${k}:updated`,
         );
-      }
+        const baseUrlChanged = !!(
+          validation.data.anthropicBaseUrl !== undefined &&
+          validation.data.anthropicBaseUrl !== previous.anthropicBaseUrl
+        );
+        const modelChanged = !!(
+          validation.data.anthropicModel !== undefined &&
+          validation.data.anthropicModel !== previous.anthropicModel
+        );
+        const protocolFieldChanged = baseUrlChanged || modelChanged;
+        const pendingInvalidation = getPendingProviderSessionInvalidation(id);
+        const sessionInvalidation = {
+          modelChanged:
+            modelChanged || pendingInvalidation?.modelChanged === true,
+          baseUrlChanged:
+            baseUrlChanged || pendingInvalidation?.baseUrlChanged === true,
+        };
+        // Preserve this PR's model/base-URL resume behavior for third-party
+        // gateways. We do not have a reproducible third-party backend failure
+        // proving that their sessions must be invalidated.
+        const shouldClearSessions =
+          !!pendingInvalidation ||
+          (protocolFieldChanged && previous.type === 'official');
+        const metadata = {
+          trigger: 'provider_update',
+          providerId: id,
+          protocolFieldChanged,
+          baseUrlChanged,
+          modelChanged,
+        };
+        const commit = () => {
+          let updated = updateProvider(id, validation.data);
+          // updateProvider 只管 name/baseUrl/model/customEnv/weight；enabled 的
+          // 开关由 setProviderEnabled 负责（与 codex / grok 两条路由同口径）。
+          if (
+            validation.data.enabled !== undefined &&
+            updated.enabled !== validation.data.enabled
+          ) {
+            updated = setProviderEnabled(id, validation.data.enabled);
+          }
+          appendClaudeConfigAuditBestEffort(actor, 'update_provider', [
+            `id:${id}`,
+            ...changedFields,
+            ...(protocolFieldChanged ? ['protocolFieldChanged'] : []),
+          ]);
+          return updated;
+        };
 
-      return c.json({
-        provider: toPublicProvider(updated),
-        ...(applied ? { applied } : {}),
+        let mutation: ClaudeMutationResult<ReturnType<typeof updateProvider>>;
+        if (previous.enabled) {
+          mutation = await mutateClaudeConfigForAllGroups(
+            actor,
+            metadata,
+            commit,
+            shouldClearSessions
+              ? {
+                  clearSessionsForProviderId: id,
+                  sessionInvalidation,
+                }
+              : undefined,
+          );
+        } else {
+          const committed = shouldClearSessions
+            ? commitProviderConfigWithSessionInvalidation(
+                id,
+                sessionInvalidation,
+                commit,
+              )
+            : { value: commit(), clearedSessionsCount: undefined };
+          const updated = committed.value;
+          const clearedSessionsCount = committed.clearedSessionsCount;
+          if (shouldClearSessions) {
+            clearPendingProviderSessionInvalidation(id);
+            if (!hasPendingProviderSessionInvalidations()) {
+              deps?.queue?.unblockGroupsForRuntimeSafety?.(
+                getKnownClaudeRuntimeJids(),
+                PROVIDER_RUNTIME_SAFETY_SOURCE,
+              );
+            }
+          }
+          mutation = {
+            value: updated,
+            applied: {
+              success: true,
+              stoppedCount: 0,
+              failedCount: 0,
+              persisted: true,
+              ...(clearedSessionsCount !== undefined
+                ? { clearedSessionsCount }
+                : {}),
+            },
+          };
+        }
+
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json({
+          provider: toPublicProvider(mutation.value!),
+          applied: mutation.applied,
+        });
       });
     } catch (err) {
       const message =
@@ -803,53 +1412,81 @@ configRoutes.put(
     const actor = (c.get('user') as AuthUser).username;
 
     try {
-      const current = getProviders().find((p) => p.id === id);
-      if (!current || current.providerPoolId !== 'claude') {
-        return c.json({ error: 'Claude provider not found' }, 404);
-      }
-      const updated = updateProviderSecrets(id, validation.data);
+      return await withClaudeConfigMutationLock(async () => {
+        const previous = getProviders().find((provider) => provider.id === id);
+        if (!previous) throw new Error('未找到指定供应商');
+        // 池过滤：upstream 版没有这道检查，用 Claude 的 provider API 去改
+        // grok/codex 的 provider 会成功，并按 Claude schema 落盘——销毁其凭据。
+        if (previous.providerPoolId !== 'claude') {
+          throw new Error('Claude provider not found');
+        }
+        const changedFields: string[] = [];
+        if (validation.data.anthropicAuthToken !== undefined)
+          changedFields.push('anthropicAuthToken:set');
+        if (validation.data.clearAnthropicAuthToken)
+          changedFields.push('anthropicAuthToken:clear');
+        if (validation.data.anthropicApiKey !== undefined)
+          changedFields.push('anthropicApiKey:set');
+        if (validation.data.clearAnthropicApiKey)
+          changedFields.push('anthropicApiKey:clear');
+        if (validation.data.claudeCodeOauthToken !== undefined)
+          changedFields.push('claudeCodeOauthToken:set');
+        if (validation.data.clearClaudeCodeOauthToken)
+          changedFields.push('claudeCodeOauthToken:clear');
+        if (validation.data.claudeOAuthCredentials)
+          changedFields.push('claudeOAuthCredentials:set');
+        if (validation.data.clearClaudeOAuthCredentials)
+          changedFields.push('claudeOAuthCredentials:clear');
 
-      const changedFields: string[] = [];
-      if (validation.data.anthropicAuthToken !== undefined)
-        changedFields.push('anthropicAuthToken:set');
-      if (validation.data.clearAnthropicAuthToken)
-        changedFields.push('anthropicAuthToken:clear');
-      if (validation.data.anthropicApiKey !== undefined)
-        changedFields.push('anthropicApiKey:set');
-      if (validation.data.clearAnthropicApiKey)
-        changedFields.push('anthropicApiKey:clear');
-      if (validation.data.claudeCodeOauthToken !== undefined)
-        changedFields.push('claudeCodeOauthToken:set');
-      if (validation.data.clearClaudeCodeOauthToken)
-        changedFields.push('claudeCodeOauthToken:clear');
-      if (validation.data.claudeOAuthCredentials)
-        changedFields.push('claudeOAuthCredentials:set');
-      if (validation.data.clearClaudeOAuthCredentials)
-        changedFields.push('claudeOAuthCredentials:clear');
+        const commit = () => {
+          const updated = updateProviderSecrets(id, validation.data);
+          appendClaudeConfigAuditBestEffort(actor, 'update_provider_secrets', [
+            `id:${id}`,
+            ...changedFields,
+          ]);
+          return runAfterProviderPersistence(updated, () => {
+            if (validation.data.claudeOAuthCredentials && updated.enabled) {
+              updateAllSessionCredentials(providerToConfig(updated));
+              deps?.queue?.closeAllActiveForCredentialRefresh();
+            }
+          });
+        };
 
-      appendClaudeConfigAudit(actor, 'update_provider_secrets', [
-        `id:${id}`,
-        ...changedFields,
-      ]);
+        const mutation = previous.enabled
+          ? await mutateClaudeConfigForAllGroups(
+              actor,
+              {
+                trigger: 'provider_secrets_update',
+                providerId: id,
+              },
+              commit,
+            )
+          : {
+              value: commit(),
+              applied: {
+                success: true,
+                stoppedCount: 0,
+                failedCount: 0,
+                persisted: true,
+              } satisfies ClaudeApplyResultPayload,
+            };
 
-      // Update .credentials.json if OAuth credentials changed
-      if (validation.data.claudeOAuthCredentials && updated.enabled) {
-        updateAllSessionCredentials(providerToConfig(updated));
-        deps?.queue?.closeAllActiveForCredentialRefresh();
-      }
-
-      // Apply if enabled
-      let applied: ClaudeApplyResultPayload | null = null;
-      if (updated.enabled) {
-        applied = await applyClaudeConfigToAllGroups(actor, {
-          trigger: 'provider_secrets_update',
-          providerId: id,
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json({
+          provider: toPublicProvider(mutation.value!),
+          applied: mutation.applied,
         });
-      }
-
-      return c.json({
-        provider: toPublicProvider(updated),
-        ...(applied ? { applied } : {}),
       });
     } catch (err) {
       const message =
@@ -865,18 +1502,52 @@ configRoutes.delete(
   '/claude/providers/:id',
   authMiddleware,
   systemConfigMiddleware,
-  (c) => {
+  async (c) => {
     const { id } = c.req.param();
     const actor = (c.get('user') as AuthUser).username;
 
     try {
-      const current = getProviders().find((p) => p.id === id);
-      if (!current || current.providerPoolId !== 'claude') {
-        return c.json({ error: 'Claude provider not found' }, 404);
-      }
-      deleteProvider(id);
-      appendClaudeConfigAudit(actor, 'delete_provider', [`id:${id}`]);
-      return c.json({ ok: true });
+      return await withClaudeConfigMutationLock(async () => {
+        const previous = getProviders().find((provider) => provider.id === id);
+        const pendingInvalidation = getPendingProviderSessionInvalidation(id);
+        if (!previous && !pendingInvalidation) {
+          throw new Error('未找到指定供应商');
+        }
+        if (previous && previous.providerPoolId !== 'claude') {
+          throw new Error('Claude provider not found');
+        }
+        const sessionInvalidation = pendingInvalidation ?? {
+          modelChanged: true,
+          baseUrlChanged: true,
+        };
+        const mutation = await mutateClaudeConfigForAllGroups(
+          actor,
+          { trigger: 'provider_delete', providerId: id },
+          () => {
+            if (previous) {
+              deleteProvider(id);
+              appendClaudeConfigAuditBestEffort(actor, 'delete_provider', [
+                `id:${id}`,
+              ]);
+            }
+            return { id };
+          },
+          {
+            clearSessionsForProviderId: id,
+            sessionInvalidation,
+          },
+        );
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+            },
+            503,
+          );
+        }
+        return c.json({ ok: true, applied: mutation.applied });
+      });
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Failed to delete provider';
@@ -894,26 +1565,46 @@ configRoutes.post(
   async (c) => {
     const { id } = c.req.param();
     const actor = (c.get('user') as AuthUser).username;
+    const body = await c.req.json().catch(() => ({}));
+    if (typeof body.enabled !== 'boolean') {
+      return c.json({ error: 'enabled must be a boolean' }, 400);
+    }
 
     try {
-      const current = getProviders().find((p) => p.id === id);
-      if (!current || current.providerPoolId !== 'claude') {
-        return c.json({ error: 'Claude provider not found' }, 404);
-      }
-      const updated = toggleProvider(id);
-      appendClaudeConfigAudit(actor, 'toggle_provider', [
-        `id:${id}`,
-        `enabled:${updated.enabled}`,
-      ]);
-
-      const applied = await applyClaudeConfigToAllGroups(actor, {
-        trigger: 'provider_toggle',
-        providerId: id,
-      });
-
-      return c.json({
-        provider: toPublicProvider(updated),
-        applied,
+      return await withClaudeConfigMutationLock(async () => {
+        const previous = getProviders().find((provider) => provider.id === id);
+        // upstream 的 toggle 完全没查 provider 归属，直接 setProviderEnabled。
+        if (!previous || previous.providerPoolId !== 'claude') {
+          throw new Error('Claude provider not found');
+        }
+        const mutation = await mutateClaudeConfigForAllGroups(
+          actor,
+          { trigger: 'provider_toggle', providerId: id },
+          () => {
+            const updated = setProviderEnabled(id, body.enabled);
+            appendClaudeConfigAuditBestEffort(actor, 'toggle_provider', [
+              `id:${id}`,
+              `enabled:${updated.enabled}`,
+            ]);
+            return updated;
+          },
+        );
+        if (!mutation.applied.success) {
+          return c.json(
+            {
+              error: mutation.applied.error,
+              applied: mutation.applied,
+              ...(mutation.value
+                ? { provider: toPublicProvider(mutation.value) }
+                : {}),
+            },
+            503,
+          );
+        }
+        return c.json({
+          provider: toPublicProvider(mutation.value!),
+          applied: mutation.applied,
+        });
       });
     } catch (err) {
       const message =
@@ -1250,7 +1941,7 @@ configRoutes.patch(
         weight: validation.data.weight,
       });
       if (validation.data.enabled !== undefined && provider.enabled !== validation.data.enabled) {
-        provider = toggleProvider(id);
+        provider = setProviderEnabled(id, validation.data.enabled);
       }
       return c.json({ provider: toPublicProvider(provider) });
     } catch (err) {
@@ -1717,7 +2408,7 @@ configRoutes.patch(
         validation.data.enabled !== undefined &&
         provider.enabled !== validation.data.enabled
       ) {
-        provider = toggleProvider(id);
+        provider = setProviderEnabled(id, validation.data.enabled);
       }
       return c.json({ provider: toPublicProvider(provider) });
     } catch (err) {
@@ -1836,11 +2527,15 @@ configRoutes.post(
   async (c) => {
     const actor = (c.get('user') as AuthUser).username;
     try {
-      const result = await applyClaudeConfigToAllGroups(actor);
-      if (!result.success) {
-        return c.json(result, 207);
-      }
-      return c.json(result);
+      return await withClaudeConfigMutationLock(async () => {
+        const result = await applyClaudeConfigToAllGroups(actor, {
+          trigger: 'manual_provider_apply',
+        });
+        if (!result.success) {
+          return c.json(result, 503);
+        }
+        return c.json(result);
+      });
     } catch (err) {
       logger.error({ err }, 'Failed to apply Claude config to all groups');
       return c.json({ error: 'Server not initialized' }, 500);
@@ -2075,13 +2770,160 @@ function resolveProxyInfo(
 
 /** Persist a RegisteredGroup update and sync to the in-memory cache. */
 function applyBindingUpdate(imJid: string, updated: RegisteredGroup): void {
-  setRegisteredGroup(imJid, updated);
+  commitChannelMountUpdate(imJid, updated);
+}
+
+function applyRegisteredGroupUpdate(
+  jid: string,
+  updated: RegisteredGroup,
+): void {
+  setRegisteredGroup(jid, updated);
   const webDeps = getWebDeps();
   if (webDeps) {
     const groups = webDeps.getRegisteredGroups();
-    if (groups[imJid]) groups[imJid] = updated;
-    webDeps.clearImFailCounts?.(imJid);
+    if (groups[jid]) groups[jid] = updated;
   }
+}
+
+function hasConsistentChannelAccount(
+  userId: string,
+  imJid: string,
+  group: RegisteredGroup,
+): boolean {
+  const encodedAccountId = parseChannelAddress(imJid)?.channelAccountId ?? null;
+  const storedAccountId = group.channel_account_id ?? null;
+  if (encodedAccountId !== storedAccountId) {
+    if (!encodedAccountId && storedAccountId) {
+      const account = getChannelAccount(storedAccountId);
+      return (
+        account?.is_legacy_default === true && account.owner_user_id === userId
+      );
+    }
+    return false;
+  }
+  if (!storedAccountId) return true;
+  return getChannelAccount(storedAccountId)?.owner_user_id === userId;
+}
+
+function refreshAgentLastImJid(agentId: string): void {
+  const agent = getAgent(agentId);
+  if (!agent) return;
+  const remaining = getGroupsByTargetAgent(agentId);
+  const current = agent.last_im_jid
+    ? channelConversationJid(agent.last_im_jid)
+    : null;
+  if (current && remaining.some(({ jid }) => jid === current)) return;
+  remaining.sort((a, b) => {
+    const dateDiff =
+      Date.parse(b.group.added_at) - Date.parse(a.group.added_at);
+    if (Number.isFinite(dateDiff) && dateDiff !== 0) return dateDiff;
+    return a.jid.localeCompare(b.jid);
+  });
+  updateAgentLastImJid(agentId, remaining[0]?.jid ?? null);
+}
+
+type ChannelChatInfo = NativeContextMetadata & {
+  avatar?: string;
+  name?: string;
+  user_count?: string;
+};
+
+function getConversationKind(
+  imJid: string,
+  group: Pick<RegisteredGroup, 'feishu_chat_mode'>,
+  chatInfo?: ChannelChatInfo | null,
+): ChannelConversationKind {
+  return resolveChannelConversationKind(imJid, {
+    feishu_chat_mode: group.feishu_chat_mode,
+    chat_mode: chatInfo?.chat_mode,
+  });
+}
+
+// Only fetches live chat metadata — does NOT compute threadCapable. That
+// decision must be (re-)computed by the caller against a freshly re-read
+// imGroup taken AFTER this await, never against the pre-await snapshot —
+// see the identical helper's doc comment in routes/agents.ts for why.
+/**
+ * 把 ChatProbe 解包成裸元数据。
+ * `gone` / `unknown` / `unsupported` 一律返回 null——调用方只关心「有没有拿到
+ * 元数据」；对 `gone` 的自动解绑决策由 index.ts 的 onConfirmedGone 单独负责，
+ * 绝不在这里把瞬时故障混同为群失效。
+ */
+function unwrapChatProbe(
+  probe: ChatProbe | null | undefined,
+): ChannelChatInfo | null {
+  // 探测器可能返回 null（渠道未接入 / deps 未注入）——按"没拿到元数据"处理，
+  // 与 gone / unknown / unsupported 同归 null，绝不当作确定性否定。
+  return probe?.status === 'ok' ? (probe.info as ChannelChatInfo) : null;
+}
+async function fetchLiveChatInfo(
+  userId: string,
+  imJid: string,
+): Promise<{ chatInfo?: ChannelChatInfo | null }> {
+  const channelType = getChannelType(imJid);
+  if (!channelType) return {};
+  const webDeps = getWebDeps();
+  const chatInfo = webDeps?.getChannelChatInfo
+    ? unwrapChatProbe(await webDeps.getChannelChatInfo(imJid))
+    : channelType === 'feishu' && webDeps?.getFeishuChatInfo
+      ? await webDeps.getFeishuChatInfo(userId, extractChatId(imJid))
+      : null;
+  return { chatInfo };
+}
+
+function resolveWorkspaceForBinding(
+  targetMainJid: string,
+): { jid: string; group: RegisteredGroup } | null {
+  const direct = getRegisteredGroup(targetMainJid);
+  if (direct) return { jid: targetMainJid, group: direct };
+  if (!targetMainJid.startsWith('web:')) return null;
+
+  const folder = targetMainJid.slice(4);
+  for (const [jid, group] of Object.entries(getAllRegisteredGroups())) {
+    if (jid.startsWith('web:') && group.folder === folder) {
+      return { jid, group };
+    }
+  }
+  return null;
+}
+
+function detachThreadMapWorkspaceIfLast(
+  targetMainJid: string | undefined,
+  excludingImJid: string,
+  nextWorkspaceJid?: string,
+  nextRoutingMode?: 'single_session' | 'thread_map',
+): void {
+  if (!targetMainJid) return;
+  const workspace = resolveWorkspaceForBinding(targetMainJid);
+  if (!workspace) return;
+  const nextWorkspace =
+    nextRoutingMode === 'thread_map' && nextWorkspaceJid
+      ? resolveWorkspaceForBinding(nextWorkspaceJid)
+      : null;
+  if (nextWorkspace?.jid === workspace.jid) return;
+  if (hasRemainingThreadMapMount(workspace.jid, excludingImJid)) return;
+
+  applyRegisteredGroupUpdate(
+    workspace.jid,
+    buildDetachedWorkspaceUpdate(workspace.group),
+  );
+}
+
+function markNativeContextWorkspace(targetMainJid: string): void {
+  const workspace = resolveWorkspaceForBinding(targetMainJid);
+  if (!workspace) return;
+  applyRegisteredGroupUpdate(workspace.jid, {
+    ...workspace.group,
+    conversation_source: 'native_thread',
+    conversation_nav_mode: 'vertical_threads',
+  });
+}
+
+function restoreDefaultChannelError(restored: { reason: string }): string {
+  if (restored.reason === 'account_mismatch') {
+    return 'Channel account does not match this chat or owner';
+  }
+  return 'Channel account has no default or owner home workspace';
 }
 
 configRoutes.get('/feishu', authMiddleware, systemConfigMiddleware, (c) => {
@@ -2345,6 +3187,24 @@ configRoutes.put(
 
 // ─── Appearance config ────────────────────────────────────────────
 
+const SYSTEM_AGENT_AVATARS_DIR = path.join(DATA_DIR, 'avatars');
+const SYSTEM_AGENT_AVATAR_PREFIX = 'system-agent-';
+const SYSTEM_AGENT_AVATAR_EXTENSIONS: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+};
+
+function removeStaleSystemAgentAvatars(keep?: string): void {
+  if (!fs.existsSync(SYSTEM_AGENT_AVATARS_DIR)) return;
+  for (const filename of fs.readdirSync(SYSTEM_AGENT_AVATARS_DIR)) {
+    if (!filename.startsWith(SYSTEM_AGENT_AVATAR_PREFIX) || filename === keep)
+      continue;
+    fs.rmSync(path.join(SYSTEM_AGENT_AVATARS_DIR, filename), { force: true });
+  }
+}
+
 configRoutes.get('/appearance', authMiddleware, systemConfigMiddleware, (c) => {
   try {
     return c.json(getAppearanceConfig());
@@ -2382,6 +3242,58 @@ configRoutes.put(
   },
 );
 
+configRoutes.post(
+  '/appearance/avatar',
+  authMiddleware,
+  adminRoleMiddleware,
+  avatarUploadBodyLimit,
+  async (c) => {
+    if (!(c.req.header('content-type') || '').includes('multipart/form-data')) {
+      return c.json({ error: 'Expected multipart/form-data' }, 400);
+    }
+    const formData = await c.req.formData();
+    const file = formData.get('avatar');
+    if (!file || !(file instanceof File)) {
+      return c.json({ error: 'No avatar file provided' }, 400);
+    }
+    if (file.size > AVATAR_MAX_FILE_BYTES) {
+      return c.json({ error: 'File too large (max 3MB)' }, 413);
+    }
+    const extension = SYSTEM_AGENT_AVATAR_EXTENSIONS[file.type];
+    if (!extension) {
+      return c.json(
+        { error: 'Unsupported image type. Use jpg, png, gif or webp' },
+        400,
+      );
+    }
+
+    fs.mkdirSync(SYSTEM_AGENT_AVATARS_DIR, { recursive: true });
+    const filename = `${SYSTEM_AGENT_AVATAR_PREFIX}${randomBytes(4).toString('hex')}${extension}`;
+    const destination = path.join(SYSTEM_AGENT_AVATARS_DIR, filename);
+    const temporary = `${destination}.tmp`;
+    fs.writeFileSync(temporary, Buffer.from(await file.arrayBuffer()));
+    fs.renameSync(temporary, destination);
+    const aiAvatarUrl = `/api/auth/avatars/${filename}`;
+    const appearance = saveAppearanceConfig({ aiAvatarUrl });
+    removeStaleSystemAgentAvatars(filename);
+    return c.json({ appearance, avatarUrl: aiAvatarUrl });
+  },
+);
+
+configRoutes.delete(
+  '/appearance/avatar',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => {
+    const appearance = saveAppearanceConfig({
+      aiAvatarUrl: null,
+      aiAvatarMode: 'emoji',
+    });
+    removeStaleSystemAgentAvatars();
+    return c.json({ appearance });
+  },
+);
+
 // Public endpoint — no auth required (like /api/auth/status)
 configRoutes.get('/appearance/public', (c) => {
   try {
@@ -2391,6 +3303,8 @@ configRoutes.get('/appearance/public', (c) => {
       aiName: config.aiName,
       aiAvatarEmoji: config.aiAvatarEmoji,
       aiAvatarColor: config.aiAvatarColor,
+      aiAvatarUrl: config.aiAvatarUrl,
+      aiAvatarMode: config.aiAvatarMode,
     });
   } catch (err) {
     logger.error({ err }, 'Failed to load public appearance config');
@@ -2400,9 +3314,38 @@ configRoutes.get('/appearance/public', (c) => {
 
 // ─── System settings ───────────────────────────────────────────────
 
+function toSystemSettingsResponse(
+  settings: ReturnType<typeof getSystemSettings>,
+) {
+  return {
+    containerTimeout: settings.containerTimeout,
+    idleTimeout: settings.idleTimeout,
+    containerMaxOutputSize: settings.containerMaxOutputSize,
+    maxConcurrentContainers: settings.maxConcurrentContainers,
+    maxLoginAttempts: settings.maxLoginAttempts,
+    loginLockoutMinutes: settings.loginLockoutMinutes,
+    maxConcurrentScripts: settings.maxConcurrentScripts,
+    scriptTimeout: settings.scriptTimeout,
+    taskBackfillGraceMs: settings.taskBackfillGraceMs,
+    maxRepliesPerTurn: settings.maxRepliesPerTurn,
+    maxTasksPerUser: settings.maxTasksPerUser,
+    fallbackModel: settings.fallbackModel,
+  };
+}
+
+function changedSettingFields(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  submitted: Record<string, unknown>,
+): string[] {
+  return Object.keys(submitted)
+    .filter((key) => !Object.is(before[key], after[key]))
+    .sort();
+}
+
 configRoutes.get('/system', authMiddleware, systemConfigMiddleware, (c) => {
   try {
-    return c.json(getSystemSettings());
+    return c.json(toSystemSettingsResponse(getSystemSettings()));
   } catch (err) {
     logger.error({ err }, 'Failed to load system settings');
     return c.json({ error: 'Failed to load system settings' }, 500);
@@ -2423,26 +3366,32 @@ configRoutes.put(
       );
     }
 
-    // 启用「禁用 HappyClaw 记忆层」开关前必须给 admin 主容器配 customCwd，
-    // 否则 CLAUDE_CONFIG_DIR 仍指向 data/sessions/main/.claude，SDK 读不到 ~/.claude/
-    // 又没有 HappyClaw 记忆层注入，agent 会变成空白沙箱。
-    if (validation.data.disableMemoryLayerForAdminHost === true) {
-      const adminMain = getRegisteredGroup('web:main');
-      if (!adminMain || !adminMain.customCwd) {
-        return c.json(
-          {
-            error:
-              '启用前请先给 admin 主容器（web:main）配置 customCwd，否则 SDK 既读不到 HappyClaw 记忆层也读不到 ~/.claude/，会是空白沙箱。',
-          },
-          400,
-        );
-      }
-    }
-
     try {
-      const saved = saveSystemSettings(validation.data);
-      clearBillingEnabledCache();
-      return c.json(saved);
+      const before = toSystemSettingsResponse(getSystemSettings());
+      // Deprecated compatibility input. Host mode no longer has an
+      // application-level concurrency pool; accept the old key so stale Web
+      // clients do not fail the whole request, but never persist/apply it.
+      const effectiveSettings = { ...validation.data };
+      delete effectiveSettings.maxConcurrentHostProcesses;
+      const saved = saveSystemSettings(effectiveSettings);
+      const response = toSystemSettingsResponse(saved);
+      const changedFields = changedSettingFields(
+        before,
+        response,
+        effectiveSettings,
+      );
+      if (changedFields.length > 0) {
+        const actor = c.get('user') as AuthUser;
+        logAuthEvent({
+          event_type: 'system_settings_updated',
+          username: actor.username,
+          actor_username: actor.username,
+          ip_address: getClientIp(c),
+          user_agent: c.req.header('user-agent') ?? null,
+          details: { changed_fields: changedFields },
+        });
+      }
+      return c.json(response);
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Invalid system settings payload';
@@ -2452,72 +3401,263 @@ configRoutes.put(
   },
 );
 
-// ─── External Claude resources (admin only) ─────────────────────────
+// ─── Host integration settings (admin role only) ───────────────────
 
-configRoutes.get('/external-resources', authMiddleware, systemConfigMiddleware, (c) => {
-  // 仅 admin 可查看宿主机资源，普通用户不允许看到宿主机任何内容
-  const user = c.get('user') as AuthUser;
-  if (user.role !== 'admin') {
-    return c.json({ dir: '', rules: [], claudeMd: null });
-  }
-  const effectiveDir = getEffectiveExternalDir();
+function toHostIntegrationResponse(
+  settings: ReturnType<typeof getSystemSettings>,
+) {
+  return {
+    externalClaudeDir: settings.externalClaudeDir,
+    pluginAutoScan: settings.pluginAutoScan,
+    mainAgentContextSource: settings.mainAgentContextSource,
+    mainAgentAutoCompactWindow: settings.mainAgentAutoCompactWindow,
+    mainAgentAutoCompactPercentage: settings.mainAgentAutoCompactPercentage,
+  };
+}
 
-  const result: {
-    dir: string;
-    rules: Array<{ name: string; size: number }>;
-    claudeMd: string | null;
-  } = { dir: effectiveDir, rules: [], claudeMd: null };
+configRoutes.get(
+  '/host-integration',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => c.json(toHostIntegrationResponse(getSystemSettings())),
+);
 
-  // Rules
-  const rulesDir = path.join(effectiveDir, 'rules');
-  try {
-    if (fs.existsSync(rulesDir)) {
-      for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
-        if (!entry.isFile() && !entry.isSymbolicLink()) continue;
-        try {
-          const st = fs.statSync(path.join(rulesDir, entry.name));
-          result.rules.push({ name: entry.name, size: st.size });
-        } catch { /* skip */ }
+configRoutes.put(
+  '/host-integration',
+  authMiddleware,
+  adminRoleMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = HostIntegrationSettingsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const requestedDir = validation.data.externalClaudeDir?.trim();
+    if (requestedDir) {
+      try {
+        const resolved = fs.realpathSync(requestedDir);
+        if (
+          !path.isAbsolute(requestedDir) ||
+          !fs.statSync(resolved).isDirectory()
+        ) {
+          throw new Error('not an absolute directory');
+        }
+      } catch {
+        return c.json(
+          { error: 'externalClaudeDir must be an existing absolute directory' },
+          400,
+        );
       }
     }
-  } catch { /* ignore */ }
 
-  // CLAUDE.md
-  const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
-  try {
-    if (fs.existsSync(claudeMdPath)) {
-      const content = fs.readFileSync(claudeMdPath, 'utf-8');
-      result.claudeMd = content.length > 10000 ? content.slice(0, 10000) + '\n...(截断)' : content;
+    const before = toHostIntegrationResponse(getSystemSettings());
+    const mainContextSourceChanged =
+      validation.data.mainAgentContextSource !== undefined &&
+      validation.data.mainAgentContextSource !== before.mainAgentContextSource;
+    const externalClaudeDirChanged =
+      validation.data.externalClaudeDir !== undefined &&
+      validation.data.externalClaudeDir !== before.externalClaudeDir;
+    const hostContextChanged =
+      mainContextSourceChanged || externalClaudeDirChanged;
+    const defaultCompactChanged =
+      (validation.data.mainAgentAutoCompactWindow !== undefined &&
+        validation.data.mainAgentAutoCompactWindow !==
+          before.mainAgentAutoCompactWindow) ||
+      (validation.data.mainAgentAutoCompactPercentage !== undefined &&
+        validation.data.mainAgentAutoCompactPercentage !==
+          before.mainAgentAutoCompactPercentage);
+    const contextMutationRequested =
+      hostContextChanged || defaultCompactChanged;
+    const workspaces = contextMutationRequested
+      ? Object.entries(getAllRegisteredGroups())
+          .map(([jid, group]) => ({
+            jid,
+            group,
+            profile: group.created_by
+              ? getAgentProfileForWorkspace(group.folder, group.created_by)
+              : undefined,
+          }))
+          .filter(({ group, profile }) => {
+            if (!group.created_by || !profile) return false;
+            const isActiveAdmin =
+              getUserById(group.created_by)?.role === 'admin';
+            const currentContextSource =
+              resolveEffectiveAgentProfile(profile)?.runtime_policy.context
+                .source ?? 'managed';
+            const nextContextSource = profile.is_default
+              ? (validation.data.mainAgentContextSource ??
+                before.mainAgentContextSource)
+              : profile.runtime_policy.context.source;
+            return (
+              (defaultCompactChanged && profile.is_default) ||
+              (mainContextSourceChanged &&
+                profile.is_default &&
+                isActiveAdmin) ||
+              (externalClaudeDirChanged &&
+                isActiveAdmin &&
+                (currentContextSource === 'host_claude' ||
+                  nextContextSource === 'host_claude'))
+            );
+          })
+      : [];
+    const sessionResetFolders = Array.from(
+      new Set(workspaces.map(({ group }) => group.folder)),
+    );
+    const commit = () => {
+      const value = saveSystemSettings(validation.data);
+      for (const folder of sessionResetFolders) deleteWorkspaceSessions(folder);
+      return value;
+    };
+    let saved: ReturnType<typeof saveSystemSettings>;
+    if (contextMutationRequested && deps) {
+      const profileIds = Array.from(
+        new Set(
+          workspaces
+            .map(({ profile }) => profile)
+            .filter((profile) => !!profile)
+            .map((profile) => profile.id),
+        ),
+      );
+      try {
+        const result = await withAgentProfileLocks(profileIds, () =>
+          quiesceWorkspaceRunnersAroundCommit(
+            deps,
+            workspaces.map(({ jid, group }) => ({
+              folder: group.folder,
+              primaryJid: jid,
+            })),
+            { reason: 'Host integration context updated' },
+            commit,
+          ),
+        );
+        saved = result.value;
+      } catch (err) {
+        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+        return c.json(
+          {
+            error: err.persisted
+              ? 'Host integration was updated, but runtime cleanup failed; retry the same request'
+              : 'Failed to quiesce active workspaces; host integration was not updated',
+            persisted: err.persisted,
+            retryable: true,
+          },
+          503,
+        );
+      }
+    } else {
+      saved = commit();
     }
-  } catch { /* ignore */ }
+    const response = toHostIntegrationResponse(saved);
+    const changedFields = changedSettingFields(
+      before,
+      response,
+      validation.data,
+    );
+    const actor = c.get('user') as AuthUser;
+    if (changedFields.length > 0) {
+      logAuthEvent({
+        event_type: 'host_integration_updated',
+        username: actor.username,
+        actor_username: actor.username,
+        ip_address: getClientIp(c),
+        user_agent: c.req.header('user-agent') ?? null,
+        // Only names and a boolean are recorded; the host path is never logged.
+        details: {
+          changed_fields: changedFields,
+          external_claude_dir_configured: Boolean(response.externalClaudeDir),
+        },
+      });
+    }
 
-  return c.json(result);
-});
+    return c.json(response);
+  },
+);
+
+// ─── External Claude resources (admin only) ─────────────────────────
+
+configRoutes.get(
+  '/external-resources',
+  authMiddleware,
+  adminRoleMiddleware,
+  (c) => {
+    const effectiveDir = getEffectiveExternalDir();
+
+    const result: {
+      dir: string;
+      rules: Array<{ name: string; size: number }>;
+      claudeMd: string | null;
+    } = { dir: effectiveDir, rules: [], claudeMd: null };
+
+    // Rules
+    const rulesDir = path.join(effectiveDir, 'rules');
+    try {
+      if (fs.existsSync(rulesDir)) {
+        for (const entry of fs.readdirSync(rulesDir, { withFileTypes: true })) {
+          if (!entry.isFile() && !entry.isSymbolicLink()) continue;
+          try {
+            const st = fs.statSync(path.join(rulesDir, entry.name));
+            result.rules.push({ name: entry.name, size: st.size });
+          } catch {
+            /* skip */
+          }
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // CLAUDE.md
+    const claudeMdPath = path.join(effectiveDir, 'CLAUDE.md');
+    try {
+      if (fs.existsSync(claudeMdPath)) {
+        const content = fs.readFileSync(claudeMdPath, 'utf-8');
+        result.claudeMd =
+          content.length > 10000
+            ? content.slice(0, 10000) + '\n...(截断)'
+            : content;
+      }
+    } catch {
+      /* ignore */
+    }
+
+    return c.json(result);
+  },
+);
 
 // Read a single rule file content (admin only)
-configRoutes.get('/external-resources/rule', authMiddleware, systemConfigMiddleware, (c) => {
-  const user = c.get('user') as AuthUser;
-  if (user.role !== 'admin') {
-    return c.text('Forbidden', 403);
-  }
-  const name = c.req.query('name');
-  if (!name || name.includes('/') || name.includes('..')) {
-    return c.text('Invalid name', 400);
-  }
-  const effectiveDir = getEffectiveExternalDir();
-  const filePath = path.join(effectiveDir, 'rules', name);
-  try {
-    const resolved = fs.realpathSync(filePath);
-    // 确保解析后的路径仍在 rules 目录内
-    if (!resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))) {
+configRoutes.get(
+  '/external-resources/rule',
+  authMiddleware,
+  systemConfigMiddleware,
+  (c) => {
+    const user = c.get('user') as AuthUser;
+    if (user.role !== 'admin') {
       return c.text('Forbidden', 403);
     }
-    const content = fs.readFileSync(resolved, 'utf-8');
-    return c.text(content);
-  } catch {
-    return c.text('Not found', 404);
-  }
-});
+    const name = c.req.query('name');
+    if (!name || name.includes('/') || name.includes('..')) {
+      return c.text('Invalid name', 400);
+    }
+    const effectiveDir = getEffectiveExternalDir();
+    const filePath = path.join(effectiveDir, 'rules', name);
+    try {
+      const resolved = fs.realpathSync(filePath);
+      // 确保解析后的路径仍在 rules 目录内
+      if (
+        !resolved.startsWith(fs.realpathSync(path.join(effectiveDir, 'rules')))
+      ) {
+        return c.text('Forbidden', 403);
+      }
+      const content = fs.readFileSync(resolved, 'utf-8');
+      return c.text(content);
+    } catch {
+      return c.text('Not found', 404);
+    }
+  },
+);
 
 // ─── Per-user IM connection status ──────────────────────────────────
 
@@ -2530,6 +3670,7 @@ configRoutes.get('/user-im/status', authMiddleware, (c) => {
     wechat: deps?.isUserWeChatConnected?.(user.id) ?? false,
     dingtalk: deps?.isUserDingTalkConnected?.(user.id) ?? false,
     discord: deps?.isUserDiscordConnected?.(user.id) ?? false,
+    whatsapp: deps?.isUserWhatsAppConnected?.(user.id) ?? false,
   });
 });
 
@@ -2676,9 +3817,15 @@ configRoutes.put('/user-im/feishu', authMiddleware, async (c) => {
       autoIsolateContext: next.autoIsolateContext as boolean | undefined,
       ownerOpenId: next.ownerOpenId as string | undefined,
     });
-    appendImConfigAudit(user.username, 'feishu', 'update', Object.keys(validation.data), {
-      userId: user.id,
-    });
+    appendImConfigAudit(
+      user.username,
+      'feishu',
+      'update',
+      Object.keys(validation.data),
+      {
+        userId: user.id,
+      },
+    );
 
     // Migrate existing Feishu chats when autoIsolateContext toggle changes
     const oldAutoIsolate = current?.autoIsolateContext ?? false;
@@ -2806,7 +3953,13 @@ configRoutes.put('/user-im/telegram', authMiddleware, async (c) => {
       proxyUrl: next.proxyUrl || undefined,
       enabled: next.enabled,
     });
-    appendImConfigAudit(user.username, 'telegram', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'telegram',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's Telegram channel
     if (deps?.reloadUserIMConfig) {
@@ -2902,11 +4055,22 @@ configRoutes.get('/user-im/telegram/paired-chats', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const groups = (deps?.getRegisteredGroups() ?? {}) as Record<
     string,
-    { name: string; added_at: string; created_by?: string }
+    {
+      name: string;
+      added_at: string;
+      created_by?: string;
+      channel_account_id?: string | null;
+    }
   >;
+  const legacy = getLegacyChannelAccount(user.id, 'telegram');
   const chats: Array<{ jid: string; name: string; addedAt: string }> = [];
   for (const [jid, group] of Object.entries(groups)) {
-    if (jid.startsWith('telegram:') && group.created_by === user.id) {
+    const address = parseChannelAddress(jid);
+    if (
+      address?.provider === 'telegram' &&
+      group.created_by === user.id &&
+      (address.legacy || group.channel_account_id === legacy?.id)
+    ) {
       chats.push({ jid, name: group.name, addedAt: group.added_at });
     }
   }
@@ -2931,6 +4095,11 @@ configRoutes.delete(
       return c.json({ error: 'Chat not found' }, 404);
     }
     if (group.created_by !== user.id) {
+      return c.json({ error: 'Not authorized to remove this chat' }, 403);
+    }
+    const legacy = getLegacyChannelAccount(user.id, 'telegram');
+    const address = parseChannelAddress(jid);
+    if (!address?.legacy && group.channel_account_id !== legacy?.id) {
       return c.json({ error: 'Not authorized to remove this chat' }, 403);
     }
 
@@ -3032,7 +4201,13 @@ configRoutes.put('/user-im/qq', authMiddleware, async (c) => {
       appSecret: next.appSecret,
       enabled: next.enabled,
     });
-    appendImConfigAudit(user.username, 'qq', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'qq',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's QQ channel
     if (deps?.reloadUserIMConfig) {
@@ -3161,11 +4336,22 @@ configRoutes.get('/user-im/qq/paired-chats', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const groups = (deps?.getRegisteredGroups() ?? {}) as Record<
     string,
-    { name: string; added_at: string; created_by?: string }
+    {
+      name: string;
+      added_at: string;
+      created_by?: string;
+      channel_account_id?: string | null;
+    }
   >;
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
   const chats: Array<{ jid: string; name: string; addedAt: string }> = [];
   for (const [jid, group] of Object.entries(groups)) {
-    if (jid.startsWith('qq:') && group.created_by === user.id) {
+    const address = parseChannelAddress(jid);
+    if (
+      address?.provider === 'qq' &&
+      group.created_by === user.id &&
+      (address.legacy || group.channel_account_id === legacy?.id)
+    ) {
       chats.push({ jid, name: group.name, addedAt: group.added_at });
     }
   }
@@ -3189,10 +4375,15 @@ configRoutes.put('/user-im/qq/paired-chats/:jid', authMiddleware, async (c) => {
   if (group.created_by !== user.id) {
     return c.json({ error: 'Not authorized to rename this chat' }, 403);
   }
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
+  const address = parseChannelAddress(jid);
+  if (!address?.legacy && group.channel_account_id !== legacy?.id) {
+    return c.json({ error: 'Not authorized to rename this chat' }, 403);
+  }
 
   const body = await c.req
     .json<{ name?: unknown }>()
-    .catch(() => ({} as { name?: unknown }));
+    .catch(() => ({}) as { name?: unknown });
   const rawName = typeof body.name === 'string' ? body.name : '';
   const name = rawName.trim();
   if (!name) {
@@ -3224,6 +4415,11 @@ configRoutes.delete('/user-im/qq/paired-chats/:jid', authMiddleware, (c) => {
     return c.json({ error: 'Chat not found' }, 404);
   }
   if (group.created_by !== user.id) {
+    return c.json({ error: 'Not authorized to remove this chat' }, 403);
+  }
+  const legacy = getLegacyChannelAccount(user.id, 'qq');
+  const address = parseChannelAddress(jid);
+  if (!address?.legacy && group.channel_account_id !== legacy?.id) {
     return c.json({ error: 'Not authorized to remove this chat' }, 403);
   }
 
@@ -3325,7 +4521,13 @@ configRoutes.put('/user-im/dingtalk', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserDingTalkConfig(user.id, next);
-    appendImConfigAudit(user.username, 'dingtalk', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'dingtalk',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's DingTalk channel
     if (deps?.reloadUserIMConfig) {
@@ -3471,7 +4673,13 @@ configRoutes.put('/user-im/discord', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserDiscordConfig(user.id, next);
-    appendImConfigAudit(user.username, 'discord', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'discord',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's Discord channel
     if (deps?.reloadUserIMConfig) {
@@ -3651,10 +4859,13 @@ configRoutes.put('/user-im/wechat', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWeChatConfig(user.id, next);
-    appendImConfigAudit(user.username, 'wechat', 'update', Object.keys(validation.data), { userId: user.id });
-
-    // Update NO_PROXY based on bypassProxy setting
-    updateWeChatNoProxy(saved.bypassProxy ?? true);
+    appendImConfigAudit(
+      user.username,
+      'wechat',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's WeChat channel
     if (deps?.reloadUserIMConfig) {
@@ -3782,7 +4993,13 @@ configRoutes.get('/user-im/wechat/qrcode-status', authMiddleware, async (c) => {
         baseUrl: data.baseurl || undefined,
         enabled: true,
       });
-    appendImConfigAudit(user.username, 'wechat', 'oauth_qr_confirmed', ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'], { userId: user.id });
+      appendImConfigAudit(
+        user.username,
+        'wechat',
+        'oauth_qr_confirmed',
+        ['botToken', 'ilinkBotId', 'baseUrl', 'enabled'],
+        { userId: user.id },
+      );
 
       // Note: ilink_user_id (the QR scanner) is NOT auto-paired here.
       // The scanner needs to send a message to the bot and use /pair <code>
@@ -3934,7 +5151,13 @@ configRoutes.put('/user-im/whatsapp', authMiddleware, async (c) => {
 
   try {
     const saved = saveUserWhatsAppConfig(user.id, next);
-    appendImConfigAudit(user.username, 'whatsapp', 'update', Object.keys(validation.data), { userId: user.id });
+    appendImConfigAudit(
+      user.username,
+      'whatsapp',
+      'update',
+      Object.keys(validation.data),
+      { userId: user.id },
+    );
 
     // Hot-reload: reconnect user's WhatsApp channel (skeleton always returns false)
     if (deps?.reloadUserIMConfig) {
@@ -3979,16 +5202,19 @@ configRoutes.put('/user-im/whatsapp', authMiddleware, async (c) => {
 configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   const current = getUserWhatsAppConfig(user.id);
-  const accountId = current?.accountId || 'default';
+  // Compatibility facade: the first-class default account owns the actual
+  // Baileys connection/authDir. Never use the user-editable legacy label as
+  // an auth directory key.
+  const accountId =
+    getDefaultChannelAccount(user.id, 'whatsapp')?.id ??
+    current?.accountId ??
+    'default';
 
   if (deps?.logoutUserWhatsApp) {
     try {
       await deps.logoutUserWhatsApp(user.id, accountId);
     } catch (err) {
-      logger.warn(
-        { err, userId: user.id },
-        'WhatsApp logout deps call failed',
-      );
+      logger.warn({ err, userId: user.id }, 'WhatsApp logout deps call failed');
     }
   }
 
@@ -3999,7 +5225,13 @@ configRoutes.post('/user-im/whatsapp/logout', authMiddleware, async (c) => {
       enabled: false,
       paired: false,
     });
-    appendImConfigAudit(user.username, 'whatsapp', 'logout', ['enabled', 'paired'], { userId: user.id, accountId });
+    appendImConfigAudit(
+      user.username,
+      'whatsapp',
+      'logout',
+      ['enabled', 'paired'],
+      { userId: user.id, accountId },
+    );
     const state = deps?.getUserWhatsAppState?.(user.id) ?? {
       status: 'logged_out' as const,
     };
@@ -4037,82 +5269,222 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   // IM-binding 改的是 imGroup 行（target_agent_id / target_main_jid /
   // activation_mode 等），与 agents.ts 的 4 个 IM-binding 路由对齐：
   // 非成员用 access 检查隐藏存在性（404），成员但非 owner 拒绝写（403）。
-  // 否则共享工作区里的 member 可以劫持 owner 的 IM 路由到自己 agent。
+  // IM 路由变更必须由对应工作区所有者执行。
   if (!canAccessGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'IM group not found' }, 404);
   }
   if (!canModifyGroup(user, { ...imGroup, jid: imJid })) {
     return c.json({ error: 'Forbidden' }, 403);
   }
+  if (!hasConsistentChannelAccount(user.id, imJid, imGroup)) {
+    return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+  }
 
   const body = await c.req.json().catch(() => ({}));
 
   // Unbind mode
   if (body.unbind === true) {
-    const updated: RegisteredGroup = {
-      ...imGroup,
-      target_main_jid: undefined,
-      target_agent_id: undefined,
-    };
-    applyBindingUpdate(imJid, updated);
-    logger.info({ imJid, userId: user.id }, 'IM group unbound (bindings page)');
-    return c.json({ success: true });
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read + re-authorize after the await — fetchLiveChatInfo
+    // yields the event loop on a live network call, during which ownership
+    // or binding state may have changed. restoreDefaultChannelMount commits
+    // whatever `group` it's given, so building it from the stale pre-await
+    // snapshot would silently clobber a concurrent write and could cross
+    // the original authorization boundary.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+      return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+    }
+    const previousTargetAgentId = freshImGroup.target_agent_id;
+    const previousTargetMainJid = freshImGroup.target_main_jid;
+    const wasThreadMap = freshImGroup.binding_mode === 'thread_map';
+    const restored = restoreDefaultChannelMount(
+      imJid,
+      freshImGroup,
+      user.id,
+      chatInfo ?? {},
+    );
+    if (restored.status !== 'resolved') {
+      return c.json({ error: restoreDefaultChannelError(restored) }, 409);
+    }
+    if (wasThreadMap) {
+      detachThreadMapWorkspaceIfLast(
+        previousTargetMainJid,
+        imJid,
+        restored.workspaceJid,
+        restored.routingMode,
+      );
+    }
+    if (restored.routingMode === 'thread_map') {
+      markNativeContextWorkspace(restored.workspaceJid);
+    }
+    if (previousTargetAgentId) {
+      refreshAgentLastImJid(previousTargetAgentId);
+    }
+    logger.info(
+      {
+        imJid,
+        defaultWorkspaceJid: restored.workspaceJid,
+        userId: user.id,
+      },
+      'IM group restored to channel account default workspace (bindings page)',
+    );
+    return c.json({ success: true, target_main_jid: restored.workspaceJid });
   }
 
-  // Bind to agent
-  if (typeof body.target_agent_id === 'string' && body.target_agent_id.trim()) {
-    const agentId = body.target_agent_id.trim();
-    const agent = getAgent(agentId);
+  const targetSessionId =
+    typeof body.target_session_id === 'string' && body.target_session_id.trim()
+      ? body.target_session_id.trim()
+      : typeof body.target_agent_id === 'string' && body.target_agent_id.trim()
+        ? body.target_agent_id.trim()
+        : '';
+
+  // Bind to workspace session. Stored in target_agent_id for backward compatibility.
+  if (targetSessionId) {
+    const sessionId = targetSessionId;
+    const agent = getAgent(sessionId);
     if (!agent) {
-      return c.json({ error: 'Agent not found' }, 404);
+      return c.json({ error: 'Session not found' }, 404);
     }
     if (agent.kind !== 'conversation') {
       return c.json(
-        { error: 'Only conversation agents can bind IM groups' },
+        { error: 'Only workspace sessions can bind IM groups' },
         400,
       );
     }
-    // Check user can access the workspace that owns this agent
+    if (!agent.chat_jid.startsWith('web:')) {
+      return c.json(
+        { error: 'Session target must belong to a workspace' },
+        400,
+      );
+    }
+    // Check user can access the workspace that owns this session.
     const ownerGroup = getRegisteredGroup(agent.chat_jid);
     if (
       !ownerGroup ||
-      !canAccessGroup(user, { ...ownerGroup, jid: agent.chat_jid })
+      !canModifyGroup(user, { ...ownerGroup, jid: agent.chat_jid })
     ) {
       return c.json({ error: 'Forbidden' }, 403);
+    }
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read after the await: fetchLiveChatInfo makes a live network call
+    // that yields the event loop, during which a concurrent bind request or
+    // the message router's owner-learning path can commit a new mount for
+    // this exact imJid, or upgrade native_context_type from 'none' to
+    // 'thread'. Building the update, or computing threadCapable, from the
+    // pre-await snapshot would silently clobber that write or bind a
+    // now-thread-capable container as a fixed single session.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    // Re-run authorization against the fresh row — the handler's top-level
+    // checks only proved it against the stale imGroup read before the await.
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+      return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+    }
+    const freshAgent = getAgent(sessionId);
+    if (
+      !freshAgent ||
+      freshAgent.kind !== 'conversation' ||
+      !freshAgent.chat_jid.startsWith('web:')
+    ) {
+      return c.json({ error: 'Session not found' }, 404);
+    }
+    const freshOwnerGroup = getRegisteredGroup(freshAgent.chat_jid);
+    if (
+      !freshOwnerGroup ||
+      !canModifyGroup(user, {
+        ...freshOwnerGroup,
+        jid: freshAgent.chat_jid,
+      })
+    ) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    // Compute against freshImGroup, not the pre-await snapshot — see
+    // fetchLiveChatInfo's doc comment.
+    if (isNativeContextContainer(imJid, freshImGroup, chatInfo ?? {})) {
+      return c.json(
+        {
+          error:
+            'Native thread containers can only bind to a workspace, not a single session',
+        },
+        400,
+      );
+    }
+    const bindingPolicyError = conversationBindingPolicyError(
+      getConversationKind(imJid, freshImGroup, chatInfo),
+      'session',
+    );
+    if (bindingPolicyError) {
+      return c.json({ error: bindingPolicyError }, 400);
     }
 
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
-    const hasConflict =
-      (imGroup.target_agent_id && imGroup.target_agent_id !== agentId) ||
-      !!imGroup.target_main_jid;
+    const hasConflict = hasSessionMountConflict(freshImGroup, sessionId);
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
 
-    const updated: RegisteredGroup = {
-      ...imGroup,
-      target_agent_id: agentId,
-      target_main_jid: undefined,
-      reply_policy: replyPolicy,
-    };
+    const updated: RegisteredGroup = buildSessionMountUpdate(
+      freshImGroup,
+      sessionId,
+      {
+        replyPolicy,
+      },
+    );
     applyBindingUpdate(imJid, updated);
+    if (freshImGroup.binding_mode === 'thread_map') {
+      detachThreadMapWorkspaceIfLast(freshImGroup.target_main_jid, imJid);
+    }
     logger.info(
-      { imJid, agentId, userId: user.id },
-      'IM group bound to agent (bindings page)',
+      { imJid, sessionId, userId: user.id },
+      'IM group bound to workspace session (bindings page)',
     );
     return c.json({ success: true });
   }
 
   // Parse activation_mode for activation-only update
   const rawActivationMode = body.activation_mode;
-  const activationMode =
+  let activationMode =
     typeof rawActivationMode === 'string' &&
     VALID_ACTIVATION_MODES.has(rawActivationMode)
-      ? (rawActivationMode as typeof rawActivationMode &
-          'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled')
+      ? (rawActivationMode as
+          | (typeof rawActivationMode & 'auto')
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled')
       : undefined;
+  let audienceMode: AudienceMode | undefined =
+    body.audience_mode === 'everyone' || body.audience_mode === 'owner_only'
+      ? body.audience_mode
+      : undefined;
+  if (channelType === 'feishu') {
+    const normalized = normalizeLegacyOwnerMention({
+      activationMode,
+      audienceMode,
+    });
+    activationMode = normalized.activationMode;
+    audienceMode = normalized.audienceMode;
+  }
 
   // Parse owner_im_id for owner_mentioned mode
   const ownerImId =
@@ -4123,74 +5495,187 @@ configRoutes.put('/user-im/bindings/:imJid', authMiddleware, async (c) => {
   // Bind to workspace main conversation
   if (typeof body.target_main_jid === 'string' && body.target_main_jid.trim()) {
     const targetMainJid = body.target_main_jid.trim();
+    if (!targetMainJid.startsWith('web:')) {
+      return c.json({ error: 'Target must be a workspace' }, 400);
+    }
     const targetGroup = getRegisteredGroup(targetMainJid);
     if (!targetGroup) {
       return c.json({ error: 'Target workspace not found' }, 404);
     }
-    if (!canAccessGroup(user, { ...targetGroup, jid: targetMainJid })) {
+    if (!canModifyGroup(user, { ...targetGroup, jid: targetMainJid })) {
       return c.json({ error: 'Forbidden' }, 403);
     }
-    if (targetGroup.is_home) {
+    const { chatInfo } = await fetchLiveChatInfo(user.id, imJid);
+    // Re-read + re-authorize after the await — see the analogous comment
+    // in the session-bind branch above.
+    const freshImGroup = getRegisteredGroup(imJid);
+    if (!freshImGroup) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canAccessGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'IM group not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshImGroup, jid: imJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    if (!hasConsistentChannelAccount(user.id, imJid, freshImGroup)) {
+      return c.json({ error: 'Invalid or inaccessible channel account' }, 400);
+    }
+    const freshTargetGroup = getRegisteredGroup(targetMainJid);
+    if (!freshTargetGroup) {
+      return c.json({ error: 'Target workspace not found' }, 404);
+    }
+    if (!canModifyGroup(user, { ...freshTargetGroup, jid: targetMainJid })) {
+      return c.json({ error: 'Forbidden' }, 403);
+    }
+    const bindingPolicyError = conversationBindingPolicyError(
+      getConversationKind(imJid, freshImGroup, chatInfo),
+      'workspace',
+    );
+    if (bindingPolicyError) {
+      return c.json({ error: bindingPolicyError }, 400);
+    }
+    if (
+      getChannelType(imJid) === 'feishu' &&
+      (chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode) === 'p2p' &&
+      isMentionActivationMode(activationMode)
+    ) {
       return c.json(
-        { error: 'Home workspace main conversation uses default IM routing' },
+        { error: 'Feishu private chats do not support mention activation' },
         400,
       );
     }
-
+    // Compute against freshImGroup, not the pre-await snapshot — see
+    // fetchLiveChatInfo's doc comment.
+    const threadCapable = isNativeContextContainer(imJid, freshImGroup, {
+      ...(chatInfo ?? {}),
+      activation_mode: activationMode ?? freshImGroup.activation_mode,
+    });
     const force = body.force === true;
     const replyPolicy =
       body.reply_policy === 'mirror' ? 'mirror' : 'source_only';
-    const legacyMainJid = `web:${targetGroup.folder}`;
-    const hasConflict =
-      !!imGroup.target_agent_id ||
-      (imGroup.target_main_jid &&
-        imGroup.target_main_jid !== targetMainJid &&
-        imGroup.target_main_jid !== legacyMainJid);
+    const legacyMainJid = `web:${freshTargetGroup.folder}`;
+    const hasConflict = hasWorkspaceMountConflict(
+      freshImGroup,
+      targetMainJid,
+      legacyMainJid,
+    );
     if (hasConflict && !force) {
       return c.json({ error: 'IM group is already bound elsewhere' }, 409);
     }
-
     const updated: RegisteredGroup = {
-      ...imGroup,
-      target_main_jid: targetMainJid,
-      target_agent_id: undefined,
-      reply_policy: replyPolicy,
-      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
-      ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
+      ...buildWorkspaceMountUpdate(
+        freshImGroup,
+        targetMainJid,
+        threadCapable ? 'thread_map' : 'single_session',
+        {
+          replyPolicy,
+          ...(activationMode !== undefined ? { activationMode } : {}),
+          ...(audienceMode !== undefined ? { audienceMode } : {}),
+          ...(ownerImId !== undefined ? { ownerImId } : {}),
+        },
+      ),
+      feishu_chat_mode: chatInfo?.chat_mode ?? freshImGroup.feishu_chat_mode,
+      feishu_group_message_type:
+        chatInfo?.group_message_type ?? freshImGroup.feishu_group_message_type,
+      ...(ownerImId !== undefined
+        ? { owner_claim_source: 'configured' as const }
+        : {}),
     };
     applyBindingUpdate(imJid, updated);
+    if (freshImGroup.binding_mode === 'thread_map') {
+      detachThreadMapWorkspaceIfLast(
+        freshImGroup.target_main_jid,
+        imJid,
+        targetMainJid,
+        threadCapable ? 'thread_map' : 'single_session',
+      );
+    }
+    if (threadCapable) markNativeContextWorkspace(targetMainJid);
     logger.info(
-      { imJid, targetMainJid, userId: user.id },
+      { imJid, targetMainJid, threadCapable, userId: user.id },
       'IM group bound to workspace (bindings page)',
     );
     return c.json({ success: true });
   }
 
   // Activation-only update (no target, just update activation_mode and/or owner_im_id)
-  if (activationMode !== undefined || ownerImId !== undefined) {
-    const updated: RegisteredGroup = {
+  if (
+    activationMode !== undefined ||
+    audienceMode !== undefined ||
+    ownerImId !== undefined
+  ) {
+    if (
+      getChannelType(imJid) === 'feishu' &&
+      imGroup.feishu_chat_mode === 'p2p' &&
+      isMentionActivationMode(activationMode)
+    ) {
+      return c.json(
+        { error: 'Feishu private chats do not support mention activation' },
+        400,
+      );
+    }
+    const candidate: RegisteredGroup = {
       ...imGroup,
-      ...(activationMode !== undefined ? { activation_mode: activationMode } : {}),
+      ...(activationMode !== undefined
+        ? { activation_mode: activationMode }
+        : {}),
+      ...(audienceMode !== undefined ? { audience_mode: audienceMode } : {}),
       ...(ownerImId !== undefined ? { owner_im_id: ownerImId } : {}),
+      ...(ownerImId !== undefined
+        ? { owner_claim_source: 'configured' as const }
+        : {}),
     };
+    const threadCapable = isNativeContextContainer(imJid, candidate, {
+      activation_mode: candidate.activation_mode,
+    });
+    if (threadCapable && candidate.target_agent_id) {
+      return c.json(
+        {
+          error:
+            'Mention-activated and native-topic Feishu chats must bind to a workspace, not a fixed session',
+        },
+        400,
+      );
+    }
+    const updated = candidate.target_main_jid
+      ? buildWorkspaceMountUpdate(
+          candidate,
+          candidate.target_main_jid,
+          threadCapable ? 'thread_map' : 'single_session',
+          {
+            activationMode: candidate.activation_mode,
+            audienceMode: candidate.audience_mode,
+            ownerImId: candidate.owner_im_id ?? null,
+          },
+        )
+      : candidate;
     applyBindingUpdate(imJid, updated);
+    if (imGroup.binding_mode === 'thread_map' && !threadCapable) {
+      detachThreadMapWorkspaceIfLast(imGroup.target_main_jid, imJid);
+    }
+    if (threadCapable && updated.target_main_jid) {
+      markNativeContextWorkspace(updated.target_main_jid);
+    }
     logger.info(
-      { imJid, activationMode, ownerImId, userId: user.id },
-      'IM group activation_mode updated (bindings page)',
+      { imJid, activationMode, audienceMode, ownerImId, userId: user.id },
+      'IM group response policies updated (bindings page)',
     );
     return c.json({ success: true });
   }
 
   return c.json(
-    { error: 'Must provide target_main_jid, target_agent_id, activation_mode, or unbind' },
+    {
+      error:
+        'Must provide target_main_jid, target_session_id, target_agent_id, activation_mode, audience_mode, or unbind',
+    },
     400,
   );
 });
 
-// Reset sender_allowlist to NULL (unrestricted) — escape hatch for the
-// "owner-locked trap" where buildOnNewChat registered the group with `[]`
-// because the Feishu owner had not DM'd the bot yet. After reset, anyone
-// in the group can trigger the bot.
+// Escape hatch for the pre-owner Feishu lock. Reset both the legacy allowlist
+// and the v58 audience policy so the visible "解除限制" action truly allows
+// everyone to trigger the bot.
 configRoutes.post(
   '/user-im/bindings/:imJid/reset-allowlist',
   authMiddleware,
@@ -4223,18 +5708,16 @@ configRoutes.post(
       return c.json({ error: 'Group is not in locked allowlist state' }, 400);
     }
 
-    clearSenderAllowlist(imJid);
-
-    const updated = { ...imGroup, sender_allowlist: undefined };
-    const webDeps = getWebDeps();
-    if (webDeps) {
-      const groups = webDeps.getRegisteredGroups();
-      if (groups[imJid]) groups[imJid] = updated;
-    }
+    const updated: RegisteredGroup = {
+      ...imGroup,
+      sender_allowlist: undefined,
+      audience_mode: 'everyone',
+    };
+    applyBindingUpdate(imJid, updated);
 
     logger.info(
       { imJid, userId: user.id },
-      'Sender allowlist cleared (manual reset from bindings page)',
+      'Feishu response audience reset to everyone (bindings page)',
     );
     return c.json({ success: true });
   },

@@ -1,4 +1,4 @@
-import { exec } from 'child_process';
+import { ChildProcess, execFile, spawn } from 'child_process';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
@@ -10,10 +10,22 @@ export interface ScriptRunResult {
   stderr: string;
   exitCode: number | null;
   timedOut: boolean;
+  aborted: boolean;
   durationMs: number;
 }
 
 let activeScriptCount = 0;
+let nextScriptRunId = 1;
+
+interface ActiveScriptRun {
+  child: ChildProcess;
+  ownerId?: string;
+  groupFolder: string;
+  abort: () => void;
+  settled: Promise<void>;
+}
+
+const activeScriptRuns = new Map<number, ActiveScriptRun>();
 
 export function getActiveScriptCount(): number {
   return activeScriptCount;
@@ -24,11 +36,56 @@ export function hasScriptCapacity(): boolean {
   return activeScriptCount < maxConcurrentScripts;
 }
 
+function killScriptProcessTree(child: ChildProcess): void {
+  const pid = child.pid;
+  if (!pid) return;
+  if (process.platform === 'win32') {
+    execFile('taskkill', ['/pid', String(pid), '/T', '/F'], () => undefined);
+    return;
+  }
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* already exited */
+    }
+  }
+}
+
+export async function terminateScriptsForOwner(
+  userId: string,
+): Promise<number> {
+  const targets = [...activeScriptRuns.values()].filter(
+    (run) => run.ownerId === userId,
+  );
+  // Use the same state transition as AbortSignal cancellation. Killing the
+  // process tree directly would leave `aborted=false`; a SIGKILL close event
+  // with a null exit code could then be misclassified as a successful script.
+  for (const run of targets) run.abort();
+  await Promise.all(
+    targets.map((run) =>
+      Promise.race([
+        run.settled,
+        new Promise<void>((_, reject) =>
+          setTimeout(
+            () => reject(new Error('Timed out terminating host script task')),
+            5_000,
+          ).unref?.(),
+        ),
+      ]),
+    ),
+  );
+  return targets.length;
+}
+
 const MAX_BUFFER = 1024 * 1024; // 1MB
 
 export async function runScript(
   command: string,
   groupFolder: string,
+  options?: { ownerId?: string; signal?: AbortSignal },
 ): Promise<ScriptRunResult> {
   const { scriptTimeout } = getSystemSettings();
   const cwd = path.join(GROUPS_DIR, groupFolder);
@@ -38,45 +95,85 @@ export async function runScript(
 
   try {
     return await new Promise<ScriptRunResult>((resolve) => {
-      const child = exec(
-        command,
-        {
-          cwd,
-          timeout: scriptTimeout,
-          maxBuffer: MAX_BUFFER,
-          env: {
-            // Inherit full parent env so child processes (e.g. Claude CLI)
-            // can access OAuth credentials, Keychain, and system services.
-            ...process.env,
-            LANG: process.env.LANG || 'en_US.UTF-8',
-            TZ:
-              process.env.TZ ||
-              Intl.DateTimeFormat().resolvedOptions().timeZone,
-            GROUP_FOLDER: groupFolder,
-          },
-          shell: '/bin/sh',
+      const runId = nextScriptRunId++;
+      let settleRun!: () => void;
+      const settled = new Promise<void>((settle) => {
+        settleRun = settle;
+      });
+      let stdout = '';
+      let stderr = '';
+      let timedOut = false;
+      let aborted = false;
+      let finished = false;
+      const child = spawn(command, {
+        cwd,
+        env: {
+          // 继承完整父进程环境：脚本任务会调 Claude CLI 等子进程，它们要读 OAuth
+          // 凭据、Keychain 与系统服务。upstream 收紧成 PATH/LANG/TZ/GROUP_FOLDER/
+          // HOME 五项白名单，会让这类任务静默失败。
+          ...process.env,
+          LANG: process.env.LANG || 'en_US.UTF-8',
+          TZ:
+            process.env.TZ || Intl.DateTimeFormat().resolvedOptions().timeZone,
+          GROUP_FOLDER: groupFolder,
+          HOME: process.env.HOME || cwd,
         },
-        (error, stdout, stderr) => {
-          activeScriptCount--;
-          const durationMs = Date.now() - startTime;
-          const timedOut = error?.killed === true;
+        shell: '/bin/sh',
+        detached: process.platform !== 'win32',
+      });
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        killScriptProcessTree(child);
+      }, scriptTimeout);
+      timeout.unref?.();
+      const onAbort = () => {
+        aborted = true;
+        killScriptProcessTree(child);
+      };
+      if (options?.signal?.aborted) onAbort();
+      else options?.signal?.addEventListener('abort', onAbort, { once: true });
+      child.stdout?.on('data', (chunk: Buffer | string) => {
+        if (stdout.length < MAX_BUFFER) stdout += chunk.toString();
+      });
+      child.stderr?.on('data', (chunk: Buffer | string) => {
+        if (stderr.length < MAX_BUFFER) stderr += chunk.toString();
+      });
+      const finish = (exitCode: number | null, spawnError?: Error) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        options?.signal?.removeEventListener('abort', onAbort);
+        activeScriptRuns.delete(runId);
+        activeScriptCount--;
+        settleRun();
+        const durationMs = Date.now() - startTime;
 
-          if (timedOut) {
-            logger.warn(
-              { command: command.slice(0, 100), groupFolder, durationMs },
-              'Script timed out',
-            );
-          }
+        if (timedOut) {
+          logger.warn(
+            { command: command.slice(0, 100), groupFolder, durationMs },
+            'Script timed out',
+          );
+        }
 
-          resolve({
-            stdout: stdout.slice(0, MAX_BUFFER),
-            stderr: stderr.slice(0, MAX_BUFFER),
-            exitCode: timedOut ? null : (child.exitCode ?? (error ? 1 : 0)),
-            timedOut,
-            durationMs,
-          });
-        },
-      );
+        resolve({
+          stdout: stdout.slice(0, MAX_BUFFER),
+          stderr: (spawnError?.message || stderr).slice(0, MAX_BUFFER),
+          exitCode:
+            timedOut || aborted ? null : (exitCode ?? (spawnError ? 1 : 0)),
+          timedOut,
+          aborted,
+          durationMs,
+        });
+      };
+      child.once('error', (err) => finish(1, err));
+      child.once('close', (code) => finish(code));
+      activeScriptRuns.set(runId, {
+        child,
+        ownerId: options?.ownerId,
+        groupFolder,
+        abort: onAbort,
+        settled,
+      });
     });
   } catch (err) {
     activeScriptCount--;
@@ -90,6 +187,7 @@ export async function runScript(
       stderr: err instanceof Error ? err.message : String(err),
       exitCode: 1,
       timedOut: false,
+      aborted: false,
       durationMs,
     };
   }

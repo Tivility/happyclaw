@@ -2,25 +2,39 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '../../../api/client';
 import { useChatStore } from '../../../stores/chat';
 import type { AvailableImGroup, AgentInfo } from '../../../types';
+import { getAgentProfileDisplayName } from '../../../utils/agent-product';
 
 export interface BindingTarget {
-  type: 'main' | 'agent';
+  type: 'main' | 'session';
   groupJid: string;
   groupName: string;
-  agentId?: string;
-  agentName?: string;
+  agentProfileId?: string;
+  agentProfileName?: string;
+  sessionId?: string;
+  sessionName?: string;
 }
+
+type WorkspaceSessionInfo = Omit<AgentInfo, 'kind'> & {
+  kind: AgentInfo['kind'] | 'main';
+  is_main?: boolean;
+};
 
 export function useImBindings() {
   const [bindings, setBindings] = useState<AvailableImGroup[]>([]);
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
+  const [syncError, setSyncError] = useState<string | null>(null);
   const [targets, setTargets] = useState<BindingTarget[]>([]);
   const [targetsLoading, setTargetsLoading] = useState(true);
+  const [bindingsLoadError, setBindingsLoadError] = useState<string | null>(
+    null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const groups = useChatStore((s) => s.groups);
   const loadGroups = useChatStore((s) => s.loadGroups);
   const loadAvailableImGroups = useChatStore((s) => s.loadAvailableImGroups);
+  const syncAvailableImGroups = useChatStore((s) => s.syncAvailableImGroups);
 
   // Derive homeJid as a stable value — no callback, no dependency cycle
   const homeJid = useMemo((): string | null => {
@@ -44,9 +58,14 @@ export function useImBindings() {
       return;
     }
     setLoading(true);
+    setBindingsLoadError(null);
     try {
       const result = await loadAvailableImGroups(hJid);
       setBindings(result);
+    } catch (err) {
+      setBindingsLoadError(
+        err instanceof Error ? err.message : '消息渠道加载失败，请稍后重试',
+      );
     } finally {
       setLoading(false);
     }
@@ -56,8 +75,8 @@ export function useImBindings() {
     setTargetsLoading(true);
     try {
       const currentGroups = groupsRef.current;
-      const webGroups = Object.entries(currentGroups).filter(
-        ([jid, g]) => jid.startsWith('web:') && !g.is_home,
+      const webGroups = Object.entries(currentGroups).filter(([jid]) =>
+        jid.startsWith('web:'),
       );
 
       const allTargets: BindingTarget[] = [];
@@ -67,32 +86,39 @@ export function useImBindings() {
           type: 'main',
           groupJid: jid,
           groupName: group.name,
+          agentProfileId: group.agent_profile_id,
+          agentProfileName: getAgentProfileDisplayName(
+            group.agent_profile_name,
+          ),
         });
       }
 
-      // Load conversation agents for each workspace
-      const agentPromises = webGroups.map(async ([jid, group]) => {
+      const sessionPromises = webGroups.map(async ([jid, group]) => {
         try {
-          const data = await api.get<{ agents: AgentInfo[] }>(
-            `/api/groups/${encodeURIComponent(jid)}/agents`,
+          const data = await api.get<{ sessions: WorkspaceSessionInfo[] }>(
+            `/api/groups/${encodeURIComponent(jid)}/sessions`,
           );
-          return data.agents
-            .filter((a) => a.kind === 'conversation')
+          return data.sessions
+            .filter((a) => a.kind === 'conversation' && a.id !== 'main')
             .map((a) => ({
-              type: 'agent' as const,
+              type: 'session' as const,
               groupJid: jid,
               groupName: group.name,
-              agentId: a.id,
-              agentName: a.name,
+              agentProfileId: group.agent_profile_id,
+              agentProfileName: getAgentProfileDisplayName(
+                group.agent_profile_name,
+              ),
+              sessionId: a.id,
+              sessionName: a.name,
             }));
         } catch {
           return [];
         }
       });
 
-      const agentResults = await Promise.all(agentPromises);
-      for (const agents of agentResults) {
-        allTargets.push(...agents);
+      const sessionResults = await Promise.all(sessionPromises);
+      for (const sessions of sessionResults) {
+        allTargets.push(...sessions);
       }
 
       setTargets(allTargets);
@@ -100,6 +126,25 @@ export function useImBindings() {
       setTargetsLoading(false);
     }
   }, []);
+
+  const syncBindings = useCallback(async () => {
+    const hJid = homeJidRef.current;
+    if (!hJid) return;
+    setSyncing(true);
+    setSyncError(null);
+    try {
+      await syncAvailableImGroups(hJid);
+      const result = await loadAvailableImGroups(hJid);
+      setBindings(result);
+      setBindingsLoadError(null);
+    } catch (err) {
+      setSyncError(
+        err instanceof Error ? err.message : '渠道聊天同步失败，已保留本地列表',
+      );
+    } finally {
+      setSyncing(false);
+    }
+  }, [loadAvailableImGroups, syncAvailableImGroups]);
 
   // Initial load — run once
   useEffect(() => {
@@ -109,26 +154,33 @@ export function useImBindings() {
   // When homeJid changes (derived from groups), reload bindings and targets
   useEffect(() => {
     if (homeJid) {
-      loadBindings();
+      void loadBindings().then(() => void syncBindings());
       loadTargets();
     } else {
       // No home group — clear loading state to avoid perpetual spinner
       setLoading(false);
       setTargetsLoading(false);
     }
-  }, [homeJid, loadBindings, loadTargets]);
+  }, [homeJid, loadBindings, loadTargets, syncBindings]);
 
   const rebind = useCallback(
     async (
       imJid: string,
       target: {
         target_main_jid?: string;
+        target_session_id?: string;
         target_agent_id?: string;
         unbind?: boolean;
         force?: boolean;
         reply_policy?: 'source_only' | 'mirror';
-        activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled';
+        activation_mode?:
+          | 'auto'
+          | 'always'
+          | 'when_mentioned'
+          | 'owner_mentioned'
+          | 'disabled';
         owner_im_id?: string;
+        audience_mode?: 'everyone' | 'owner_only';
       },
     ): Promise<string | null> => {
       setError(null);
@@ -140,8 +192,7 @@ export function useImBindings() {
         await loadBindings();
         return null;
       } catch (err) {
-        const msg =
-          err instanceof Error ? err.message : '操作失败，请重试';
+        const msg = err instanceof Error ? err.message : '操作失败，请重试';
         setError(msg);
         return msg;
       }
@@ -150,9 +201,9 @@ export function useImBindings() {
   );
 
   const reload = useCallback(() => {
-    loadBindings();
+    void syncBindings();
     loadTargets();
-  }, [loadBindings, loadTargets]);
+  }, [loadTargets, syncBindings]);
 
   const resetAllowlist = useCallback(
     async (imJid: string): Promise<string | null> => {
@@ -164,7 +215,7 @@ export function useImBindings() {
         await loadBindings();
         return null;
       } catch (err) {
-        const msg = err instanceof Error ? err.message : '重置白名单失败';
+        const msg = err instanceof Error ? err.message : '解除发言者限制失败';
         setError(msg);
         return msg;
       }
@@ -174,5 +225,18 @@ export function useImBindings() {
 
   const clearError = useCallback(() => setError(null), []);
 
-  return { bindings, loading, targets, targetsLoading, reload, rebind, resetAllowlist, error, clearError };
+  return {
+    bindings,
+    loading,
+    syncing,
+    syncError,
+    bindingsLoadError,
+    targets,
+    targetsLoading,
+    reload,
+    rebind,
+    resetAllowlist,
+    error,
+    clearError,
+  };
 }

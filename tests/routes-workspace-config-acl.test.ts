@@ -1,16 +1,11 @@
 /**
  * Verifies that workspace-config write routes (mcp-servers + skills) require
- * owner-level permissions (canModifyGroup), while read routes still allow
- * shared members (canAccessGroup).
+ * owner-level permissions (canModifyGroup).
  *
  * Coverage matrix (per Codex v4 review):
  *   - owner       → mcp-servers POST / PATCH succeed
- *   - shared member → mcp-servers POST / PATCH return 403
- *   - shared member → mcp-servers GET still 200
- *   - non-member  → all routes return 404 (group hidden by canAccessGroup)
+ *   - non-owner   → all routes return 404 (group hidden by canAccessGroup)
  *   - owner       → skills PATCH (toggle) on a fake-on-disk skill succeeds
- *   - shared member → skills PATCH returns 403
- *   - shared member → skills DELETE returns 403
  *
  * Skills install is NOT covered (it runs `npx skills add` and is a wrapper
  * around an external tool). The DELETE / PATCH paths exercise the same
@@ -20,7 +15,15 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from 'vitest';
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+  vi,
+} from 'vitest';
 
 const SHARED_TMP =
   process.env.HAPPYCLAW_TEST_DATA_DIR ??
@@ -66,16 +69,14 @@ vi.mock('../src/middleware/auth.ts', () => ({
   },
 }));
 
-const workspaceConfigRoutesModule = await import(
-  '../src/routes/workspace-config.js'
-);
+const workspaceConfigRoutesModule =
+  await import('../src/routes/workspace-config.js');
 const db = await import('../src/db.js');
 const config = await import('../src/config.js');
 
 const workspaceConfigRoutes = workspaceConfigRoutesModule.default;
 
 const OWNER_ID = 'alice';
-const MEMBER_ID = 'bob';
 const OUTSIDER_ID = 'charlie';
 const GROUP_JID = 'web:test-group';
 const GROUP_FOLDER = 'test-group';
@@ -89,8 +90,6 @@ function seedTestGroup(): void {
     created_by: OWNER_ID,
     is_home: false,
   } as any);
-  db.addGroupMember(GROUP_FOLDER, OWNER_ID, 'owner');
-  db.addGroupMember(GROUP_FOLDER, MEMBER_ID, 'member');
 }
 
 function asUser(userId: string, role: 'admin' | 'member' = 'member'): void {
@@ -108,14 +107,6 @@ beforeAll(() => {
 beforeEach(() => {
   // Clear DB tables between tests instead of recreating the DB (WAL handle
   // would otherwise dangle). Reuse the singleton from beforeAll.
-  for (const groupFolder of [GROUP_FOLDER]) {
-    try {
-      db.removeGroupMember(groupFolder, OWNER_ID);
-      db.removeGroupMember(groupFolder, MEMBER_ID);
-    } catch {
-      /* ignore */
-    }
-  }
   try {
     db.deleteRegisteredGroup(GROUP_JID);
   } catch {
@@ -230,133 +221,13 @@ describe('workspace-config ACL — MCP servers', () => {
     expect(body.server.id).toBe('mysrv');
   });
 
-  test('shared member is denied for POST (403)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-
-    const { status, body } = await postMcp({ id: 'srv2', command: 'echo' });
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member is denied for PATCH (403)', async () => {
-    seedTestGroup();
-    // Owner first creates a server so PATCH has a target
-    asUser(OWNER_ID);
-    await postMcp({ id: 'srv3', command: 'echo' });
-
-    asUser(MEMBER_ID);
-    const { status, body } = await patchMcp('srv3', { enabled: false });
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member is denied for DELETE (403)', async () => {
-    seedTestGroup();
-    asUser(OWNER_ID);
-    await postMcp({ id: 'srv4', command: 'echo' });
-
-    asUser(MEMBER_ID);
-    const { status, body } = await deleteMcp('srv4');
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member can still GET (200)', async () => {
-    seedTestGroup();
-    asUser(MEMBER_ID);
-
-    const { status } = await getMcp();
-    expect(status).toBe(200);
-  });
-
-  test('non-member returns 404 on POST (group hidden by canAccessGroup)', async () => {
+  test('non-owner returns 404 on POST (group hidden by canAccessGroup)', async () => {
     seedTestGroup();
     asUser(OUTSIDER_ID);
 
     const { status, body } = await postMcp({ id: 'srv5', command: 'echo' });
     expect(status).toBe(404);
     expect(body.error).toMatch(/not found/i);
-  });
-
-  // Regression: legacy IM groups bound to a non-home shared workspace (created_by=null,
-  // no is_home sibling) used to 403 the real owner because canModifyGroup's only
-  // fallback was the sibling lookup. canModifyGroup must consult group_members
-  // first so role='owner' wins.
-  test('legacy IM group with created_by=null: group_members owner can POST', async () => {
-    const LEGACY_JID = 'feishu:legacy-shared';
-    const LEGACY_FOLDER = 'legacy-shared';
-    try {
-      db.setRegisteredGroup(LEGACY_JID, {
-        name: 'Legacy Shared IM',
-        folder: LEGACY_FOLDER,
-        added_at: new Date().toISOString(),
-        executionMode: 'container',
-        created_by: null,
-        is_home: false,
-      } as any);
-      db.addGroupMember(LEGACY_FOLDER, OWNER_ID, 'owner');
-      db.addGroupMember(LEGACY_FOLDER, MEMBER_ID, 'member');
-      asUser(OWNER_ID);
-
-      const res = await workspaceConfigRoutes.request(
-        `/${encodeURIComponent(LEGACY_JID)}/workspace-config/mcp-servers`,
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ id: 'legacy-srv', command: 'echo' }),
-        },
-      );
-      const body = await res.json().catch(() => ({}));
-      expect(res.status).toBe(200);
-      expect((body as any).success).toBe(true);
-    } finally {
-      try {
-        db.removeGroupMember(LEGACY_FOLDER, OWNER_ID);
-        db.removeGroupMember(LEGACY_FOLDER, MEMBER_ID);
-        db.deleteRegisteredGroup(LEGACY_JID);
-      } catch {
-        /* ignore */
-      }
-    }
-  });
-
-  test('legacy IM group with created_by=null: group_members non-owner is still 403', async () => {
-    const LEGACY_JID = 'feishu:legacy-shared-2';
-    const LEGACY_FOLDER = 'legacy-shared-2';
-    try {
-      db.setRegisteredGroup(LEGACY_JID, {
-        name: 'Legacy Shared IM 2',
-        folder: LEGACY_FOLDER,
-        added_at: new Date().toISOString(),
-        executionMode: 'container',
-        created_by: null,
-        is_home: false,
-      } as any);
-      db.addGroupMember(LEGACY_FOLDER, OWNER_ID, 'owner');
-      db.addGroupMember(LEGACY_FOLDER, MEMBER_ID, 'member');
-      asUser(MEMBER_ID);
-
-      const res = await workspaceConfigRoutes.request(
-        `/${encodeURIComponent(LEGACY_JID)}/workspace-config/mcp-servers`,
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ id: 'legacy-srv-2', command: 'echo' }),
-        },
-      );
-      const body = await res.json().catch(() => ({}));
-      expect(res.status).toBe(403);
-      expect((body as any).error).toMatch(/owner/i);
-    } finally {
-      try {
-        db.removeGroupMember(LEGACY_FOLDER, OWNER_ID);
-        db.removeGroupMember(LEGACY_FOLDER, MEMBER_ID);
-        db.deleteRegisteredGroup(LEGACY_JID);
-      } catch {
-        /* ignore */
-      }
-    }
   });
 });
 
@@ -371,27 +242,7 @@ describe('workspace-config ACL — skills', () => {
     expect(body.success).toBe(true);
   });
 
-  test('shared member is denied for skills PATCH (403)', async () => {
-    seedTestGroup();
-    seedFakeSkill('my-skill');
-    asUser(MEMBER_ID);
-
-    const { status, body } = await patchSkill('my-skill', { enabled: false });
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('shared member is denied for skills DELETE (403)', async () => {
-    seedTestGroup();
-    seedFakeSkill('my-skill');
-    asUser(MEMBER_ID);
-
-    const { status, body } = await deleteSkill('my-skill');
-    expect(status).toBe(403);
-    expect(body.error).toMatch(/owner/i);
-  });
-
-  test('non-member returns 404 on skills DELETE', async () => {
+  test('non-owner returns 404 on skills DELETE', async () => {
     seedTestGroup();
     seedFakeSkill('my-skill');
     asUser(OUTSIDER_ID);

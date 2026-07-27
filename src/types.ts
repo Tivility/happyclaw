@@ -1,4 +1,7 @@
-import type { StreamEvent } from './stream-event.types.js';
+import type {
+  StreamEvent,
+  WorkflowRunSnapshot,
+} from './stream-event.types.js';
 
 export interface AdditionalMount {
   hostPath: string; // Absolute path on host (supports ~ for home)
@@ -66,9 +69,13 @@ export type RuntimeAvailabilityStatus =
   | 'model_hidden'
   | 'unsupported'
   | 'no_provider';
-export type ConversationSource = 'manual' | 'feishu_thread';
+/** User-visible interaction contract owned by one Workspace↔Agent binding. */
+export type InteractionMode = 'assistant' | 'proactive';
+export type ConversationSource = 'manual' | 'native_thread' | 'feishu_thread';
 export type ConversationNavMode = 'horizontal' | 'vertical_threads';
 export type ImBindingMode = 'single_context' | 'thread_map';
+export type ChannelRoutingMode = 'single_session' | 'thread_map';
+export type AudienceMode = 'everyone' | 'owner_only';
 
 export interface ModelBinding {
   runtime: AgentRuntime;
@@ -203,50 +210,341 @@ export type ChatProbe =
   | { status: 'unknown'; reason: string } // 我方/传输故障：token/网络/超时/429/5xx/client 未就绪
   | { status: 'unsupported' }; // 渠道不支持（替代旧 undefined）
 
-/** 飞书消息的话题/线程元数据，用于 thread_map 路由 */
-export interface FeishuMessageMeta {
+/**
+ * 飞书消息的话题/线程元数据，用于 thread_map 路由。
+ *
+ * 继承 ChannelMessageMeta：飞书是它的超集，只额外带多账号路由字段（决策 18）。
+ * 继承而非平行定义，是为了让声明成 ChannelMessageMeta 形参的回调能直接赋给
+ * 飞书侧的钩子（函数形参逆变要求 FeishuMessageMeta 可赋给 ChannelMessageMeta）。
+ */
+export interface FeishuMessageMeta extends ChannelMessageMeta {
+  /** upstream 多账号路由字段（决策 18）。 */
+  channelAccountId?: string | null;
+  /** upstream 多账号路由字段（决策 18）。 */
+  sourceJid?: string;
+}
+
+/**
+ * Sanitized provider context for one inbound turn.
+ *
+ * This object is safe to persist and expose to the Agent. It intentionally
+ * contains public routing identifiers only: credentials, access tokens and
+ * application secrets must never be added here.
+ */
+export interface ChannelTurnContext {
+  schemaVersion: 1;
+  provider: string;
+  channelAccountId: string | null;
+  sourceJid: string;
+  targetJid?: string;
+  workspaceJid?: string;
+  sessionAgentId?: string | null;
+  bot?: {
+    appId?: string;
+    openId?: string;
+    name?: string;
+    avatarUrl?: string;
+  };
+  chat: {
+    id: string;
+    type?: 'p2p' | 'group';
+    name?: string;
+    mode?: string;
+    groupMessageType?: string;
+    isTopicStyle?: boolean;
+  };
+  message: {
+    id: string;
+    rootId?: string;
+    parentId?: string;
+    threadId?: string;
+    type?: string;
+  };
+  sender?: {
+    openId?: string;
+    userId?: string;
+    unionId?: string;
+    name?: string;
+    tenantKey?: string;
+    type?: string;
+  };
+  mentions?: Array<{
+    key?: string;
+    name?: string;
+    openId?: string;
+    userId?: string;
+    unionId?: string;
+  }>;
+  /** Capability names are populated by the host broker, never by the model. */
+  capabilities?: string[];
+}
+
+export interface ChannelMount {
+  channel_jid: string;
+  channel_account_id?: string | null;
+  channel_type: string;
+  workspace_jid: string;
+  session_id?: string | null;
+  routing_mode: ChannelRoutingMode;
+  reply_policy: 'source_only' | 'mirror';
+  activation_mode:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled';
+  audience_mode: AudienceMode;
+  owner_im_id?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Provider-native topic/thread metadata used by workspace thread_map routing. */
+export interface ChannelMessageMeta {
+  provider?: string;
+  chatType?: 'p2p' | 'group';
+  mentionedBot?: boolean;
+  nativeContextType?: 'thread';
+  contextId?: string;
   threadId?: string;
   rootId?: string;
   parentId?: string;
   messageId?: string;
   text?: string;
+  title?: string;
+  channelContext?: ChannelTurnContext;
 }
+
+/** @deprecated Use ChannelMessageMeta. Kept for connector compatibility. */
+/** upstream 把它并入 ChannelMessageMeta；本地保留独立 interface（含 threadId/rootId/parentId）。 */
+export type ChannelMessageMetaAlias = ChannelMessageMeta;
 
 export interface RegisteredGroup {
   name: string;
   folder: string;
   added_at: string;
+  /** Provider-hosted avatar URL for an external IM chat. */
+  avatar_url?: string;
   containerConfig?: ContainerConfig;
   executionMode?: ExecutionMode; // 默认 'container'
   customCwd?: string; // 宿主机模式的自定义工作目录（绝对路径）
   initSourcePath?: string; // 容器模式下复制来源的宿主机绝对路径
   initGitUrl?: string; // 容器模式下 clone 来源的 Git URL
   created_by?: string;
+  /** Channel account that owns this external chat. Null means legacy/default. */
+  channel_account_id?: string;
   is_home?: boolean; // 用户主容器标记
-  target_agent_id?: string; // IM 消息路由到指定 conversation agent
-  target_main_jid?: string; // IM 消息路由到指定工作区的主对话（web:{folder}）
+  /** Direct-chat binding target: a specific workspace conversation session. */
+  target_agent_id?: string;
+  /**
+   * Binding target stored as the canonical workspace JID.
+   * - group chats: the workspace itself owns the channel context;
+   * - direct chats: the workspace's main session owns the channel context.
+   */
+  target_main_jid?: string;
   reply_policy?: 'source_only' | 'mirror'; // IM 绑定的回复策略
   require_mention?: boolean; // 群聊是否需要 @机器人 才响应（默认 false）
-  activation_mode?: 'auto' | 'always' | 'when_mentioned' | 'owner_mentioned' | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
-  owner_im_id?: string; // activation_mode 为 'owner_mentioned' 时，仅此 IM 标识符的发送者被响应
+  activation_mode?:
+    | 'auto'
+    | 'always'
+    | 'when_mentioned'
+    | 'owner_mentioned'
+    | 'disabled'; // 消息门控模式（默认 'auto'，兼容 require_mention）
+  audience_mode?: AudienceMode; // 响应对象，与是否需要 @ 独立（默认 everyone）
+  owner_im_id?: string; // audience_mode 为 owner_only 时，仅此 IM 标识符的发送者被响应
+  /** Provenance for privileged owner workflows. Weak automatic/explicit claims
+   * and credential-transfer quarantine cannot authorize Agent Builder. */
+  owner_claim_source?:
+    | 'explicit'
+    | 'configured'
+    | 'trusted_direct'
+    | 'auto_feishu'
+    | 'transfer_reset';
   sender_allowlist?: string[] | null; // null/undefined = 不限制，[] = 仅 owner 可触发（未 /claim 时无人可触发），[ids] = 白名单
   mcp_mode?: 'inherit' | 'custom'; // MCP 配置模式（默认 'inherit' 继承用户配置）
   selected_mcps?: string[] | null; // custom 模式下选中的 MCP server IDs
   conversation_source?: ConversationSource; // 工作区会话来源（默认 manual）
   conversation_nav_mode?: ConversationNavMode; // 工作区会话导航模式（默认 horizontal）
   binding_mode?: ImBindingMode; // IM 绑定模式（默认 single_context）
+  native_context_type?: 'none' | 'thread'; // 渠道原生上下文能力（如飞书话题、Telegram Forum）
   feishu_chat_mode?: string; // 飞书群模式：group/topic/p2p 等
   feishu_group_message_type?: string; // 飞书群消息形式：chat/thread
   privacy_mode?: boolean; // 隐私模式：对话不落盘，单方向切换（public → private），不可逆
 }
 
-export interface GroupMember {
-  user_id: string;
-  role: 'owner' | 'member';
-  added_at: string;
-  added_by?: string;
-  username: string;
-  display_name: string;
+export type ChannelProvider =
+  | 'feishu'
+  | 'telegram'
+  | 'qq'
+  | 'wechat'
+  | 'dingtalk'
+  | 'discord'
+  | 'whatsapp';
+
+export type ChannelAuthMode = 'credentials' | 'bot_token' | 'qr_session';
+export type ChannelAuthStatus =
+  | 'draft'
+  | 'awaiting_scan'
+  | 'authorized'
+  | 'revoked'
+  | 'error';
+export type ChannelTransportStatus =
+  | 'disconnected'
+  | 'connecting'
+  | 'reconnecting'
+  | 'connected'
+  | 'error';
+
+/** Public metadata only. Credentials live behind secret_ref and are never serialized. */
+export interface ChannelAccount {
+  id: string;
+  owner_user_id: string;
+  provider: ChannelProvider;
+  name: string;
+  secret_ref: string;
+  enabled: boolean;
+  is_default: boolean;
+  /** Legacy singleton keeps unscoped JIDs so existing history/bindings survive. */
+  is_legacy_default: boolean;
+  /** How this provider authorizes an account. Derived at creation and immutable. */
+  auth_mode: ChannelAuthMode;
+  /** Authorization lifecycle; separate from the live transport connection. */
+  auth_status: ChannelAuthStatus;
+  /** Live socket/stream lifecycle. */
+  transport_status: ChannelTransportStatus;
+  /** @deprecated Compatibility projection of transport_status. */
+  status:
+    | 'disconnected'
+    | 'connecting'
+    | 'reconnecting'
+    | 'connected'
+    | 'error';
+  default_agent_profile_id: string | null;
+  default_workspace_jid: string | null;
+  last_error: string | null;
+  connected_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ChannelAccountPublic extends Omit<
+  ChannelAccount,
+  'secret_ref' | 'default_agent_profile_id'
+> {
+  has_credentials: boolean;
+  options?: {
+    bypassProxy?: boolean;
+    streamingMode?: 'card' | 'text' | 'edit' | 'off';
+    phoneNumber?: string;
+  };
+}
+
+export interface AgentProfile {
+  id: string;
+  owner_user_id: string;
+  name: string;
+  /** IDENTITY: concise role and public identity. */
+  identity_prompt: string;
+  /** SOUL: values, temperament, and durable judgment principles. */
+  soul_prompt: string;
+  /** AGENTS: operating rules, workflows, and collaboration behavior. */
+  agents_prompt: string;
+  /** TOOLS: tool-selection and tool-usage guidance. */
+  tools_prompt: string;
+  /** Append to or replace the Claude Code preset. Platform runtime instructions remain. */
+  prompt_mode: AgentProfilePromptMode;
+  /** @deprecated Compatibility alias for prompt_mode === 'append'. */
+  include_claude_preset: boolean;
+  avatar_emoji: string | null;
+  avatar_color: string | null;
+  avatar_url: string | null;
+  runtime_policy: AgentProfileRuntimePolicy;
+  identity_hash: string;
+  version: number;
+  is_default: boolean;
+  status: 'active' | 'archived';
+  created_at: string;
+  updated_at: string;
+}
+
+export type AgentProfilePromptMode = 'append' | 'replace';
+
+export interface AgentProfilePrompts {
+  identity_prompt: string;
+  soul_prompt: string;
+  agents_prompt: string;
+  tools_prompt: string;
+  prompt_mode: AgentProfilePromptMode;
+}
+
+export interface AgentProfilePromptVersion extends AgentProfilePrompts {
+  id: string;
+  agent_profile_id: string;
+  version: number;
+  name: string;
+  identity_hash: string;
+  change_source: 'create' | 'update' | 'restore' | 'migration';
+  restored_from_version: number | null;
+  created_at: string;
+}
+
+/** Durable Workspace↔AgentProfile binding and its interaction contract. */
+export interface WorkspaceAgentProfileBinding {
+  group_folder: string;
+  agent_profile_id: string;
+  interaction_mode: InteractionMode;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentProfileRuntimePolicy {
+  context: {
+    source: 'managed' | 'host_claude';
+    auto_compact_window: number;
+    auto_compact_percentage: number;
+  };
+  skills: {
+    mode: 'inherit' | 'custom' | 'disabled';
+    ids: string[];
+    /**
+     * Native host ~/.claude/skills selection. Missing is a legacy sentinel:
+     * follow the effective context source (host_claude => inherit, otherwise
+     * disabled). New profiles persist this field explicitly.
+     */
+    host?: {
+      mode: 'inherit' | 'custom' | 'disabled';
+      ids: string[];
+    };
+  };
+  mcp: {
+    mode: 'inherit' | 'custom' | 'disabled';
+    ids: string[];
+  };
+}
+
+export interface AgentBuilderDefinition extends AgentProfilePrompts {
+  name: string;
+  avatar_emoji: string | null;
+  avatar_color: string | null;
+  runtime_policy: AgentProfileRuntimePolicy;
+}
+
+export interface AgentBuilderDraft {
+  id: string;
+  owner_user_id: string;
+  source_group: string;
+  source_chat_jid: string;
+  target_agent_profile_id: string | null;
+  base_agent_version: number | null;
+  revision: number;
+  state: 'ready' | 'published' | 'discarded';
+  definition: AgentBuilderDefinition;
+  assumptions: string[];
+  prepared_turn_id: string | null;
+  confirmation_phrase: string;
+  published_agent_profile_id: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface NewMessage {
@@ -258,12 +556,64 @@ export interface NewMessage {
   content: string;
   timestamp: string;
   attachments?: string;
+  token_usage?: string;
+  /** Sanitized provider-native identifiers for this exact inbound turn. */
+  channel_context?: ChannelTurnContext;
+  /** Session-derived Claude Code Workflow snapshots for historical replay. */
+  workflow_runs?: WorkflowRunSnapshot[];
   turn_id?: string | null;
   session_id?: string | null;
   sdk_message_uuid?: string | null;
   source_kind?: MessageSourceKind | null;
   finalization_reason?: MessageFinalizationReason | null;
   task_id?: string | null;
+  delivery_mode?: FollowUpMode | null;
+  delivery_status?: FollowUpStatus | null;
+  delivery_run_id?: string | null;
+  delivery_priority?: number | null;
+  delivery_updated_at?: string | null;
+}
+
+export type FollowUpMode = 'queue' | 'steer';
+
+export type FollowUpStatus = 'queued' | 'promoting' | 'released' | 'cancelled';
+
+export interface QueuedFollowUp {
+  id: string;
+  chat_jid: string;
+  source_jid?: string;
+  sender: string;
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  attachments?: string;
+  channel_context?: ChannelTurnContext;
+  delivery_mode: FollowUpMode;
+  delivery_status: 'queued' | 'promoting';
+  delivery_run_id?: string | null;
+  delivery_priority: number;
+}
+
+export interface FollowUpTransition {
+  id: string;
+  delivery_status: 'released' | 'cancelled';
+  delivery_run_id?: string | null;
+  delivery_updated_at: string;
+}
+
+export interface FollowUpDisposition {
+  disposition: 'started' | 'queued' | 'steered';
+  runId?: string;
+  position?: number;
+}
+
+export type FollowUpAction = 'steer' | 'cancel' | 'interrupt_and_run';
+
+export interface FollowUpActionResult {
+  ok: boolean;
+  state?: 'steered' | 'cancelled' | 'interrupting' | 'queued';
+  message: string;
+  item?: QueuedFollowUp;
 }
 
 export type MessageSourceKind =
@@ -276,7 +626,8 @@ export type MessageSourceKind =
   | 'scheduled_task_prompt'
   | 'silent_success_fallback'
   | 'legacy'
-  | 'auto_continue';
+  | 'auto_continue'
+  | 'truncation_continue';
 
 export type MessageFinalizationReason =
   | 'completed'
@@ -284,7 +635,8 @@ export type MessageFinalizationReason =
   | 'error'
   | 'no_visible_reply'
   | 'shutdown'
-  | 'crash_recovery';
+  | 'crash_recovery'
+  | 'truncated';
 
 export interface MessageAttachment {
   type: 'image';
@@ -310,6 +662,8 @@ export interface ScheduledTask {
   execution_mode?: 'host' | 'container' | null;
   workspace_jid?: string | null;
   workspace_folder?: string | null;
+  running_until?: string | null;
+  runner_id?: string | null;
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;
@@ -317,13 +671,115 @@ export interface ScheduledTask {
   created_at: string;
   created_by?: string;
   notify_channels?: string[] | null;
+  /**
+   * Concrete delivery route captured when the task was created.
+   *
+   * `chat_jid` is workspace-level, so execution used to re-derive its target and
+   * could fall back to another group in the same folder. This JID carries the
+   * whole binding — provider, external chat, channel account and Feishu
+   * thread/root — so a run either reaches the place it was scheduled from or
+   * fails; it never silently picks somewhere else.
+   */
+  delivery_route_jid?: string | null;
+  /** Optimistic-concurrency revision for edits made through REST/MCP/UI. */
+  revision: number;
+  updated_at: string;
+  /** Soft deletion keeps task history queryable while removing future fires. */
+  deleted_at: string | null;
+}
+
+export type TaskRunTrigger = 'scheduled' | 'manual' | 'backfill';
+
+export type TaskRunStatus =
+  | 'queued'
+  | 'running'
+  | 'retry_wait'
+  | 'success'
+  | 'failed'
+  | 'cancelled'
+  | 'missed'
+  | 'delivered';
+
+export type TaskRunNotificationStatus =
+  | 'pending'
+  | 'success'
+  | 'partial_failed'
+  | 'failed'
+  | 'skipped';
+
+export interface TaskRunNotificationSummary {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  failed_channels: string[];
+}
+
+export interface TaskRunNotificationReceipt {
+  status: Exclude<TaskRunNotificationStatus, 'pending'>;
+  summary: TaskRunNotificationSummary;
+  error?: string | null;
+}
+
+/**
+ * Immutable, non-secret definition used by one occurrence. A queued/retried run
+ * must never silently switch to a newer task definition.
+ */
+export interface TaskRunDefinitionSnapshot {
+  prompt: string;
+  group_folder: string;
+  chat_jid: string;
+  delivery_route_jid: string | null;
+  context_mode: 'group' | 'isolated';
+  execution_type: 'agent' | 'script';
+  execution_mode: 'host' | 'container' | null;
+  script_command: string | null;
+  notify_channels: string[] | null;
+}
+
+/** Durable state for one scheduled/manual occurrence. */
+export interface TaskRun {
+  id: string;
+  task_id: string;
+  trigger_type: TaskRunTrigger;
+  idempotency_key: string | null;
+  scheduled_for: string;
+  definition_revision: number;
+  definition_snapshot: TaskRunDefinitionSnapshot;
+  status: TaskRunStatus;
+  attempt: number;
+  available_at: string;
+  lease_owner: string | null;
+  lease_token: number;
+  lease_expires_at: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  created_at: string;
+  updated_at: string;
+  duration_ms: number;
+  result: string | null;
+  error: string | null;
+  notification_status: TaskRunNotificationStatus;
+  notification_error: string | null;
+  notification_summary: TaskRunNotificationSummary | null;
+  notification_attempt: number;
+  notification_available_at: string | null;
+}
+
+export interface ClaimedTaskRun extends TaskRun {
+  status: 'running';
+  lease_owner: string;
+  lease_expires_at: string;
 }
 
 export interface TaskRunLog {
+  id?: number;
+  run_id?: string;
   task_id: string;
   run_at: string;
   duration_ms: number;
-  status: 'running' | 'success' | 'error';
+  /** `queued` means a group-mode prompt was delivered to the workspace queue;
+   * it does not claim that the Agent has finished executing it. */
+  status: 'running' | 'queued' | 'success' | 'error';
   result: string | null;
   error: string | null;
 }
@@ -466,7 +922,9 @@ export type AuthEventType =
   | 'invite_deleted'
   | 'invite_used'
   | 'recovery_reset'
-  | 'register_success';
+  | 'register_success'
+  | 'system_settings_updated'
+  | 'host_integration_updated';
 
 export interface AuthAuditLog {
   id: number;
@@ -499,10 +957,16 @@ export interface SubAgent {
   last_im_jid: string | null;
   /** 发起 /spawn 命令的源会话 JID，用于完成后结果回注 */
   spawned_from_jid: string | null;
-  source_kind?: 'manual' | 'feishu_thread' | 'auto_im' | null;
+  source_kind?: 'manual' | 'native_thread' | 'feishu_thread' | 'auto_im' | null;
   thread_id?: string | null;
   root_message_id?: string | null;
-  title_source?: 'manual' | 'feishu_root' | 'auto' | 'auto_pending' | null;
+  title_source?:
+    | 'manual'
+    | 'native_root'
+    | 'feishu_root'
+    | 'auto'
+    | 'auto_pending'
+    | null;
   last_active_at?: string | null;
 }
 
@@ -518,6 +982,22 @@ export interface ImContextBinding {
   created_at: string;
   updated_at: string;
 }
+
+export interface ActiveRunSnapshot {
+  chatJid: string;
+  runId: string;
+  startedAt: string;
+  // No 'queued': a queued message has no exact attempt identity yet, so it can
+  // never receive a matching run_finished terminal. Queued chats travel in
+  // `queuedChatJids` on the snapshot message instead.
+  phase: 'preparing' | 'running';
+}
+
+export type RunFinishReason =
+  | 'completed'
+  | 'released'
+  | 'runner_exit'
+  | 'stopped';
 
 // WebSocket message types
 export type WsMessageOut =
@@ -548,6 +1028,8 @@ export type WsMessageOut =
       chatJid: string;
       event: StreamEvent;
       agentId?: string;
+      /** Exact GroupQueue attempt that owns this stream event. */
+      runId?: string;
     }
   | {
       type: 'agent_status';
@@ -564,6 +1046,38 @@ export type WsMessageOut =
       type: 'runner_state';
       chatJid: string;
       state: 'idle' | 'running';
+    }
+  | {
+      type: 'run_started';
+      chatJid: string;
+      runId: string;
+      startedAt: string;
+      phase: 'preparing';
+    }
+  | {
+      type: 'run_finished';
+      chatJid: string;
+      runId: string;
+      finishedAt: string;
+      reason: RunFinishReason;
+    }
+  | {
+      type: 'active_run_snapshot';
+      runs: ActiveRunSnapshot[];
+      /**
+       * Chats whose message is enqueued behind a busy runner. They have no run
+       * identity yet, so they cannot be `runs` entries — but the client still
+       * has to show a wait state, otherwise a user who reloads mid-queue sees
+       * an idle composer and sends the same message twice.
+       */
+      queuedChatJids: string[];
+    }
+  | {
+      type: 'follow_up_update';
+      chatJid: string;
+      items: QueuedFollowUp[];
+      agentId?: string;
+      transition?: FollowUpTransition;
     }
   | {
       type: 'task_state';
@@ -586,17 +1100,24 @@ export type WsMessageOut =
   | {
       type: 'whatsapp_status';
       userId: string;
-      status:
-        | 'connecting'
-        | 'qr'
-        | 'connected'
-        | 'disconnected'
-        | 'logged_out';
+      accountId?: string;
+      status: 'connecting' | 'qr' | 'connected' | 'disconnected' | 'logged_out';
       qr?: string;
       qrDataUrl?: string;
       error?: string;
       meJid?: string;
       meName?: string;
+    }
+  | {
+      type: 'channel_account_status';
+      userId: string;
+      accountId: string;
+      transportStatus: ChannelTransportStatus;
+      lastError?: string | null;
+      connectedAt?: string | null;
+      errorCode?: string;
+      consecutiveFailures?: number;
+      nextRetryMs?: number;
     }
   | {
       type: 'billing_update';
@@ -607,6 +1128,8 @@ export type WsMessageOut =
   | {
       type: 'stream_snapshot';
       chatJid: string;
+      /** Exact GroupQueue attempt that owns this reconnect snapshot. */
+      runId?: string;
       snapshot: {
         partialText: string;
         thinkingText?: string;
@@ -621,12 +1144,30 @@ export type WsMessageOut =
           id: string;
           timestamp: number;
           text: string;
-          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+          kind:
+            | 'tool'
+            | 'skill'
+            | 'hook'
+            | 'status'
+            | 'task'
+            | 'memory'
+            | 'debug'
+            | 'context'
+            | 'permission';
         }>;
         traceEvents?: Array<{
           id: string;
           timestamp: number;
-          kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'debug' | 'context' | 'permission';
+          kind:
+            | 'tool'
+            | 'skill'
+            | 'hook'
+            | 'status'
+            | 'task'
+            | 'memory'
+            | 'debug'
+            | 'context'
+            | 'permission';
           scope?: StreamEvent['agentScope'];
           title: string;
           summary?: string;
@@ -653,6 +1194,7 @@ export type WsMessageIn =
       content: string;
       attachments?: MessageAttachment[];
       agentId?: string;
+      followUpBehavior?: FollowUpMode;
     }
   | { type: 'terminal_start'; chatJid: string; cols: number; rows: number }
   | { type: 'terminal_input'; chatJid: string; data: string }
@@ -735,6 +1277,7 @@ export type BalanceTransactionSource =
 export type BalanceOperatorType = 'system' | 'admin' | 'user';
 export type BalanceReferenceType =
   | 'message'
+  | 'usage_event'
   | 'task'
   | 'subscription'
   | 'redeem_code'
@@ -807,7 +1350,8 @@ export type BillingAuditEventType =
   | 'code_deleted'
   | 'wallet_blocked'
   | 'wallet_unblocked'
-  | 'quota_exceeded';
+  | 'quota_exceeded'
+  | 'billing_settings_updated';
 
 export interface BillingAuditLog {
   id: number;

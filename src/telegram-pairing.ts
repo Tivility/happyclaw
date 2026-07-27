@@ -10,6 +10,7 @@ import crypto from 'crypto';
 
 interface PairingEntry {
   userId: string;
+  accountId?: string;
   expiresAt: number; // epoch ms
 }
 
@@ -18,8 +19,12 @@ const CODE_LENGTH = 6;
 
 // code → entry
 const codes = new Map<string, PairingEntry>();
-// userId → code  (ensures only one active code per user)
+// userId + accountId → code (one active code per channel account)
 const userCodes = new Map<string, string>();
+
+function ownerKey(userId: string, accountId?: string): string {
+  return `${userId}\u0000${accountId || 'legacy'}`;
+}
 
 function randomCode(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -32,13 +37,17 @@ function randomCode(): string {
   return result;
 }
 
-export function generatePairingCode(userId: string): {
+export function generatePairingCode(
+  userId: string,
+  accountId?: string,
+): {
   code: string;
   expiresAt: number;
   ttlSeconds: number;
 } {
   // Revoke any previous code for this user
-  const prev = userCodes.get(userId);
+  const key = ownerKey(userId, accountId);
+  const prev = userCodes.get(key);
   if (prev) codes.delete(prev);
 
   let code: string;
@@ -47,27 +56,31 @@ export function generatePairingCode(userId: string): {
   } while (codes.has(code)); // extremely unlikely collision
 
   const expiresAt = Date.now() + PAIRING_TTL_MS;
-  codes.set(code, { userId, expiresAt });
-  userCodes.set(userId, code);
+  codes.set(code, { userId, accountId, expiresAt });
+  userCodes.set(key, code);
 
   return { code, expiresAt, ttlSeconds: PAIRING_TTL_MS / 1000 };
 }
 
-export function verifyPairingCode(code: string): { userId: string } | null {
+export function verifyPairingCode(
+  code: string,
+): { userId: string; accountId?: string } | null {
   const entry = codes.get(code.toUpperCase());
   if (!entry) return null;
   if (Date.now() > entry.expiresAt) {
     // Expired — clean up
     codes.delete(code.toUpperCase());
-    if (userCodes.get(entry.userId) === code.toUpperCase()) {
-      userCodes.delete(entry.userId);
+    const key = ownerKey(entry.userId, entry.accountId);
+    if (userCodes.get(key) === code.toUpperCase()) {
+      userCodes.delete(key);
     }
     return null;
   }
   // Consume (single use)
   codes.delete(code.toUpperCase());
-  if (userCodes.get(entry.userId) === code.toUpperCase()) {
-    userCodes.delete(entry.userId);
+  const key = ownerKey(entry.userId, entry.accountId);
+  if (userCodes.get(key) === code.toUpperCase()) {
+    userCodes.delete(key);
   }
-  return { userId: entry.userId };
+  return { userId: entry.userId, accountId: entry.accountId };
 }

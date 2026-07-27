@@ -89,7 +89,7 @@ export interface EnvRow {
 }
 
 export interface SessionInfo {
-  id: string;
+  shortId: string;
   ip_address: string | null;
   user_agent: string | null;
   created_at: string;
@@ -102,22 +102,22 @@ export interface SystemSettings {
   idleTimeout: number;
   containerMaxOutputSize: number;
   maxConcurrentContainers: number;
-  maxConcurrentHostProcesses: number;
   maxLoginAttempts: number;
   loginLockoutMinutes: number;
   maxConcurrentScripts: number;
   scriptTimeout: number;
-  billingEnabled: boolean;
-  billingMode: 'wallet_first';
-  billingMinStartBalanceUsd: number;
-  billingCurrency: string;
-  billingCurrencyRate: number;
-  externalClaudeDir: string;
-  autoCompactWindow: number;
-  subagentModel: string;
-  disableMemoryLayerForAdminHost: boolean;
-  pluginAutoScan: boolean;
   taskBackfillGraceMs: number;
+  maxRepliesPerTurn: number;
+  maxTasksPerUser: number;
+  fallbackModel: string;
+}
+
+export interface HostIntegrationSettings {
+  mainAgentContextSource: 'managed' | 'host_claude';
+  mainAgentAutoCompactWindow: number;
+  mainAgentAutoCompactPercentage: number;
+  externalClaudeDir: string;
+  pluginAutoScan: boolean;
 }
 
 // ─── OAuth Usage ────────────────────────────────────────────
@@ -169,7 +169,34 @@ export interface ConversationRuntimeState {
   binding_source: 'system_default' | 'workspace_default' | 'copied_workspace_default' | 'user_pinned';
 }
 
-export type SettingsTab = 'models' | 'claude' | 'gpt' | 'grok' | 'registration' | 'appearance' | 'system' | 'profile' | 'my-channels' | 'security' | 'groups' | 'memory' | 'skills' | 'mcp-servers' | 'plugins' | 'agent-definitions' | 'users' | 'about' | 'bindings' | 'usage' | 'monitor';
+export type SettingsTab =
+  | 'about'
+  | 'agent-definitions'
+  | 'agent-profiles'
+  | 'appearance'
+  | 'automation'
+  | 'billing'
+  | 'bindings'
+  | 'claude'
+  | 'gpt'
+  | 'grok'
+  | 'groups'
+  | 'host-integration'
+  | 'main-agent'
+  | 'mcp-servers'
+  | 'memory'
+  | 'models'
+  | 'monitor'
+  | 'my-channels'
+  | 'plugins'
+  | 'preferences'
+  | 'profile'
+  | 'registration'
+  | 'security'
+  | 'skills'
+  | 'system'
+  | 'usage'
+  | 'users';
 
 export function getErrorMessage(err: unknown, fallback: string): string {
   if (typeof err === 'object' && err !== null && 'message' in err) {

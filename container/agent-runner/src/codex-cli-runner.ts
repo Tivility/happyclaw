@@ -562,6 +562,8 @@ export function emitCodexEvent(
           outputTokens: Number(usage.output_tokens || 0),
           cacheReadInputTokens: Number(usage.cached_input_tokens || 0),
           cacheCreationInputTokens: 0,
+          // OpenAI/xAI 口径：outputTokens 已含 reasoning，不另计（CLAUDE.md §8.14）
+          reasoningTokens: 0,
           costUSD: 0,
           durationMs: Date.now() - startedAt,
           numTurns: 1,
@@ -844,6 +846,8 @@ export const codexCliAdapter: AgentRuntimeAdapter = {
                 outputTokens: 0,
                 cacheReadInputTokens: 0,
                 cacheCreationInputTokens: 0,
+                // OpenAI/xAI 口径：outputTokens 已含 reasoning，不另计（CLAUDE.md §8.14）
+                reasoningTokens: 0,
                 costUSD: 0,
                 durationMs: Date.now() - startedAt,
                 numTurns: 1,

@@ -52,6 +52,8 @@ export function buildRecentConversationHistoryContext(
     limit?: number;
     tokenBudget?: number;
     intro: string;
+    /** 单条消息最大长度（本地历史注入用）。 */
+    maxMessageLength?: number;
   },
 ): { context: string; count: number; droppedCount: number } | null {
   const recentHistory = getMessagesPage(chatJid, undefined, opts.limit ?? 1000);

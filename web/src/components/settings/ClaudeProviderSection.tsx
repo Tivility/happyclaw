@@ -1,8 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  ExternalLink,
-  Loader2,
-} from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { api } from '../../api/client';
@@ -22,7 +19,10 @@ interface ClaudeProviderSectionProps {
   setError: (msg: string | null) => void;
 }
 
-export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSectionProps) {
+export function ClaudeProviderSection({
+  setNotice,
+  setError,
+}: ClaudeProviderSectionProps) {
   const [providers, setProviders] = useState<ProviderWithHealth[]>([]);
   const [balancing, setBalancing] = useState<BalancingConfig>({
     strategy: 'round-robin',
@@ -37,53 +37,22 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
 
   // 编辑器状态
   const [editorOpen, setEditorOpen] = useState(false);
-  const [editingProvider, setEditingProvider] = useState<ProviderWithHealth | null>(null);
+  const [editingProvider, setEditingProvider] =
+    useState<ProviderWithHealth | null>(null);
 
   // 确认对话框
-  const [pendingDeleteProvider, setPendingDeleteProvider] = useState<ProviderWithHealth | null>(null);
+  const [pendingDeleteProvider, setPendingDeleteProvider] =
+    useState<ProviderWithHealth | null>(null);
 
   // 健康轮询标记
   const healthTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Claude 服务状态
-  const [claudeStatus, setClaudeStatus] = useState<{
-    indicator: string;
-    components: { name: string; status: string }[];
-  } | null>(null);
-
-  // ─── Claude 服务状态轮询 ───────────────────────────────────────
-  useEffect(() => {
-    const fetchStatus = async () => {
-      try {
-        const [statusRes, compRes] = await Promise.all([
-          fetch('https://status.claude.com/api/v2/status.json'),
-          fetch('https://status.claude.com/api/v2/components.json'),
-        ]);
-        if (!statusRes.ok || !compRes.ok) return;
-        const statusData = await statusRes.json() as { status?: { indicator?: string } };
-        const compData = await compRes.json() as { components?: Array<{ name: string; status: string }> };
-        const keyComponents = (compData.components || [])
-          .filter((c) =>
-            ['Claude API (api.anthropic.com)', 'claude.ai', 'Claude Code'].includes(c.name),
-          )
-          .map((c) => ({ name: c.name, status: c.status }));
-        setClaudeStatus({
-          indicator: statusData.status?.indicator || 'none',
-          components: keyComponents,
-        });
-      } catch {
-        // 静默忽略 — 状态信息非关键
-      }
-    };
-    fetchStatus();
-    const timer = setInterval(fetchStatus, 5 * 60 * 1000);
-    return () => clearInterval(timer);
-  }, []);
-
   // ─── 加载提供商列表 ──────────────────────────────────────────
   const loadProviders = useCallback(async () => {
     try {
-      const data = await api.get<ProvidersListResponse>('/api/config/claude/providers');
+      const data = await api.get<ProvidersListResponse>(
+        '/api/config/claude/providers',
+      );
       setProviders(data.providers);
       setBalancing(data.balancing);
       setEnabledCount(data.enabledCount);
@@ -137,12 +106,22 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
     async (provider: ProviderWithHealth) => {
       setTogglingId(provider.id);
       try {
-        await api.patch(`/api/config/claude/providers/${provider.id}`, {
-          enabled: !provider.enabled,
-        });
+        await api.post(
+          `/api/config/claude/providers/${provider.id}/toggle`,
+          { enabled: !provider.enabled },
+          120_000,
+        );
         await loadProviders();
-        setNotice(provider.enabled ? `已禁用「${provider.name}」` : `已启用「${provider.name}」`);
+        setNotice(
+          provider.enabled
+            ? `已禁用「${provider.name}」`
+            : `已启用「${provider.name}」`,
+        );
       } catch (err) {
+        // A 503 can mean the target state was persisted but runtime teardown
+        // failed afterward. Reload instead of leaving a stale toggle that a
+        // user might click again and accidentally reverse.
+        await loadProviders().catch(() => {});
         setError(getErrorMessage(err, '切换提供商状态失败'));
       } finally {
         setTogglingId(null);
@@ -155,7 +134,9 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
   const handleResetHealth = useCallback(
     async (provider: ProviderWithHealth) => {
       try {
-        await api.post(`/api/config/claude/providers/${provider.id}/reset-health`);
+        await api.post(
+          `/api/config/claude/providers/${provider.id}/reset-health`,
+        );
         await loadProviders();
         setNotice('健康状态已重置');
       } catch (err) {
@@ -267,51 +248,6 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
         disabled={busy}
       />
 
-      {/* Anthropic 服务状态 */}
-      {claudeStatus && (
-        <div className="rounded-xl border border-border px-4 py-3">
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-2 text-sm">
-              <span className="text-foreground font-medium">Anthropic 服务状态</span>
-              <span className="text-xs text-muted-foreground">
-                {claudeStatus.indicator === 'none'
-                  ? '正常运行'
-                  : claudeStatus.indicator === 'minor'
-                    ? '部分降级'
-                    : '服务中断'}
-              </span>
-            </div>
-            <a
-              href="https://status.claude.com"
-              target="_blank"
-              rel="noreferrer"
-              className="text-xs text-muted-foreground hover:text-teal-600 flex items-center gap-1"
-            >
-              详情
-              <ExternalLink className="w-3 h-3" />
-            </a>
-          </div>
-          {claudeStatus.components.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-              {claudeStatus.components.map((comp) => (
-                <span key={comp.name} className="inline-flex items-center gap-1.5">
-                  <span
-                    className={`w-1.5 h-1.5 rounded-full ${
-                      comp.status === 'operational'
-                        ? 'bg-emerald-400'
-                        : comp.status === 'degraded_performance'
-                          ? 'bg-amber-400'
-                          : 'bg-red-400'
-                    }`}
-                  />
-                  {comp.name}
-                </span>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
       {/* 负载均衡设置（启用 >= 2 个提供商时显示） */}
       {enabledCount >= 2 && (
         <BalancingSettings
@@ -338,7 +274,11 @@ export function ClaudeProviderSection({ setNotice, setError }: ClaudeProviderSec
         onClose={() => setPendingDeleteProvider(null)}
         onConfirm={handleDeleteConfirm}
         title="删除提供商"
-        message={pendingDeleteProvider ? `确认删除提供商「${pendingDeleteProvider.name}」？` : '确认删除该提供商？'}
+        message={
+          pendingDeleteProvider
+            ? `确认删除提供商「${pendingDeleteProvider.name}」？`
+            : '确认删除该提供商？'
+        }
         confirmText="确认删除"
         confirmVariant="danger"
         loading={deletingId !== null}

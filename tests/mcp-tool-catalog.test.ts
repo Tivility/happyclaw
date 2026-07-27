@@ -76,9 +76,41 @@ describe('runtime-neutral MCP tool catalog', () => {
     );
     expect(sendMessage).toBeTruthy();
 
-    const result = await sendMessage!.handler({ text: 'hello from catalog' });
+    // send_message 不再是 fire-and-forget：写完 IPC 后会等主进程回写
+    // message-results/send_message_result_{requestId}.json，失败要抛错让
+    // Agent 知道消息没送到。这里模拟主进程那一侧。
+    const messagesDir = path.join(ctx.workspaceIpc, 'messages');
+    const resultsDir = path.join(ctx.workspaceIpc, 'message-results');
+    fs.mkdirSync(resultsDir, { recursive: true });
+    const ackTimer = setInterval(() => {
+      if (!fs.existsSync(messagesDir)) return;
+      for (const file of fs.readdirSync(messagesDir)) {
+        if (!file.endsWith('.json')) continue;
+        const { requestId } = JSON.parse(
+          fs.readFileSync(path.join(messagesDir, file), 'utf-8'),
+        ) as { requestId?: string };
+        if (!requestId) continue;
+        const out = path.join(
+          resultsDir,
+          `send_message_result_${requestId}.json`,
+        );
+        if (!fs.existsSync(out)) {
+          fs.writeFileSync(
+            out,
+            JSON.stringify({ success: true, disposition: 'delivered_separately' }),
+            'utf-8',
+          );
+        }
+      }
+    }, 20);
+    let result;
+    try {
+      result = await sendMessage!.handler({ text: 'hello from catalog' });
+    } finally {
+      clearInterval(ackTimer);
+    }
     expect(result).toMatchObject({
-      content: [{ type: 'text', text: 'Message sent.' }],
+      content: [{ type: 'text', text: 'Message sent separately.' }],
     });
 
     const messageDir = path.join(ctx.workspaceIpc, 'messages');

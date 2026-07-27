@@ -20,6 +20,7 @@ vi.mock('../src/config.js', async () => {
 const {
   initDatabase,
   setSession,
+  getSession,
   getSessionProviderId,
   setSessionProviderId,
   deleteSession,
@@ -41,7 +42,9 @@ afterAll(() => {
 describe('session→provider sticky binding', () => {
   test('returns undefined for unknown session', () => {
     expect(getSessionProviderId('unknown-folder')).toBeUndefined();
-    expect(getSessionProviderId('unknown-folder', 'some-agent')).toBeUndefined();
+    expect(
+      getSessionProviderId('unknown-folder', 'some-agent'),
+    ).toBeUndefined();
   });
 
   test('setSessionProviderId creates a row when none exists', () => {
@@ -130,5 +133,21 @@ describe('deleteSessionsByProviderId — narrowed cleanup (issue #476)', () => {
       'folder-narrow-4',
       'folder-narrow-5',
     ]);
+  });
+
+  test('only removes unbound legacy rows from explicitly attributable folders', () => {
+    setSession('folder-unbound-safe', 'sess-safe', '');
+    setSession('folder-unbound-ambiguous', 'sess-ambiguous', '');
+
+    const result = deleteSessionsByProviderId('provider-target', {
+      includeUnboundFolders: ['folder-unbound-safe'],
+    });
+
+    expect(result.deletedCount).toBe(1);
+    expect(result.affectedFolders).toEqual(['folder-unbound-safe']);
+    expect(getSessionProviderId('folder-unbound-safe')).toBeUndefined();
+    expect(getSessionProviderId('folder-unbound-ambiguous')).toBeUndefined();
+    expect(getSession('folder-unbound-safe')).toBeUndefined();
+    expect(getSession('folder-unbound-ambiguous')).toBe('sess-ambiguous');
   });
 });

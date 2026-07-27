@@ -13,7 +13,11 @@ import {
   AdminPatchUserSchema,
   InviteCreateSchema,
 } from '../schemas.js';
-import { isUsernameConflictError, toUserPublic, setSessionCookie } from './auth.js';
+import {
+  isUsernameConflictError,
+  toUserPublic,
+  setSessionCookie,
+} from './auth.js';
 import type {
   AuthUser,
   Permission,
@@ -34,11 +38,11 @@ import {
   updateUserFields,
   deleteUser,
   restoreUser,
-
   deleteUserSessionsByUserId,
   createUserSession,
   getActiveAdminCount,
   logAuthEvent,
+  getAllRegisteredGroups,
   getAllInviteCodes,
   getInviteCode,
   createInviteCode as dbCreateInviteCode,
@@ -63,9 +67,84 @@ import {
 } from '../permissions.js';
 import { getClientIp, escapeCsvField } from '../utils.js';
 import { DATA_DIR } from '../config.js';
+import {
+  quiesceWorkspaceRunnersAroundCommit,
+  WorkspaceRuntimeQuiesceError,
+} from '../agent-profile-runtime.js';
+import {
+  beginHostPrivilegeRevocation,
+  endHostPrivilegeRevocation,
+} from '../host-execution-policy.js';
+import { terminateScriptsForOwner } from '../script-runner.js';
 import { logger } from '../logger.js';
 
 const adminRoutes = new Hono<{ Variables: Variables }>();
+function getUserWorkspaceRuntimeTargets(userId: string) {
+  const seenFolders = new Set<string>();
+  return Object.entries(getAllRegisteredGroups())
+    .filter(([, group]) => {
+      if (group.created_by !== userId || seenFolders.has(group.folder)) {
+        return false;
+      }
+      seenFolders.add(group.folder);
+      return true;
+    })
+    .map(([jid, group]) => ({ folder: group.folder, primaryJid: jid }));
+}
+
+async function commitHostPrivilegeRevocation<T>(
+  userId: string,
+  reason: string,
+  commit: () => T,
+): Promise<T> {
+  const targets = getUserWorkspaceRuntimeTargets(userId);
+  const deps = getWebDeps();
+  if (targets.length > 0 && !deps) {
+    throw new WorkspaceRuntimeQuiesceError('pre_commit', [
+      { jid: userId, err: new Error('Runtime dependencies unavailable') },
+    ]);
+  }
+
+  beginHostPrivilegeRevocation(userId);
+  try {
+    await terminateScriptsForOwner(userId);
+    let value: T;
+    if (deps && targets.length > 0) {
+      value = (
+        await quiesceWorkspaceRunnersAroundCommit(
+          deps,
+          targets,
+          {
+            reason,
+            onPostCommitFailure: (runtimeJids) =>
+              deps.queue.blockGroupsForRuntimeSafety(
+                runtimeJids,
+                `${reason}: post-commit runtime cleanup failed`,
+              ),
+          },
+          commit,
+        )
+      ).value;
+    } else {
+      value = commit();
+    }
+    try {
+      // Close the script start-before-commit race. New starts are denied by
+      // beginHostPrivilegeRevocation; this second pass catches any process
+      // registered immediately before the gate became visible.
+      await terminateScriptsForOwner(userId);
+    } catch (err) {
+      throw new WorkspaceRuntimeQuiesceError(
+        'post_commit',
+        [{ jid: `${userId}:scripts`, err }],
+        value,
+      );
+    }
+    return value;
+  } finally {
+    endHostPrivilegeRevocation(userId);
+  }
+}
 
 // ISO 8601 日期格式验证正则（审计日志查询 from/to 参数）
 const ISO_DATE_RE =
@@ -319,6 +398,13 @@ adminRoutes.patch(
       return c.json({ error: 'Cannot remove the last active admin' }, 400);
     }
 
+    const postCommitActions: Array<() => void> = [];
+    let postCommitActionsRan = false;
+    const runPostCommitActions = () => {
+      if (postCommitActionsRan) return;
+      postCommitActionsRan = true;
+      for (const action of postCommitActions) action();
+    };
     const updates: Parameters<typeof updateUserFields>[1] = {};
 
     if (validation.data.role !== undefined) {
@@ -331,23 +417,22 @@ adminRoutes.patch(
           validation.data.role === 'admin' ? [...ALL_PERMISSIONS] : [];
       }
       if (validation.data.role !== target.role) {
-        // 用户角色变更必须立即作废 session：authMiddleware 用 sessionCache
-        // 缓存 30 秒（web-context.ts），不主动 invalidate 的话被降级用户在
-        // 接下来 30s 内仍能用旧权限访问受限端点。
-        invalidateUserSessions(id);
-        logAuthEvent({
-          event_type: 'role_changed',
-          username: target.username,
-          actor_username: actor.username,
-          ip_address: getClientIp(c),
-          details: { from: target.role, to: validation.data.role },
-        });
-        logAuthEvent({
-          event_type: 'session_revoked',
-          username: target.username,
-          actor_username: actor.username,
-          ip_address: getClientIp(c),
-          details: { action: 'role_change' },
+        postCommitActions.push(() => {
+          invalidateUserSessions(id);
+          logAuthEvent({
+            event_type: 'role_changed',
+            username: target.username,
+            actor_username: actor.username,
+            ip_address: getClientIp(c),
+            details: { from: target.role, to: validation.data.role },
+          });
+          logAuthEvent({
+            event_type: 'session_revoked',
+            username: target.username,
+            actor_username: actor.username,
+            ip_address: getClientIp(c),
+            details: { action: 'role_change' },
+          });
         });
       }
     }
@@ -384,18 +469,18 @@ adminRoutes.patch(
       updates.permissions = nextPermissions;
       // 权限变更也走作废逻辑，与角色变更对齐。比较使用规范化后的 permissions
       // 排序+JSON 字符串比对，避免顺序差异误判为变更。
-      const prevSorted = JSON.stringify(
-        [...(target.permissions ?? [])].sort(),
-      );
+      const prevSorted = JSON.stringify([...(target.permissions ?? [])].sort());
       const nextSorted = JSON.stringify([...nextPermissions].sort());
       if (prevSorted !== nextSorted) {
-        invalidateUserSessions(id);
-        logAuthEvent({
-          event_type: 'session_revoked',
-          username: target.username,
-          actor_username: actor.username,
-          ip_address: getClientIp(c),
-          details: { action: 'permissions_change' },
+        postCommitActions.push(() => {
+          invalidateUserSessions(id);
+          logAuthEvent({
+            event_type: 'session_revoked',
+            username: target.username,
+            actor_username: actor.username,
+            ip_address: getClientIp(c),
+            details: { action: 'permissions_change' },
+          });
         });
       }
     }
@@ -406,60 +491,60 @@ adminRoutes.patch(
 
     if (validation.data.status !== undefined) {
       if (validation.data.status === 'deleted') {
-        deleteUser(id);
-        // sessionCache 是 30s TTL（web-context.ts），不主动 invalidate
-        // 的话被删用户在缓存中仍是 status='active'，可继续 HTTP / WS。
-        invalidateUserSessions(id);
-        // Tear down all IM connections so feishu/telegram/qq/wechat/etc bots
-        // stop responding immediately. Without this the bots would keep firing
-        // until the next service restart (loadState filters non-active users).
-        void imManager
-          .disconnectAllUserChannels(id)
-          .catch(() => undefined);
-        logAuthEvent({
-          event_type: 'user_deleted',
-          username: target.username,
-          actor_username: actor.username,
-          ip_address: getClientIp(c),
-        });
-        const deleted = getUserById(id)!;
-        return c.json({ success: true, user: toUserPublic(deleted) });
-      }
-
-      updates.status = validation.data.status;
-      if (validation.data.status === 'disabled') {
-        // Revoke all sessions when disabling + clean caches
-        invalidateUserSessions(id);
-        deleteUserSessionsByUserId(id);
-        // Tear down all IM connections — see note above on the 'deleted' branch.
-        void imManager
-          .disconnectAllUserChannels(id)
-          .catch(() => undefined);
+        updates.status = 'deleted';
+        updates.deleted_at = new Date().toISOString();
         updates.disable_reason =
-          validation.data.disable_reason ?? 'disabled_by_admin';
-        logAuthEvent({
-          event_type: 'user_disabled',
-          username: target.username,
-          actor_username: actor.username,
-          ip_address: getClientIp(c),
-        });
-      } else if (validation.data.status === 'active') {
-        updates.disable_reason = null;
-        if (target.status === 'disabled') {
+          validation.data.disable_reason ??
+          target.disable_reason ??
+          'deleted_by_admin';
+        postCommitActions.push(() => {
+          invalidateUserSessions(id);
+          deleteUserSessionsByUserId(id);
+          void imManager.disconnectAllUserChannels(id).catch(() => undefined);
           logAuthEvent({
-            event_type: 'user_enabled',
+            event_type: 'user_deleted',
             username: target.username,
             actor_username: actor.username,
             ip_address: getClientIp(c),
           });
-        }
-        if (target.status === 'deleted') {
-          updates.deleted_at = null;
+        });
+      } else if (validation.data.status === 'disabled') {
+        updates.status = 'disabled';
+        updates.disable_reason =
+          validation.data.disable_reason ?? 'disabled_by_admin';
+        postCommitActions.push(() => {
+          invalidateUserSessions(id);
+          deleteUserSessionsByUserId(id);
+          void imManager.disconnectAllUserChannels(id).catch(() => undefined);
           logAuthEvent({
-            event_type: 'user_restored',
+            event_type: 'user_disabled',
             username: target.username,
             actor_username: actor.username,
             ip_address: getClientIp(c),
+          });
+        });
+      } else if (validation.data.status === 'active') {
+        updates.status = 'active';
+        updates.disable_reason = null;
+        if (target.status === 'disabled') {
+          postCommitActions.push(() => {
+            logAuthEvent({
+              event_type: 'user_enabled',
+              username: target.username,
+              actor_username: actor.username,
+              ip_address: getClientIp(c),
+            });
+          });
+        }
+        if (target.status === 'deleted') {
+          updates.deleted_at = null;
+          postCommitActions.push(() => {
+            logAuthEvent({
+              event_type: 'user_restored',
+              username: target.username,
+              actor_username: actor.username,
+              ip_address: getClientIp(c),
+            });
           });
         }
       }
@@ -472,6 +557,7 @@ adminRoutes.patch(
     ) {
       updates.disable_reason = validation.data.disable_reason;
     }
+
     const isSelfPasswordReset =
       validation.data.password !== undefined && id === actor.id;
     if (validation.data.password !== undefined) {
@@ -481,35 +567,70 @@ adminRoutes.patch(
       if (id !== actor.id) {
         updates.must_change_password = true;
       }
-      invalidateUserSessions(id);
-      deleteUserSessionsByUserId(id);
-      logAuthEvent({
-        event_type: 'password_changed',
-        username: target.username,
-        actor_username: actor.username,
-        ip_address: getClientIp(c),
-        details: { admin_reset: true },
-      });
-      logAuthEvent({
-        event_type: 'session_revoked',
-        username: target.username,
-        actor_username: actor.username,
-        ip_address: getClientIp(c),
-        details: { action: 'password_reset_revoke_all' },
+      postCommitActions.push(() => {
+        invalidateUserSessions(id);
+        deleteUserSessionsByUserId(id);
+        logAuthEvent({
+          event_type: 'password_changed',
+          username: target.username,
+          actor_username: actor.username,
+          ip_address: getClientIp(c),
+          details: { admin_reset: true },
+        });
+        logAuthEvent({
+          event_type: 'session_revoked',
+          username: target.username,
+          actor_username: actor.username,
+          ip_address: getClientIp(c),
+          details: { action: 'password_reset_revoke_all' },
+        });
       });
     }
 
     if (Object.keys(updates).length > 0) {
-      logAuthEvent({
-        event_type: 'user_updated',
-        username: target.username,
-        actor_username: actor.username,
-        ip_address: getClientIp(c),
-        details: { fields: Object.keys(updates) },
+      postCommitActions.push(() => {
+        logAuthEvent({
+          event_type: 'user_updated',
+          username: target.username,
+          actor_username: actor.username,
+          ip_address: getClientIp(c),
+          details: { fields: Object.keys(updates) },
+        });
       });
     }
 
-    updateUserFields(id, updates);
+    let updateAlreadyCommitted = false;
+    const revokesHostPrivilege =
+      targetIsActiveAdmin && !targetRemainsActiveAdmin;
+    if (revokesHostPrivilege) {
+      try {
+        await commitHostPrivilegeRevocation(
+          id,
+          `Administrator ${id} lost active host privileges`,
+          () => updateUserFields(id, updates),
+        );
+        updateAlreadyCommitted = true;
+      } catch (err) {
+        if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+        logger.error(
+          { err, userId: id, persisted: err.persisted },
+          'Failed to revoke active administrator host privileges',
+        );
+        if (err.persisted) runPostCommitActions();
+        return c.json(
+          {
+            error: err.persisted
+              ? 'Account changed, but one or more host runtimes could not be stopped'
+              : 'Could not stop active runtimes; account was not changed',
+            persisted: err.persisted,
+            retryable: true,
+          },
+          503,
+        );
+      }
+    }
+    if (!updateAlreadyCommitted) updateUserFields(id, updates);
+    runPostCommitActions();
     const updated = getUserById(id)!;
 
     // Symmetric to the disconnect-on-disable/delete above: when a user is
@@ -557,67 +678,96 @@ adminRoutes.patch(
 );
 
 // DELETE /api/admin/users/:id - 删除用户
-adminRoutes.delete('/users/:id', authMiddleware, usersManageMiddleware, (c) => {
-  const id = c.req.param('id');
-  const target = getUserById(id);
-  if (!target) return c.json({ error: 'User not found' }, 404);
+adminRoutes.delete(
+  '/users/:id',
+  authMiddleware,
+  usersManageMiddleware,
+  async (c) => {
+    const id = c.req.param('id');
+    const target = getUserById(id);
+    if (!target) return c.json({ error: 'User not found' }, 404);
 
-  const actor = c.get('user') as AuthUser;
-  if (actor.role !== 'admin' && target.role === 'admin') {
-    return c.json(
-      { error: 'Forbidden: only admin can delete admin users' },
-      403,
-    );
-  }
-  {
-    const denial = denyEscalationToTarget(c, actor, target, 'delete');
-    if (denial) return denial;
-  }
-  if (target.id === actor.id) {
-    return c.json({ error: 'Cannot delete yourself' }, 400);
-  }
-  if (
-    target.role === 'admin' &&
-    target.status === 'active' &&
-    getActiveAdminCount() <= 1
-  ) {
-    return c.json({ error: 'Cannot delete the last active admin' }, 400);
-  }
-
-  deleteUser(id);
-  // 与 PATCH status='deleted' 路径对齐：清缓存 + 断 IM 连接，否则前端调
-  // DELETE 之后 sessionCache 仍是 active 状态、IM bot 持续响应群消息直到重启。
-  invalidateUserSessions(id);
-  void imManager
-    .disconnectAllUserChannels(id)
-    .catch(() => undefined);
-
-  // Cleanup avatar files for deleted user
-  try {
-    const avatarsDir = path.join(DATA_DIR, 'avatars');
-    if (fs.existsSync(avatarsDir)) {
-      const files = fs
-        .readdirSync(avatarsDir)
-        .filter((f) => f.startsWith(`${id}-`));
-      for (const file of files) {
-        fs.unlinkSync(path.join(avatarsDir, file));
-      }
+    const actor = c.get('user') as AuthUser;
+    if (actor.role !== 'admin' && target.role === 'admin') {
+      return c.json(
+        { error: 'Forbidden: only admin can delete admin users' },
+        403,
+      );
     }
-  } catch (e) {
-    // Avatar cleanup failure should not block user deletion
-    logger.warn({ error: e, userId: id }, 'Failed to cleanup avatar files');
-  }
+    {
+      const denial = denyEscalationToTarget(c, actor, target, 'delete');
+      if (denial) return denial;
+    }
+    if (target.id === actor.id) {
+      return c.json({ error: 'Cannot delete yourself' }, 400);
+    }
+    if (
+      target.role === 'admin' &&
+      target.status === 'active' &&
+      getActiveAdminCount() <= 1
+    ) {
+      return c.json({ error: 'Cannot delete the last active admin' }, 400);
+    }
+    try {
+      if (target.role === 'admin' && target.status === 'active') {
+        await commitHostPrivilegeRevocation(
+          id,
+          `Administrator ${id} was deleted`,
+          () => deleteUser(id),
+        );
+      } else {
+        deleteUser(id);
+      }
+    } catch (err) {
+      if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+      if (err.persisted) {
+        invalidateUserSessions(id);
+        deleteUserSessionsByUserId(id);
+        void imManager.disconnectAllUserChannels(id).catch(() => undefined);
+      }
+      return c.json(
+        {
+          error: err.persisted
+            ? 'User was deleted, but one or more runtimes could not be stopped'
+            : 'Could not stop active runtimes; user was not deleted',
+          persisted: err.persisted,
+          retryable: true,
+        },
+        503,
+      );
+    }
+    // 与 PATCH status='deleted' 路径对齐：清缓存 + 断 IM 连接，否则前端调
+    // DELETE 之后 sessionCache 仍是 active 状态、IM bot 持续响应群消息直到重启。
+    invalidateUserSessions(id);
+    void imManager.disconnectAllUserChannels(id).catch(() => undefined);
 
-  logAuthEvent({
-    event_type: 'user_deleted',
-    username: target.username,
-    actor_username: actor.username,
-    ip_address: getClientIp(c),
-    details: { action: 'deleted' },
-  });
+    // Cleanup avatar files for deleted user
+    try {
+      const avatarsDir = path.join(DATA_DIR, 'avatars');
+      if (fs.existsSync(avatarsDir)) {
+        const files = fs
+          .readdirSync(avatarsDir)
+          .filter((f) => f.startsWith(`${id}-`));
+        for (const file of files) {
+          fs.unlinkSync(path.join(avatarsDir, file));
+        }
+      }
+    } catch (e) {
+      // Avatar cleanup failure should not block user deletion
+      logger.warn({ error: e, userId: id }, 'Failed to cleanup avatar files');
+    }
 
-  return c.json({ success: true });
-});
+    logAuthEvent({
+      event_type: 'user_deleted',
+      username: target.username,
+      actor_username: actor.username,
+      ip_address: getClientIp(c),
+      details: { action: 'deleted' },
+    });
+
+    return c.json({ success: true });
+  },
+);
 
 // POST /api/admin/users/:id/restore - 恢复已删除用户
 adminRoutes.post(
@@ -671,7 +821,12 @@ adminRoutes.delete(
       );
     }
     {
-      const denial = denyEscalationToTarget(c, actor, target, 'revoke sessions for');
+      const denial = denyEscalationToTarget(
+        c,
+        actor,
+        target,
+        'revoke sessions for',
+      );
       if (denial) return denial;
     }
 

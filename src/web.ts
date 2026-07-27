@@ -1,10 +1,23 @@
-import { Hono } from 'hono';
-import { cors } from 'hono/cors';
-import { serve } from '@hono/node-server';
-import { serveStatic } from '@hono/node-server/serve-static';
-import { WebSocketServer, WebSocket } from 'ws';
+import {
+  Hono,
+} from 'hono';
+import {
+  cors,
+} from 'hono/cors';
+import {
+  serve,
+} from '@hono/node-server';
+import {
+  serveStatic,
+} from '@hono/node-server/serve-static';
+import {
+  WebSocketServer,
+  WebSocket,
+} from 'ws';
 import crypto from 'crypto';
-import { TerminalManager } from './terminal-manager.js';
+import {
+  TerminalManager,
+} from './terminal-manager.js';
 
 // Web context and shared utilities
 import {
@@ -56,11 +69,17 @@ import agentRoutes from './routes/agents.js';
 import mcpServersRoutes from './routes/mcp-servers.js';
 import pluginsRoutes from './routes/plugins.js';
 import workspaceConfigRoutes from './routes/workspace-config.js';
-import agentDefinitionsRoutes from './routes/agent-definitions.js';
-import { usage as usageRoutes } from './routes/usage.js';
+import agentProfileRoutes from './routes/agent-profiles.js';
+import workspaceRoutes from './routes/workspaces.js';
+import {
+  usage as usageRoutes,
+} from './routes/usage.js';
 import billingRoutes from './routes/billing.js';
 import bugReportRoutes from './routes/bug-report.js';
 import modelRoutes from './routes/model.js';
+import channelAccountRoutes, {
+  injectChannelAccountDeps,
+} from './routes/channel-accounts.js';
 import {
   checkBillingAccess,
   formatBillingAccessDeniedMessage,
@@ -74,27 +93,39 @@ import {
   storeMessageDirect,
   deleteUserSession,
   updateSessionLastActive,
-  getGroupMembers,
   getAgent,
-  isGroupShared,
   getUserById,
   updateAgentContextInfo,
   updateChatName,
   ensureConversationRuntimeState,
   getProviderPool,
   setConversationRuntimeBinding,
+  listQueuedFollowUps,
+  setMessageFollowUp,
 } from './db.js';
-import { recordTurnEvent } from './turn-trace.js';
-import { markdownToPlainText } from './im-utils.js';
-import { isSessionExpired } from './auth.js';
+import { getGroupAllowedUserIds } from './group-broadcast-acl.js';
+import {
+  recordTurnEvent,
+} from './turn-trace.js';
+import {
+  markdownToPlainText,
+} from './im-utils.js';
+import {
+  isSessionExpired,
+} from './auth.js';
 import type {
   AgentStatus,
   NewMessage,
+  FollowUpMode,
+  FollowUpTransition,
+  QueuedFollowUp,
   WsMessageOut,
   WsMessageIn,
   AuthUser,
   StreamEvent,
   UserRole,
+  MessageCursor,
+  RunFinishReason,
 } from './types.js';
 import {
   WEB_PORT,
@@ -103,13 +134,30 @@ import {
   ASSISTANT_NAME,
   GROUPS_DIR,
 } from './config.js';
-import { expandPluginSlashCommandIfNeeded } from './plugin-expander-core.js';
-import { makeExpandContext } from './plugin-expander-context.js';
-import type { ExpandContext } from './plugin-expander-context.js';
-import { PLUGIN_EXPANSION_ATTACHMENT_TYPE } from './plugin-expander-sentinel.js';
-import { resolvePerMessageRuntimeOwner } from './runtime-owner.js';
-import { persistPluginExpansion } from './plugin-expander-store.js';
-import { logger } from './logger.js';
+import {
+  expandPluginSlashCommandIfNeeded,
+} from './plugin-expander-core.js';
+import {
+  makeExpandContext,
+} from './plugin-expander-context.js';
+import type {
+  ExpandContext,
+} from './plugin-expander-context.js';
+import {
+  PLUGIN_EXPANSION_ATTACHMENT_TYPE,
+} from './plugin-expander-sentinel.js';
+import {
+  persistPluginExpansion,
+} from './plugin-expander-store.js';
+import {
+  logger,
+} from './logger.js';
+import {
+  recordRunContextSnapshot,
+} from './run-context-snapshot.js';
+import {
+  RunStreamFence,
+} from './run-stream-fence.js';
 import {
   executeSessionReset,
   isClearCommand,
@@ -127,7 +175,9 @@ import {
   parseModelBindingFromArgs,
   shouldIncludeAllModelOptions,
 } from './model-command.js';
-import { createModelSwitchHandoffSummary } from './model-switch-handoff.js';
+import {
+  createModelSwitchHandoffSummary,
+} from './model-switch-handoff.js';
 
 // --- App Setup ---
 
@@ -154,16 +204,6 @@ function normalizeTerminalSize(
  * group. Returns null when the group has no resolvable owner (no plugins to
  * resolve in that case).
  *
- * Plugins are per-user config. On the admin-shared `web:main + isHome`
- * workspace each admin owns a separate runtime, so the message sender wins
- * over `group.created_by` — but only when the sender is an active admin
- * (#24 round-16 P2-1). Non-admin / disabled / unknown senders fall back to
- * `created_by`, mirroring `resolvePerMessageRuntimeOwner` used by the
- * cold-start path; pre-fix the web fast-path blindly returned senderUserId
- * on `web:main + isHome`, so `/foo` from a member resolved to the member's
- * (empty) plugin runtime when the runner was active and to admin's runtime
- * when idle — same command, two different behaviors.
- *
  * Host mode honors `group.customCwd` so inline `!` commands run against the
  * user's real repo (#18 P2-bug-4).
  */
@@ -176,26 +216,13 @@ function buildWebExpandContext(
     customCwd?: string | null;
     is_home?: boolean;
   },
-  senderUserId?: string | null,
 ): ExpandContext | null {
   const deps = getWebDeps();
-  // Default getUserById: when the WebDeps wiring did not inject one (older
-  // tests / partial fixtures), `resolvePerMessageRuntimeOwner` falls back to
-  // `created_by` for any non-empty sender — admin gating is opt-in. The
-  // production wiring in src/index.ts ALWAYS injects the lookup.
-  const getUserById = deps?.getUserById ?? (() => null);
-  const ownerId = resolvePerMessageRuntimeOwner({
-    chatJid: groupJid,
-    isHome: !!group.is_home,
-    fallbackOwner: group.created_by,
-    message: { sender: senderUserId ?? '' },
-    getUserById,
-  });
   const containerName = deps?.queue.getActiveContainerName(groupJid) ?? null;
   return makeExpandContext({
     chatJid: groupJid,
     groupFolder: group.folder,
-    ownerId,
+    ownerId: group.created_by,
     executionMode: group.executionMode,
     customCwd: group.customCwd,
     groupsDir: GROUPS_DIR,
@@ -346,6 +373,23 @@ function handleWebModelCommand(input: {
 const CORS_ALLOWED_ORIGINS = process.env.CORS_ALLOWED_ORIGINS || '';
 const CORS_ALLOW_LOCALHOST = process.env.CORS_ALLOW_LOCALHOST !== 'false'; // default: true
 
+function completeWebOutOfBandMessage(
+  webDeps: WebDeps,
+  jid: string,
+  cursor: MessageCursor,
+): void {
+  if (webDeps.completeOutOfBandMessage) {
+    webDeps.completeOutOfBandMessage(jid, cursor);
+    return;
+  }
+  // Compatibility for focused tests that predate the production chokepoint.
+  if (webDeps.hasEarlierPendingMessages(jid, cursor)) {
+    webDeps.advanceNextPullCursorOnly(jid, cursor);
+  } else {
+    webDeps.advanceCursors(jid, cursor);
+  }
+}
+
 function isAllowedOrigin(origin: string | undefined): string | null {
   if (!origin) return null; // same-origin requests
   // 环境变量设为 '*' 时允许所有来源
@@ -393,14 +437,16 @@ app.route('/api/admin', adminRoutes);
 app.route('/api/browse', browseRoutes);
 app.route('/api/mcp-servers', mcpServersRoutes);
 app.route('/api/plugins', pluginsRoutes);
-app.route('/api/agent-definitions', agentDefinitionsRoutes);
-app.route('/api/groups', agentRoutes); // Agent routes under /api/groups/:jid/agents
+app.route('/api/agent-profiles', agentProfileRoutes);
+app.route('/api/workspaces', workspaceRoutes);
+app.route('/api/groups', agentRoutes); // Workspace session routes; /agents paths remain compatibility aliases
 app.route('/api/groups', workspaceConfigRoutes); // Workspace config under /api/groups/:jid/workspace-config
 app.route('/api', monitorRoutes);
 app.route('/api/usage', usageRoutes);
 app.route('/api/billing', billingRoutes);
 app.route('/api/bug-report', bugReportRoutes);
 app.route('/api/model', modelRoutes);
+app.route('/api/channel-accounts', channelAccountRoutes);
 
 // --- POST /api/messages ---
 
@@ -415,7 +461,8 @@ app.post('/api/messages', authMiddleware, async (c) => {
     );
   }
 
-  const { chatJid, content, attachments } = validation.data;
+  const { chatJid, agentId, content, attachments, followUpBehavior } =
+    validation.data;
   const group = getRegisteredGroup(chatJid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
   const authUser = c.get('user') as AuthUser;
@@ -429,6 +476,13 @@ app.post('/api/messages', authMiddleware, async (c) => {
     );
   }
 
+  if (agentId) {
+    const agent = getAgent(agentId);
+    if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
+      return c.json({ error: 'Agent not found' }, 404);
+    }
+  }
+
   // /clear: reset session without entering message pipeline.
   // Permission: owner-only (canModifyGroup) — aligned with `reset-session`
   // route, since /clear has the same destructive effect (clears agent
@@ -440,10 +494,7 @@ app.post('/api/messages', authMiddleware, async (c) => {
         { ...group, jid: chatJid },
       )
     ) {
-      return c.json(
-        { error: 'Only the workspace owner can run /clear' },
-        403,
-      );
+      return c.json({ error: 'Only the workspace owner can run /clear' }, 403);
     }
     if (!deps) return c.json({ error: 'Server not initialized' }, 500);
     try {
@@ -452,6 +503,16 @@ app.post('/api/messages', authMiddleware, async (c) => {
         broadcast: broadcastNewMessage,
         setLastAgentTimestamp: deps.setLastAgentTimestamp,
       });
+      await executeSessionReset(
+        chatJid,
+        group.folder,
+        {
+          queue: deps.queue,
+          broadcast: broadcastNewMessage,
+          setLastAgentTimestamp: deps.setLastAgentTimestamp,
+        },
+        agentId,
+      );
       return c.json({ success: true, cleared: true });
     } catch (err) {
       logger.error({ chatJid, err }, '/clear command failed');
@@ -480,19 +541,35 @@ app.post('/api/messages', authMiddleware, async (c) => {
     }
   }
 
+  if (agentId) {
+    const result = await handleAgentConversationMessage(
+      chatJid,
+      agentId,
+      content.trim(),
+      authUser.id,
+      authUser.display_name || authUser.username,
+      attachments,
+      followUpBehavior,
+    );
+    if (!result.ok) return c.json({ error: result.error }, result.status);
+    return c.json({ success: true, ...result });
+  }
+
   const result = await handleWebUserMessage(
     chatJid,
     content.trim(),
     attachments,
     authUser.id,
     authUser.display_name || authUser.username,
+    followUpBehavior,
   );
   if (!result.ok) return c.json({ error: result.error }, result.status);
   return c.json({
     success: true,
     messageId: result.messageId,
     timestamp: result.timestamp,
-    handledCommand: result.handledCommand ?? false,
+    disposition: result.disposition,
+    runId: result.runId,
   });
 });
 
@@ -528,6 +605,102 @@ function storeAndBroadcastCommandReply(
   );
 }
 
+app.get('/api/follow-ups', authMiddleware, async (c) => {
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+  const chatJid = c.req.query('chatJid')?.trim();
+  if (!chatJid) return c.json({ error: 'chatJid is required' }, 400);
+  const baseJid = chatJid.includes('#agent:')
+    ? chatJid.slice(0, chatJid.indexOf('#agent:'))
+    : chatJid;
+  const group = getRegisteredGroup(baseJid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup(authUser, group)) {
+    return c.json({ error: 'Access denied' }, 403);
+  }
+  return c.json({ items: listQueuedFollowUps(chatJid) });
+});
+
+app.post('/api/follow-ups/:messageId/action', authMiddleware, async (c) => {
+  if (!deps) return c.json({ error: 'Server not initialized' }, 500);
+  const messageId = c.req.param('messageId');
+  const body = (await c.req.json().catch(() => ({}))) as {
+    chatJid?: string;
+    action?:
+      | 'steer'
+      | 'cancel'
+      | 'edit'
+      | 'move_up'
+      | 'move_down'
+      | 'interrupt_and_run';
+    expectedRunId?: string;
+    content?: string;
+  };
+  const chatJid = body.chatJid?.trim();
+  if (!chatJid || !body.action) {
+    return c.json({ error: 'chatJid and action are required' }, 400);
+  }
+  const baseJid = chatJid.includes('#agent:')
+    ? chatJid.slice(0, chatJid.indexOf('#agent:'))
+    : chatJid;
+  const group = getRegisteredGroup(baseJid);
+  if (!group) return c.json({ error: 'Group not found' }, 404);
+  const authUser = c.get('user') as AuthUser;
+  if (!canAccessGroup(authUser, group)) {
+    return c.json({ error: 'Access denied' }, 403);
+  }
+
+  let result;
+  if (body.action === 'cancel') {
+    result = deps.cancelFollowUp?.(chatJid, messageId);
+  } else if (body.action === 'edit') {
+    const content = body.content?.trim();
+    if (!content || content.length > 64 * 1024) {
+      return c.json(
+        { error: 'content must be between 1 and 65536 characters' },
+        400,
+      );
+    }
+    result = deps.editFollowUp?.(chatJid, messageId, content);
+  } else if (body.action === 'move_up' || body.action === 'move_down') {
+    result = deps.reorderFollowUp?.(
+      chatJid,
+      messageId,
+      body.action === 'move_up' ? 'up' : 'down',
+    );
+  } else if (body.action === 'steer') {
+    const currentRunId = deps.queue.getActiveQueryId(chatJid);
+    const targetRunId = currentRunId ?? body.expectedRunId;
+    if (!targetRunId) {
+      return c.json({ error: 'expectedRunId is required' }, 400);
+    }
+    result = await deps.promoteFollowUp?.(chatJid, messageId, targetRunId);
+  } else {
+    if (
+      !canModifyGroup(
+        { id: authUser.id, role: authUser.role },
+        { ...group, jid: baseJid },
+      )
+    ) {
+      return c.json(
+        { error: 'Only the workspace owner can interrupt it' },
+        403,
+      );
+    }
+    if (!body.expectedRunId) {
+      return c.json({ error: 'expectedRunId is required' }, 400);
+    }
+    result = deps.interruptAndRunFollowUp?.(
+      chatJid,
+      messageId,
+      body.expectedRunId,
+    );
+  }
+  if (!result) return c.json({ error: 'Follow-up action unavailable' }, 503);
+  if (!result.ok) return c.json({ ...result, error: result.message }, 409);
+  return c.json(result, 200);
+});
+
 // --- handleWebUserMessage ---
 
 async function handleWebUserMessage(
@@ -536,12 +709,15 @@ async function handleWebUserMessage(
   attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
   userId = 'web-user',
   displayName = 'Web',
+  followUpBehavior: FollowUpMode = 'queue',
 ): Promise<
   | {
       ok: true;
       messageId: string;
       timestamp: string;
       handledCommand?: boolean;
+      disposition: 'started' | 'queued' | 'steered';
+      runId?: string;
     }
   | {
       ok: false;
@@ -575,6 +751,13 @@ async function handleWebUserMessage(
     normalizedAttachments.length > 0
       ? JSON.stringify(normalizedAttachments)
       : undefined;
+  const activeRunId = deps.queue.getActiveQueryId(chatJid);
+  const effectiveFollowUpBehavior: FollowUpMode = followUpBehavior;
+  // Both queue and steer remain durable until the active query reaches idle.
+  // A steer requests a controlled interrupt below; it must not be released
+  // early and injected into Claude as a best-effort queued_command attachment.
+  const queueForLater = !!activeRunId;
+  const deliveryStatus = activeRunId ? 'queued' : null;
   storeMessageDirect(
     messageId,
     chatJid,
@@ -583,7 +766,17 @@ async function handleWebUserMessage(
     content,
     timestamp,
     false,
-    { attachments: attachmentsStr },
+    {
+      attachments: attachmentsStr,
+      meta: activeRunId
+        ? {
+            deliveryMode: effectiveFollowUpBehavior,
+            deliveryStatus,
+            deliveryRunId: activeRunId,
+            deliveryUpdatedAt: timestamp,
+          }
+        : undefined,
+    },
   );
 
   broadcastNewMessage(chatJid, {
@@ -595,6 +788,10 @@ async function handleWebUserMessage(
     timestamp,
     is_from_me: false,
     attachments: attachmentsStr,
+    delivery_mode: activeRunId ? effectiveFollowUpBehavior : null,
+    delivery_status: deliveryStatus,
+    delivery_run_id: activeRunId,
+    delivery_updated_at: activeRunId ? timestamp : null,
   });
 
   const modelCommandReply = handleWebModelCommand({
@@ -608,7 +805,15 @@ async function handleWebUserMessage(
     storeAndBroadcastCommandReply(chatJid, modelCommandReply);
     deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
     deps.advanceGlobalCursor({ timestamp, id: messageId });
-    return { ok: true, messageId, timestamp, handledCommand: true };
+    // 决策 51：命令响应契约取并集 —— handledCommand 供本地 /model 用，
+    // disposition 供 upstream 队列语义用。命令是即时处理，故 'started'。
+    return {
+      ok: true,
+      messageId,
+      timestamp,
+      handledCommand: true,
+      disposition: 'started' as const,
+    };
   }
 
   if (group.created_by) {
@@ -616,6 +821,23 @@ async function handleWebUserMessage(
     if (owner && owner.role !== 'admin') {
       const accessResult = checkBillingAccess(group.created_by, owner.role);
       if (!accessResult.allowed) {
+        if (queueForLater) {
+          const deliveryUpdatedAt = new Date().toISOString();
+          setMessageFollowUp(chatJid, messageId, {
+            mode: effectiveFollowUpBehavior,
+            // This input received a terminal billing response, so it belongs
+            // in the transcript immediately before that response rather than
+            // behaving like a user-cancelled queued message.
+            status: 'released',
+            runId: activeRunId,
+          });
+          broadcastFollowUpUpdate(chatJid, {
+            id: messageId,
+            delivery_status: 'released',
+            delivery_run_id: activeRunId,
+            delivery_updated_at: deliveryUpdatedAt,
+          });
+        }
         const sysMsg = formatBillingAccessDeniedMessage(accessResult);
         const sysMsgId = `sys_quota_${Date.now()}`;
         const sysTimestamp = new Date().toISOString();
@@ -637,11 +859,40 @@ async function handleWebUserMessage(
           timestamp: sysTimestamp,
           is_from_me: true,
         });
-        deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
+        completeWebOutOfBandMessage(deps, chatJid, {
+          timestamp,
+          id: messageId,
+        });
         deps.advanceGlobalCursor({ timestamp, id: messageId });
-        return { ok: true, messageId, timestamp };
+        return { ok: true, messageId, timestamp, disposition: 'started' };
       }
     }
+  }
+
+  if (queueForLater) {
+    broadcastFollowUpUpdate(chatJid);
+    deps.advanceGlobalCursor({ timestamp, id: messageId });
+    if (effectiveFollowUpBehavior === 'steer') {
+      const steerResult = await deps.promoteFollowUp?.(
+        chatJid,
+        messageId,
+        activeRunId!,
+      );
+      return {
+        ok: true,
+        messageId,
+        timestamp,
+        disposition: steerResult?.ok ? 'steered' : 'queued',
+        runId: activeRunId!,
+      };
+    }
+    return {
+      ok: true,
+      messageId,
+      timestamp,
+      disposition: 'queued',
+      runId: activeRunId,
+    };
   }
 
   // Plugin command expander (DMI commands).
@@ -665,8 +916,7 @@ async function handleWebUserMessage(
   // so cold-start re-expands and inline runs again. Lead-approved tradeoff;
   // log a warn line so we can confirm rarity in production.
   let sendContent = content;
-  const eagerExpandActive =
-    deps.queue.hasActiveMainRunnerForMessage(chatJid);
+  const eagerExpandActive = deps.queue.hasActiveMainRunnerForMessage(chatJid);
   if (eagerExpandActive) {
     // Use the effective (sibling-resolved) group so non-home groups bound to a
     // home sibling inherit executionMode / customCwd / created_by — otherwise
@@ -675,7 +925,7 @@ async function handleWebUserMessage(
     const expandGroup = deps.resolveEffectiveGroup
       ? deps.resolveEffectiveGroup(group).effectiveGroup
       : group;
-    const expandCtx = buildWebExpandContext(chatJid, expandGroup, userId);
+    const expandCtx = buildWebExpandContext(chatJid, expandGroup);
     if (expandCtx) {
       const expansion = await expandPluginSlashCommandIfNeeded(
         expandCtx,
@@ -714,13 +964,15 @@ async function handleWebUserMessage(
         //     committed → already-processed messages re-polled and the
         //     reply re-fired.
         const replyCursor = { timestamp, id: messageId };
-        if (deps.hasEarlierPendingMessages(chatJid, replyCursor)) {
-          deps.advanceNextPullCursorOnly(chatJid, replyCursor);
-        } else {
-          deps.advanceCursors(chatJid, replyCursor);
-        }
+        completeWebOutOfBandMessage(deps, chatJid, replyCursor);
         deps.advanceGlobalCursor(replyCursor);
-        return { ok: true, messageId, timestamp };
+        return {
+          ok: true,
+          messageId,
+          timestamp,
+          disposition: activeRunId ? 'steered' : 'started',
+          runId: activeRunId ?? undefined,
+        };
       }
       if (expansion.kind === 'expanded') {
         sendContent = expansion.prompt;
@@ -757,20 +1009,16 @@ async function handleWebUserMessage(
   // Idle path: skip expander entirely; cold-start will expand once from the
   // original DB row via `expandMessagesIfNeeded` (handles reply/expanded/miss).
 
-  const shared = !group.is_home && isGroupShared(group.folder);
-  const formatted = deps.formatMessages(
-    [
-      {
-        id: messageId,
-        chat_jid: chatJid,
-        sender: userId,
-        sender_name: displayName,
-        content: sendContent,
-        timestamp,
-      },
-    ],
-    shared,
-  );
+  const formatted = deps.formatMessages([
+    {
+      id: messageId,
+      chat_jid: chatJid,
+      sender: userId,
+      sender_name: displayName,
+      content: sendContent,
+      timestamp,
+    },
+  ]);
 
   // IPC-inject the message into the running agent process.  For home groups,
   // the reply route is dynamically updated via activeRouteUpdaters so we no
@@ -778,16 +1026,31 @@ async function handleWebUserMessage(
   let pipedToActive = false;
   const images = toAgentImages(normalizedAttachments);
   const updateRoute = deps.updateReplyRoute;
+  const preAdmitRoute = deps.preAdmitReplyRoute;
   const sendResult = deps.queue.sendMessage(
     chatJid,
     formatted,
     images,
-    () => {
+    (receipt) => {
       // IPC write succeeded — update reply route for home groups.
       // Web messages have no IM source, so clear the IM route.
-      updateRoute?.(group.folder, null);
+      updateRoute?.(
+        group.folder,
+        null,
+        receipt?.deliveryId,
+        receipt?.cursor,
+        receipt?.chatJid,
+      );
     },
     chatJid,
+    undefined,
+    {
+      chatJid,
+      coveredCursors: [{ timestamp, id: messageId }],
+      cursor: { timestamp, id: messageId },
+    },
+    undefined,
+    (receipt) => preAdmitRoute?.(group.folder, null, receipt) ?? false,
   );
   if (sendResult === 'sent') {
     pipedToActive = true;
@@ -807,10 +1070,7 @@ async function handleWebUserMessage(
         'Race: eager-expanded but runner exited before sendMessage; cold-start will re-expand (inline may run twice)',
       );
     }
-    // Pass the sender as the run initiator so the stop/interrupt routes can do
-    // a resource-level "owner OR initiator" check — a shared member can stop /
-    // interrupt the run they started, but not the owner's.
-    deps.queue.enqueueMessageCheck(chatJid, userId);
+    deps.queue.enqueueMessageCheck(chatJid);
   }
 
   // Only advance per-group cursor when we piped directly into a running container.
@@ -819,11 +1079,17 @@ async function handleWebUserMessage(
   // messages. If the agent crashes without processing them, the close handler
   // resets pendingMessages so drainGroup re-reads from DB.
   if (pipedToActive) {
-    deps.setLastAgentTimestamp(chatJid, { timestamp, id: messageId });
-    deps.queue.markIpcInjectedMessage(chatJid);
+    deps.advanceNextPullCursorOnly(chatJid, { timestamp, id: messageId });
   }
   deps.advanceGlobalCursor({ timestamp, id: messageId });
-  return { ok: true, messageId, timestamp };
+  const startedRunId = deps.queue.getActiveQueryId(chatJid);
+  return {
+    ok: true,
+    messageId,
+    timestamp,
+    disposition: activeRunId ? 'steered' : 'started',
+    runId: activeRunId ?? startedRunId ?? undefined,
+  };
 }
 
 // --- Auto-title for conversations ---
@@ -833,9 +1099,7 @@ function generateAutoTitle(content: string): string | null {
   const trimmed = content.trim();
   if (!trimmed || trimmed.startsWith('/')) return null;
 
-  const text = markdownToPlainText(trimmed)
-    .replace(/\n+/g, ' ')
-    .trim();
+  const text = markdownToPlainText(trimmed).replace(/\n+/g, ' ').trim();
 
   if (!text) return null;
 
@@ -855,8 +1119,20 @@ async function handleAgentConversationMessage(
   userId: string,
   displayName: string,
   attachments?: Array<{ type: 'image'; data: string; mimeType?: string }>,
-): Promise<void> {
-  if (!deps) return;
+  followUpBehavior: FollowUpMode = 'queue',
+): Promise<
+  | {
+      ok: true;
+      messageId: string;
+      timestamp: string;
+      disposition: 'started' | 'queued' | 'steered';
+      runId?: string;
+    }
+  | { ok: false; status: 404 | 500; error: string }
+> {
+  if (!deps) {
+    return { ok: false, status: 500, error: 'Server not initialized' };
+  }
 
   const agent = getAgent(agentId);
   if (!agent || agent.kind !== 'conversation' || agent.chat_jid !== chatJid) {
@@ -864,7 +1140,7 @@ async function handleAgentConversationMessage(
       { chatJid, agentId },
       'Agent conversation message rejected: agent not found or not a conversation',
     );
-    return;
+    return { ok: false, status: 404, error: 'Agent not found' };
   }
 
   const virtualChatJid = `${chatJid}#agent:${agentId}`;
@@ -884,6 +1160,12 @@ async function handleAgentConversationMessage(
     normalizedAttachments.length > 0
       ? JSON.stringify(normalizedAttachments)
       : undefined;
+  const activeRunId = deps.queue.getActiveQueryId(virtualChatJid);
+  const effectiveFollowUpBehavior: FollowUpMode = followUpBehavior;
+  // Keep steering durable across the SDK interrupt boundary, exactly like the
+  // workspace chat path above.
+  const queueForLater = !!activeRunId;
+  const deliveryStatus = activeRunId ? 'queued' : null;
 
   ensureChatExists(virtualChatJid);
   storeMessageDirect(
@@ -894,7 +1176,17 @@ async function handleAgentConversationMessage(
     content,
     timestamp,
     false,
-    { attachments: attachmentsStr },
+    {
+      attachments: attachmentsStr,
+      meta: activeRunId
+        ? {
+            deliveryMode: effectiveFollowUpBehavior,
+            deliveryStatus,
+            deliveryRunId: activeRunId,
+            deliveryUpdatedAt: timestamp,
+          }
+        : undefined,
+    },
   );
   updateAgentContextInfo(agentId, { last_active_at: timestamp });
 
@@ -906,7 +1198,13 @@ async function handleAgentConversationMessage(
     if (autoTitle) {
       updateAgentContextInfo(agentId, { name: autoTitle });
       updateChatName(virtualChatJid, autoTitle);
-      broadcastAgentStatus(chatJid, agentId, agent.status as AgentStatus, autoTitle, agent.prompt);
+      broadcastAgentStatus(
+        chatJid,
+        agentId,
+        agent.status as AgentStatus,
+        autoTitle,
+        agent.prompt,
+      );
     }
   }
 
@@ -922,6 +1220,10 @@ async function handleAgentConversationMessage(
       timestamp,
       is_from_me: false,
       attachments: attachmentsStr,
+      delivery_mode: activeRunId ? effectiveFollowUpBehavior : null,
+      delivery_status: deliveryStatus,
+      delivery_run_id: activeRunId,
+      delivery_updated_at: activeRunId ? timestamp : null,
     },
     agentId,
   );
@@ -937,7 +1239,14 @@ async function handleAgentConversationMessage(
   if (modelCommandReply !== null) {
     storeAndBroadcastCommandReply(virtualChatJid, modelCommandReply, agentId);
     deps.setLastAgentTimestamp(virtualChatJid, { timestamp, id: messageId });
-    return;
+    // 与 809 行的非 Agent 命令路径同口径（决策 51）：命令即时处理完毕，
+    // 没有 agent run 被拉起，disposition 记 'started'。
+    return {
+      ok: true,
+      messageId,
+      timestamp,
+      disposition: 'started' as const,
+    };
   }
 
   // Plugin command expander (DMI commands).
@@ -964,11 +1273,7 @@ async function handleAgentConversationMessage(
       const expandParent = deps.resolveEffectiveGroup
         ? deps.resolveEffectiveGroup(parentGroup).effectiveGroup
         : parentGroup;
-      const expandCtx = buildWebExpandContext(
-        virtualChatJid,
-        expandParent,
-        userId,
-      );
+      const expandCtx = buildWebExpandContext(virtualChatJid, expandParent);
       if (expandCtx) {
         const expansion = await expandPluginSlashCommandIfNeeded(
           expandCtx,
@@ -1008,12 +1313,14 @@ async function handleAgentConversationMessage(
           // (#27 round-17 P2-2) — direct overwrite would regress cursor on
           // same-millisecond batches and re-fire the reply.
           const replyCursor = { timestamp, id: messageId };
-          if (deps.hasEarlierPendingMessages(virtualChatJid, replyCursor)) {
-            deps.advanceNextPullCursorOnly(virtualChatJid, replyCursor);
-          } else {
-            deps.advanceCursors(virtualChatJid, replyCursor);
-          }
-          return;
+          completeWebOutOfBandMessage(deps, virtualChatJid, replyCursor);
+          return {
+            ok: true,
+            messageId,
+            timestamp,
+            disposition: activeRunId ? 'steered' : 'started',
+            runId: activeRunId ?? undefined,
+          };
         }
         if (expansion.kind === 'expanded') {
           agentSendContent = expansion.prompt;
@@ -1047,30 +1354,60 @@ async function handleAgentConversationMessage(
   // `expandMessagesIfNeeded` (handles reply/expanded/miss uniformly).
 
   // Format for agent
-  const shared = false; // agent conversations are not shared
-  const formatted = deps.formatMessages(
-    [
-      {
-        id: messageId,
-        chat_jid: virtualChatJid,
-        sender: userId,
-        sender_name: displayName,
-        content: agentSendContent,
-        timestamp,
-      },
-    ],
-    shared,
-  );
+  const formatted = deps.formatMessages([
+    {
+      id: messageId,
+      chat_jid: virtualChatJid,
+      sender: userId,
+      sender_name: displayName,
+      content: agentSendContent,
+      timestamp,
+    },
+  ]);
 
   // Try to pipe into running agent process
   const agentImages = toAgentImages(normalizedAttachments);
+  const finalizeHeld = deps.finalizeHeldCard;
+  const updateRoute = deps.updateReplyRoute;
+  const preAdmitRoute = deps.preAdmitReplyRoute;
   const agentSendResult = deps.queue.sendMessage(
     virtualChatJid,
     formatted,
     agentImages,
-    undefined,
+    (receipt) => {
+      // Route update owns both the durable warm turn and card rotation. Older
+      // embedders without updateReplyRoute retain the legacy finalizer hook.
+      if (updateRoute) {
+        updateRoute(
+          agent.group_folder,
+          null,
+          receipt?.deliveryId,
+          receipt?.cursor,
+          receipt?.chatJid,
+          undefined,
+          agentId,
+        );
+      } else {
+        finalizeHeld?.(virtualChatJid);
+      }
+    },
     virtualChatJid,
+    undefined,
+    {
+      chatJid: virtualChatJid,
+      coveredCursors: [{ timestamp, id: messageId }],
+      cursor: { timestamp, id: messageId },
+    },
+    undefined,
+    (receipt) =>
+      preAdmitRoute?.(agent.group_folder, null, receipt, agentId) ?? false,
   );
+  if (agentSendResult === 'sent') {
+    deps.advanceNextPullCursorOnly(virtualChatJid, {
+      timestamp,
+      id: messageId,
+    });
+  }
   if (agentSendResult === 'no_active') {
     if (eagerExpandAgentActive && agentSendContent !== content) {
       // Race: peek said active, but the runner exited before sendMessage.
@@ -1095,11 +1432,19 @@ async function handleAgentConversationMessage(
     if (deps.processAgentConversation) {
       const taskId = `agent-conv:${agentId}:${Date.now()}`;
       deps.queue.enqueueTask(virtualChatJid, taskId, async () => {
-        await deps!.processAgentConversation!(chatJid, agentId);
+        return deps!.processAgentConversation!(chatJid, agentId);
       });
     }
   }
   // 'sent' needs no further action
+  const startedRunId = deps.queue.getActiveQueryId(virtualChatJid);
+  return {
+    ok: true,
+    messageId,
+    timestamp,
+    disposition: activeRunId ? 'steered' : 'started',
+    runId: activeRunId ?? startedRunId ?? undefined,
+  };
 }
 
 // --- Static Files ---
@@ -1116,7 +1461,7 @@ app.use(
   serveStatic({ root: './web/dist' }),
 );
 
-// SPA fallback：index.html / sw.js 等必须每次验证
+// SPA shell、manifest 和旧 Service Worker 清理脚本必须每次走网络。
 app.use(
   '/*',
   async (c, next) => {
@@ -1126,6 +1471,7 @@ app.use(
       // 非文件扩展名路径（SPA fallback → index.html）、SW 脚本、manifest 禁止缓存
       if (
         !p.match(/\.\w+$/) ||
+        p === '/index.html' ||
         p === '/sw.js' ||
         p === '/registerSW.js' ||
         p === '/manifest.webmanifest'
@@ -1160,7 +1506,10 @@ function setupWebSocket(server: any): WebSocketServer {
   // attachments 上限里的极端情形——通过 schema 上的 attachments.max(10) 控制
   // 而不是把 ws frame 单帧打到 100MB），也防止认证用户用单帧 OOM 服务器
   // （ws 库默认 100 MiB；详见 node_modules/ws/lib/websocket-server.js）。
-  const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: 8 * 1024 * 1024,
+  });
 
   server.on('upgrade', (request: any, socket: any, head: any) => {
     const { pathname } = new URL(request.url, `http://${request.headers.host}`);
@@ -1184,7 +1533,9 @@ function setupWebSocket(server: any): WebSocketServer {
         try {
           const originHost = new URL(origin).host;
           sameOrigin = originHost === host;
-        } catch { /* invalid origin */ }
+        } catch {
+          /* invalid origin */
+        }
       }
       if (!sameOrigin) {
         const allowed = isAllowedOrigin(origin);
@@ -1210,9 +1561,15 @@ function setupWebSocket(server: any): WebSocketServer {
     // WebSocket upgrade cannot return Set-Cookie, so legacy cookies are
     // accepted here but upgraded on the next HTTP request instead.
     const cookieHeader = request.headers.cookie as string | undefined;
-    let allCookieValues = getAllCookieValues(cookieHeader, SESSION_COOKIE_NAME_SECURE);
+    let allCookieValues = getAllCookieValues(
+      cookieHeader,
+      SESSION_COOKIE_NAME_SECURE,
+    );
     if (allCookieValues.length === 0) {
-      allCookieValues = getAllCookieValues(cookieHeader, SESSION_COOKIE_NAME_PLAIN);
+      allCookieValues = getAllCookieValues(
+        cookieHeader,
+        SESSION_COOKIE_NAME_PLAIN,
+      );
     }
     if (allCookieValues.length === 0) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -1265,14 +1622,66 @@ function setupWebSocket(server: any): WebSocketServer {
   wss.on('connection', (ws, request: any) => {
     const sessionId = request?.__happyclawSessionId as string | undefined;
     logger.info('WebSocket client connected');
-    const connSession = sessionId ? getCachedSessionWithUser(sessionId) : undefined;
+    const connSession = sessionId
+      ? getCachedSessionWithUser(sessionId)
+      : undefined;
     wsClients.set(ws, {
       sessionId: sessionId || '',
       userId: connSession?.user_id || '',
       role: (connSession?.role || 'member') as UserRole,
     });
 
-    // Push streaming snapshots for active groups this user can access
+    // Push an authoritative logical-run snapshot on every connection. A warm
+    // agent process may be active while no query is running, so process
+    // lifecycle (`active`) is not sufficient for restoring the composer and
+    // stream card after a reconnect. This must precede stream_snapshot so the
+    // client can fence each projection against its exact attempt.
+    if (connSession && deps) {
+      const userId = connSession.user_id;
+      const queueStatus = deps.queue.getStatus();
+      const runs: Array<{
+        chatJid: string;
+        runId: string;
+        startedAt: string;
+        phase: 'preparing' | 'running';
+      }> = [];
+      const queuedChatJids: string[] = [];
+      for (const g of queueStatus.groups) {
+        const baseJid = stripRuntimeJidSuffix(g.jid);
+        const jid = normalizeRuntimeJid(g.jid);
+        const allowed = getGroupAllowedUserIds(baseJid);
+        if (allowed === null || !allowed.has(userId)) continue;
+        // A pending message/retry timer has no exact attempt identity yet, so
+        // it cannot be a `runs` entry: emitting runId:null would create a wait
+        // state that can never receive a matching run_finished terminal. It
+        // still has to reach the client, or a reload mid-queue shows an idle
+        // composer and invites a duplicate send.
+        if (!g.queryInFlight || !g.queryId) {
+          if (g.pendingMessages) queuedChatJids.push(jid);
+          continue;
+        }
+        const hasStreamSnapshot = streamingSnapshots.has(jid);
+        runs.push({
+          chatJid: jid,
+          runId: g.queryId,
+          startedAt: new Date(g.queryStartedAt ?? Date.now()).toISOString(),
+          phase: hasStreamSnapshot ? 'running' : 'preparing',
+        });
+      }
+      try {
+        ws.send(
+          JSON.stringify({
+            type: 'active_run_snapshot',
+            runs,
+            queuedChatJids,
+          } satisfies WsMessageOut),
+        );
+      } catch {
+        /* client not ready */
+      }
+    }
+
+    // Push streaming snapshots for active groups this user can access.
     if (connSession && streamingSnapshots.size > 0) {
       const userId = connSession.user_id;
       for (const [jid, snap] of streamingSnapshots) {
@@ -1283,8 +1692,17 @@ function setupWebSocket(server: any): WebSocketServer {
           streamingSnapshots.delete(jid);
           continue;
         }
-        // Skip empty snapshots
-        if (!snap.partialText && !snap.thinkingText && snap.activeTools.length === 0 && snap.recentEvents.length === 0 && snap.traceEvents.length === 0 && Object.keys(snap.taskStates).length === 0 && !snap.contextAudit) {
+        // Skip empty or unowned snapshots. Every live query projection must
+        // have a terminal-capable run identity before it can restore waiting.
+        if (
+          !snap.runId ||
+          (!snap.partialText &&
+            !snap.thinkingText &&
+            snap.activeTools.length === 0 &&
+            snap.recentEvents.length === 0 &&
+            snap.traceEvents.length === 0 &&
+            Object.keys(snap.taskStates).length === 0)
+        ) {
           continue;
         }
         // Strip #agent: suffix for ACL lookup (virtual JIDs not in registered_groups)
@@ -1292,47 +1710,29 @@ function setupWebSocket(server: any): WebSocketServer {
         const allowed = getGroupAllowedUserIds(baseJid);
         if (allowed === null || !allowed.has(userId)) continue;
         try {
-          ws.send(JSON.stringify({
-            type: 'stream_snapshot',
-            chatJid: jid,
-            snapshot: {
-              partialText: snap.partialText,
-              thinkingText: snap.thinkingText,
-              activeTools: snap.activeTools,
-              recentEvents: snap.recentEvents,
-              traceEvents: snap.traceEvents,
-              taskStates: snap.taskStates,
-              contextAudit: snap.contextAudit,
-              todos: snap.todos,
-              systemStatus: snap.systemStatus,
-              isThinking: snap.isThinking,
-              activeHook: snap.activeHook,
-              turnId: snap.turnId,
-            },
-          } satisfies WsMessageOut));
-        } catch { /* client not ready */ }
-      }
-    }
-
-    // Push runner_state: 'running' for all active groups on WS connect.
-    // This prevents a race where a late-arriving new_message clears
-    // waiting=false after snapshot restore, blocking all subsequent
-    // stream events. The runner_state event resets waiting=true.
-    if (connSession && deps) {
-      const userId = connSession.user_id;
-      const queueStatus = deps.queue.getStatus();
-      for (const g of queueStatus.groups) {
-        if (!g.active) continue;
-        const jid = normalizeHomeJid(g.jid);
-        const allowed = getGroupAllowedUserIds(g.jid);
-        if (allowed === null || !allowed.has(userId)) continue;
-        try {
-          ws.send(JSON.stringify({
-            type: 'runner_state',
-            chatJid: jid,
-            state: 'running',
-          } satisfies WsMessageOut));
-        } catch { /* client not ready */ }
+          ws.send(
+            JSON.stringify({
+              type: 'stream_snapshot',
+              chatJid: jid,
+              runId: snap.runId,
+              snapshot: {
+                partialText: snap.partialText,
+                thinkingText: snap.thinkingText,
+                activeTools: snap.activeTools,
+                recentEvents: snap.recentEvents,
+                traceEvents: snap.traceEvents,
+                taskStates: snap.taskStates,
+                todos: snap.todos,
+                systemStatus: snap.systemStatus,
+                isThinking: snap.isThinking,
+                activeHook: snap.activeHook,
+                turnId: snap.turnId,
+              },
+            } satisfies WsMessageOut),
+          );
+        } catch {
+          /* client not ready */
+        }
       }
     }
 
@@ -1395,16 +1795,21 @@ function setupWebSocket(server: any): WebSocketServer {
             chatJid: msg.chatJid,
             content: msg.content,
             attachments: msg.attachments,
+            followUpBehavior: msg.followUpBehavior,
           });
           if (!wsValidation.success) {
             sendWsError('消息格式无效', msg.chatJid);
             logger.warn(
-              { chatJid: msg.chatJid, issues: wsValidation.error.issues.map(i => i.message) },
+              {
+                chatJid: msg.chatJid,
+                issues: wsValidation.error.issues.map((i) => i.message),
+              },
               'WebSocket send_message validation failed',
             );
             return;
           }
-          const { chatJid, content, attachments } = wsValidation.data;
+          const { chatJid, content, attachments, followUpBehavior } =
+            wsValidation.data;
           const agentId = (msg as { agentId?: string }).agentId;
 
           // 群组访问权限检查
@@ -1450,7 +1855,8 @@ function setupWebSocket(server: any): WebSocketServer {
                 const userMsgTs = new Date().toISOString();
                 ensureChatExists(effectiveChatJid);
                 storeMessageDirect(
-                  userMsgId, effectiveChatJid,
+                  userMsgId,
+                  effectiveChatJid,
                   session.user_id,
                   session.display_name || session.username,
                   content.trim(),
@@ -1459,7 +1865,8 @@ function setupWebSocket(server: any): WebSocketServer {
                   { meta: { sourceKind: 'user_command' } },
                 );
                 broadcastNewMessage(effectiveChatJid, {
-                  id: userMsgId, chat_jid: effectiveChatJid,
+                  id: userMsgId,
+                  chat_jid: effectiveChatJid,
                   sender: session.user_id,
                   sender_name: session.display_name || session.username,
                   content: content.trim(),
@@ -1518,10 +1925,7 @@ function setupWebSocket(server: any): WebSocketServer {
                 agentId,
               );
             } catch (err) {
-              logger.error(
-                { chatJid, agentId, err },
-                '/clear command failed',
-              );
+              logger.error({ chatJid, agentId, err }, '/clear command failed');
               const errId = crypto.randomUUID();
               const errTs = new Date().toISOString();
               ensureChatExists(errorTargetJid);
@@ -1556,6 +1960,7 @@ function setupWebSocket(server: any): WebSocketServer {
               session.user_id,
               session.display_name || session.username,
               attachments,
+              followUpBehavior,
             );
             return;
           }
@@ -1566,6 +1971,7 @@ function setupWebSocket(server: any): WebSocketServer {
             attachments,
             session.user_id,
             session.display_name || session.username,
+            followUpBehavior,
           );
           if (!result.ok) {
             logger.warn(
@@ -1862,7 +2268,7 @@ function setupWebSocket(server: any): WebSocketServer {
  *     including admin). 这是有意的硬拒绝，不区分角色，避免 ACL 解析失败时
  *     管理员意外看到本不该看的群组事件。注意先前文档说"only admin can see"
  *     与代码不一致，代码 default-deny 更安全所以保留代码、对齐注释。
- *   - Set<string>: only these users (admin must be an explicit member to see)
+ *   - Set<string>: only these workspace owners
  */
 function safeBroadcast(
   msg: WsMessageOut,
@@ -1888,10 +2294,7 @@ function safeBroadcast(
 
     const session = getCachedSessionWithUser(clientInfo.sessionId);
     const expired = !!session && isSessionExpired(session.expires_at);
-    const invalid =
-      !session ||
-      expired ||
-      session.status !== 'active';
+    const invalid = !session || expired || session.status !== 'active';
     if (invalid) {
       if (expired) {
         deleteUserSession(clientInfo.sessionId);
@@ -1910,7 +2313,7 @@ function safeBroadcast(
       continue;
     }
 
-    // Group isolation: only allowed users (owner + shared members) can see this group's events.
+    // Group isolation: only the workspace owner can see this group's events.
     // allowedUserIds === null means ownership unresolvable → default-deny EVERYONE
     // (including admin). 故意这样：解析失败时宁可不广播也不要意外泄漏。
     if (allowedUserIds !== undefined) {
@@ -1929,87 +2332,12 @@ function safeBroadcast(
 
 /**
  * Get the set of user IDs allowed to receive broadcasts for a group.
- * Includes the owner and all shared members. Admin is NOT automatically included
- * — they must be the owner or a shared member to receive broadcasts.
+ * Admin is not automatically included; the account must own the workspace.
  *
  * Returns:
- * - Set<string>: allowed user IDs (owner + shared members)
- * - null: ownership unresolvable → default-deny (admin-only)
+ * - Set<string>: the owner user ID
+ * - null: ownership unresolvable → default-deny
  */
-const allowedUserIdsCache = new Map<
-  string,
-  { ids: Set<string> | null; expiry: number }
->();
-const ALLOWED_CACHE_TTL = 10_000; // 10 seconds
-
-function getGroupAllowedUserIds(chatJid: string): Set<string> | null {
-  const now = Date.now();
-  const cached = allowedUserIdsCache.get(chatJid);
-  if (cached && cached.expiry > now) return cached.ids;
-
-  const result = computeGroupAllowedUserIds(chatJid);
-  allowedUserIdsCache.set(chatJid, {
-    ids: result,
-    expiry: now + ALLOWED_CACHE_TTL,
-  });
-  return result;
-}
-
-/** Invalidate the allowed-user cache for a group and all sibling JIDs sharing the same folder. */
-export function invalidateAllowedUserCache(chatJid: string): void {
-  allowedUserIdsCache.delete(chatJid);
-  // Also clear cache for sibling JIDs sharing the same folder,
-  // since membership is per-folder, not per-JID.
-  const group = getRegisteredGroup(chatJid);
-  if (group) {
-    const siblingJids = getJidsByFolder(group.folder);
-    for (const jid of siblingJids) {
-      allowedUserIdsCache.delete(jid);
-    }
-  }
-}
-
-function computeGroupAllowedUserIds(chatJid: string): Set<string> | null {
-  const group = getRegisteredGroup(chatJid);
-  if (!group) return null; // Unknown group → deny by default
-
-  const allowed = new Set<string>();
-
-  // Add owner
-  let ownerId: string | null = group.created_by ?? null;
-
-  // Legacy fallback: IM group without created_by, resolve by sibling home group.
-  if (!ownerId && !chatJid.startsWith('web:')) {
-    const siblingJids = getJidsByFolder(group.folder);
-    for (const siblingJid of siblingJids) {
-      if (!siblingJid.startsWith('web:')) continue;
-      const siblingGroup = getRegisteredGroup(siblingJid);
-      if (siblingGroup?.is_home && siblingGroup.created_by) {
-        ownerId = siblingGroup.created_by;
-        break;
-      }
-    }
-  }
-
-  if (!ownerId) {
-    if (group.is_home) return null;
-    if (group.folder === 'main') return null;
-    return null; // Unresolvable → deny by default
-  }
-
-  allowed.add(ownerId);
-
-  // For non-home groups, include shared members
-  if (!group.is_home) {
-    const members = getGroupMembers(group.folder);
-    for (const m of members) {
-      allowed.add(m.user_id);
-    }
-  }
-
-  return allowed;
-}
-
 /** Check if a chatJid belongs to a host-mode group (for broadcast filtering) */
 function isHostGroupJid(chatJid: string): boolean {
   const group = getRegisteredGroup(chatJid);
@@ -2034,6 +2362,20 @@ function normalizeHomeJid(chatJid: string): string {
     }
   }
   return chatJid;
+}
+
+function stripRuntimeJidSuffix(chatJid: string): string {
+  const markerIndex = chatJid.indexOf('#agent:');
+  return markerIndex >= 0 ? chatJid.slice(0, markerIndex) : chatJid;
+}
+
+/** Normalize the workspace part of a virtual conversation JID without losing
+ * its #agent suffix. */
+function normalizeRuntimeJid(chatJid: string): string {
+  const markerIndex = chatJid.indexOf('#agent:');
+  if (markerIndex < 0) return normalizeHomeJid(chatJid);
+  const baseJid = chatJid.slice(0, markerIndex);
+  return `${normalizeHomeJid(baseJid)}${chatJid.slice(markerIndex)}`;
 }
 
 export function broadcastToWebClients(chatJid: string, text: string): void {
@@ -2083,6 +2425,30 @@ export function broadcastModelChanged(chatJid: string, agentId?: string): void {
   );
 }
 
+export function broadcastFollowUpUpdate(
+  chatJid: string,
+  transition?: FollowUpTransition,
+): void {
+  let baseChatJid = chatJid;
+  let agentId: string | undefined;
+  if (chatJid.includes('#agent:')) {
+    const parts = chatJid.split('#agent:');
+    baseChatJid = parts[0];
+    agentId = parts[1];
+  }
+  const jid = normalizeHomeJid(baseChatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseChatJid);
+  const items = listQueuedFollowUps(chatJid);
+  const msg: WsMessageOut = {
+    type: 'follow_up_update',
+    chatJid: jid,
+    items,
+    ...(agentId ? { agentId } : {}),
+    ...(transition ? { transition } : {}),
+  };
+  safeBroadcast(msg, isHostGroupJid(baseChatJid), allowedUserIds);
+}
+
 export function broadcastTyping(chatJid: string, isTyping: boolean): void {
   const jid = normalizeHomeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(chatJid);
@@ -2110,12 +2476,28 @@ interface StreamingSnapshotEntry {
     id: string;
     timestamp: number;
     text: string;
-    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission';
+    kind:
+      | 'tool'
+      | 'skill'
+      | 'hook'
+      | 'status'
+      | 'task'
+      | 'memory'
+      | 'debug'
+      | 'permission';
   }>;
   traceEvents: Array<{
     id: string;
     timestamp: number;
-    kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission';
+    kind:
+      | 'tool'
+      | 'skill'
+      | 'hook'
+      | 'status'
+      | 'task'
+      | 'memory'
+      | 'debug'
+      | 'permission';
     scope?: StreamEvent['agentScope'];
     title: string;
     summary?: string;
@@ -2125,20 +2507,26 @@ interface StreamingSnapshotEntry {
     parentToolUseId?: string | null;
     displayLevel?: StreamEvent['displayLevel'];
   }>;
-  contextAudit?: StreamEvent['contextAudit'];
-  taskStates: Record<string, {
-    id: string;
-    title: string;
-    status: 'running' | 'completed' | 'error' | 'backgrounded';
-    subagentType?: string;
-    latestSummary?: string;
-    lastToolName?: string;
-    thinkingTail: string;
-    textTail: string;
-    activeTools: StreamingSnapshotEntry['activeTools'];
-    recentTools: StreamingSnapshotEntry['recentEvents'];
-    updatedAt: number;
-  }>;
+  taskStates: Record<
+    string,
+    {
+      id: string;
+      title: string;
+      status: 'running' | 'completed' | 'error' | 'backgrounded';
+      subagentType?: string;
+      taskType?: string;
+      workflowName?: string;
+      workflowRun?: StreamEvent['workflowRun'];
+      usage?: StreamEvent['sdkTaskUsage'];
+      latestSummary?: string;
+      lastToolName?: string;
+      thinkingTail: string;
+      textTail: string;
+      activeTools: StreamingSnapshotEntry['activeTools'];
+      recentTools: StreamingSnapshotEntry['recentEvents'];
+      updatedAt: number;
+    }
+  >;
   todos?: Array<{ id: string; content: string; status: string }>;
   systemStatus: string | null;
   /** Whether the agent is mid-thinking (no text emitted yet) — kept in the
@@ -2149,10 +2537,20 @@ interface StreamingSnapshotEntry {
    *  survives the reconnect instead of silently disappearing. */
   activeHook?: { hookName: string; hookEvent: string } | null;
   turnId?: string;
+  /** Exact GroupQueue attempt that owns this projection. */
+  runId?: string;
   updatedAt: number;
 }
 
 const streamingSnapshots = new Map<string, StreamingSnapshotEntry>();
+/** Exact query attempt currently projected for each runtime JID. This is
+ * deliberately separate from process lifecycle: a conversation process may
+ * stay warm while no query is active. */
+const activeLogicalRuns = new Map<
+  string,
+  { runId: string; startedAt: number }
+>();
+const streamRunFence = new RunStreamFence();
 /** runner idle 后的墓碑标记：阻止迟到 stream 事件重建已清理的快照。
  * key 为完整 normalizedJid（主 jid 或 `web:folder#agent:id` 虚拟 jid），
  * 与 runner/快照同粒度；下一个 run 的 'running' 状态清除。 */
@@ -2167,31 +2565,67 @@ const MAX_SNAPSHOT_TRACE_EVENTS = 200;
 const MAX_SNAPSHOT_TASK_TAIL = 4000;
 
 /** Push a recent event entry and truncate to MAX_SNAPSHOT_EVENTS. */
-function pushRecentEvent(snap: StreamingSnapshotEntry, event: { id: string; timestamp: number; text: string; kind: 'tool' | 'skill' | 'hook' | 'status' | 'task' | 'memory' | 'context' | 'debug' | 'permission' }): void {
+function pushRecentEvent(
+  snap: StreamingSnapshotEntry,
+  event: {
+    id: string;
+    timestamp: number;
+    text: string;
+    kind:
+      | 'tool'
+      | 'skill'
+      | 'hook'
+      | 'status'
+      | 'task'
+      | 'memory'
+      | 'debug'
+      | 'permission';
+  },
+): void {
   snap.recentEvents.push(event);
   if (snap.recentEvents.length > MAX_SNAPSHOT_EVENTS) {
     snap.recentEvents = snap.recentEvents.slice(-MAX_SNAPSHOT_EVENTS);
   }
 }
 
-function pushTraceEvent(snap: StreamingSnapshotEntry, event: StreamEvent): void {
-  if (event.eventType === 'text_delta' || event.eventType === 'thinking_delta' || event.eventType === 'usage' || event.eventType === 'init') return;
-  const kind =
-    event.eventType.startsWith('tool_') ? (event.skillName ? 'skill' : 'tool') :
-    event.eventType.startsWith('hook_') ? 'hook' :
-    event.eventType.startsWith('task_') ? 'task' :
-    event.eventType === 'memory_recall' || event.eventType === 'compact_boundary' ? 'memory' :
-    event.eventType === 'context_audit' ? 'context' :
-    event.eventType === 'permission_denied' ? 'permission' :
-    event.eventType === 'raw_sdk_event' ? 'debug' :
-    'status';
-  const title = event.title
-    || event.summary
-    || event.taskSummary
-    || event.statusText
-    || event.toolName
-    || event.rawType
-    || event.eventType;
+function pushTraceEvent(
+  snap: StreamingSnapshotEntry,
+  event: StreamEvent,
+): void {
+  if (
+    event.eventType === 'text_delta' ||
+    event.eventType === 'thinking_delta' ||
+    event.eventType === 'usage' ||
+    event.eventType === 'init' ||
+    event.eventType === 'context_audit' ||
+    (event.eventType === 'status' &&
+      isInternalLifecycleStatus(event.statusText))
+  )
+    return;
+  const kind = event.eventType.startsWith('tool_')
+    ? event.skillName
+      ? 'skill'
+      : 'tool'
+    : event.eventType.startsWith('hook_')
+      ? 'hook'
+      : event.eventType.startsWith('task_')
+        ? 'task'
+        : event.eventType === 'memory_recall' ||
+            event.eventType === 'compact_boundary'
+          ? 'memory'
+          : event.eventType === 'permission_denied'
+            ? 'permission'
+            : event.eventType === 'raw_sdk_event'
+              ? 'debug'
+              : 'status';
+  const title =
+    event.title ||
+    event.summary ||
+    event.taskSummary ||
+    event.statusText ||
+    event.toolName ||
+    event.rawType ||
+    event.eventType;
   snap.traceEvents.push({
     id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
     timestamp: Date.now(),
@@ -2214,20 +2648,42 @@ function tailText(text: string, max: number): string {
   return text.length > max ? text.slice(-max) : text;
 }
 
-function snapshotTaskId(event: StreamEvent): string | null {
-  return event.parentToolUseId || event.taskId || (
-    event.eventType.startsWith('task_') ? event.toolUseId || null : null
+function isInternalLifecycleStatus(statusText?: string | null): boolean {
+  return (
+    statusText === 'requesting' ||
+    statusText === 'compacting' ||
+    statusText === 'idle' ||
+    statusText === 'interrupted'
   );
 }
 
-function updateSnapshotTask(snap: StreamingSnapshotEntry, event: StreamEvent): void {
+function snapshotTaskId(event: StreamEvent): string | null {
+  return (
+    event.parentToolUseId ||
+    event.taskId ||
+    (event.eventType.startsWith('task_') ? event.toolUseId || null : null)
+  );
+}
+
+function updateSnapshotTask(
+  snap: StreamingSnapshotEntry,
+  event: StreamEvent,
+): void {
   const taskId = snapshotTaskId(event);
   if (!taskId) return;
   const task = snap.taskStates[taskId] || {
     id: taskId,
-    title: event.taskDescription || event.toolInputSummary || event.summary || 'Task',
+    title:
+      event.taskDescription ||
+      event.toolInputSummary ||
+      event.summary ||
+      'Task',
     status: 'running' as const,
     subagentType: event.subagentType,
+    taskType: event.taskType,
+    workflowName: event.workflowName,
+    workflowRun: event.workflowRun,
+    usage: event.sdkTaskUsage,
     thinkingTail: '',
     textTail: '',
     activeTools: [],
@@ -2235,25 +2691,72 @@ function updateSnapshotTask(snap: StreamingSnapshotEntry, event: StreamEvent): v
     updatedAt: Date.now(),
   };
   task.updatedAt = Date.now();
-  if (event.taskDescription && (!task.title || task.title === 'Task')) task.title = event.taskDescription;
+  if (event.taskDescription && (!task.title || task.title === 'Task'))
+    task.title = event.taskDescription;
   if (event.subagentType) task.subagentType = event.subagentType;
+  if (event.taskType) task.taskType = event.taskType;
+  if (event.workflowName) task.workflowName = event.workflowName;
+  if (event.sdkTaskUsage) task.usage = event.sdkTaskUsage;
+  if (event.workflowRun) {
+    task.workflowRun = {
+      ...(task.workflowRun ?? {}),
+      ...event.workflowRun,
+      phases:
+        event.workflowRun.phases.length > 0
+          ? event.workflowRun.phases
+          : (task.workflowRun?.phases ?? []),
+      agents:
+        event.workflowRun.agents.length > 0
+          ? event.workflowRun.agents
+          : (task.workflowRun?.agents ?? []),
+    };
+  }
   if (event.eventType === 'text_delta') {
-    task.textTail = tailText(task.textTail + (event.text || ''), MAX_SNAPSHOT_TASK_TAIL);
+    task.textTail = tailText(
+      task.textTail + (event.text || ''),
+      MAX_SNAPSHOT_TASK_TAIL,
+    );
   } else if (event.eventType === 'thinking_delta') {
-    task.thinkingTail = tailText(task.thinkingTail + (event.text || ''), MAX_SNAPSHOT_TASK_TAIL);
+    task.thinkingTail = tailText(
+      task.thinkingTail + (event.text || ''),
+      MAX_SNAPSHOT_TASK_TAIL,
+    );
   } else if (event.eventType === 'task_progress') {
-    task.latestSummary = event.summary || event.taskSummary || event.taskDescription || task.latestSummary;
+    task.latestSummary =
+      event.summary ||
+      event.taskSummary ||
+      event.taskDescription ||
+      task.latestSummary;
     task.lastToolName = event.lastToolName || task.lastToolName;
     task.status = 'running';
+    if (task.workflowRun && event.sdkTaskUsage) {
+      task.workflowRun = {
+        ...task.workflowRun,
+        status: 'running',
+        totalTokens: event.sdkTaskUsage.totalTokens,
+        totalToolCalls: event.sdkTaskUsage.toolUses,
+        durationMs: event.sdkTaskUsage.durationMs,
+      };
+    }
   } else if (event.eventType === 'task_updated') {
     const patch = event.taskPatch;
     if (patch?.status === 'completed') task.status = 'completed';
-    else if (patch?.status === 'failed' || patch?.status === 'killed') task.status = 'error';
+    else if (patch?.status === 'failed' || patch?.status === 'killed')
+      task.status = 'error';
     else if (patch?.is_backgrounded) task.status = 'backgrounded';
-    task.latestSummary = event.summary || patch?.description || patch?.error || task.latestSummary;
+    task.latestSummary =
+      event.summary || patch?.description || patch?.error || task.latestSummary;
   } else if (event.eventType === 'task_notification') {
     task.status = event.taskStatus === 'completed' ? 'completed' : 'error';
-    task.latestSummary = event.taskSummary || event.summary || task.latestSummary;
+    task.latestSummary =
+      event.taskSummary || event.summary || task.latestSummary;
+    if (task.workflowRun) {
+      task.workflowRun = {
+        ...task.workflowRun,
+        status: event.taskStatus === 'completed' ? 'completed' : 'failed',
+        completedAt: task.workflowRun.completedAt ?? Date.now(),
+      };
+    }
   } else if (event.eventType === 'tool_use_start' && event.parentToolUseId) {
     const tool = {
       toolName: event.toolName || 'unknown',
@@ -2262,19 +2765,38 @@ function updateSnapshotTask(snap: StreamingSnapshotEntry, event: StreamEvent): v
       toolInputSummary: event.toolInputSummary,
       parentToolUseId: event.parentToolUseId,
     };
-    task.activeTools = task.activeTools.some(t => t.toolUseId === tool.toolUseId && tool.toolUseId)
-      ? task.activeTools.map(t => (t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t))
+    task.activeTools = task.activeTools.some(
+      (t) => t.toolUseId === tool.toolUseId && tool.toolUseId,
+    )
+      ? task.activeTools.map((t) =>
+          t.toolUseId === tool.toolUseId ? { ...t, ...tool } : t,
+        )
       : [...task.activeTools, tool];
   } else if (event.eventType === 'tool_use_end' && event.parentToolUseId) {
-    task.activeTools = task.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+    task.activeTools = task.activeTools.filter(
+      (t) => t.toolUseId !== event.toolUseId,
+    );
   }
   snap.taskStates[taskId] = task;
 }
 
-function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): void {
+function updateStreamingSnapshot(
+  normalizedJid: string,
+  event: StreamEvent,
+  runId?: string,
+): void {
+  // Context audits are operator diagnostics. They must not enter user-facing
+  // WebSocket snapshots, even if this helper is called outside the broadcaster.
+  if (event.eventType === 'context_audit') return;
+
   // turn 干净结束（silent-success）：删除快照而非累积，避免 WS 重连恢复到
   // 「生成中」僵尸快照。前端收到同一 idle 事件后清 waiting/streaming。
   if (event.eventType === 'status' && event.statusText === 'idle') {
+    // Legacy stream events do not carry GroupQueue's exact queryId. If another
+    // query is already active for this JID, this may be a late idle from the
+    // previous attempt and must not clear the new snapshot. The exact
+    // run_finished event owns cleanup for the active attempt.
+    if (activeLogicalRuns.has(normalizedJid)) return;
     streamingSnapshots.delete(normalizedJid);
     streamingFullTexts.delete(normalizedJid);
     return;
@@ -2309,12 +2831,14 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       taskStates: {},
       systemStatus: null,
       turnId: event.turnId,
+      runId,
       updatedAt: Date.now(),
     };
   }
 
   snap.updatedAt = Date.now();
   if (event.turnId) snap.turnId = event.turnId;
+  if (runId) snap.runId = runId;
   pushTraceEvent(snap, event);
   updateSnapshotTask(snap, event);
 
@@ -2328,7 +2852,10 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
           snap.partialText = snap.partialText.slice(-MAX_SNAPSHOT_TEXT);
         }
         // Accumulate full (non-truncated) text for shutdown persistence
-        streamingFullTexts.set(normalizedJid, (streamingFullTexts.get(normalizedJid) || '') + event.text);
+        streamingFullTexts.set(
+          normalizedJid,
+          (streamingFullTexts.get(normalizedJid) || '') + event.text,
+        );
       }
       break;
 
@@ -2364,15 +2891,20 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
 
     case 'tool_use_end':
       if (event.toolUseId) {
-        snap.activeTools = snap.activeTools.filter(t => t.toolUseId !== event.toolUseId);
+        snap.activeTools = snap.activeTools.filter(
+          (t) => t.toolUseId !== event.toolUseId,
+        );
       }
       break;
 
     case 'tool_progress':
       if (event.toolUseId) {
-        const tool = snap.activeTools.find(t => t.toolUseId === event.toolUseId);
+        const tool = snap.activeTools.find(
+          (t) => t.toolUseId === event.toolUseId,
+        );
         if (tool) {
-          if (event.toolInputSummary) tool.toolInputSummary = event.toolInputSummary;
+          if (event.toolInputSummary)
+            tool.toolInputSummary = event.toolInputSummary;
         }
       }
       break;
@@ -2406,7 +2938,7 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
 
     case 'status':
       snap.systemStatus = event.statusText || null;
-      if (event.statusText) {
+      if (event.statusText && !isInternalLifecycleStatus(event.statusText)) {
         pushRecentEvent(snap, {
           id: `status-${Date.now()}`,
           timestamp: Date.now(),
@@ -2417,7 +2949,10 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       break;
 
     case 'hook_started':
-      snap.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      snap.activeHook = {
+        hookName: event.hookName || '',
+        hookEvent: event.hookEvent || '',
+      };
       if (event.hookName) {
         pushRecentEvent(snap, {
           id: `hook-${Date.now()}`,
@@ -2429,7 +2964,10 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       break;
 
     case 'hook_progress':
-      snap.activeHook = { hookName: event.hookName || '', hookEvent: event.hookEvent || '' };
+      snap.activeHook = {
+        hookName: event.hookName || '',
+        hookEvent: event.hookEvent || '',
+      };
       break;
 
     case 'hook_response':
@@ -2446,21 +2984,13 @@ function updateStreamingSnapshot(normalizedJid: string, event: StreamEvent): voi
       });
       break;
 
-    case 'context_audit':
-      snap.contextAudit = event.contextAudit;
-      if (event.contextAudit?.warnings?.length) {
-        pushRecentEvent(snap, {
-          id: `context-audit-${Date.now()}`,
-          timestamp: Date.now(),
-          text: `Agent Context: ${event.contextAudit.warnings[0]}`,
-          kind: 'context',
-        });
-      }
-      break;
-
     case 'todo_update':
       if (event.todos) {
-        snap.todos = event.todos.map(t => ({ id: t.id, content: t.content, status: t.status }));
+        snap.todos = event.todos.map((t) => ({
+          id: t.id,
+          content: t.content,
+          status: t.status,
+        }));
       }
       break;
   }
@@ -2494,17 +3024,62 @@ export function broadcastStreamEvent(
   event: StreamEvent,
   agentId?: string,
 ): void {
+  // Keep runtime context audits on the server side. Sending them over the
+  // user WebSocket exposes paths, prompt wiring, and framework terminology.
+  if (event.eventType === 'context_audit') {
+    if (event.contextAudit) {
+      recordRunContextSnapshot({
+        chatJid,
+        agentId,
+        turnId: event.turnId,
+        sessionId: event.sessionId,
+        audit: event.contextAudit,
+      });
+    }
+    if (event.contextAudit?.warnings?.length) {
+      logger.warn(
+        { chatJid, warnings: event.contextAudit.warnings },
+        'Agent context audit warning',
+      );
+    }
+    return;
+  }
+
   const jid = normalizeHomeJid(chatJid);
   const allowedUserIds = getGroupAllowedUserIds(chatJid);
-  const msg: WsMessageOut = agentId
-    ? { type: 'stream_event', chatJid: jid, event, agentId }
-    : { type: 'stream_event', chatJid: jid, event };
-  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
-
-  // Accumulate snapshot for both main and agent streams.
-  // Agent streams use virtual JID format (jid#agent:agentId) as the key.
+  // Agent streams use virtual JID format (jid#agent:agentId) as the exact
+  // query-lifecycle key. turnId ownership survives an A→B replacement so a
+  // delayed callback from A cannot be relabelled as B.
   const snapshotJid = agentId ? `${jid}#agent:${agentId}` : jid;
-  updateStreamingSnapshot(snapshotJid, event);
+  const decision = event.queryRunId
+    ? streamRunFence.observeExact(snapshotJid, event.queryRunId, event.turnId)
+    : streamRunFence.observe(snapshotJid, event.turnId);
+  if (!decision.accepted) {
+    logger.debug(
+      {
+        chatJid: snapshotJid,
+        turnId: event.turnId,
+        runId: decision.runId,
+      },
+      'Discarding stream event from superseded query attempt',
+    );
+    return;
+  }
+  const msg: WsMessageOut = agentId
+    ? {
+        type: 'stream_event',
+        chatJid: jid,
+        event,
+        agentId,
+        runId: decision.runId,
+      }
+    : {
+        type: 'stream_event',
+        chatJid: jid,
+        event,
+        runId: decision.runId,
+      };
+  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
 
   // Persist turn structure. The snapshot above is in-memory and lives only as
   // long as the stream, so without this the record of what the agent actually
@@ -2514,6 +3089,7 @@ export function broadcastStreamEvent(
   if (traceGroup?.folder) {
     recordTurnEvent(chatJid, traceGroup.folder, event, agentId);
   }
+  updateStreamingSnapshot(snapshotJid, event, decision.runId);
 }
 
 export function broadcastGroupCreated(
@@ -2523,7 +3099,11 @@ export function broadcastGroupCreated(
   userId?: string,
 ): void {
   const allowedUserIds = userId ? new Set([userId]) : undefined;
-  safeBroadcast({ type: 'group_created', jid, folder, name }, false, allowedUserIds);
+  safeBroadcast(
+    { type: 'group_created', jid, folder, name },
+    false,
+    allowedUserIds,
+  );
 }
 
 export function broadcastBillingUpdate(
@@ -2542,6 +3122,7 @@ export function broadcastBillingUpdate(
 
 export function broadcastWhatsAppStatus(
   userId: string,
+  accountId: string,
   state: {
     status: 'connecting' | 'qr' | 'connected' | 'disconnected' | 'logged_out';
     qr?: string;
@@ -2554,10 +3135,32 @@ export function broadcastWhatsAppStatus(
   const msg: WsMessageOut = {
     type: 'whatsapp_status',
     userId,
+    accountId,
     ...state,
   };
   const allowedUserIds = new Set([userId]);
   safeBroadcast(msg, false, allowedUserIds);
+}
+
+export function broadcastChannelAccountStatus(
+  userId: string,
+  accountId: string,
+  state: {
+    transportStatus: import('./types.js').ChannelTransportStatus;
+    lastError?: string | null;
+    connectedAt?: string | null;
+    errorCode?: string;
+    consecutiveFailures?: number;
+    nextRetryMs?: number;
+  },
+): void {
+  const msg: WsMessageOut = {
+    type: 'channel_account_status',
+    userId,
+    accountId,
+    ...state,
+  };
+  safeBroadcast(msg, false, new Set([userId]));
 }
 
 export function broadcastAgentStatus(
@@ -2593,7 +3196,15 @@ export function broadcastAgentRemoved(
   agentId: string,
   name: string,
 ): void {
-  broadcastAgentStatus(chatJid, agentId, 'error', name, '', '__removed__', 'conversation');
+  broadcastAgentStatus(
+    chatJid,
+    agentId,
+    'error',
+    name,
+    '',
+    '__removed__',
+    'conversation',
+  );
 }
 
 /**
@@ -2626,38 +3237,104 @@ export function broadcastRunnerState(
   chatJid: string,
   state: 'idle' | 'running',
 ): void {
-  const jid = normalizeHomeJid(chatJid);
-  const allowedUserIds = getGroupAllowedUserIds(chatJid);
+  const baseJid = stripRuntimeJidSuffix(chatJid);
+  const jid = normalizeRuntimeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseJid);
   const msg: WsMessageOut = {
     type: 'runner_state',
     chatJid: jid,
     state,
   };
-  safeBroadcast(msg, isHostGroupJid(chatJid), allowedUserIds);
+  safeBroadcast(msg, isHostGroupJid(baseJid), allowedUserIds);
+  if (state === 'idle') pruneOrphanedAgentSnapshots(jid);
+}
 
-  // Clear streaming snapshots when runner goes idle (main + all agent snapshots)
-  if (state === 'idle') {
-    streamingSnapshots.delete(jid);
-    streamingFullTexts.delete(jid);
-    // Collect keys first, then delete (avoid mutating Map during iteration)
-    const agentPrefix = jid + '#agent:';
-    const snapshotKeysToDelete = [...streamingSnapshots.keys()].filter(k => k.startsWith(agentPrefix));
-    const fullTextKeysToDelete = [...streamingFullTexts.keys()].filter(k => k.startsWith(agentPrefix));
-    for (const key of snapshotKeysToDelete) streamingSnapshots.delete(key);
-    for (const key of fullTextKeysToDelete) streamingFullTexts.delete(key);
-    // 墓碑：拦截本 run 残留 outputChain 回调对快照的迟到重建。同粒度落键——
-    // 主 runner idle 落 `web:folder`，agent/task runner idle 落各自虚拟 jid，
-    // 互不误伤。容量上限防 Map 无界增长（长期运行会累积大量短命虚拟 jid）。
-    snapshotTombstones.set(jid, Date.now());
-    if (snapshotTombstones.size > MAX_SNAPSHOT_TOMBSTONES) {
-      for (const k of snapshotTombstones.keys()) {
-        if (snapshotTombstones.size <= MAX_SNAPSHOT_TOMBSTONES) break;
-        snapshotTombstones.delete(k);
-      }
+/**
+ * Drop sub-agent stream snapshots that no longer have a live run.
+ *
+ * `broadcastRunFinished` deletes only the exact JID whose runId matched, so a
+ * sub-agent run ending without one — dropped before announceQueryStart, or a
+ * runId mismatch — leaves its snapshot resident until the 30-minute staleness
+ * sweep that runs on the next reconnect. Until then a reconnecting client can
+ * restore a zombie "generating" card.
+ *
+ * Entries still in `activeLogicalRuns` are left alone: those are the live
+ * sub-agents that the narrower deletion was introduced to protect.
+ */
+function pruneOrphanedAgentSnapshots(baseRuntimeJid: string): void {
+  const prefix = `${baseRuntimeJid}#agent:`;
+  for (const key of [...streamingSnapshots.keys()]) {
+    if (!key.startsWith(prefix) || activeLogicalRuns.has(key)) continue;
+    streamingSnapshots.delete(key);
+    streamingFullTexts.delete(key);
+  }
+  for (const key of [...streamingFullTexts.keys()]) {
+    if (!key.startsWith(prefix) || activeLogicalRuns.has(key)) continue;
+    streamingFullTexts.delete(key);
+  }
+}
+
+export function broadcastRunStarted(
+  chatJid: string,
+  runId: string,
+  startedAt: number,
+): void {
+  const baseJid = stripRuntimeJidSuffix(chatJid);
+  const jid = normalizeRuntimeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseJid);
+  activeLogicalRuns.set(jid, { runId, startedAt });
+  streamRunFence.start(jid, runId);
+  // New exact attempt supersedes the previous attempt's late-event tombstone.
+  snapshotTombstones.delete(jid);
+  safeBroadcast(
+    {
+      type: 'run_started',
+      chatJid: jid,
+      runId,
+      startedAt: new Date(startedAt).toISOString(),
+      phase: 'preparing',
+    },
+    isHostGroupJid(baseJid),
+    allowedUserIds,
+  );
+}
+
+export function broadcastRunFinished(
+  chatJid: string,
+  runId: string,
+  reason: RunFinishReason,
+  finishedAt: number,
+): void {
+  const baseJid = stripRuntimeJidSuffix(chatJid);
+  const jid = normalizeRuntimeJid(chatJid);
+  const allowedUserIds = getGroupAllowedUserIds(baseJid);
+  const current = activeLogicalRuns.get(jid);
+
+  // Always publish the exact terminal event so clients can fence it. Only
+  // mutate server-side projection when it still belongs to this attempt.
+  safeBroadcast(
+    {
+      type: 'run_finished',
+      chatJid: jid,
+      runId,
+      reason,
+      finishedAt: new Date(finishedAt).toISOString(),
+    },
+    isHostGroupJid(baseJid),
+    allowedUserIds,
+  );
+
+  if (current?.runId !== runId) return;
+  activeLogicalRuns.delete(jid);
+  streamRunFence.finish(jid, runId);
+  streamingSnapshots.delete(jid);
+  streamingFullTexts.delete(jid);
+  snapshotTombstones.set(jid, finishedAt);
+  if (snapshotTombstones.size > MAX_SNAPSHOT_TOMBSTONES) {
+    for (const key of snapshotTombstones.keys()) {
+      if (snapshotTombstones.size <= MAX_SNAPSHOT_TOMBSTONES) break;
+      snapshotTombstones.delete(key);
     }
-  } else {
-    // 新 run 启动，恢复快照写入
-    snapshotTombstones.delete(jid);
   }
 }
 
@@ -2717,6 +3394,7 @@ export function createAppForTest(webDeps: WebDeps): typeof app {
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);
+  injectChannelAccountDeps(webDeps);
   injectMonitorDeps({
     broadcastDockerBuildLog,
     broadcastDockerBuildComplete,
@@ -2728,6 +3406,7 @@ export function startWebServer(webDeps: WebDeps): void {
   deps = webDeps;
   setWebDeps(webDeps);
   injectConfigDeps(webDeps);
+  injectChannelAccountDeps(webDeps);
   injectMonitorDeps({
     broadcastDockerBuildLog,
     broadcastDockerBuildComplete,
@@ -2778,6 +3457,8 @@ export function startWebServer(webDeps: WebDeps): void {
 
   // Register runner state change callback for sidebar indicators
   webDeps.queue.setOnRunnerStateChange(broadcastRunnerState);
+  webDeps.queue.setOnQueryStart(broadcastRunStarted);
+  webDeps.queue.setOnQueryFinish(broadcastRunFinished);
 
   // Broadcast status every 5 seconds
   if (statusInterval) clearInterval(statusInterval);

@@ -1,10 +1,20 @@
 # HappyClaw Claude Code 插件自动化导入与运行设计方案
 
+> **状态：已实施的历史设计记录。**
+>
+> 本文保留 Plugin Catalog、用户启用状态、Runtime Snapshot 和命令展开机制的设计过程。
+> 第 3 节“当前代码基础”描述的是方案启动时的旧实现，不代表今天的目录和 API。
+> 当前接口以 `docs/API.md`、`src/routes/plugins.ts`、`src/plugin-importer.ts`、
+> `src/plugin-materializer.ts` 和 `src/plugin-command-index.ts` 为准。
+
 ## 1. 背景与目标
 
-HappyClaw 当前通过 `@anthropic-ai/claude-agent-sdk` 启动 Claude Code Agent，并已经具备把本地 Claude Code plugin 目录注入 SDK 的基础能力。SDK 的 `options.plugins` 会被转换为 Claude Code CLI 的 `--plugin-dir <path>` 参数，因此插件中的 `agents/`、`skills/`、`hooks/`、`mcp-servers/`、普通 slash command 可以被 Claude Code 原生加载。
+HappyClaw 通过 `@anthropic-ai/claude-agent-sdk` 启动 Claude Code Agent，并使用 SDK
+`options.plugins` 注入版本化 Plugin Runtime。SDK 会把它转换为 Claude Code CLI 的
+`--plugin-dir <path>` 参数，因此插件中的 `agents/`、`skills/`、`hooks/`、
+`mcp-servers/` 和普通 slash command 可以被 Claude Code 原生加载。
 
-当前仍存在三个核心缺口：
+方案启动时存在三个核心缺口：
 
 1. 插件导入依赖手动从宿主机同步到用户 cache，缺少全局 catalog、版本追踪和自动发现。
 2. 用户启用状态与插件文件混在 per-user cache 中，不利于多用户共享、审计和回滚。
@@ -383,7 +393,7 @@ interface PluginCommandIndexEntry {
 - 官方插件存在数组字段：
 
 ```yaml
-allowed-tools: ["Read", "Write", "AskUserQuestion"]
+allowed-tools: ['Read', 'Write', 'AskUserQuestion']
 ```
 
 - 也存在单行字符串、布尔值、多行结构。
@@ -432,7 +442,7 @@ expandPluginSlashCommandIfNeeded({
   content,
   runtime,
   cwd,
-})
+});
 ```
 
 4. Web 和 IM 共用同一 expansion。
@@ -515,11 +525,13 @@ Expansion 层执行 inline `!`，把 stdout 注入 body。
 
 不把以下内容当作 HappyClaw 本地脚本：
 
-```markdown
+````markdown
 ```bash
 node ...
 ```
-```
+````
+
+````
 
 原因：
 
@@ -590,7 +602,7 @@ GET  /api/plugins/catalog
 POST /api/plugins/catalog/scan
 GET  /api/plugins/catalog/marketplaces/:marketplace
 GET  /api/plugins/catalog/marketplaces/:marketplace/plugins/:plugin
-```
+````
 
 权限：
 

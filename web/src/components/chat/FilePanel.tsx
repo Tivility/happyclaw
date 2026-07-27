@@ -989,7 +989,7 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border">
         <h3 className="font-semibold text-foreground text-sm">
-          工作区文件管理
+          当前上下文文件
         </h3>
         <div className="flex items-center gap-1">
           {canOpenLocalFolder && (
@@ -1262,25 +1262,53 @@ export function FilePanel({ groupJid, onClose }: FilePanelProps) {
 
       {/* Preview / Editor Overlays */}
       {preview?.kind === 'image' && (
-        <ImagePreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <ImagePreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'edit' && (
-        <TextEditor groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <TextEditor
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'markdown' && (
-        <MarkdownFileViewer groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <MarkdownFileViewer
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'pdf' && (
-        <PdfPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <PdfPreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'video' && (
-        <VideoPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <VideoPreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'audio' && (
-        <AudioPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <AudioPreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
       {preview?.kind === 'text' && (
-        <GenericTextPreview groupJid={groupJid} file={preview.file} onClose={() => setPreview(null)} />
+        <GenericTextPreview
+          groupJid={groupJid}
+          file={preview.file}
+          onClose={() => setPreview(null)}
+        />
       )}
     </div>
   );

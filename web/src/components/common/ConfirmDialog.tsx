@@ -21,6 +21,8 @@ export interface ConfirmDialogProps {
   cancelText?: string;
   confirmVariant?: 'primary' | 'danger';
   loading?: boolean;
+  confirmDisabled?: boolean;
+  messageClassName?: string;
 }
 
 export function ConfirmDialog({
@@ -33,13 +35,19 @@ export function ConfirmDialog({
   cancelText = '取消',
   confirmVariant = 'primary',
   loading = false,
+  confirmDisabled = false,
+  messageClassName,
 }: ConfirmDialogProps) {
   return (
     <AlertDialog open={open} onOpenChange={(v) => !v && onClose()}>
       <AlertDialogContent>
         <AlertDialogHeader>
           <AlertDialogTitle>{title}</AlertDialogTitle>
-          <AlertDialogDescription>{message}</AlertDialogDescription>
+          <AlertDialogDescription
+            className={cn('whitespace-pre-line', messageClassName)}
+          >
+            {message}
+          </AlertDialogDescription>
         </AlertDialogHeader>
         <AlertDialogFooter>
           <AlertDialogCancel disabled={loading}>{cancelText}</AlertDialogCancel>
@@ -48,7 +56,7 @@ export function ConfirmDialog({
               e.preventDefault();
               onConfirm();
             }}
-            disabled={loading}
+            disabled={loading || confirmDisabled}
             className={cn(
               confirmVariant === 'danger' &&
                 'bg-destructive text-white hover:bg-destructive/90',

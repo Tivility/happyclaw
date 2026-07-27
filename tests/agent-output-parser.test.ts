@@ -2,10 +2,13 @@ import { describe, expect, test } from 'vitest';
 import { PassThrough } from 'node:stream';
 
 import {
+  classifyProviderLimitNotice,
   isApiError,
   isProviderFailureResult,
   createStdoutParserState,
+  createStderrState,
   attachStdoutHandler,
+  handleNonZeroExit,
 } from '../src/agent-output-parser.js';
 import type { ContainerOutput } from '../src/container-runner.js';
 
@@ -18,6 +21,55 @@ describe('isProviderFailureResult — positive (genuine Claude limit notices)', 
   test('detects legacy Claude "hit your limit" final text', () => {
     const msg = "You've hit your limit · resets 3am (Asia/Shanghai)";
     expect(isProviderFailureResult(msg)).toBe(true);
+  });
+
+  test('detects Claude "hit your session limit" banner (qualified limit)', () => {
+    // Regression: the real banner qualifies "limit" ("session limit"), which
+    // the original pattern missed — the notice leaked to users verbatim and
+    // the exhausted account was never marked unhealthy, so weighted pools
+    // never rotated off it.
+    const msg =
+      "You've hit your session limit · resets 11:10pm (Asia/Singapore)";
+    expect(isProviderFailureResult(msg)).toBe(true);
+  });
+
+  test('detects other qualified limit variants (weekly/usage, "reached")', () => {
+    expect(
+      isProviderFailureResult(
+        "You've hit your weekly limit · resets 3am (America/New_York)",
+      ),
+    ).toBe(true);
+    expect(isProviderFailureResult("You've reached your usage limit.")).toBe(
+      true,
+    );
+  });
+
+  test('detects known multi-word account limit labels', () => {
+    expect(
+      classifyProviderLimitNotice(
+        "You've hit your monthly spend limit · resets 12am (UTC)",
+      ),
+    ).toBe('account');
+    expect(
+      classifyProviderLimitNotice("You've reached your org monthly limit."),
+    ).toBe('account');
+    expect(
+      classifyProviderLimitNotice(
+        "You've reached your organization monthly limit.",
+      ),
+    ).toBe('account');
+  });
+
+  test('classifies model-specific banners without quarantining the account', () => {
+    const fable = "You've reached your Fable 5 limit. /model to switch models.";
+    expect(classifyProviderLimitNotice(fable)).toBe('model');
+    expect(classifyProviderLimitNotice("You've hit your Opus limit.")).toBe(
+      'model',
+    );
+    expect(classifyProviderLimitNotice("You've hit your Sonnet limit.")).toBe(
+      'model',
+    );
+    expect(isProviderFailureResult(fable)).toBe(false);
   });
 
   test('detects "usage limit reached" notice with reset time', () => {
@@ -107,6 +159,17 @@ describe('isProviderFailureResult — negative (normal replies must NOT be flagg
     expect(isProviderFailureResult(msg)).toBe(false);
   });
 
+  test.each([
+    "You've hit your rate limit.",
+    "You've reached your storage limit.",
+    "You've reached your character limit.",
+    "You've hit your project limit.",
+    "You've reached your speed limit.",
+  ])('does not accept an arbitrary short qualifier: %s', (msg) => {
+    expect(classifyProviderLimitNotice(msg)).toBeNull();
+    expect(isProviderFailureResult(msg)).toBe(false);
+  });
+
   test('does not flag null or empty result', () => {
     expect(isProviderFailureResult(null)).toBe(false);
     expect(isProviderFailureResult('')).toBe(false);
@@ -144,11 +207,74 @@ describe('isApiError — stderr classification still detects provider issues', (
   });
 });
 
+describe('handleNonZeroExit — provider failure lifecycle', () => {
+  test.each([
+    {
+      label: 'SIGTERM',
+      code: null,
+      signal: 'SIGTERM' as const,
+      status: 'success',
+    },
+    {
+      label: 'SIGKILL',
+      code: null,
+      signal: 'SIGKILL' as const,
+      status: 'success',
+    },
+    { label: 'code 137', code: 137, signal: null, status: 'success' },
+    { label: 'code 143', code: 143, signal: null, status: 'error' },
+  ])(
+    'preserves providerFailure when docker stop closes with $label',
+    async ({ code, signal, status }) => {
+      const stdoutState = createStdoutParserState();
+      stdoutState.hasSuccessOutput = true;
+      stdoutState.hasProviderFailureOutput = true;
+      stdoutState.newSessionId = 'session-after-limit';
+      const resolved: ContainerOutput[] = [];
+
+      expect(
+        handleNonZeroExit(
+          {
+            groupName: 'fallback-test',
+            label: 'Container',
+            filePrefix: 'container',
+            identifier: 'container-id',
+            logsDir: '/tmp',
+            input: { prompt: 'prompt', isMain: true },
+            stdoutState,
+            stderrState: createStderrState(),
+            onOutput: async () => {},
+            resolvePromise: (output) => resolved.push(output),
+            startTime: Date.now(),
+            timeoutMs: 1_000,
+          },
+          code,
+          signal,
+          10,
+          '/tmp/fallback-test.log',
+        ),
+      ).toBe(true);
+
+      await stdoutState.outputChain;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(resolved).toHaveLength(1);
+      expect(resolved[0]).toMatchObject({
+        status,
+        providerFailure: true,
+      });
+      if (status === 'success') {
+        expect(resolved[0]).toMatchObject({
+          result: null,
+          newSessionId: 'session-after-limit',
+        });
+      }
+    },
+  );
+});
+
 describe('attachStdoutHandler — framed output parsing (marker collision)', () => {
   // Helper: feed chunks through the parser and collect emitted outputs.
-  async function runParser(
-    chunks: string[],
-  ): Promise<ContainerOutput[]> {
+  async function runParser(chunks: string[]): Promise<ContainerOutput[]> {
     const stream = new PassThrough();
     const state = createStdoutParserState();
     const collected: ContainerOutput[] = [];
@@ -177,6 +303,22 @@ describe('attachStdoutHandler — framed output parsing (marker collision)', () 
     ]);
     expect(out).toHaveLength(1);
     expect(out[0].result).toBe('hi');
+  });
+
+  test('preserves an explicit structured provider failure with no banner text', async () => {
+    const out = await runParser([
+      `${S}${JSON.stringify({
+        status: 'success',
+        result: null,
+        providerFailure: true,
+      })}${E}`,
+    ]);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      status: 'success',
+      result: null,
+      providerFailure: true,
+    });
   });
 
   test('does NOT drop a result whose payload contains the literal END marker', async () => {

@@ -2,7 +2,7 @@
  * Resolves an absolute path to the `node` binary for spawning host-side
  * child processes (host-mode agent-runner, PTY worker, etc.).
  *
- * Host services launched by PM2 / launchd / GUI launchers may inherit a
+ * Host services launched by process managers / launchd / GUI launchers may inherit a
  * minimal PATH that does not include nvm / fnm / volta managed Node
  * installations. A bare `spawn('node', ...)` then fails with ENOENT even
  * though the parent process is itself running on Node. This module walks

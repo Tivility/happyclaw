@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { lazy, Suspense, useCallback, useMemo, useState } from 'react';
+import { Navigate, useSearchParams } from 'react-router-dom';
 import { Menu } from 'lucide-react';
+import { toast } from 'sonner';
 
 import { useAuthStore } from '../stores/auth';
 import { SettingsNav } from '../components/settings/SettingsNav';
@@ -10,37 +11,107 @@ import { GrokProviderSection } from '../components/settings/GrokProviderSection'
 import { ModelSettingsSection } from '../components/settings/ModelSettingsSection';
 import { RegistrationSection } from '../components/settings/RegistrationSection';
 import { ProfileSection } from '../components/settings/ProfileSection';
+import { PreferencesSection } from '../components/settings/PreferencesSection';
 import { SecuritySection } from '../components/settings/SecuritySection';
 import { AboutSection } from '../components/settings/AboutSection';
 import { AppearanceSection } from '../components/settings/AppearanceSection';
-import { SystemSettingsSection } from '../components/settings/SystemSettingsSection';
+import { MainAgentIdentitySection } from '../components/settings/MainAgentIdentitySection';
+import { MainAgentCapabilitiesSection } from '../components/settings/MainAgentCapabilitiesSection';
+import {
+  HostIntegrationSettingsSection,
+  SystemSettingsSection,
+} from '../components/settings/SystemSettingsSection';
 import { UserChannelsSection } from '../components/settings/UserChannelsSection';
-import { GroupsPage } from './GroupsPage';
-import { MemoryPage } from './MemoryPage';
-import { SkillsPage } from './SkillsPage';
-import { McpServersPage } from './McpServersPage';
-import { PluginsPage } from './PluginsPage';
-import { AgentDefinitionsPage } from './AgentDefinitionsPage';
 import { UsersPage } from './UsersPage';
-import { BindingsSection } from '../components/settings/BindingsSection';
-import { UsagePage } from './UsagePage';
 import { MonitorPage } from './MonitorPage';
-import { Card, CardContent } from '@/components/ui/card';
 import type { SettingsTab } from '../components/settings/types';
 
-const VALID_TABS: SettingsTab[] = ['models', 'claude', 'gpt', 'grok', 'registration', 'appearance', 'system', 'profile', 'my-channels', 'security', 'groups', 'memory', 'skills', 'mcp-servers', 'plugins', 'agent-definitions', 'users', 'about', 'bindings', 'usage', 'monitor'];
-const SYSTEM_TABS: SettingsTab[] = ['models', 'claude', 'gpt', 'grok', 'registration', 'appearance', 'system'];
-const FULLPAGE_TABS: SettingsTab[] = ['groups', 'memory', 'skills', 'mcp-servers', 'plugins', 'agent-definitions', 'users', 'bindings', 'usage', 'monitor'];
+const VALID_TABS: SettingsTab[] = [
+  'models',
+  'claude',
+  'gpt',
+  'grok',
+  'registration',
+  'appearance',
+  'system',
+  'profile',
+  'my-channels',
+  'security',
+  'groups',
+  'memory',
+  'skills',
+  'mcp-servers',
+  'plugins',
+  'agent-definitions',
+  'users',
+  'about',
+  'bindings',
+  'usage',
+  'monitor',
+  'automation',
+  'main-agent',
+  'host-integration',
+  'billing',
+  'preferences',
+  'agent-profiles',
+];
+const SYSTEM_TABS: SettingsTab[] = [
+  'models',
+  'claude',
+  'gpt',
+  'grok',
+  'registration',
+  'appearance',
+  'system',
+  'automation',
+  'main-agent',
+  'host-integration',
+];
+const FULLPAGE_TABS: SettingsTab[] = [
+  'groups',
+  'memory',
+  'skills',
+  'mcp-servers',
+  'plugins',
+  'agent-definitions',
+  'users',
+  'bindings',
+  'usage',
+  'monitor',
+  'billing',
+];
+const BillingPage = lazy(() => import('./BillingPage'));
+
+
+
+
+
+const LEGACY_TAB_ROUTES: Partial<Record<SettingsTab, string>> = {
+  groups: '/chat',
+  'agent-profiles': '/agent-profiles',
+  memory: '/memory',
+  skills: '/capabilities/skills',
+  'mcp-servers': '/capabilities/mcp',
+  plugins: '/capabilities/plugins',
+  bindings: '/settings?tab=my-channels&view=bindings',
+  usage: '/usage',
+};
 
 export function SettingsPage() {
   const { user: currentUser } = useAuthStore();
+  const hasBillingPermission = useAuthStore((state) =>
+    state.hasPermission('manage_billing'),
+  );
   const [searchParams, setSearchParams] = useSearchParams();
   const [navOpen, setNavOpen] = useState(false);
 
   const hasSystemConfigPermission =
-    currentUser?.role === 'admin' || !!currentUser?.permissions.includes('manage_system_config');
+    currentUser?.role === 'admin' ||
+    !!currentUser?.permissions.includes('manage_system_config');
   const mustChangePassword = !!currentUser?.must_change_password;
-  const canManageSystemConfig = hasSystemConfigPermission && !mustChangePassword;
+  const canManageSystemConfig =
+    hasSystemConfigPermission && !mustChangePassword;
+  const canManageBilling = hasBillingPermission && !mustChangePassword;
   const canManageUsers =
     currentUser?.role === 'admin' ||
     !!currentUser?.permissions.includes('manage_users') ||
@@ -48,188 +119,203 @@ export function SettingsPage() {
     !!currentUser?.permissions.includes('view_audit_log');
 
   const defaultTab: SettingsTab = canManageSystemConfig ? 'models' : 'profile';
+  const rawTab = searchParams.get('tab') as SettingsTab | null;
 
   const activeTab = useMemo((): SettingsTab => {
-    if (mustChangePassword) return 'profile';
-    const raw = searchParams.get('tab') as SettingsTab | null;
+    if (mustChangePassword) return 'security';
+    const raw = rawTab;
     if (raw && VALID_TABS.includes(raw)) {
-      if (SYSTEM_TABS.includes(raw) && !canManageSystemConfig) return defaultTab;
+      if (SYSTEM_TABS.includes(raw) && !canManageSystemConfig)
+        return defaultTab;
+      if (
+        (raw === 'main-agent' || raw === 'host-integration') &&
+        currentUser?.role !== 'admin'
+      ) {
+        return defaultTab;
+      }
       if (raw === 'monitor' && !canManageSystemConfig) return defaultTab;
+      if (raw === 'billing' && !canManageBilling) return defaultTab;
       if (raw === 'users' && !canManageUsers) return defaultTab;
       return raw;
     }
     return defaultTab;
-  }, [searchParams, canManageSystemConfig, canManageUsers, mustChangePassword, defaultTab]);
+  }, [
+    rawTab,
+    canManageSystemConfig,
+    canManageUsers,
+    canManageBilling,
+    mustChangePassword,
+    defaultTab,
+    currentUser?.role,
+  ]);
 
-  const handleTabChange = useCallback((tab: SettingsTab) => {
-    setNavOpen(false);
-    setSearchParams({ tab }, { replace: true });
-  }, [setSearchParams]);
-
-  // Mobile horizontal tab bar
-  const mobileTabs = useMemo(() => {
-    const tabs: { key: SettingsTab; label: string }[] = [];
-    tabs.push({ key: 'profile', label: '个人偏好' });
-    tabs.push({ key: 'my-channels', label: '消息通道' });
-    tabs.push({ key: 'security', label: '安全' });
-    if (canManageSystemConfig) {
-      tabs.push({ key: 'models', label: '模型' });
-      tabs.push({ key: 'claude', label: 'Claude' });
-      tabs.push({ key: 'gpt', label: 'GPT' });
-      tabs.push({ key: 'grok', label: 'Grok' });
-      tabs.push({ key: 'registration', label: '注册' });
-      tabs.push({ key: 'appearance', label: '全局外观' });
-      tabs.push({ key: 'system', label: '系统' });
-    }
-    tabs.push({ key: 'groups', label: '会话' });
-    tabs.push({ key: 'memory', label: '记忆' });
-    tabs.push({ key: 'skills', label: '技能' });
-    tabs.push({ key: 'mcp-servers', label: 'MCP' });
-    tabs.push({ key: 'agent-definitions', label: 'Agent' });
-    tabs.push({ key: 'bindings', label: 'IM 绑定' });
-    tabs.push({ key: 'usage', label: '用量' });
-    if (canManageSystemConfig) {
-      tabs.push({ key: 'monitor', label: '监控' });
-    }
-    if (canManageUsers) {
-      tabs.push({ key: 'users', label: '用户' });
-    }
-    tabs.push({ key: 'about', label: '关于' });
-    return tabs;
-  }, [canManageSystemConfig, canManageUsers]);
-
-  const tabBarRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    const container = tabBarRef.current;
-    if (!container) return;
-    const activeEl = container.querySelector('[data-active="true"]');
-    if (activeEl) {
-      activeEl.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
-    }
-  }, [activeTab]);
+  const handleTabChange = useCallback(
+    (tab: SettingsTab) => {
+      setNavOpen(false);
+      setSearchParams({ tab }, { replace: true });
+    },
+    [setSearchParams],
+  );
 
   const sectionTitle: Record<SettingsTab, string> = {
-    models: '模型',
-    claude: 'Claude 提供商',
-    gpt: 'GPT 提供商',
-    grok: 'Grok 提供商',
-    registration: '注册管理',
-    appearance: '全局外观',
-    system: '系统参数',
-    profile: '个人偏好',
-    'my-channels': '消息通道',
+  // 本地多运行时新增的三个入口（模型 / GPT / Grok 提供商）
+  models: '模型',
+  claude: 'Claude 提供商',
+  gpt: 'GPT 提供商',
+  grok: 'Grok 提供商',
+    registration: '注册策略',
+    appearance: '常规与品牌',
+    system: '运行与容量',
+    automation: '任务与自动化',
+    'main-agent': '主 HappyClaw',
+    'host-integration': '宿主机集成',
+    billing: '计费管理',
+    profile: '个人资料',
+    preferences: '常规',
+    'my-channels': '消息渠道',
     security: '安全与设备',
     groups: '会话管理',
+    'agent-profiles': 'Agent',
     memory: '记忆管理',
     skills: '技能(Skill)管理',
     'mcp-servers': 'MCP 服务器',
     plugins: '插件 (Plugins)',
-    'agent-definitions': 'Agent 管理',
-    users: '用户管理',
+    users: '用户与访问',
     about: '关于',
-    bindings: 'IM 绑定',
+    bindings: '渠道绑定',
     usage: '用量统计',
-    monitor: '系统监控',
+    monitor: '运行状态',
+    'agent-definitions': 'SubAgent 定义',
   };
 
+  const sectionDescription: Partial<Record<SettingsTab, string>> = {
+    'main-agent':
+      '管理主 Agent 的头像、系统附加能力、宿主机配置继承和上下文压缩策略。',
+    'host-integration':
+      '管理宿主机 Claude 目录以及共享 Plugin Catalog 的来源。',
+  };
+
+  const legacyRoute =
+    !mustChangePassword && rawTab ? LEGACY_TAB_ROUTES[rawTab] : undefined;
+  if (legacyRoute) return <Navigate to={legacyRoute} replace />;
+
   return (
-    <div className="h-full bg-background flex flex-col lg:flex-row overflow-hidden">
+    <div
+      data-settings-page="true"
+      className="min-h-full bg-background lg:flex lg:items-start"
+    >
       {/* Mobile header */}
-      <div
-        className="lg:hidden sticky top-0 z-10 flex items-center bg-background border-b border-border px-4 h-12"
-      >
+      <div className="lg:hidden sticky top-0 z-10 flex items-center bg-background border-b border-border px-4 h-12">
         <button
           onClick={() => setNavOpen(true)}
-          className="p-1.5 -ml-1.5 rounded-lg hover:bg-muted transition-colors"
+          className="-ml-2 flex size-11 items-center justify-center rounded-lg transition-colors hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           aria-label="打开导航"
         >
           <Menu className="w-5 h-5 text-muted-foreground" />
         </button>
-        <span className="ml-3 text-sm font-semibold text-foreground truncate">{sectionTitle[activeTab]}</span>
-      </div>
-
-      {/* Mobile horizontal tab bar */}
-      <div
-        ref={tabBarRef}
-        className="lg:hidden flex items-center gap-1 px-3 py-2 overflow-x-auto bg-background border-b border-border [touch-action:pan-x] [&::-webkit-scrollbar]:hidden"
-        style={{ scrollbarWidth: 'none', WebkitOverflowScrolling: 'touch' } as React.CSSProperties}
-      >
-        {mobileTabs.map((tab) => {
-          const isActive = activeTab === tab.key;
-          const disabled = mustChangePassword && tab.key !== 'profile';
-          return (
-            <button
-              key={tab.key}
-              data-active={isActive}
-              onClick={() => !disabled && handleTabChange(tab.key)}
-              disabled={disabled}
-              className={`flex-shrink-0 px-3 py-1.5 rounded-full text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
-                isActive
-                  ? 'bg-primary text-white'
-                  : disabled
-                    ? 'text-muted-foreground/50'
-                    : 'text-muted-foreground hover:bg-muted hover:text-foreground'
-              }`}
-            >
-              {tab.label}
-            </button>
-          );
-        })}
+        <span className="ml-3 text-sm font-semibold text-foreground truncate">
+          {sectionTitle[activeTab]}
+        </span>
       </div>
 
       <SettingsNav
         activeTab={activeTab}
         onTabChange={handleTabChange}
         canManageSystemConfig={canManageSystemConfig}
+        canManageBilling={canManageBilling}
         canManageUsers={!!canManageUsers}
+        isAdmin={currentUser?.role === 'admin'}
         mustChangePassword={mustChangePassword}
         open={navOpen}
         onOpenChange={setNavOpen}
       />
 
-      <div className="flex-1 min-w-0 overflow-y-auto">
+      <div data-settings-content="true" className="min-w-0 flex-1">
         {FULLPAGE_TABS.includes(activeTab) ? (
           <>
-            {activeTab === 'groups' && <GroupsPage />}
-            {activeTab === 'memory' && <MemoryPage />}
-            {activeTab === 'skills' && <SkillsPage />}
-            {activeTab === 'mcp-servers' && <McpServersPage />}
-            {activeTab === 'plugins' && <PluginsPage />}
-            {activeTab === 'agent-definitions' && <AgentDefinitionsPage />}
             {activeTab === 'users' && <UsersPage />}
-            {activeTab === 'bindings' && <BindingsSection />}
-            {activeTab === 'usage' && <UsagePage />}
             {activeTab === 'monitor' && <MonitorPage />}
+            {activeTab === 'billing' && (
+              <Suspense fallback={null}>
+                <BillingPage managementOnly />
+              </Suspense>
+            )}
           </>
         ) : (
-          <div className="p-4 lg:p-8">
-            <div className="max-w-3xl mx-auto space-y-6">
-              <div>
-                <h1 className="text-2xl font-bold text-foreground">{sectionTitle[activeTab]}</h1>
-              </div>
+          <div className="px-4 py-6 sm:px-6 lg:px-10 lg:py-8">
+            <div className="mx-auto max-w-6xl">
+              <header className="mb-6">
+                <h1 className="text-2xl font-bold text-foreground">
+                  {sectionTitle[activeTab]}
+                </h1>
+                {sectionDescription[activeTab] && (
+                  <p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">
+                    {sectionDescription[activeTab]}
+                  </p>
+                )}
+              </header>
 
               {mustChangePassword && (
-                <div className="bg-warning-bg border border-warning/20 rounded-xl px-4 py-3 text-sm text-warning">
-                  检测到首次登录或管理员重置密码，请先完成"修改密码"，其余关键操作会被暂时限制。
+                <div className="mb-6 rounded-xl border border-warning/20 bg-warning-bg px-4 py-3 text-sm text-warning">
+                  检测到首次登录或管理员重置密码，请先在“安全与设备”中修改密码；完成前其他设置暂不可用。
                 </div>
               )}
 
-              <Card>
-                <CardContent>
-                  {activeTab === 'claude' && <ClaudeProviderSection setNotice={() => {}} setError={() => {}} />}
-                  {activeTab === 'gpt' && <GptProviderSection setNotice={() => {}} setError={() => {}} />}
-                  {activeTab === 'grok' && <GrokProviderSection setNotice={() => {}} setError={() => {}} />}
+              {activeTab === 'system' || activeTab === 'automation' ? (
+                <SystemSettingsSection
+                  scope={activeTab === 'automation' ? 'automation' : 'runtime'}
+                />
+              ) : activeTab === 'main-agent' ||
+                activeTab === 'host-integration' ? (
+                <div>
+                  {activeTab === 'main-agent' && <MainAgentIdentitySection />}
+                  {activeTab === 'main-agent' && (
+                    <MainAgentCapabilitiesSection />
+                  )}
+                  <div className={activeTab === 'main-agent' ? 'pt-6' : ''}>
+                    <HostIntegrationSettingsSection
+                      scope={activeTab === 'main-agent' ? 'main-agent' : 'host'}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <>
+                  {activeTab === 'claude' && (
+                    <ClaudeProviderSection
+                      setNotice={(message) => message && toast.success(message)}
+                      setError={(message) => message && toast.error(message)}
+                    />
+                  )}
+                  {activeTab === 'registration' && (
+                    <div className="space-y-8">
+                      <RegistrationSection />
+                      <div className="border-t border-border pt-6">
+                        <SystemSettingsSection scope="security" />
+                      </div>
+                    </div>
+                  )}
+                  {/* 本地多运行时新增入口 */}
+                  {activeTab === 'gpt' && (
+                    <GptProviderSection
+                      setNotice={(message) => message && toast.success(message)}
+                      setError={(message) => message && toast.error(message)}
+                    />
+                  )}
+                  {activeTab === 'grok' && (
+                    <GrokProviderSection
+                      setNotice={(message) => message && toast.success(message)}
+                      setError={(message) => message && toast.error(message)}
+                    />
+                  )}
                   {activeTab === 'models' && <ModelSettingsSection />}
-                  {activeTab === 'registration' && <RegistrationSection />}
                   {activeTab === 'appearance' && <AppearanceSection />}
-                  {activeTab === 'system' && <SystemSettingsSection />}
                   {activeTab === 'profile' && <ProfileSection />}
+                  {activeTab === 'preferences' && <PreferencesSection />}
                   {activeTab === 'my-channels' && <UserChannelsSection />}
                   {activeTab === 'security' && <SecuritySection />}
                   {activeTab === 'about' && <AboutSection />}
-                </CardContent>
-              </Card>
+                </>
+              )}
             </div>
           </div>
         )}

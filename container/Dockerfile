@@ -154,14 +154,11 @@ RUN set -e && \
     echo "Installing feishu-cli $VERSION for $ARCH" && \
     curl -fsSL "https://github.com/riba2534/feishu-cli/releases/download/${VERSION}/feishu-cli_${VERSION}_linux-${ARCH}.tar.gz" \
       | tar -xz --strip-components=1 -C /usr/local/bin && \
-    feishu-cli --version && \
-    mkdir -p /opt/builtin-skills && \
-    SKILLS_TMP=$(mktemp -d) && \
-    curl -fsSL "https://github.com/riba2534/feishu-cli/archive/refs/tags/${VERSION}.tar.gz" \
-      | tar -xz -C "$SKILLS_TMP" && \
-    cp -r "$SKILLS_TMP"/*/skills/. /opt/builtin-skills/ && \
-    rm -rf "$SKILLS_TMP" && \
-    ls /opt/builtin-skills/
+    feishu-cli --version
+# 注意：不在镜像里预置任何 Skill 目录层。feishu-cli 自带的 skills 由 host 侧
+# scripts/install-host-tools.sh skills 物化，并和其它 Skill 一样受
+# EffectiveSkillManifest 治理；镜像内注入会绕过该治理层（且此前无任何消费方，
+# 拷进去的目录从未被读取）。
 
 # Copy source code
 COPY agent-runner/ ./

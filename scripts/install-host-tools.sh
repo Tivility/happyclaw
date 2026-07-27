@@ -15,6 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DATA_DIR="$PROJECT_ROOT/data"
 BUILTIN_SKILLS_DIR="$DATA_DIR/builtin-skills"
+FEISHU_CLI_VERSION="v1.35.0"
+FEISHU_CLI_SOURCE_SHA256="91b5575833f003527c7b60a26f08703ebfdb348098deecfa9ceed1dcf230f253"
 
 # ── Helpers ──────────────────────────────────────────────────
 
@@ -24,6 +26,15 @@ skip()  { echo "  [SKIP]  $*"; }
 warn()  { echo "  [WARN]  $*" >&2; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
+verify_sha256() {
+  local expected="$1"
+  local file="$2"
+  if has_cmd sha256sum; then
+    echo "$expected  $file" | sha256sum -c -
+  else
+    echo "$expected  $file" | shasum -a 256 -c -
+  fi
+}
 
 # Detect platform
 OS="$(uname -s)"
@@ -42,17 +53,12 @@ esac
 # ── feishu-cli ───────────────────────────────────────────────
 
 install_feishu_cli() {
-  if has_cmd feishu-cli; then
-    skip "feishu-cli already installed ($(feishu-cli --version 2>/dev/null || echo 'unknown version'))"
+  CURRENT_VERSION="$(feishu-cli --version 2>/dev/null || true)"
+  if has_cmd feishu-cli && [[ "$CURRENT_VERSION" == *"$FEISHU_CLI_VERSION"* || "$CURRENT_VERSION" == *"${FEISHU_CLI_VERSION#v}"* ]]; then
+    skip "feishu-cli already installed ($CURRENT_VERSION)"
   else
-    info "Installing feishu-cli..."
-    VERSION=$(curl -sI "https://github.com/riba2534/feishu-cli/releases/latest" \
-      | grep -i '^location:' | head -1 \
-      | sed 's|.*/tag/\([^[:space:]]*\).*|\1|' | tr -d '\r\n')
-    if [ -z "$VERSION" ]; then
-      warn "Failed to detect feishu-cli latest version"
-      return 1
-    fi
+    info "Installing feishu-cli $FEISHU_CLI_VERSION..."
+    VERSION="$FEISHU_CLI_VERSION"
     curl -fsSL "https://github.com/riba2534/feishu-cli/releases/download/${VERSION}/feishu-cli_${VERSION}_${OS_GO}-${ARCH_GO}.tar.gz" \
       | tar -xz --strip-components=1 -C /usr/local/bin 2>/dev/null \
       || tar -xzf <(curl -fsSL "https://github.com/riba2534/feishu-cli/releases/download/${VERSION}/feishu-cli_${VERSION}_${OS_GO}-${ARCH_GO}.tar.gz") -C /usr/local/bin
@@ -64,24 +70,33 @@ install_feishu_cli() {
 
 refresh_builtin_skills() {
   info "Refreshing builtin-skills cache in $BUILTIN_SKILLS_DIR ..."
-  VERSION=$(curl -sI "https://github.com/riba2534/feishu-cli/releases/latest" \
-    | grep -i '^location:' | head -1 \
-    | sed 's|.*/tag/\([^[:space:]]*\).*|\1|' | tr -d '\r\n')
-  if [ -z "$VERSION" ]; then
-    warn "Failed to detect feishu-cli latest version — cannot refresh builtin-skills"
-    return 1
-  fi
+  VERSION="$FEISHU_CLI_VERSION"
 
   TMP=$(mktemp -d)
-  trap 'rm -rf "$TMP"' RETURN
-  curl -fsSL "https://github.com/riba2534/feishu-cli/archive/refs/tags/${VERSION}.tar.gz" \
-    | tar -xz -C "$TMP"
+  mkdir -p "$DATA_DIR"
+  STAGING=$(mktemp -d "$DATA_DIR/.builtin-skills-staging.XXXXXX")
+  PREVIOUS="$DATA_DIR/.builtin-skills-previous.$$"
+  trap 'rm -rf "$TMP" "$STAGING" "$PREVIOUS"' RETURN
+  curl -fsSL \
+    -o "$TMP/feishu-cli-source.tar.gz" \
+    "https://github.com/riba2534/feishu-cli/archive/refs/tags/${VERSION}.tar.gz"
+  verify_sha256 "$FEISHU_CLI_SOURCE_SHA256" "$TMP/feishu-cli-source.tar.gz"
+  tar -xzf "$TMP/feishu-cli-source.tar.gz" -C "$TMP"
 
-  # Clear old cache and copy fresh skills
-  rm -rf "$BUILTIN_SKILLS_DIR"
-  mkdir -p "$BUILTIN_SKILLS_DIR"
-  cp -r "$TMP"/*/skills/. "$BUILTIN_SKILLS_DIR"/
-  ok "Cached $(ls -d "$BUILTIN_SKILLS_DIR"/*/ 2>/dev/null | wc -l | tr -d ' ') builtin skills (feishu-cli $VERSION)"
+  cp -r "$TMP"/*/skills/. "$STAGING"/
+  node "$PROJECT_ROOT/scripts/builtin-skill-catalog.mjs" write "$STAGING"
+
+  # Build completely in a same-filesystem staging directory, then swap. If
+  # publication fails, restore the previous valid catalog.
+  if [ -e "$BUILTIN_SKILLS_DIR" ]; then
+    mv "$BUILTIN_SKILLS_DIR" "$PREVIOUS"
+  fi
+  if ! mv "$STAGING" "$BUILTIN_SKILLS_DIR"; then
+    if [ -e "$PREVIOUS" ]; then mv "$PREVIOUS" "$BUILTIN_SKILLS_DIR"; fi
+    return 1
+  fi
+  rm -rf "$PREVIOUS"
+  ok "Cached $(find "$BUILTIN_SKILLS_DIR" -mindepth 2 -maxdepth 2 -name SKILL.md | wc -l | tr -d ' ') builtin skills (feishu-cli $VERSION)"
 }
 
 # ── agent-browser ────────────────────────────────────────────

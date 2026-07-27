@@ -52,18 +52,53 @@ export function AppLayout() {
         useBillingStore.getState().handleBillingUpdate(data.usage);
       }
     });
-    return () => { unsub(); };
+    return () => {
+      unsub();
+    };
   }, []);
 
-  // 监听 runner_state 更新 sidebar 运行状态指示器
+  // Process lifecycle (legacy) plus logical query lifecycle. A conversation
+  // process may stay warm between turns, so run_started/active_run_snapshot
+  // are the authoritative signals for immediate and reconnect restoration.
   useEffect(() => {
-    const unsub = wsManager.on('runner_state', (data: any) => {
+    const unsubRunner = wsManager.on('runner_state', (data: any) => {
       if (data.chatJid && data.state) {
-        useGroupsStore.getState().setRunnerState(data.chatJid, data.state);
+        if (!data.chatJid.includes('#agent:')) {
+          useGroupsStore.getState().setRunnerState(data.chatJid, data.state);
+        }
         useChatStore.getState().handleRunnerState(data.chatJid, data.state);
       }
     });
-    return () => { unsub(); };
+    const unsubStarted = wsManager.on('run_started', (data: any) => {
+      if (!data.chatJid) return;
+      if (!data.chatJid.includes('#agent:')) {
+        useGroupsStore.getState().setRunnerState(data.chatJid, 'running');
+      }
+      useChatStore.getState().handleRunStarted(data.chatJid, data.runId);
+    });
+    const unsubFinished = wsManager.on('run_finished', (data: any) => {
+      if (!data.chatJid || !data.runId) return;
+      useChatStore.getState().handleRunFinished(data.chatJid, data.runId);
+    });
+    const unsubSnapshot = wsManager.on('active_run_snapshot', (data: any) => {
+      const runs = Array.isArray(data.runs) ? data.runs : [];
+      const queuedChatJids = Array.isArray(data.queuedChatJids)
+        ? data.queuedChatJids
+        : [];
+      useChatStore.getState().handleActiveRunSnapshot(runs, queuedChatJids);
+      for (const run of runs) {
+        if (!run?.chatJid) continue;
+        if (!run.chatJid.includes('#agent:')) {
+          useGroupsStore.getState().setRunnerState(run.chatJid, 'running');
+        }
+      }
+    });
+    return () => {
+      unsubRunner();
+      unsubStarted();
+      unsubFinished();
+      unsubSnapshot();
+    };
   }, []);
 
   // 监听 group_created（定时任务工作区创建），刷新侧边栏和任务列表
@@ -71,13 +106,19 @@ export function AppLayout() {
     const unsub = wsManager.on('group_created', () => {
       useGroupsStore.getState().loadGroups();
       // Also refresh tasks — workspace_folder may have been populated
-      import('../../stores/tasks').then((m) => m.useTasksStore.getState().loadTasks());
+      import('../../stores/tasks').then((m) =>
+        m.useTasksStore.getState().loadTasks(),
+      );
     });
-    return () => { unsub(); };
+    return () => {
+      unsub();
+    };
   }, []);
 
   // 更新 document.title，显示未读回复数
-  const totalUnread = useChatStore((s) => Object.values(s.unreadReplies).reduce((sum, n) => sum + n, 0));
+  const totalUnread = useChatStore((s) =>
+    Object.values(s.unreadReplies).reduce((sum, n) => sum + n, 0),
+  );
   const appearance = useAuthStore((s) => s.appearance);
   useEffect(() => {
     const appName = appearance?.appName || 'HappyClaw';
@@ -88,14 +129,23 @@ export function AppLayout() {
   useEffect(() => {
     const unsub = wsManager.on('agent_status', (data: any) => {
       if (data.chatJid && data.agentId) {
-        useChatStore.getState().handleAgentStatus(
-          data.chatJid, data.agentId, data.status,
-          data.name, data.prompt, data.resultSummary, data.kind,
-          data.titleGenerating,
-        );
+        useChatStore
+          .getState()
+          .handleAgentStatus(
+            data.chatJid,
+            data.agentId,
+            data.status,
+            data.name,
+            data.prompt,
+            data.resultSummary,
+            data.kind,
+            data.titleGenerating,
+          );
       }
     });
-    return () => { unsub(); };
+    return () => {
+      unsub();
+    };
   }, []);
 
   return (

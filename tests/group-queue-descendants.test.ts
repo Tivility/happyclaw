@@ -125,4 +125,29 @@ describe('GroupQueue.listDescendantJids', () => {
     // raw:jid#agent:x → `raw:jid#agent:x` → does it start with `raw:jid#`? Yes.
     expect(q.listDescendantJids('raw:jid')).toEqual(['raw:jid#agent:x']);
   });
+
+  test('stopGroup invokes queued task drop callback before discarding it', async () => {
+    const q = new GroupQueue();
+    let dropped = 0;
+    const jid = 'web:main#task:queued';
+    seed(q, jid, {
+      active: false,
+      pendingTasks: [
+        {
+          id: 'scheduled-task',
+          groupJid: jid,
+          fn: async () => {},
+          onDropped: () => {
+            dropped++;
+          },
+        },
+      ],
+    });
+    (q as unknown as { waitingGroups: Set<string> }).waitingGroups.add(jid);
+
+    await q.stopGroup(jid);
+
+    expect(dropped).toBe(1);
+    expect(q.listDescendantJids('web:main')).toEqual([]);
+  });
 });

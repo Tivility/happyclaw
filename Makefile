@@ -1,10 +1,6 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web start \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
-       format format-check install install-host-tools clean reset-init update-sdk update-codex-sdk ensure-latest-sdk ensure-latest-codex-sdk check-container-sdk sync-types \
-       backup restore launchd-install launchd-uninstall launchd-restart \
-       launchd-status launchd-log help _ensure-docker-image logs status stop \
-       _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale \
-       _start-pm2 _start-direct
+		_build-ar-if-stale _build-backend-if-stale _build-web-if-stale _check-sync _ensure-builtin-skills _ensure-docker-image backup check-container-sdk clean ensure-latest-codex-sdk ensure-latest-sdk format format-check help install install-host-tools launchd-install launchd-log launchd-restart launchd-status launchd-uninstall logs reset-init restore status stop sync-types update-codex-sdk update-sdk
 
 # ─── Runtime ────────────────────────────────────────────────
 # 本项目只用原生 Node 工具链运行（npm / npx / tsx / node），不使用 bun。
@@ -14,32 +10,25 @@
 PORT    ?= $(or $(WEB_PORT),3000)
 # Container image name — mirrors the CONTAINER_IMAGE env default in src/config.ts.
 CONTAINER_IMAGE ?= happyclaw-agent:latest
+export WEB_PORT := $(PORT)
 PKG     := npm
 RUN     := npx
 RUNNER  := npx tsx src/index.ts
+RUNTIME_DATA_DIR ?= data
+BACKUP_DIR ?= .
 
 # ─── Development ─────────────────────────────────────────────
 
-# 单行 shell 片段：运行 dev 命令前暂停 pm2 中的 happyclaw，退出（正常/中断/终止）时恢复。
-# 用法示例：@$(PM2_GUARD); <command>
-PM2_GUARD = PM2_WAS_RUNNING=0; \
-	if command -v pm2 >/dev/null 2>&1 && pm2 show happyclaw 2>/dev/null | grep -q 'online'; then \
-	  PM2_WAS_RUNNING=1; \
-	  echo "⏸  暂停 pm2 happyclaw..."; \
-	  pm2 stop happyclaw; \
-	fi; \
-	trap "if [ \"$$PM2_WAS_RUNNING\" = '1' ]; then echo '▶  恢复 pm2 happyclaw...'; pm2 start happyclaw; fi" EXIT INT TERM
-
-dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）；自动暂停 pm2，退出后恢复
-	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）
+	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
 	@$(PKG) --prefix container/agent-runner run build --silent 2>/dev/null || $(PKG) --prefix container/agent-runner run build
-	@$(PM2_GUARD); \
-	echo "🚀 使用 $(PKG) 启动..."; \
+	@echo "🚀 使用 $(PKG) 启动..."
 	$(PKG) run dev:all
 
-dev-backend: ## 仅启动后端（tsx 直跑 TS）；自动暂停 pm2，退出后恢复
-	@$(PM2_GUARD); $(RUNNER)
+dev-backend: ## 仅启动后端（tsx 直跑 TS）
+	$(RUNNER)
 
 dev-web: ## 仅启动前端
 	cd web && $(PKG) run dev
@@ -58,30 +47,17 @@ build-web: ## 仅编译前端
 
 # ─── Production ──────────────────────────────────────────────
 
-start: ensure-latest-sdk ensure-latest-codex-sdk check-container-sdk ## 一键启动生产环境（pm2 托管时自动走 pm2 restart；否则前台阻塞）
-	@# pm2 注册过 happyclaw 就路由到 pm2，避免裸跑和 pm2 抢端口
-	@if command -v pm2 >/dev/null 2>&1 && pm2 describe happyclaw >/dev/null 2>&1; then \
-	  $(MAKE) --no-print-directory _start-pm2; \
-	else \
-	  $(MAKE) --no-print-directory _start-direct; \
-	fi
-
-_start-pm2: ## (内部) pm2 托管模式：build 后 pm2 restart
-	@echo "🔄 检测到 pm2 托管 happyclaw，改走 pm2 restart"
-	@$(MAKE) _check-sync _build-web-if-stale _build-ar-if-stale _build-backend-if-stale
-	@pm2 restart happyclaw --update-env
-	@sleep 2
-	@pm2 logs happyclaw --lines 20 --nostream || true
-	@echo "✅ 启动完成，查看实时日志：pm2 logs happyclaw"
-
-_start-direct: ## (内部) 裸跑模式（无 pm2 或未注册）
+start: ensure-latest-sdk ensure-latest-codex-sdk check-container-sdk ## 一键启动生产环境（前台阻塞运行）
+	@# 生产启动不得隐式改写依赖图；SDK 升级请显式执行 make update-sdk，
+	@# 验证通过后再提交 package.json 与 lockfile。
 	@# 检查端口是否被占用
 	@if lsof -ti:$(PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
 	  echo "❌ 端口 $(PORT) 已被占用，请先停掉旧进程：make stop"; \
 	  lsof -ti:$(PORT) -sTCP:LISTEN | xargs ps -fp 2>/dev/null | tail -1; \
 	  exit 1; \
 	fi
-	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
 	@$(MAKE) _check-sync
 	@$(MAKE) _build-backend-if-stale
@@ -99,6 +75,14 @@ _check-sync: ## (内部) 检测 shared/ 类型变更并同步
 	done; \
 	if [ "$$NEED_SYNC" = "1" ]; then echo "🔄 检测到 shared/ 类型变更，同步类型..."; $(MAKE) sync-types; fi
 
+_ensure-builtin-skills: ## (内部) 物化固定版本、Host/Container 共用的内置 Skills
+	@if ! node scripts/builtin-skill-catalog.mjs validate data/builtin-skills; then \
+	  echo "📚 固定版本内置 Skills 缺失，正在物化..."; \
+	  ./scripts/install-host-tools.sh skills; \
+	else \
+	  echo "✅ 内置 Skills catalog 已就绪"; \
+	fi
+
 _build-web-if-stale: ## (内部) 前端变更时重新编译
 	@NEED_WEB=0; \
 	if [ ! -f web/dist/index.html ]; then NEED_WEB=1; \
@@ -106,7 +90,7 @@ _build-web-if-stale: ## (内部) 前端变更时重新编译
 	  for f in web/package.json web/vite.config.ts web/index.html web/tsconfig.json; do \
 	    if [ -f "$$f" ] && [ "$$f" -nt web/dist/index.html ]; then NEED_WEB=1; break; fi; \
 	  done; \
-	  if [ "$$NEED_WEB" = "0" ] && [ -n "$$(find web/src/ -newer web/dist/index.html \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) 2>/dev/null | head -1)" ]; then NEED_WEB=1; fi; \
+	  if [ "$$NEED_WEB" = "0" ] && [ -n "$$(find web/src/ web/public/ -type f -newer web/dist/index.html 2>/dev/null | head -1)" ]; then NEED_WEB=1; fi; \
 	fi; \
 	if [ "$$NEED_WEB" = "1" ]; then echo "🔨 检测到前端变更，重新编译前端..."; cd web && $(PKG) run build; else echo "✅ 前端无变更，跳过编译"; fi
 
@@ -135,19 +119,11 @@ _build-backend-if-stale: ## (内部) 后端变更时重新编译（Node 模式�
 logs: ## 实时查看日志（需配合手动后台运行：make start > /tmp/happyclaw.log 2>&1 &）
 	@tail -f /tmp/happyclaw.log
 
-stop: ## 停止服务（pm2 托管时走 pm2 stop，否则杀端口监听进程）
-	@if command -v pm2 >/dev/null 2>&1 && pm2 describe happyclaw >/dev/null 2>&1; then \
-	  pm2 stop happyclaw >/dev/null && echo "✅ 已 pm2 stop happyclaw（需再起用 pm2 start happyclaw）"; \
-	else \
-	  lsof -ti:$(PORT) -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null && echo "✅ 已停止 HappyClaw (端口 $(PORT))" || echo "⚠️  端口 $(PORT) 未被占用，无需停止"; \
-	fi
+stop: ## 停止监听指定端口的服务进程
+	@lsof -ti:$(PORT) -sTCP:LISTEN 2>/dev/null | xargs kill 2>/dev/null && echo "✅ 已停止 HappyClaw (端口 $(PORT))" || echo "⚠️  端口 $(PORT) 未被占用，无需停止"
 
 status: ## 查看服务运行状态
 	@echo "=== HappyClaw 服务状态 ==="
-	@if command -v pm2 >/dev/null 2>&1 && pm2 describe happyclaw >/dev/null 2>&1; then \
-	  echo "🔧 pm2 托管模式（重启请用 pm2 restart happyclaw，勿混用 make start/stop）"; \
-	  pm2 describe happyclaw 2>/dev/null | grep -E "status|pid|uptime|restarts" | head -4 | sed 's/^/   /'; \
-	fi
 	@if lsof -ti:$(PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
 	  echo "✅ 后端进程: 运行中 (端口 $(PORT))"; \
 	  curl -s http://localhost:$(PORT)/api/health 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"   健康状态: {d.get('status','unknown')}\")" 2>/dev/null || echo "   健康状态: 无法获取"; \
@@ -157,7 +133,7 @@ status: ## 查看服务运行状态
 	@echo ""
 	@echo "=== 日志文件 ==="
 	@if [ -f /tmp/happyclaw.log ]; then \
-	  echo "✅ /tmp/happyclaw.log 存在 ($(wc -l < /tmp/happyclaw.log) 行)"; \
+	  echo "✅ /tmp/happyclaw.log 存在 ($$(wc -l < /tmp/happyclaw.log) 行)"; \
 	  echo "   最近 3 行:"; \
 	  tail -3 /tmp/happyclaw.log | sed 's/^/   /'; \
 	else \
@@ -172,6 +148,7 @@ status: ## 查看服务运行状态
 typecheck: sync-types typecheck-backend typecheck-web typecheck-agent-runner ## 全量类型检查
 	@./scripts/check-stream-event-sync.sh
 	@./scripts/check-agent-runner-prompts.sh
+	@$(PKG) run docs:check
 
 typecheck-backend:
 	$(RUN) tsc --noEmit
@@ -194,8 +171,10 @@ format-check: ## 检查代码格式
 # ─── Docker Image ─────────────────────────────────────────────
 
 # Docker 镜像源文件：Dockerfile、entrypoint.sh、agent-runner 源码和运行时 prompts
-# prompts 用 find -type f 递归收集（含 channels/*.md），否则子目录文件改动不触发重建
-DOCKER_SRC := container/Dockerfile container/entrypoint.sh container/agent-runner/package.json $(wildcard container/agent-runner/src/*.ts) $(shell find container/agent-runner/prompts -type f 2>/dev/null)
+DOCKER_SRC := container/Dockerfile container/entrypoint.sh \
+	container/agent-runner/package.json \
+	$(wildcard container/agent-runner/src/*.ts) \
+	$(shell find container/agent-runner/prompts -type f 2>/dev/null)
 
 _ensure-docker-image: ## (内部) 检测 Docker 镜像是否需要构建/重建
 	@if command -v docker >/dev/null 2>&1; then \
@@ -226,13 +205,16 @@ sync-types: ## 同步 shared/ 下的类型定义到各子项目
 
 # ─── SDK ─────────────────────────────────────────────────────
 
-update-sdk: ## 更新 agent-runner + 主服务的 Claude Agent SDK 到最新版本
-	cd container/agent-runner && $(PKG) update @anthropic-ai/claude-agent-sdk && $(PKG) run build
-	$(PKG) update @anthropic-ai/claude-agent-sdk
-	@# npm update 会将 "*" 回写为具体版本，还原它（agent-runner + 主服务）
-	@sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json
-	@sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' package.json
-	@echo "SDK updated. Run 'make typecheck' to verify."
+update-sdk: ## 显式更新 agent-runner + 主服务的 Claude Agent SDK 到最新版本
+	@SDK_LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000); \
+	CLI_LATEST=$$(npm view @anthropic-ai/claude-code version --fetch-timeout=5000); \
+	echo "🔄 更新 Agent SDK → $$SDK_LATEST，Claude Code → $$CLI_LATEST"; \
+	$(PKG) --prefix container/agent-runner install --save-exact \
+	  @anthropic-ai/claude-agent-sdk@$$SDK_LATEST \
+	  @anthropic-ai/claude-code@$$CLI_LATEST; \
+	$(PKG) install --save-exact @anthropic-ai/claude-agent-sdk@$$SDK_LATEST; \
+	$(PKG) --prefix container/agent-runner run build; \
+	echo "✅ SDK/CLI 与 runner lockfile 已更新。请运行 make typecheck && make test 验证。"
 
 update-codex-sdk: ## 更新宿主服务与 agent-runner 的 Codex SDK 到最新版本
 	$(PKG) update @openai/codex-sdk
@@ -243,8 +225,10 @@ update-codex-sdk: ## 更新宿主服务与 agent-runner 的 Codex SDK 到最新�
 	@echo "Codex SDK updated. Run 'make typecheck' to verify."
 
 ensure-latest-sdk: ## 启动前自动检测并更新 SDK（agent-runner + 主服务，有新版才更新）
+ensure-latest-sdk: ## 只读检查 SDK/CLI 最新版本（兼容旧工作流）
 	@LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
 	ROOT_LOCAL=$$(node -p "require('./node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
+	CLI_LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-code/package.json').version" 2>/dev/null || echo "0.0.0"); \
 	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
 		echo "🔄 [agent-runner] Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
@@ -351,16 +335,17 @@ update-feishu-cli: ## 更新 feishu-cli 到最新版本
 
 # ─── Setup ───────────────────────────────────────────────────
 
-install-host-tools: ## 安装宿主机模式所需的外部工具（feishu-cli、agent-browser、uv）+ 刷新 builtin-skills 缓存
+install-host-tools: ## 安装宿主工具 + 刷新 Host/Container 共用的固定版本 builtin-skills Manifest 源
 	@./scripts/install-host-tools.sh
 
 install: ## 安装全部依赖并编译 agent-runner
-	$(PKG) install
+	$(PKG) ci
 	@# node-pty 的 spawn-helper 预构建二进制可能缺少可执行权限，导致 PTY 模式失败
 	@chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper 2>/dev/null || true
-	cd container/agent-runner && $(PKG) install
+	cd container/agent-runner && $(PKG) ci
 	cd container/agent-runner && $(PKG) run build
-	cd web && $(PKG) install
+	cd web && $(PKG) ci
+	@$(MAKE) _ensure-builtin-skills
 	@# 更新目录 mtime 以配合 start 中的依赖变更检测（[ package.json -nt node_modules ]）
 	@touch node_modules web/node_modules container/agent-runner/node_modules
 
@@ -377,45 +362,79 @@ reset-init: ## 完全重置为首装状态（清空所有运行时数据）
 # ─── Backup / Restore ────────────────────────────────────────
 
 backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
-	@DATE=$$(date +%Y%m%d-%H%M%S); \
-	FILE="happyclaw-backup-$$DATE.tar.gz"; \
+	@set -eu; \
+	DATE=$$(date +%Y%m%d-%H%M%S); \
+	mkdir -p "$(BACKUP_DIR)"; \
+	FILE="$(BACKUP_DIR)/happyclaw-backup-$$DATE.tar.gz"; \
+	if [ -e "$$FILE" ]; then FILE="$(BACKUP_DIR)/happyclaw-backup-$$DATE-$$$$.tar.gz"; fi; \
+	TMP_FILE="$$FILE.tmp-$$$$"; \
+	TMP_ROOT=$$(mktemp -d "$${TMPDIR:-/tmp}/happyclaw-backup.XXXXXX"); \
+	trap 'rm -rf "$$TMP_ROOT" "$$TMP_FILE"' EXIT INT TERM; \
+	mkdir -p "$$TMP_ROOT/data/db"; \
+	echo "📦 正在创建 SQLite 一致性快照..."; \
+	node scripts/sqlite-snapshot.mjs \
+	  "$(RUNTIME_DATA_DIR)/db/messages.db" \
+	  "$$TMP_ROOT/data/db/messages.db"; \
+	for DIR in config groups sessions skills mcp-servers plugins memory avatars extra builtin-skills; do \
+	  if [ -d "$(RUNTIME_DATA_DIR)/$$DIR" ]; then \
+	    mkdir -p "$$TMP_ROOT/data/$$DIR"; \
+	    cp -a "$(RUNTIME_DATA_DIR)/$$DIR/." "$$TMP_ROOT/data/$$DIR/"; \
+	  fi; \
+	done; \
+	node scripts/prepare-backup-tree.mjs "$$TMP_ROOT/data"; \
+	UNSAFE_ENTRY=$$(find "$$TMP_ROOT/data" \( -type l -o \( ! -type f ! -type d \) \) -print -quit); \
+	if [ -n "$$UNSAFE_ENTRY" ]; then \
+	  echo "❌ 运行时数据包含不安全的链接或特殊文件，拒绝创建不可安全恢复的备份：$$UNSAFE_ENTRY"; \
+	  exit 1; \
+	fi; \
+	: "检查源目录而非 TMP_ROOT：macOS 的 cp -a 不保留硬链接（GNU cp -a 才保留），"; \
+	: "拷贝后 nlink already 降为 1，对副本检查在 macOS 上恒不触发。"; \
+	HARDLINK_ENTRY=$$(find "$(RUNTIME_DATA_DIR)" -type f -links +1 -print -quit); \
+	if [ -n "$$HARDLINK_ENTRY" ]; then \
+	  echo "❌ 运行时数据包含硬链接文件，tar 会将其存为不完整的链接条目导致备份无法恢复，拒绝创建：$$HARDLINK_ENTRY"; \
+	  exit 1; \
+	fi; \
+	if [ -d "$$TMP_ROOT/data/groups" ]; then \
+	  find "$$TMP_ROOT/data/groups" -mindepth 2 -maxdepth 2 -type d -name logs \
+	    -prune -exec rm -rf {} +; \
+	fi; \
+	node scripts/backup-manifest.mjs "$$TMP_ROOT/data"; \
 	echo "📦 正在打包备份到 $$FILE ..."; \
-	tar -czf "$$FILE" \
-	  --exclude='data/ipc' \
-	  --exclude='data/env' \
-	  --exclude='data/happyclaw.log' \
-	  --exclude='data/db/messages.db-shm' \
-	  --exclude='data/db/messages.db-wal' \
-	  --exclude='data/groups/*/logs' \
-	  data/db \
-	  data/config \
-	  data/groups \
-	  data/sessions \
-	  $$([ -d data/skills ] && echo data/skills) \
-	  2>/dev/null; \
-	echo "✅ 备份完成：$$FILE ($$(du -sh $$FILE | cut -f1))"
+	tar -czf "$$TMP_FILE" -C "$$TMP_ROOT" data; \
+	mv "$$TMP_FILE" "$$FILE"; \
+	chmod 600 "$$FILE"; \
+	echo "✅ 备份完成：$$FILE ($$(du -sh "$$FILE" | cut -f1))"
 
 restore: ## 从 happyclaw-backup-*.tar.gz 恢复数据（用法：make restore 或 make restore FILE=xxx.tar.gz）
-	@if [ -n "$(FILE)" ]; then \
+	@set -eu; \
+	if [ -n "$(FILE)" ]; then \
 	  BACKUP="$(FILE)"; \
-	elif [ $$(ls happyclaw-backup-*.tar.gz 2>/dev/null | wc -l) -eq 1 ]; then \
-	  BACKUP=$$(ls happyclaw-backup-*.tar.gz); \
-	elif [ $$(ls happyclaw-backup-*.tar.gz 2>/dev/null | wc -l) -gt 1 ]; then \
+	elif [ $$(find "$(BACKUP_DIR)" -maxdepth 1 -type f -name 'happyclaw-backup-*.tar.gz' 2>/dev/null | wc -l) -eq 1 ]; then \
+	  BACKUP=$$(find "$(BACKUP_DIR)" -maxdepth 1 -type f -name 'happyclaw-backup-*.tar.gz' | head -1); \
+	elif [ $$(find "$(BACKUP_DIR)" -maxdepth 1 -type f -name 'happyclaw-backup-*.tar.gz' 2>/dev/null | wc -l) -gt 1 ]; then \
 	  echo "❌ 发现多个备份文件，请用 make restore FILE=xxx.tar.gz 指定："; \
-	  ls happyclaw-backup-*.tar.gz; \
+	  find "$(BACKUP_DIR)" -maxdepth 1 -type f -name 'happyclaw-backup-*.tar.gz' -print; \
 	  exit 1; \
 	else \
 	  echo "❌ 未找到备份文件，请将 happyclaw-backup-*.tar.gz 放到当前目录"; \
 	  exit 1; \
 	fi; \
+	if [ ! -f "$$BACKUP" ]; then \
+	  echo "❌ 备份文件不存在：$$BACKUP"; \
+	  exit 1; \
+	fi; \
+	if ! node scripts/restore-backup.mjs assert-port-free "$(PORT)"; then \
+	  echo "❌ 检测到运行中的服务，拒绝覆盖数据库"; \
+	  exit 1; \
+	fi; \
 	echo "📂 正在从 $$BACKUP 恢复..."; \
-	if [ -d data ] && [ "$$(ls -A data 2>/dev/null)" ]; then \
-	  echo "⚠️  data/ 目录已存在数据，继续将覆盖。是否继续？[y/N] "; \
+	if [ -d "$(RUNTIME_DATA_DIR)" ] && [ "$$(ls -A "$(RUNTIME_DATA_DIR)" 2>/dev/null)" ]; then \
+	  echo "⚠️  $(RUNTIME_DATA_DIR)/ 目录已存在数据，继续将覆盖。是否继续？[y/N] "; \
 	  read CONFIRM; \
 	  [ "$$CONFIRM" = "y" ] || [ "$$CONFIRM" = "Y" ] || { echo "已取消"; exit 1; }; \
 	fi; \
-	tar -xzf "$$BACKUP"; \
-	if [ ! -f data/config/session-secret.key ]; then \
+	node scripts/restore-backup.mjs restore "$$BACKUP" "$(RUNTIME_DATA_DIR)" "$(PORT)"; \
+	if [ ! -f "$(RUNTIME_DATA_DIR)/config/session-secret.key" ]; then \
 	  echo "⚠️  警告：备份中缺少 session-secret.key，用户登录 cookie 将失效，需重新登录"; \
 	fi; \
 	echo "✅ 数据恢复完成"; \

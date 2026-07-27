@@ -111,6 +111,32 @@ describe('PR #547: conversation agent stays warm after final reply', () => {
     expect(files.length).toBe(1);
   });
 
+  test('a new query on a warm runner is announced exactly once before streaming begins', () => {
+    const q = new GroupQueue();
+    const jid = `web:${folder}`;
+    seedRunner(q, jid, { groupFolder: folder, queryInFlight: false });
+    const starts: Array<{ jid: string; queryId: string; startedAt: number }> =
+      [];
+    q.setOnQueryStart((callbackJid, queryId, startedAt) => {
+      starts.push({ jid: callbackJid, queryId, startedAt });
+    });
+
+    expect(q.sendMessage(jid, 'first warm follow-up')).toBe('sent');
+    expect(starts).toHaveLength(1);
+    expect(starts[0].jid).toBe(jid);
+    expect(starts[0].queryId).toBe(getState(q, jid).queryId);
+    expect(starts[0].startedAt).toBeGreaterThan(0);
+
+    // More input for the same in-flight query must not reopen the UI run.
+    expect(q.sendMessage(jid, 'same in-flight query')).toBe('sent');
+    expect(starts).toHaveLength(1);
+
+    q.markRunnerQueryIdle(jid);
+    expect(q.sendMessage(jid, 'next logical query')).toBe('sent');
+    expect(starts).toHaveLength(2);
+    expect(starts[1].queryId).not.toBe(starts[0].queryId);
+  });
+
   test('markRunnerActivity refreshes lastActivityAt so IDLE_TIMEOUT reclaims the warm runner', () => {
     const q = new GroupQueue();
     const jid = `web:${folder}`;

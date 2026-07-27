@@ -42,8 +42,26 @@ import type { RegisteredGroup } from './types.js';
 export function claimOwner(
   group: RegisteredGroup,
   senderImId: string,
+  source: NonNullable<RegisteredGroup['owner_claim_source']> = 'explicit',
 ): RegisteredGroup {
-  return { ...group, owner_im_id: senderImId };
+  return { ...group, owner_im_id: senderImId, owner_claim_source: source };
+}
+
+/** Idempotent `/owner_mention` must not downgrade a stronger trust source or
+ * clear credential-transfer quarantine. A genuinely new claim is recorded as
+ * `explicit`, sufficient for ordinary owner-only commands but not Builder. */
+export function claimOwnerFromMention(
+  group: RegisteredGroup,
+  senderImId: string,
+): RegisteredGroup {
+  if (group.owner_claim_source === 'transfer_reset') return group;
+  const existingSource =
+    group.owner_im_id === senderImId &&
+    (group.owner_claim_source === 'configured' ||
+      group.owner_claim_source === 'trusted_direct')
+      ? group.owner_claim_source
+      : 'explicit';
+  return claimOwner(group, senderImId, existingSource);
 }
 
 /**
@@ -55,7 +73,10 @@ export function releaseOwner(group: RegisteredGroup): RegisteredGroup {
   return {
     ...group,
     owner_im_id: undefined,
+    owner_claim_source: undefined,
     sender_allowlist: undefined,
+    audience_mode:
+      group.audience_mode === 'owner_only' ? 'everyone' : group.audience_mode,
     activation_mode:
       group.activation_mode === 'owner_mentioned'
         ? 'when_mentioned'
@@ -84,7 +105,10 @@ export function addToAllowlist(
   const current = group.sender_allowlist ?? [ownerImId];
   const added = idsToAdd.filter((id) => !current.includes(id));
   if (added.length === 0) return { group, added };
-  return { group: { ...group, sender_allowlist: [...current, ...added] }, added };
+  return {
+    group: { ...group, sender_allowlist: [...current, ...added] },
+    added,
+  };
 }
 
 /**
@@ -99,7 +123,10 @@ export function removeFromAllowlist(
   const current = group.sender_allowlist;
   if (!current || current.length === 0) return { group, removed: 0 };
   const next = current.filter((id) => !idsToRemove.includes(id));
-  return { group: { ...group, sender_allowlist: next }, removed: current.length - next.length };
+  return {
+    group: { ...group, sender_allowlist: next },
+    removed: current.length - next.length,
+  };
 }
 
 /**

@@ -1,23 +1,38 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronUp, OctagonX } from 'lucide-react';
-import { useChatStore } from '../../stores/chat';
+import { ChevronDown, ChevronUp, Loader2 } from 'lucide-react';
+import { shouldRecoverStaleWaiting, useChatStore } from '../../stores/chat';
 import { useAuthStore } from '../../stores/auth';
-import type { AgentInfo } from '../../types';
+import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
+import type { AgentInfo, InteractionMode } from '../../types';
 import { EmojiAvatar } from '../common/EmojiAvatar';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { TodoProgressPanel } from './TodoProgressPanel';
 import { ToolActivityCard } from './ToolActivityCard';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { formatThinkingDuration } from '../../utils/thinking-duration';
+import { WorkflowRunCard } from './WorkflowRunCard';
+import { shouldShowStreamingPartialText } from '../../lib/interaction-mode';
 
 /** Render AskUserQuestion options as a visual card (read-only). */
-function AskUserQuestionCard({ toolInput }: { toolInput: Record<string, unknown> }) {
+function AskUserQuestionCard({
+  toolInput,
+}: {
+  toolInput: Record<string, unknown>;
+}) {
   // Support both "question" (string) and "questions" (array) formats
-  const questions: Array<{ question: string; options?: Array<{ value: string; label?: string }> }> = [];
+  const questions: Array<{
+    question: string;
+    options?: Array<{ value: string; label?: string }>;
+  }> = [];
   if (Array.isArray(toolInput.questions)) {
     for (const q of toolInput.questions) {
       if (q && typeof q === 'object' && 'question' in q) {
-        questions.push(q as { question: string; options?: Array<{ value: string; label?: string }> });
+        questions.push(
+          q as {
+            question: string;
+            options?: Array<{ value: string; label?: string }>;
+          },
+        );
       }
     }
   } else if (typeof toolInput.question === 'string') {
@@ -32,8 +47,13 @@ function AskUserQuestionCard({ toolInput }: { toolInput: Record<string, unknown>
   return (
     <div className="mt-2 mb-2 space-y-2">
       {questions.map((q, qi) => (
-        <div key={qi} className="rounded-lg border border-brand-200 bg-brand-50/30 p-3">
-          <div className="text-sm font-medium text-foreground mb-2">{q.question}</div>
+        <div
+          key={qi}
+          className="rounded-lg border border-brand-200 bg-brand-50/30 p-3"
+        >
+          <div className="text-sm font-medium text-foreground mb-2">
+            {q.question}
+          </div>
           {q.options && q.options.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
               {q.options.map((opt, oi) => (
@@ -61,99 +81,21 @@ const TASK_STATUS_LABELS: Record<string, string> = {
   error: '出错',
 };
 
-type StreamingState = import('../../stores/chat').StreamingState;
-type AgentContextAudit = NonNullable<StreamingState['contextAudit']>;
-
-function shortPath(path?: string): string {
-  if (!path) return '未设置';
-  if (path.length <= 72) return path;
-  return `...${path.slice(-69)}`;
-}
-
-function AgentContextPanel({ audit }: { audit: AgentContextAudit }) {
-  const [expanded, setExpanded] = useState(false);
-  const warningCount = audit.warnings.length;
-  const skillsCount = audit.skills.includedSkills ?? audit.skills.totalSkills ?? 0;
-  const skillsTokens = audit.skills.tokens ?? 0;
-  const rulesLoaded = audit.rules.loadedFileCount ?? 0;
-
-  const rows = [
-    {
-      label: 'CLAUDE.md',
-      value: audit.claudeMd.status,
-      detail: audit.claudeMd.runtimePath || audit.claudeMd.sourcePath,
-    },
-    {
-      label: 'rules/',
-      value: `${audit.rules.fileCount} 个文件${rulesLoaded ? ` · SDK 命中 ${rulesLoaded}` : ''}`,
-      detail: audit.rules.runtimePath || audit.rules.sourcePath,
-    },
-    {
-      label: 'skills/',
-      value: `${skillsCount} 个${skillsTokens ? ` · ${skillsTokens.toLocaleString()} tokens` : ''}`,
-      detail: audit.skills.sources
-        .filter((source) => source.sourcePath || source.runtimePath || source.count)
-        .map((source) => `${source.name}: ${source.count ?? 0}`)
-        .join(' · '),
-    },
-    {
-      label: 'HappyClaw prompt',
-      value: `${audit.happyclawPrompt.files.length} 个补丁 · ${audit.happyclawPrompt.totalBytes.toLocaleString()} bytes`,
-      detail: audit.happyclawPrompt.files.map((file) => file.name).join(', '),
-    },
-  ];
-
-  return (
-    <div className={`mb-2 rounded-lg border overflow-hidden ${warningCount ? 'border-amber-300/70 bg-amber-50/35 dark:border-amber-800/50 dark:bg-amber-950/25' : 'border-border bg-muted/20'}`}>
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-muted/40 transition-colors"
-      >
-        <span className="text-xs font-medium text-muted-foreground">Agent Context</span>
-        <span className={`text-[11px] ${warningCount ? 'text-amber-700 dark:text-amber-300' : 'text-muted-foreground'}`}>
-          {warningCount ? `${warningCount} 个 warning` : '已审计'}
-        </span>
-        <span className="text-[11px] text-muted-foreground hidden sm:inline">
-          {audit.executionMode} · {skillsCount} skills
-        </span>
-        <span className="flex-1" />
-        {expanded ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
-      </button>
-      {expanded && (
-        <div className="border-t border-border/60 px-3 py-2 space-y-2">
-          <div className="grid gap-1.5 sm:grid-cols-2">
-            {rows.map((row) => (
-              <div key={row.label} className="min-w-0">
-                <div className="text-[11px] font-medium text-muted-foreground">{row.label}</div>
-                <div className="text-[13px] text-foreground/80 break-words">{row.value}</div>
-                {row.detail && (
-                  <div className="text-[11px] text-muted-foreground break-all">{shortPath(row.detail)}</div>
-                )}
-              </div>
-            ))}
-          </div>
-          {(audit.externalClaudeDir || audit.claudeConfigDir) && (
-            <div className="text-[11px] text-muted-foreground break-all">
-              {audit.externalClaudeDir && <div>externalClaudeDir: {shortPath(audit.externalClaudeDir)}</div>}
-              {audit.claudeConfigDir && <div>CLAUDE_CONFIG_DIR: {shortPath(audit.claudeConfigDir)}</div>}
-            </div>
-          )}
-          {warningCount > 0 && (
-            <div className="rounded-md border border-amber-200/70 bg-amber-100/40 dark:border-amber-800/50 dark:bg-amber-900/20 px-2 py-1.5 text-[12px] text-amber-900/80 dark:text-amber-200/80 space-y-0.5">
-              {audit.warnings.slice(0, 6).map((warning, index) => (
-                <div key={`${warning}-${index}`} className="break-words">{warning}</div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
+function formatSystemStatus(status: string): string {
+  if (status === 'requesting') return '正在处理…';
+  if (status === 'compacting') return '正在整理上下文…';
+  return status;
 }
 
 /** Collapsible block for a single Task Agent — visually consistent with the Thinking block. */
-function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: string }) {
-  const streaming = useChatStore(s => s.agentStreaming[agent.id]);
+function TaskAgentBlock({
+  agent,
+  groupJid,
+}: {
+  agent: AgentInfo;
+  groupJid: string;
+}) {
+  const streaming = useChatStore((s) => s.agentStreaming[agent.id]);
   const isRunning = agent.status === 'running';
   const [expanded, setExpanded] = useState(isRunning);
   const [localElapsed, setLocalElapsed] = useState<Record<string, number>>({});
@@ -167,9 +109,8 @@ function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: strin
   // (membership) rather than the array reference — every tool_progress event
   // produces a fresh array but the same members, and re-creating the interval
   // each time would prevent it from ever ticking.
-  const activeToolIdSignature = streaming?.activeTools
-    .map((t) => t.toolUseId)
-    .join('|') ?? '';
+  const activeToolIdSignature =
+    streaming?.activeTools.map((t) => t.toolUseId).join('|') ?? '';
   useEffect(() => {
     if (!activeToolIdSignature) {
       setLocalElapsed({});
@@ -177,7 +118,8 @@ function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: strin
     }
     const interval = setInterval(() => {
       const now = Date.now();
-      const tools = useChatStore.getState().agentStreaming[agent.id]?.activeTools ?? [];
+      const tools =
+        useChatStore.getState().agentStreaming[agent.id]?.activeTools ?? [];
       const next: Record<string, number> = {};
       for (const tool of tools) {
         next[tool.toolUseId] = (now - tool.startTime) / 1000;
@@ -187,16 +129,46 @@ function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: strin
     return () => clearInterval(interval);
   }, [activeToolIdSignature, agent.id]);
 
-  const borderColor = isRunning ? 'border-blue-200/60 dark:border-blue-700/40' : agent.status === 'error' ? 'border-red-200/60 dark:border-red-700/40' : 'border-emerald-200/60 dark:border-emerald-700/40';
-  const bgColor = isRunning ? 'bg-blue-50/40 dark:bg-blue-950/30' : agent.status === 'error' ? 'bg-red-50/40 dark:bg-red-950/30' : 'bg-emerald-50/40 dark:bg-emerald-950/30';
-  const hoverBg = isRunning ? 'hover:bg-blue-50/60 dark:hover:bg-blue-900/30' : agent.status === 'error' ? 'hover:bg-red-50/60 dark:hover:bg-red-900/30' : 'hover:bg-emerald-50/60 dark:hover:bg-emerald-900/30';
-  const dotColor = isRunning ? 'bg-blue-500 animate-pulse' : agent.status === 'error' ? 'bg-red-500' : 'bg-emerald-500';
-  const textColor = isRunning ? 'text-blue-700 dark:text-blue-300' : agent.status === 'error' ? 'text-red-700 dark:text-red-300' : 'text-emerald-700 dark:text-emerald-300';
-  const chevronColor = isRunning ? 'text-blue-400 dark:text-blue-500' : agent.status === 'error' ? 'text-red-400 dark:text-red-500' : 'text-emerald-400 dark:text-emerald-500';
-  const contentBorderColor = isRunning ? 'border-blue-100 dark:border-blue-800/50' : agent.status === 'error' ? 'border-red-100 dark:border-red-800/50' : 'border-emerald-100 dark:border-emerald-800/50';
+  const borderColor = isRunning
+    ? 'border-blue-200/60 dark:border-blue-700/40'
+    : agent.status === 'error'
+      ? 'border-red-200/60 dark:border-red-700/40'
+      : 'border-emerald-200/60 dark:border-emerald-700/40';
+  const bgColor = isRunning
+    ? 'bg-blue-50/40 dark:bg-blue-950/30'
+    : agent.status === 'error'
+      ? 'bg-red-50/40 dark:bg-red-950/30'
+      : 'bg-emerald-50/40 dark:bg-emerald-950/30';
+  const hoverBg = isRunning
+    ? 'hover:bg-blue-50/60 dark:hover:bg-blue-900/30'
+    : agent.status === 'error'
+      ? 'hover:bg-red-50/60 dark:hover:bg-red-900/30'
+      : 'hover:bg-emerald-50/60 dark:hover:bg-emerald-900/30';
+  const dotColor = isRunning
+    ? 'bg-blue-500 animate-pulse'
+    : agent.status === 'error'
+      ? 'bg-red-500'
+      : 'bg-emerald-500';
+  const textColor = isRunning
+    ? 'text-blue-700 dark:text-blue-300'
+    : agent.status === 'error'
+      ? 'text-red-700 dark:text-red-300'
+      : 'text-emerald-700 dark:text-emerald-300';
+  const chevronColor = isRunning
+    ? 'text-blue-400 dark:text-blue-500'
+    : agent.status === 'error'
+      ? 'text-red-400 dark:text-red-500'
+      : 'text-emerald-400 dark:text-emerald-500';
+  const contentBorderColor = isRunning
+    ? 'border-blue-100 dark:border-blue-800/50'
+    : agent.status === 'error'
+      ? 'border-red-100 dark:border-red-800/50'
+      : 'border-emerald-100 dark:border-emerald-800/50';
 
   return (
-    <div className={`mb-3 rounded-xl border ${borderColor} ${bgColor} overflow-hidden`}>
+    <div
+      className={`mb-3 rounded-xl border ${borderColor} ${bgColor} overflow-hidden`}
+    >
       <button
         onClick={() => setExpanded(!expanded)}
         className={`w-full flex items-center gap-2 px-3 py-2 text-left ${hoverBg} transition-colors`}
@@ -218,7 +190,9 @@ function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: strin
       {expanded && (
         <div className={`px-3 pb-3 border-t ${contentBorderColor} space-y-2`}>
           {/* Agent prompt */}
-          <p className="text-[13px] text-foreground/60 mt-2 line-clamp-2">{agent.prompt}</p>
+          <p className="text-[13px] text-foreground/60 mt-2 line-clamp-2">
+            {agent.prompt}
+          </p>
 
           {/* Live streaming state (running) */}
           {isRunning && streaming && (
@@ -235,21 +209,25 @@ function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: strin
               )}
               {streaming.activeTools.length > 0 && (
                 <div className="space-y-1.5">
-                  {streaming.activeTools.filter(t => t.toolName !== 'AskUserQuestion').map((tool) => (
-                    <ToolActivityCard
-                      key={tool.toolUseId}
-                      tool={tool}
-                      localElapsed={localElapsed[tool.toolUseId]}
-                    />
-                  ))}
+                  {streaming.activeTools
+                    .filter((t) => t.toolName !== 'AskUserQuestion')
+                    .map((tool) => (
+                      <ToolActivityCard
+                        key={tool.toolUseId}
+                        tool={tool}
+                        localElapsed={localElapsed[tool.toolUseId]}
+                      />
+                    ))}
                 </div>
               )}
               {streaming.partialText && (
                 <div className="max-w-none overflow-hidden text-sm [&>div>*:first-child]:!mt-0">
                   <MarkdownRenderer
-                    content={streaming.partialText.length > 2000
-                      ? '...' + streaming.partialText.slice(-1500)
-                      : streaming.partialText}
+                    content={
+                      streaming.partialText.length > 2000
+                        ? '...' + streaming.partialText.slice(-1500)
+                        : streaming.partialText
+                    }
                     groupJid={groupJid}
                     variant="chat"
                     streaming
@@ -261,7 +239,9 @@ function TaskAgentBlock({ agent, groupJid }: { agent: AgentInfo; groupJid: strin
 
           {/* Result summary (completed/error) */}
           {!isRunning && agent.result_summary && (
-            <p className="text-[13px] text-foreground/70">{agent.result_summary}</p>
+            <p className="text-[13px] text-foreground/70">
+              {agent.result_summary}
+            </p>
           )}
         </div>
       )}
@@ -278,13 +258,14 @@ function SdkTaskRuntimeBlock({
 }) {
   const [expanded, setExpanded] = useState(task.status === 'running');
   const isRunning = task.status === 'running' || task.status === 'backgrounded';
-  const statusLabel = task.status === 'completed'
-    ? '已完成'
-    : task.status === 'error'
-      ? '出错'
-      : task.status === 'backgrounded'
-        ? '后台执行'
-        : '执行中';
+  const statusLabel =
+    task.status === 'completed'
+      ? '已完成'
+      : task.status === 'error'
+        ? '出错'
+        : task.status === 'backgrounded'
+          ? '后台执行'
+          : '执行中';
 
   return (
     <div className="rounded-lg border border-border bg-muted/20 overflow-hidden">
@@ -292,31 +273,53 @@ function SdkTaskRuntimeBlock({
         onClick={() => setExpanded(!expanded)}
         className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-muted/40 transition-colors"
       >
-        <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-blue-500 animate-pulse' : task.status === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`} />
-        <span className="text-xs font-medium text-foreground truncate">{task.title}</span>
-        {task.subagentType && <span className="text-[11px] text-muted-foreground">{task.subagentType}</span>}
+        <span
+          className={`w-2 h-2 rounded-full ${isRunning ? 'bg-blue-500 animate-pulse' : task.status === 'error' ? 'bg-red-500' : 'bg-emerald-500'}`}
+        />
+        <span className="text-xs font-medium text-foreground truncate">
+          {task.title}
+        </span>
+        {task.subagentType && (
+          <span className="text-[11px] text-muted-foreground">
+            {task.subagentType}
+          </span>
+        )}
         <span className="text-[11px] text-muted-foreground">{statusLabel}</span>
         <span className="flex-1" />
-        {expanded ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+        {expanded ? (
+          <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+        ) : (
+          <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />
+        )}
       </button>
       {expanded && (
         <div className="border-t border-border px-3 py-2 space-y-2">
           {task.latestSummary && (
             <div className="text-[13px] text-foreground/75 whitespace-pre-wrap break-words">
-              {task.lastToolName && <span className="text-muted-foreground">[{task.lastToolName}] </span>}
+              {task.lastToolName && (
+                <span className="text-muted-foreground">
+                  [{task.lastToolName}]{' '}
+                </span>
+              )}
               {task.latestSummary}
             </div>
           )}
           {task.activeTools.length > 0 && (
             <div className="space-y-1.5">
               {task.activeTools.map((tool) => (
-                <ToolActivityCard key={tool.toolUseId} tool={tool} localElapsed={undefined} />
+                <ToolActivityCard
+                  key={tool.toolUseId}
+                  tool={tool}
+                  localElapsed={undefined}
+                />
               ))}
             </div>
           )}
           {task.recentTools.length > 0 && (
             <div className="text-[13px] text-muted-foreground space-y-0.5">
-              {task.recentTools.slice(-5).map((item) => <div key={item.id}>{item.text}</div>)}
+              {task.recentTools.slice(-5).map((item) => (
+                <div key={item.id}>{item.text}</div>
+              ))}
             </div>
           )}
           {task.thinkingTail && (
@@ -327,7 +330,11 @@ function SdkTaskRuntimeBlock({
           {task.textTail && (
             <div className="max-w-none overflow-hidden text-sm [&>div>*:first-child]:!mt-0">
               <MarkdownRenderer
-                content={task.textTail.length > 2000 ? '...' + task.textTail.slice(-1500) : task.textTail}
+                content={
+                  task.textTail.length > 2000
+                    ? '...' + task.textTail.slice(-1500)
+                    : task.textTail
+                }
                 groupJid={groupJid}
                 variant="chat"
                 streaming
@@ -340,20 +347,61 @@ function SdkTaskRuntimeBlock({
   );
 }
 
-function TracePanel({ streaming }: { streaming: import('../../stores/chat').StreamingState }) {
+function TracePanel({
+  streaming,
+}: {
+  streaming: import('../../stores/chat').StreamingState;
+}) {
   const [expanded, setExpanded] = useState(false);
-  const visibleTrace = streaming.traceEvents.filter((e) => e.displayLevel !== 'debug');
-  if (visibleTrace.length === 0 && Object.keys(streaming.taskStates).length === 0) return null;
+  const seenTrace = new Set<string>();
+  const visibleTrace = streaming.traceEvents
+    .filter((e) => e.displayLevel !== 'debug' && e.kind !== 'context')
+    .filter((event) => {
+      const key = `${event.kind}\u0000${event.taskId ?? ''}\u0000${event.title}\u0000${event.summary ?? ''}\u0000${event.detail ?? ''}`;
+      if (seenTrace.has(key)) return false;
+      seenTrace.add(key);
+      return true;
+    });
+  if (
+    visibleTrace.length === 0 &&
+    Object.keys(streaming.taskStates).length === 0
+  )
+    return null;
 
   const groups = [
-    { key: 'permission', label: '🚫 权限拒绝', items: visibleTrace.filter(e => e.kind === 'permission') },
-    { key: 'task', label: 'Task / Sub-agent', items: visibleTrace.filter(e => e.kind === 'task') },
-    { key: 'tool', label: 'Tools', items: visibleTrace.filter(e => e.kind === 'tool' || e.kind === 'skill') },
-    { key: 'hook', label: 'Hooks', items: visibleTrace.filter(e => e.kind === 'hook') },
-    { key: 'memory', label: 'Memory / Compaction', items: visibleTrace.filter(e => e.kind === 'memory') },
-    { key: 'context', label: 'Agent Context', items: visibleTrace.filter(e => e.kind === 'context') },
-    { key: 'system', label: 'System', items: visibleTrace.filter(e => e.kind === 'status') },
-  ].filter(g => g.items.length > 0);
+    {
+      key: 'permission',
+      label: '🚫 权限拒绝',
+      items: visibleTrace.filter((e) => e.kind === 'permission'),
+    },
+    {
+      key: 'task',
+      label: 'Task / Sub-agent',
+      items: visibleTrace.filter((e) => e.kind === 'task'),
+    },
+    {
+      key: 'tool',
+      label: 'Tools',
+      items: visibleTrace.filter(
+        (e) => e.kind === 'tool' || e.kind === 'skill',
+      ),
+    },
+    {
+      key: 'hook',
+      label: 'Hooks',
+      items: visibleTrace.filter((e) => e.kind === 'hook'),
+    },
+    {
+      key: 'memory',
+      label: 'Memory / Compaction',
+      items: visibleTrace.filter((e) => e.kind === 'memory'),
+    },
+    {
+      key: 'system',
+      label: 'System',
+      items: visibleTrace.filter((e) => e.kind === 'status'),
+    },
+  ].filter((g) => g.items.length > 0);
 
   return (
     <div className="rounded-lg border border-border bg-muted/20 mb-2 overflow-hidden">
@@ -361,19 +409,33 @@ function TracePanel({ streaming }: { streaming: import('../../stores/chat').Stre
         onClick={() => setExpanded(!expanded)}
         className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-muted/40 transition-colors"
       >
-        <span className="text-xs font-medium text-muted-foreground">运行轨迹</span>
-        <span className="text-[11px] text-muted-foreground">{visibleTrace.length} 条</span>
+        <span className="text-xs font-medium text-muted-foreground">
+          执行详情
+        </span>
+        <span className="text-[11px] text-muted-foreground">
+          {visibleTrace.length} 条
+        </span>
         <span className="flex-1" />
-        {expanded ? <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" /> : <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />}
+        {expanded ? (
+          <ChevronUp className="w-3.5 h-3.5 text-muted-foreground" />
+        ) : (
+          <ChevronDown className="w-3.5 h-3.5 text-muted-foreground" />
+        )}
       </button>
       {expanded && (
         <div className="border-t border-border px-3 py-2 space-y-3 max-h-72 overflow-y-auto">
           {groups.map((group) => (
             <div key={group.key}>
-              <div className="text-[11px] font-medium text-muted-foreground mb-1">{group.label}</div>
+              <div className="text-[11px] font-medium text-muted-foreground mb-1">
+                {group.label}
+              </div>
               <div className="space-y-1">
                 {group.items.slice(-20).map((item) => (
-                  <TraceRow key={item.id} item={item} danger={group.key === 'permission'} />
+                  <TraceRow
+                    key={item.id}
+                    item={item}
+                    danger={group.key === 'permission'}
+                  />
                 ))}
               </div>
             </div>
@@ -396,7 +458,9 @@ function TraceRow({
 }) {
   const [open, setOpen] = useState(false);
   const hasDetail = !!item.detail && item.detail !== item.summary;
-  const base = danger ? 'text-red-800/80 dark:text-red-200/80' : 'text-foreground/75';
+  const base = danger
+    ? 'text-red-800/80 dark:text-red-200/80'
+    : 'text-foreground/75';
   return (
     <div className={`text-[13px] ${base} break-words`}>
       <div
@@ -411,7 +475,9 @@ function TraceRow({
           ))}
         <span>
           <span className="font-medium">{item.title}</span>
-          {item.summary && <span className="text-muted-foreground"> — {item.summary}</span>}
+          {item.summary && (
+            <span className="text-muted-foreground"> — {item.summary}</span>
+          )}
         </span>
       </div>
       {hasDetail && open && (
@@ -446,7 +512,10 @@ function PermissionAlert({
           >
             <span className="font-medium">{item.title}</span>
             {(item.detail || item.summary) && (
-              <span className="opacity-75"> — {item.detail || item.summary}</span>
+              <span className="opacity-75">
+                {' '}
+                — {item.detail || item.summary}
+              </span>
             )}
           </div>
         ))}
@@ -464,6 +533,7 @@ function StreamingContent({
   setThinkingExpanded,
   thinkingRef,
   handleThinkingScroll,
+  showPartialText,
 }: {
   streaming: import('../../stores/chat').StreamingState;
   localElapsed: Record<string, number>;
@@ -472,31 +542,53 @@ function StreamingContent({
   setThinkingExpanded: (v: boolean) => void;
   thinkingRef: React.RefObject<HTMLDivElement | null>;
   handleThinkingScroll: () => void;
+  showPartialText: boolean;
 }) {
   // Classify active tools
   const cardTools = streaming.activeTools.filter(
-    t => t.toolName !== 'AskUserQuestion'
+    (t) => t.toolName !== 'AskUserQuestion',
   );
   const askUserTools = streaming.activeTools.filter(
-    t => t.toolName === 'AskUserQuestion' && t.toolInput
+    (t) => t.toolName === 'AskUserQuestion' && t.toolInput,
   );
+  const hasWorkflowTasks = Object.values(streaming.taskStates).some(
+    (task) => task.workflowRun || task.taskType === 'local_workflow',
+  );
+  const showSystemStatus =
+    streaming.systemStatus &&
+    !(
+      hasWorkflowTasks &&
+      /后台任务运行中|完成后将继续汇总/u.test(streaming.systemStatus)
+    )
+      ? streaming.systemStatus
+      : null;
 
   return (
     <>
       {/* System status */}
-      {streaming.systemStatus && (
+      {showSystemStatus && (
         <div className="flex items-center gap-2 text-[13px] text-muted-foreground mb-2">
-          <svg className="w-3.5 h-3.5 animate-spin text-primary" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          <svg
+            className="w-3.5 h-3.5 animate-spin text-primary"
+            viewBox="0 0 24 24"
+            fill="none"
+          >
+            <circle
+              className="opacity-25"
+              cx="12"
+              cy="12"
+              r="10"
+              stroke="currentColor"
+              strokeWidth="4"
+            />
+            <path
+              className="opacity-75"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+            />
           </svg>
-          <span>{streaming.systemStatus === 'compacting' ? '上下文压缩中...' : streaming.systemStatus}</span>
+          <span>{formatSystemStatus(showSystemStatus)}</span>
         </div>
-      )}
-
-      {/* Runtime context audit */}
-      {streaming.contextAudit && (
-        <AgentContextPanel audit={streaming.contextAudit} />
       )}
 
       {/* Reasoning block */}
@@ -506,15 +598,26 @@ function StreamingContent({
             onClick={() => setThinkingExpanded(!thinkingExpanded)}
             className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-amber-50/60 dark:hover:bg-amber-900/30 transition-colors"
           >
-            <svg className="w-4 h-4 text-amber-500 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z" />
+            <svg
+              className="w-4 h-4 text-amber-500 flex-shrink-0"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.259 8.715L18 9.75l-.259-1.035a3.375 3.375 0 00-2.455-2.456L14.25 6l1.036-.259a3.375 3.375 0 002.455-2.456L18 2.25l.259 1.035a3.375 3.375 0 002.455 2.456L21.75 6l-1.036.259a3.375 3.375 0 00-2.455 2.456z"
+              />
             </svg>
             <span className="text-xs font-medium text-amber-700 dark:text-amber-300">
               {streaming.isThinking
                 ? 'Reasoning...'
-                : (streaming.thinkingDurationMs != null && streaming.thinkingDurationMs > 0
-                    ? formatThinkingDuration(streaming.thinkingDurationMs)
-                    : 'Reasoning')}
+                : streaming.thinkingDurationMs != null &&
+                    streaming.thinkingDurationMs > 0
+                  ? formatThinkingDuration(streaming.thinkingDurationMs)
+                  : 'Reasoning'}
             </span>
             {streaming.isThinking && (
               <span className="flex gap-0.5 ml-0.5">
@@ -557,7 +660,10 @@ function StreamingContent({
             </div>
           )}
           {askUserTools.map((tool) => (
-            <AskUserQuestionCard key={tool.toolUseId} toolInput={tool.toolInput ?? {}} />
+            <AskUserQuestionCard
+              key={tool.toolUseId}
+              toolInput={tool.toolInput ?? {}}
+            />
           ))}
         </div>
       )}
@@ -572,9 +678,37 @@ function StreamingContent({
         <div className="mb-2 space-y-1.5">
           {Object.values(streaming.taskStates)
             .sort((a, b) => a.updatedAt - b.updatedAt)
-            .map((task) => (
-              <SdkTaskRuntimeBlock key={task.id} task={task} groupJid={groupJid} />
-            ))}
+            .map((task) =>
+              task.workflowRun || task.taskType === 'local_workflow' ? (
+                <WorkflowRunCard
+                  key={task.id}
+                  run={
+                    task.workflowRun ?? {
+                      taskId: task.id,
+                      workflowName: task.workflowName,
+                      summary: task.title,
+                      status:
+                        task.status === 'completed'
+                          ? 'completed'
+                          : task.status === 'error'
+                            ? 'failed'
+                            : 'running',
+                      durationMs: task.usage?.durationMs,
+                      totalTokens: task.usage?.totalTokens,
+                      totalToolCalls: task.usage?.toolUses,
+                      phases: [],
+                      agents: [],
+                    }
+                  }
+                />
+              ) : (
+                <SdkTaskRuntimeBlock
+                  key={task.id}
+                  task={task}
+                  groupJid={groupJid}
+                />
+              ),
+            )}
         </div>
       )}
 
@@ -584,52 +718,45 @@ function StreamingContent({
       {/* Full trace */}
       <TracePanel streaming={streaming} />
 
-      {/* Recent events timeline */}
-      {streaming.recentEvents.length > 0 && (
-        <div className="rounded-lg border border-border bg-muted/30 p-2 mb-2">
-          <div className="text-xs font-medium text-muted-foreground mb-1">调用轨迹</div>
-          <div className="space-y-0.5 max-h-28 overflow-y-auto">
-            {streaming.recentEvents.map((item) => (
-              <div key={item.id} className="text-[13px] text-foreground/70 break-words">
-                {item.text}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
       {/* Hook */}
       {streaming.activeHook && (
         <div className="flex items-center gap-2 text-[13px] text-muted-foreground mb-2">
-          <svg className="w-3.5 h-3.5 animate-spin text-primary" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+          <svg
+            className="w-3.5 h-3.5 animate-spin text-primary"
+            viewBox="0 0 24 24"
+            fill="none"
+          >
+            <circle
+              className="opacity-25"
+              cx="12"
+              cy="12"
+              r="10"
+              stroke="currentColor"
+              strokeWidth="4"
+            />
+            <path
+              className="opacity-75"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+            />
           </svg>
           <span>Hook: {streaming.activeHook.hookName}</span>
         </div>
       )}
 
       {/* Partial text */}
-      {streaming.partialText && (
+      {showPartialText && streaming.partialText && (
         <div className="max-w-none overflow-hidden [&>div>*:first-child]:!mt-0">
           <MarkdownRenderer
-            content={streaming.partialText.length > 3000
-              ? '...' + streaming.partialText.slice(-2000)
-              : streaming.partialText}
+            content={
+              streaming.partialText.length > 3000
+                ? '...' + streaming.partialText.slice(-2000)
+                : streaming.partialText
+            }
             groupJid={groupJid}
             variant="chat"
             streaming
           />
-        </div>
-      )}
-
-      {/* Interrupted indicator */}
-      {streaming.interrupted && (
-        <div className="mt-3 pt-3 border-t border-border">
-          <div className="flex items-center gap-1.5 text-[13px] text-amber-600">
-            <OctagonX className="w-3.5 h-3.5" />
-            <span>已中断</span>
-          </div>
         </div>
       )}
     </>
@@ -641,24 +768,69 @@ interface StreamingDisplayProps {
   isWaiting: boolean;
   senderName?: string;
   agentId?: string;
+  agentAvatarUrl?: string | null;
+  agentAvatarEmoji?: string | null;
+  agentAvatarColor?: string | null;
+  interactionMode?: InteractionMode;
 }
 
 const EMPTY_AGENTS: AgentInfo[] = [];
 
-export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNameProp = 'AI', agentId }: StreamingDisplayProps) {
-  const mainStreaming = useChatStore(s => s.streaming[groupJid]);
-  const agentStreamingState = useChatStore(s => agentId ? s.agentStreaming[agentId] : undefined);
+export function StreamingDisplay({
+  groupJid,
+  isWaiting,
+  senderName: senderNameProp = 'AI',
+  agentId,
+  agentAvatarUrl,
+  agentAvatarEmoji,
+  agentAvatarColor,
+  interactionMode = 'assistant',
+}: StreamingDisplayProps) {
+  const mainStreaming = useChatStore((s) => s.streaming[groupJid]);
+  const agentStreamingState = useChatStore((s) =>
+    agentId ? s.agentStreaming[agentId] : undefined,
+  );
+  const runtimeAgentKind = useChatStore((s) =>
+    agentId
+      ? s.agents[groupJid]?.find((agent) => agent.id === agentId)?.kind
+      : undefined,
+  );
+  const runtimeJid = agentId ? `${groupJid}#agent:${agentId}` : groupJid;
   const streaming = agentId ? agentStreamingState : mainStreaming;
   // Task agents — only shown in main conversation (not inside agent tabs)
-  const allAgents = useChatStore(s => !agentId ? (s.agents[groupJid] ?? EMPTY_AGENTS) : EMPTY_AGENTS);
-  const taskAgents = useMemo(() => allAgents.filter(a => a.kind === 'task' && a.status === 'running'), [allAgents]);
+  const allAgents = useChatStore((s) =>
+    !agentId ? (s.agents[groupJid] ?? EMPTY_AGENTS) : EMPTY_AGENTS,
+  );
+  const taskAgents = useMemo(
+    () => allAgents.filter((a) => a.kind === 'task' && a.status === 'running'),
+    [allAgents],
+  );
   const hasTaskAgents = taskAgents.length > 0;
-  const currentUser = useAuthStore(s => s.user);
-  const appearance = useAuthStore(s => s.appearance);
-  const senderName = currentUser?.ai_name || appearance?.aiName || senderNameProp;
-  const aiEmoji = currentUser?.ai_avatar_emoji || appearance?.aiAvatarEmoji;
-  const aiColor = currentUser?.ai_avatar_color || appearance?.aiAvatarColor;
-  const aiImageUrl = currentUser?.ai_avatar_url;
+  // Fire-and-forget spawn Agents retain Assistant streaming semantics even in
+  // a proactive Workspace. The Workspace contract applies to main and
+  // conversation Agent loops.
+  const effectiveInteractionMode =
+    runtimeAgentKind === 'spawn' ? 'assistant' : interactionMode;
+  const showPartialText = shouldShowStreamingPartialText(
+    effectiveInteractionMode,
+  );
+  const appearance = useAuthStore((state) => state.appearance);
+  const agentIdentity = resolveAgentDisplayIdentity({
+    agentName: senderNameProp,
+    avatarUrl: agentAvatarUrl,
+    avatarEmoji: agentAvatarEmoji,
+    avatarColor: agentAvatarColor,
+    mainAvatarUrl: appearance?.aiAvatarUrl,
+    mainAvatarEmoji:
+      appearance?.aiAvatarMode === 'emoji'
+        ? appearance.aiAvatarEmoji
+        : undefined,
+    mainAvatarColor:
+      appearance?.aiAvatarMode === 'emoji'
+        ? appearance.aiAvatarColor
+        : undefined,
+  });
+  const senderName = agentIdentity.name;
   const { mode: displayMode } = useDisplayMode();
   const isCompact = displayMode === 'compact';
   const [thinkingExpanded, setThinkingExpanded] = useState(true);
@@ -668,55 +840,64 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
   const userToggledThinkingRef = useRef(false);
   const [localElapsed, setLocalElapsed] = useState<Record<string, number>>({});
 
-  // Auto-clear stale waiting state to prevent UI getting stuck when agent
-  // process dies without sending a final message.
+  // Exact run_started/run_finished events own the public waiting lifecycle.
+  // This timer only recovers orphaned UI state after the authoritative run has
+  // disappeared; long but healthy runs may remain quiet indefinitely.
   const lastStreamActivityRef = useRef(Date.now());
   useEffect(() => {
-    // Reset activity timer whenever streaming state changes (i.e., new stream events)
-    if (streaming) {
-      lastStreamActivityRef.current = Date.now();
-    }
+    if (streaming) lastStreamActivityRef.current = Date.now();
   }, [streaming]);
 
   useEffect(() => {
+    if (isWaiting) lastStreamActivityRef.current = Date.now();
+  }, [isWaiting, runtimeJid]);
+
+  useEffect(() => {
     if (!isWaiting) return;
-    // Record the moment waiting starts
-    lastStreamActivityRef.current = Date.now();
 
-    const STALE_NO_DATA_MS = 60_000;   // 60s with no stream data at all
-    const STALE_WITH_DATA_MS = 180_000; // 3min since last stream event
-
-    const interval = setInterval(() => {
-      const elapsed = Date.now() - lastStreamActivityRef.current;
+    const interval = window.setInterval(() => {
       const state = useChatStore.getState();
-      const hasData = agentId
+      const hasActiveRun = !!state.activeRuns[runtimeJid];
+      const hasStreamData = agentId
         ? !!state.agentStreaming[agentId]
         : !!state.streaming[groupJid];
-      const threshold = hasData ? STALE_WITH_DATA_MS : STALE_NO_DATA_MS;
+      if (
+        !shouldRecoverStaleWaiting({
+          elapsedMs: Date.now() - lastStreamActivityRef.current,
+          hasStreamData,
+          hasActiveRun,
+        })
+      ) {
+        return;
+      }
 
-      if (elapsed > threshold) {
-        // Clear the stuck waiting state via clearStreaming (handles pendingThinking + SDK Task preservation)
-        useChatStore.getState().clearStreaming(groupJid);
-        if (agentId) {
-          // clearStreaming doesn't handle agent-specific state, clean it separately
-          useChatStore.setState(s => {
-            const nextStreaming = { ...s.agentStreaming };
-            delete nextStreaming[agentId];
-            return {
-              agentWaiting: { ...s.agentWaiting, [agentId]: false },
-              agentStreaming: nextStreaming,
-            };
-          });
+      if (agentId) {
+        useChatStore.setState((current) => {
+          // Re-check under the state mutation so a concurrent run_started
+          // cannot be cleared by this stale interval tick.
+          if (current.activeRuns[runtimeJid]) return current;
+          const nextStreaming = { ...current.agentStreaming };
+          delete nextStreaming[agentId];
+          return {
+            agentWaiting: { ...current.agentWaiting, [agentId]: false },
+            agentStreaming: nextStreaming,
+          };
+        });
+      } else {
+        // clearStreaming also preserves any useful completed thinking state.
+        if (!useChatStore.getState().activeRuns[runtimeJid]) {
+          useChatStore.getState().clearStreaming(groupJid);
         }
       }
-    }, 10_000); // check every 10s
+    }, 10_000);
 
-    return () => clearInterval(interval);
-  }, [isWaiting, groupJid, agentId]);
+    return () => window.clearInterval(interval);
+  }, [agentId, groupJid, isWaiting, runtimeJid]);
 
   // Auto-scroll thinking content (unless user scrolled up)
   useEffect(() => {
-    if (!thinkingExpanded || !thinkingRef.current || userScrolledRef.current) return;
+    if (!thinkingExpanded || !thinkingRef.current || userScrolledRef.current)
+      return;
     const el = thinkingRef.current;
     el.scrollTop = el.scrollHeight;
   }, [streaming?.thinkingText, thinkingExpanded]);
@@ -761,9 +942,8 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
   // (membership) rather than the array reference; tool_progress events bump
   // the array reference every ~200ms and would otherwise reset the timer
   // before it ever ticks.
-  const mainActiveToolIdSignature = streaming?.activeTools
-    .map((t) => t.toolUseId)
-    .join('|') ?? '';
+  const mainActiveToolIdSignature =
+    streaming?.activeTools.map((t) => t.toolUseId).join('|') ?? '';
   useEffect(() => {
     if (!mainActiveToolIdSignature) {
       setLocalElapsed({});
@@ -773,9 +953,10 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     const interval = setInterval(() => {
       const now = Date.now();
       const state = useChatStore.getState();
-      const tools = (agentId
-        ? state.agentStreaming[agentId]?.activeTools
-        : state.streaming[groupJid]?.activeTools) ?? [];
+      const tools =
+        (agentId
+          ? state.agentStreaming[agentId]?.activeTools
+          : state.streaming[groupJid]?.activeTools) ?? [];
       const next: Record<string, number> = {};
       for (const tool of tools) {
         next[tool.toolUseId] = (now - tool.startTime) / 1000;
@@ -793,36 +974,74 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     userScrolledRef.current = !isAtBottom;
   };
 
+  // Proactive mode exposes only committed native messages plus an explicit run
+  // lifecycle. Keep its activity signal visually separate from message content:
+  // it is not an unfinished Assistant reply and must not look like another card.
+  if (effectiveInteractionMode === 'proactive') {
+    if (!isWaiting) return null;
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        aria-atomic="true"
+        aria-label={`${senderName}正在处理`}
+        className={
+          isCompact
+            ? 'mb-2 flex min-h-10 items-center gap-2 border-b border-border pb-2 text-sm text-muted-foreground'
+            : 'mx-auto flex min-h-10 w-full max-w-4xl items-center gap-2 px-4 py-2 text-sm text-muted-foreground lg:pl-[60px]'
+        }
+      >
+        <Loader2
+          aria-hidden="true"
+          className="h-4 w-4 shrink-0 animate-spin text-primary motion-reduce:animate-none"
+        />
+        <span>正在处理…</span>
+      </div>
+    );
+  }
+
   // 计算是否有流式数据（含中断后冻结的 partialText）
-  const hasStreamData = (streaming && (
-    streaming.partialText ||
-    streaming.thinkingText ||
-    streaming.activeTools.length > 0 ||
-    streaming.activeHook ||
-    streaming.systemStatus ||
-    streaming.contextAudit ||
-    streaming.recentEvents.length > 0 ||
-    streaming.traceEvents.length > 0 ||
-    Object.keys(streaming.taskStates).length > 0 ||
-    (streaming.todos && streaming.todos.length > 0)
-  )) || hasTaskAgents;
+  const hasStreamData =
+    (streaming &&
+      ((showPartialText && streaming.partialText) ||
+        streaming.thinkingText ||
+        streaming.activeTools.length > 0 ||
+        streaming.activeHook ||
+        streaming.systemStatus ||
+        streaming.traceEvents.length > 0 ||
+        Object.keys(streaming.taskStates).length > 0 ||
+        (streaming.todos && streaming.todos.length > 0))) ||
+    hasTaskAgents;
+  const hasWorkflowCards = Boolean(
+    streaming &&
+    Object.values(streaming.taskStates).some(
+      (task) => task.workflowRun || task.taskType === 'local_workflow',
+    ),
+  );
 
   // 仅在既不等待也无冻结数据时才隐藏
   if (!isWaiting && !hasStreamData) return null;
 
-  // Waiting but no stream data: show empty AI card with bouncing dots
+  // Waiting but no stream data: show an accessible loading indicator
   if (isWaiting && !hasStreamData) {
     if (isCompact) {
       return (
         <div className="mb-2 border-b border-border pb-2">
           <div className="flex items-center gap-1.5 mb-1">
-            <span className="text-xs font-semibold text-primary">{senderName}</span>
+            <span className="text-xs font-semibold text-primary">
+              {senderName}
+            </span>
           </div>
-          <div className="flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
-            <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
-            <span className="w-1.5 h-1.5 bg-brand-400 rounded-full animate-bounce" />
-            <span className="text-sm text-muted-foreground ml-1">正在思考...</span>
+          <div
+            role="status"
+            aria-live="polite"
+            className="flex items-center gap-2"
+          >
+            <Loader2
+              aria-hidden="true"
+              className="h-4 w-4 animate-spin text-primary motion-reduce:animate-none"
+            />
+            <span className="text-sm text-muted-foreground">正在准备回复…</span>
           </div>
         </div>
       );
@@ -831,24 +1050,47 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
       <div className="max-w-4xl mx-auto w-full px-4 py-3">
         {/* Mobile: compact avatar + name row */}
         <div className="flex items-center gap-2 mb-1.5 lg:hidden">
-          <EmojiAvatar imageUrl={aiImageUrl} emoji={aiEmoji} color={aiColor} fallbackChar={senderName[0]} size="sm" />
-          <span className="text-xs text-muted-foreground font-medium">{senderName}</span>
+          <EmojiAvatar
+            imageUrl={agentIdentity.imageUrl}
+            emoji={agentIdentity.emoji}
+            color={agentIdentity.color}
+            fallbackChar={agentIdentity.fallbackChar}
+            size="sm"
+          />
+          <span className="text-xs text-muted-foreground font-medium">
+            {senderName}
+          </span>
         </div>
 
         <div className="lg:flex lg:gap-3">
           <div className="hidden lg:block flex-shrink-0">
-            <EmojiAvatar imageUrl={aiImageUrl} emoji={aiEmoji} color={aiColor} fallbackChar={senderName[0]} size="md" />
+            <EmojiAvatar
+              imageUrl={agentIdentity.imageUrl}
+              emoji={agentIdentity.emoji}
+              color={agentIdentity.color}
+              fallbackChar={agentIdentity.fallbackChar}
+              size="md"
+            />
           </div>
           <div className="flex-1 min-w-0">
             <div className="hidden lg:flex items-center gap-2 mb-1">
-              <span className="text-xs text-muted-foreground font-medium">{senderName}</span>
+              <span className="text-xs text-muted-foreground font-medium">
+                {senderName}
+              </span>
             </div>
             <div className="bg-surface rounded-xl border border-border/60 px-5 py-4 font-serif shadow-card">
-              <div className="flex items-center gap-1.5">
-                <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
-                <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.15s]" />
-                <span className="w-2 h-2 bg-brand-400 rounded-full animate-bounce" />
-                <span className="text-sm text-muted-foreground ml-1">正在思考...</span>
+              <div
+                role="status"
+                aria-live="polite"
+                className="flex items-center gap-2"
+              >
+                <Loader2
+                  aria-hidden="true"
+                  className="h-4 w-4 animate-spin text-primary motion-reduce:animate-none"
+                />
+                <span className="text-sm text-muted-foreground">
+                  正在准备回复…
+                </span>
               </div>
             </div>
           </div>
@@ -865,7 +1107,9 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
       <div className="mb-2 border-b border-border pb-2">
         {/* Sender line */}
         <div className="flex items-center gap-1.5 mb-1">
-          <span className="text-xs font-semibold text-primary">{senderName}</span>
+          <span className="text-xs font-semibold text-primary">
+            {senderName}
+          </span>
           {streaming?.isThinking && (
             <span className="flex gap-0.5 ml-0.5">
               <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
@@ -877,7 +1121,6 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
 
         {/* Content — flat, no card wrapper */}
         <div className="min-w-0 overflow-hidden">
-
           {/* Shared streaming content */}
           {streaming && (
             <StreamingContent
@@ -892,6 +1135,7 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
               }}
               thinkingRef={thinkingRef}
               handleThinkingScroll={handleThinkingScroll}
+              showPartialText={showPartialText}
             />
           )}
 
@@ -909,8 +1153,16 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
     <div className="max-w-4xl mx-auto w-full px-4 py-3">
       {/* Mobile: compact avatar + name row */}
       <div className="flex items-center gap-2 mb-1.5 lg:hidden">
-        <EmojiAvatar imageUrl={aiImageUrl} emoji={aiEmoji} color={aiColor} fallbackChar={senderName[0]} size="sm" />
-        <span className="text-xs text-muted-foreground font-medium">{senderName}</span>
+        <EmojiAvatar
+          imageUrl={agentIdentity.imageUrl}
+          emoji={agentIdentity.emoji}
+          color={agentIdentity.color}
+          fallbackChar={agentIdentity.fallbackChar}
+          size="sm"
+        />
+        <span className="text-xs text-muted-foreground font-medium">
+          {senderName}
+        </span>
         {streaming?.isThinking && (
           <span className="flex gap-0.5 ml-1">
             <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
@@ -922,12 +1174,20 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
 
       <div className="lg:flex lg:gap-3">
         <div className="hidden lg:block flex-shrink-0">
-          <EmojiAvatar imageUrl={aiImageUrl} emoji={aiEmoji} color={aiColor} fallbackChar={senderName[0]} size="md" />
+          <EmojiAvatar
+            imageUrl={agentIdentity.imageUrl}
+            emoji={agentIdentity.emoji}
+            color={agentIdentity.color}
+            fallbackChar={agentIdentity.fallbackChar}
+            size="md"
+          />
         </div>
         <div className="flex-1 min-w-0">
           {/* Desktop: name row */}
           <div className="hidden lg:flex items-center gap-2 mb-1">
-            <span className="text-xs text-muted-foreground font-medium">{senderName}</span>
+            <span className="text-xs text-muted-foreground font-medium">
+              {senderName}
+            </span>
             {streaming?.isThinking && (
               <span className="flex gap-0.5 ml-1">
                 <span className="w-1 h-1 bg-brand-400 rounded-full animate-bounce [animation-delay:-0.3s]" />
@@ -937,8 +1197,15 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
             )}
           </div>
 
-          {/* Card */}
-          <div className="bg-surface rounded-xl border border-border/60 px-5 py-4 overflow-hidden font-serif shadow-card">
+          {/* Workflow already provides the primary card surface. Keep the
+              streaming shell flat so the UI never nests one card in another. */}
+          <div
+            className={
+              hasWorkflowCards
+                ? 'overflow-hidden font-serif'
+                : 'bg-surface rounded-xl border border-border/60 px-5 py-4 overflow-hidden font-serif shadow-card'
+            }
+          >
             {streaming && (
               <StreamingContent
                 streaming={streaming}
@@ -952,12 +1219,17 @@ export function StreamingDisplay({ groupJid, isWaiting, senderName: senderNamePr
                 }}
                 thinkingRef={thinkingRef}
                 handleThinkingScroll={handleThinkingScroll}
+                showPartialText={showPartialText}
               />
             )}
 
             {/* Task agent blocks */}
             {taskAgents.map((agent) => (
-              <TaskAgentBlock key={agent.id} agent={agent} groupJid={groupJid} />
+              <TaskAgentBlock
+                key={agent.id}
+                agent={agent}
+                groupJid={groupJid}
+              />
             ))}
           </div>
         </div>

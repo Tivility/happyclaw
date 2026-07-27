@@ -1,5 +1,9 @@
-import { logger } from './logger.js';
-import { describeFeishuError } from './feishu.js';
+import {
+  logger,
+} from './logger.js';
+import {
+  describeFeishuError,
+} from './feishu.js';
 
 /**
  * Dispatch for the `feishu_capability` IPC request that backs the ten
@@ -44,8 +48,8 @@ export interface FeishuCapabilityRequest {
 }
 
 export type FeishuCapabilityResult =
-  | { success: true; data: unknown }
-  | { success: false; error: string };
+  | { success: true; data: unknown; operation?: string }
+  | { success: false; error: string; operation?: string };
 
 const str = (v: unknown): string | undefined =>
   typeof v === 'string' && v ? v : undefined;
@@ -208,4 +212,57 @@ export async function runFeishuCapability(
     const status = described.httpStatus ? ` (HTTP ${described.httpStatus})` : '';
     return { success: false, error: `${message}${status}` };
   }
+}
+
+export type FeishuCapabilityOperation =
+  | 'get_chat'
+  | 'list_members'
+  | 'get_user'
+  | 'get_history'
+  | 'send_card'
+  | 'add_reaction'
+  | 'remove_reaction'
+  | 'edit_message'
+  | 'recall_message'
+  | 'api_request';
+
+/**
+ * The broker or Feishu explicitly rejected a capability request before any
+ * visible mutation could be accepted. The durable Outbox may safely record a
+ * definitive failure instead of fencing the whole turn as uncertain.
+ */
+export class DefinitiveFeishuCapabilityError extends Error {
+  constructor(message: string, options: { cause?: unknown } = {}) {
+    super(
+      message,
+      options.cause === undefined ? undefined : { cause: options.cause },
+    );
+    this.name = 'DefinitiveFeishuCapabilityError';
+  }
+}
+
+// operation 在本地 FeishuCapabilityRequest 里是 string（比 upstream 的联合类型宽），
+// 这里只做 has() 判定，按 string 建集即可。
+const FEISHU_READ_OPERATIONS = new Set<string>([
+  'get_chat',
+  'list_members',
+  'get_user',
+  'get_history',
+]);
+
+/** Classify operations before they cross the durable side-effect boundary. */
+export function isFeishuCapabilityMutation(
+  request: FeishuCapabilityRequest,
+): boolean {
+  if (FEISHU_READ_OPERATIONS.has(request.operation)) return false;
+  if (request.operation !== 'api_request') return true;
+  const params =
+    request.params &&
+    typeof request.params === 'object' &&
+    !Array.isArray(request.params)
+      ? request.params
+      : {};
+  const method =
+    typeof params.method === 'string' ? params.method.trim().toUpperCase() : '';
+  return method !== '' && method !== 'GET';
 }

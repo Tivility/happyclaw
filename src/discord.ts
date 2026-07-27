@@ -29,11 +29,7 @@ import type {
   NewsChannel,
   TextBasedChannel,
 } from 'discord.js';
-import {
-  storeChatMetadata,
-  storeMessageDirect,
-  updateChatName,
-} from './db.js';
+import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
 import { notifyNewImMessage } from './message-notifier.js';
 import { broadcastNewMessage } from './web.js';
 import { logger } from './logger.js';
@@ -41,12 +37,25 @@ import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { detectImageMimeType } from './image-detector.js';
 import { splitTextChunks, createDedupCache } from './im-utils.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
+import {
+  evaluateChannelAdmission,
+  resolveAdmittedChannelRoute,
+} from './channel-admission.js';
+import { extractProviderTarget } from './channel-address.js';
+import {
+  ExactAsyncIndicatorRegistry,
+  processingIndicatorKey,
+} from './processing-indicator.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
 const DISCORD_MSG_LIMIT = 2000; // Discord message character limit
 // Same 5MB threshold as other channels — only inline base64 for small images
 const IMAGE_MAX_BASE64_SIZE = 5 * 1024 * 1024;
+
+export function isUnsupportedDiscordGroupDm(type: ChannelType): boolean {
+  return type === ChannelType.GroupDM;
+}
 
 // ─── Types ──────────────────────────────────────────────────────
 
@@ -58,6 +67,11 @@ export interface DiscordConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
   isChatAuthorized?: (jid: string) => boolean;
+  onPairAttempt?: (
+    jid: string,
+    chatName: string,
+    code: string,
+  ) => Promise<boolean>;
   ignoreMessagesBefore?: number;
   onCommand?: (
     chatJid: string,
@@ -71,11 +85,9 @@ export interface DiscordConnectOpts {
   onAgentMessage?: (baseChatJid: string, agentId: string) => void;
   onBotAddedToGroup?: (chatJid: string, chatName: string) => void;
   onBotRemovedFromGroup?: (chatJid: string) => void;
-  shouldProcessGroupMessage?: (
-    chatJid: string,
-    senderImId?: string,
-  ) => boolean;
+  shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
+  normalizeIncomingJid?: (jid: string) => string;
 }
 
 export interface DiscordHistoryMessage {
@@ -85,14 +97,25 @@ export interface DiscordHistoryMessage {
   authorBot: boolean;
   content: string;
   timestamp: string;
-  attachments: Array<{ name: string; url: string; size: number; contentType?: string }>;
+  attachments: Array<{
+    name: string;
+    url: string;
+    size: number;
+    contentType?: string;
+  }>;
   replyToId?: string;
   edited: boolean;
 }
 
 export interface DiscordChannelInfo {
   id: string;
-  type: 'dm' | 'guild_text' | 'guild_voice' | 'guild_news' | 'guild_thread' | 'guild_other';
+  type:
+    | 'dm'
+    | 'guild_text'
+    | 'guild_voice'
+    | 'guild_news'
+    | 'guild_thread'
+    | 'guild_other';
   name: string;
   topic?: string;
   nsfw?: boolean;
@@ -135,7 +158,7 @@ export interface DiscordConnection {
   ): Promise<void>;
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   setTyping(chatId: string, isTyping: boolean): Promise<void>;
-  clearAckReaction(chatId: string): void;
+  clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
   getLastMessageId?(chatId: string): string | undefined;
   createStreamingSession?(
@@ -169,11 +192,9 @@ function parseChatId(
   if (chatId.startsWith('discord:'))
     return { type: 'guild', id: chatId.slice(8) };
   // Bare ID form (after extractChatId strips prefix): dm:{userId} or raw snowflake
-  if (chatId.startsWith('dm:'))
-    return { type: 'dm', id: chatId.slice(3) };
+  if (chatId.startsWith('dm:')) return { type: 'dm', id: chatId.slice(3) };
   // Bare snowflake — assume guild channel
-  if (/^\d+$/.test(chatId))
-    return { type: 'guild', id: chatId };
+  if (/^\d+$/.test(chatId)) return { type: 'guild', id: chatId };
   return null;
 }
 
@@ -264,17 +285,15 @@ export function createDiscordConnection(
   // LRU deduplication cache（共享 helper）
   const dedup = createDedupCache({ ttlMs: 30 * 60 * 1000, max: 1000 });
   const processingLock = new ProcessingLock();
+  const rejectTimestamps = new Map<string, number>();
 
   // Last message ID per chat (for reply context)
   const lastMessageIds = new Map<string, string>();
 
-  // Ack reaction per chat: { messageId, channelId }
-  const ackReactionByChat = new Map<
-    string,
-    { messageId: string; channelId: string }
-  >();
-
-
+  const ackReactions = new ExactAsyncIndicatorRegistry<{
+    messageId: string;
+    channelId: string;
+  }>();
 
   // ─── Channel Resolution ──────────────────────────────────
 
@@ -305,51 +324,28 @@ export function createDiscordConnection(
 
   // ─── Ack Reaction ─────────────────────────────────────────
 
-  /**
-   * Add an eyes emoji reaction to a user's message as ack confirmation.
-   */
-  async function attachAckReaction(
-    msg: Message,
-    jid: string,
-  ): Promise<void> {
-    try {
-      await msg.react('\u{1F440}'); // eyes emoji
-      ackReactionByChat.set(jid, {
-        messageId: msg.id,
-        channelId: msg.channelId,
-      });
-      logger.debug({ msgId: msg.id, jid }, 'Discord ack reaction attached');
-    } catch (err) {
-      logger.debug(
-        { err, msgId: msg.id, jid },
-        'Discord ack reaction attach failed',
+  async function recallAckReaction(stored: {
+    messageId: string;
+    channelId: string;
+  }): Promise<void> {
+    const client = discordClient;
+    if (!client?.user) {
+      throw new Error('Discord client is unavailable during ack recall');
+    }
+    const channel = await client.channels.fetch(stored.channelId);
+    if (!channel?.isTextBased()) {
+      throw new Error(
+        `Discord ack channel is unavailable or not text-based: ${stored.channelId}`,
       );
     }
-  }
-
-  /**
-   * Remove the eyes emoji reaction from the stored message for a chat.
-   * Silent on failure — the emoji is non-critical.
-   */
-  async function recallAckReaction(chatId: string): Promise<void> {
-    const stored = ackReactionByChat.get(chatId);
-    if (!stored) return;
-    ackReactionByChat.delete(chatId);
-    try {
-      if (!discordClient?.user) return;
-      const channel = await discordClient.channels.fetch(stored.channelId);
-      if (channel?.isTextBased()) {
-        const textChannel = channel as TextBasedChannel;
-        const msg = await textChannel.messages.fetch(stored.messageId);
-        const reaction = msg.reactions.cache.find(
-          (r) => r.emoji.name === '\u{1F440}',
-        );
-        if (reaction) {
-          await reaction.users.remove(discordClient.user.id);
-        }
-      }
-    } catch {
-      // Non-critical: emoji will remain but won't break anything
+    const textChannel = channel as TextBasedChannel;
+    const msg = await textChannel.messages.fetch(stored.messageId);
+    const reaction = msg.reactions.cache.find(
+      (r) => r.emoji.name === '\u{1F440}',
+    );
+    // Absence is an idempotent success: the provider no longer owns a reaction.
+    if (reaction) {
+      await reaction.users.remove(client.user.id);
     }
   }
 
@@ -362,6 +358,14 @@ export function createDiscordConnection(
     try {
       // Skip bot messages
       if (msg.author.bot) return;
+
+      // Discord group DMs do not have a stable channel ownership model in
+      // HappyClaw (the previous implementation incorrectly keyed them by the
+      // individual sender). Match OpenClaw's safe default and ignore them.
+      if (isUnsupportedDiscordGroupDm(msg.channel.type)) {
+        logger.debug({ channelId: msg.channelId }, 'Discord GroupDM ignored');
+        return;
+      }
 
       const msgId = msg.id;
 
@@ -385,252 +389,324 @@ export function createDiscordConnection(
       }
       dedup.markSeen(msgId);
       try {
+        // Skip stale messages from before connection (hot-reload scenario)
+        if (opts.ignoreMessagesBefore && msg.createdTimestamp) {
+          if (msg.createdTimestamp < opts.ignoreMessagesBefore) {
+            logger.debug(
+              {
+                msgId,
+                msgTime: msg.createdTimestamp,
+                ignoreBefore: opts.ignoreMessagesBefore,
+              },
+              'Discord dropped: stale message',
+            );
+            return;
+          }
+        }
 
-      // Skip stale messages from before connection (hot-reload scenario)
-      if (opts.ignoreMessagesBefore && msg.createdTimestamp) {
-        if (msg.createdTimestamp < opts.ignoreMessagesBefore) {
-          logger.debug(
-            {
-              msgId,
-              msgTime: msg.createdTimestamp,
-              ignoreBefore: opts.ignoreMessagesBefore,
-            },
-            'Discord dropped: stale message',
+        // Determine channel type and construct JID
+        const isDM = msg.channel.type === ChannelType.DM;
+        const rawJid = isDM
+          ? `discord:dm:${msg.author.id}`
+          : `discord:${msg.channelId}`;
+        const jid = opts.normalizeIncomingJid?.(rawJid) ?? rawJid;
+
+        const senderName =
+          msg.member?.displayName ||
+          msg.author.displayName ||
+          msg.author.username;
+        const chatName = isDM
+          ? senderName
+          : (msg.channel as TextChannel).name || `Discord #${msg.channelId}`;
+        const senderImId = msg.author.id;
+
+        // Admission is deliberately before metadata, registration, group gates
+        // and attachment downloads. Pairing establishes the chat's default
+        // workspace; resolveEffectiveChatJid later applies workspace/session
+        // bindings without changing that ownership decision.
+        const admission = await evaluateChannelAdmission({
+          jid,
+          chatName,
+          text: msg.content,
+          isChatAuthorized: opts.isChatAuthorized,
+          onPairAttempt: opts.onPairAttempt,
+        });
+        if (admission.kind === 'paired') {
+          await msg.reply('配对成功！此聊天已连接到你的工作区。');
+          return;
+        }
+        if (admission.kind === 'pair_rejected') {
+          await msg.reply('配对码无效或已过期，请在 Web 设置页重新生成。');
+          return;
+        }
+        if (admission.kind === 'deny') {
+          const now = Date.now();
+          const lastReject = rejectTimestamps.get(jid) ?? 0;
+          if (now - lastReject >= 60_000) {
+            rejectTimestamps.set(jid, now);
+            await msg.reply(
+              '此聊天尚未配对。请在 Web 设置页生成配对码，然后发送 /pair <code>。',
+            );
+          }
+          logger.debug({ jid }, 'Discord chat not authorized');
+          return;
+        }
+
+        // Guild channel: check group filtering (must check actual @mention first)
+        if (!isDM) {
+          const isBotMentioned = discordClient?.user
+            ? msg.mentions.has(discordClient.user)
+            : false;
+
+          // Gate 1: require_mention mode — only process if bot was @mentioned
+          if (opts.shouldProcessGroupMessage) {
+            const shouldProcess = opts.shouldProcessGroupMessage(
+              jid,
+              senderImId,
+            );
+            if (!shouldProcess && !isBotMentioned) {
+              logger.debug(
+                { jid },
+                'Discord group message dropped (mention required but bot not @mentioned)',
+              );
+              return;
+            }
+          }
+          // Gate 2: owner_mentioned mode — when the bot IS @mentioned, only the
+          // group owner may trigger it. Mirrors whatsapp.ts: a non-owner who
+          // @mentions the bot must be dropped (the old `!isOwner && !isBotMentioned`
+          // AND-guard let any member trigger the bot simply by @mentioning it).
+          if (opts.isGroupOwnerMessage && isBotMentioned) {
+            const isOwner = opts.isGroupOwnerMessage(jid, senderImId);
+            if (!isOwner) {
+              logger.debug(
+                { jid, senderImId },
+                'Discord group message dropped (owner_mentioned mode, sender is not group owner)',
+              );
+              return;
+            }
+          }
+        }
+
+        // Extract content, stripping bot mentions
+        let content = msg.content;
+        if (!isDM && discordClient?.user) {
+          // Remove bot mention patterns: <@123456> or <@!123456>
+          content = content.replace(/<@!?\d+>/g, '').trim();
+        }
+
+        // Control commands may repair/change a binding, so consume them before
+        // route validation. Attachment work deliberately stays after routing.
+        const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
+        if (slashMatch && opts.onCommand) {
+          const cmdBody = (
+            slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
+          ).trim();
+          try {
+            const reply = await opts.onCommand(jid, cmdBody, senderImId);
+            if (reply) {
+              const channel = await resolveChannel(jid);
+              if (channel) {
+                const chunks = splitDiscordChunks(reply);
+                for (const chunk of chunks) await channel.send(chunk);
+              }
+              return;
+            }
+          } catch (err) {
+            logger.error({ jid, err }, 'Discord slash command failed');
+            return;
+          }
+        }
+
+        const resolvedRoute = resolveAdmittedChannelRoute(
+          jid,
+          opts.resolveEffectiveChatJid,
+        );
+        if (!resolvedRoute) {
+          logger.warn(
+            { jid },
+            'Discord message dropped: binding resolver rejected route',
           );
           return;
         }
-      }
+        const { targetJid, routing: agentRouting } = resolvedRoute;
 
-      // Determine channel type and construct JID
-      const isDM =
-        msg.channel.type === ChannelType.DM ||
-        msg.channel.type === ChannelType.GroupDM;
-      const jid = isDM
-        ? `discord:dm:${msg.author.id}`
-        : `discord:${msg.channelId}`;
+        // Only an admitted, policy-approved, routable chat may mutate metadata.
+        lastMessageIds.set(jid, msgId);
+        lastMessageIds.set(rawJid, msgId);
+        storeChatMetadata(jid, new Date().toISOString());
+        updateChatName(jid, chatName);
+        opts.onNewChat(jid, chatName);
 
-      const senderName = msg.member?.displayName || msg.author.displayName || msg.author.username;
-      const chatName = isDM
-        ? senderName
-        : (msg.channel as TextChannel).name || `Discord #${msg.channelId}`;
-      const senderImId = msg.author.id;
+        // Process attachments
+        let attachmentsJson: string | undefined;
+        const imageAttachments: {
+          type: 'image';
+          data: string;
+          mimeType: string;
+        }[] = [];
 
-      // Store last message ID for reply context
-      lastMessageIds.set(jid, msgId);
+        for (const attachment of msg.attachments.values()) {
+          const contentType = attachment.contentType || '';
+          const isImage = contentType.startsWith('image/');
+          const attachUrl = attachment.url;
+          const attachName = attachment.name || `file_${Date.now()}`;
 
-      // Register chat early (before mention gate) so that
-      // shouldProcessGroupMessage can find the group in registeredGroups.
-      // Without this, first-time guild channel messages are always dropped
-      // because shouldProcessGroupMessage returns false for unknown groups.
-      storeChatMetadata(jid, new Date().toISOString());
-      updateChatName(jid, chatName);
-      opts.onNewChat(jid, chatName);
+          if (isImage) {
+            // Download image for base64 and disk save
+            const buffer = await downloadAttachment(attachUrl);
+            if (buffer) {
+              const mimeType = detectImageMimeType(buffer) || contentType;
 
-      // Guild channel: check group filtering (must check actual @mention first)
-      if (!isDM) {
-        const isBotMentioned = discordClient?.user
-          ? msg.mentions.has(discordClient.user)
-          : false;
+              // Inline as base64 if under threshold
+              if (buffer.length <= IMAGE_MAX_BASE64_SIZE) {
+                imageAttachments.push({
+                  type: 'image',
+                  data: buffer.toString('base64'),
+                  mimeType,
+                });
+              }
 
-        // Gate 1: require_mention mode — only process if bot was @mentioned
-        if (opts.shouldProcessGroupMessage) {
-          const shouldProcess = opts.shouldProcessGroupMessage(jid, senderImId);
-          if (!shouldProcess && !isBotMentioned) {
-            logger.debug(
-              { jid },
-              'Discord group message dropped (mention required but bot not @mentioned)',
-            );
-            return;
-          }
-        }
-        // Gate 2: owner_mentioned mode — when the bot IS @mentioned, only the
-        // group owner may trigger it. Mirrors whatsapp.ts: a non-owner who
-        // @mentions the bot must be dropped (the old `!isOwner && !isBotMentioned`
-        // AND-guard let any member trigger the bot simply by @mentioning it).
-        if (opts.isGroupOwnerMessage && isBotMentioned) {
-          const isOwner = opts.isGroupOwnerMessage(jid, senderImId);
-          if (!isOwner) {
-            logger.debug(
-              { jid, senderImId },
-              'Discord group message dropped (owner_mentioned mode, sender is not group owner)',
-            );
-            return;
-          }
-        }
-      }
-
-      // Authorization check — before downloading any attachments to avoid
-      // resource consumption from unauthorized channels
-      if (opts.isChatAuthorized && !opts.isChatAuthorized(jid)) {
-        logger.debug({ jid }, 'Discord chat not authorized');
-        return;
-      }
-
-      // Extract content, stripping bot mentions
-      let content = msg.content;
-      if (!isDM && discordClient?.user) {
-        // Remove bot mention patterns: <@123456> or <@!123456>
-        content = content.replace(/<@!?\d+>/g, '').trim();
-      }
-
-      // Process attachments
-      let attachmentsJson: string | undefined;
-      const imageAttachments: { type: 'image'; data: string; mimeType: string }[] = [];
-
-      for (const attachment of msg.attachments.values()) {
-        const contentType = attachment.contentType || '';
-        const isImage = contentType.startsWith('image/');
-        const attachUrl = attachment.url;
-        const attachName = attachment.name || `file_${Date.now()}`;
-
-        if (isImage) {
-          // Download image for base64 and disk save
-          const buffer = await downloadAttachment(attachUrl);
-          if (buffer) {
-            const mimeType = detectImageMimeType(buffer) || contentType;
-
-            // Inline as base64 if under threshold
-            if (buffer.length <= IMAGE_MAX_BASE64_SIZE) {
-              imageAttachments.push({
-                type: 'image',
-                data: buffer.toString('base64'),
-                mimeType,
-              });
-            }
-
-            // Save to disk
-            const groupFolder = opts.resolveGroupFolder?.(jid);
-            if (groupFolder) {
-              try {
-                const ext = mimeType.split('/')[1] || 'jpg';
-                const filename = `img_${Date.now()}.${ext}`;
-                const savedPath = await saveDownloadedFile(
-                  groupFolder,
-                  'discord',
-                  filename,
-                  buffer,
-                );
-                if (!content) {
-                  content = `[图片: ${savedPath}]`;
-                } else {
-                  content += `\n[图片: ${savedPath}]`;
+              // Save to disk
+              const groupFolder = opts.resolveGroupFolder?.(jid);
+              if (groupFolder) {
+                try {
+                  const ext = mimeType.split('/')[1] || 'jpg';
+                  const filename = `img_${Date.now()}.${ext}`;
+                  const savedPath = await saveDownloadedFile(
+                    groupFolder,
+                    'discord',
+                    filename,
+                    buffer,
+                  );
+                  if (!content) {
+                    content = `[图片: ${savedPath}]`;
+                  } else {
+                    content += `\n[图片: ${savedPath}]`;
+                  }
+                } catch (err) {
+                  logger.warn({ err }, 'Failed to save Discord image to disk');
+                  if (!content) content = '[图片]';
                 }
-              } catch (err) {
-                logger.warn({ err }, 'Failed to save Discord image to disk');
+              } else {
                 if (!content) content = '[图片]';
               }
-            } else {
-              if (!content) content = '[图片]';
             }
-          }
-        } else {
-          // Non-image file: download and save to workspace
-          const buffer = await downloadAttachment(attachUrl);
-          if (buffer) {
-            const groupFolder = opts.resolveGroupFolder?.(jid);
-            if (groupFolder) {
-              try {
-                const savedPath = await saveDownloadedFile(
-                  groupFolder,
-                  'discord',
-                  attachName,
-                  buffer,
-                );
-                if (!content) {
-                  content = `[文件: ${savedPath}]`;
-                } else {
-                  content += `\n[文件: ${savedPath}]`;
+          } else {
+            // Non-image file: download and save to workspace
+            const buffer = await downloadAttachment(attachUrl);
+            if (buffer) {
+              const groupFolder = opts.resolveGroupFolder?.(jid);
+              if (groupFolder) {
+                try {
+                  const savedPath = await saveDownloadedFile(
+                    groupFolder,
+                    'discord',
+                    attachName,
+                    buffer,
+                  );
+                  if (!content) {
+                    content = `[文件: ${savedPath}]`;
+                  } else {
+                    content += `\n[文件: ${savedPath}]`;
+                  }
+                } catch (err) {
+                  logger.warn({ err }, 'Failed to save Discord file to disk');
+                  if (!content) content = `[文件: ${attachName}]`;
                 }
-              } catch (err) {
-                logger.warn({ err }, 'Failed to save Discord file to disk');
+              } else {
                 if (!content) content = `[文件: ${attachName}]`;
               }
-            } else {
-              if (!content) content = `[文件: ${attachName}]`;
             }
           }
         }
-      }
 
-      if (imageAttachments.length > 0) {
-        attachmentsJson = JSON.stringify(imageAttachments);
-      }
+        if (imageAttachments.length > 0) {
+          attachmentsJson = JSON.stringify(imageAttachments);
+        }
 
-      // Skip empty messages
-      if (!content && !attachmentsJson) {
-        return;
-      }
-
-      // Handle slash commands
-      const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-      if (slashMatch && opts.onCommand) {
-        const cmdBody = (
-          slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
-        ).trim();
-        try {
-          const reply = await opts.onCommand(jid, cmdBody, senderImId);
-          if (reply) {
-            const channel = await resolveChannel(jid);
-            if (channel) {
-              const chunks = splitDiscordChunks(reply);
-              for (const chunk of chunks) {
-                await channel.send(chunk);
-              }
-            }
-            return;
-          }
-        } catch (err) {
-          logger.error({ jid, err }, 'Discord slash command failed');
+        // Skip empty messages
+        if (!content && !attachmentsJson) {
           return;
         }
-      }
 
-      // Route and store message
-      const agentRouting = opts.resolveEffectiveChatJid?.(jid);
-      const targetJid = agentRouting?.effectiveJid ?? jid;
-
-      const id = crypto.randomUUID();
-      const timestamp = new Date(msg.createdTimestamp).toISOString();
-      const senderId = `discord:${msg.author.id}`;
-      storeChatMetadata(targetJid, timestamp);
-      storeMessageDirect(id, targetJid, senderId, senderName, content, timestamp, false, {
-        attachments: attachmentsJson,
-        sourceJid: jid,
-      });
-
-      broadcastNewMessage(
-        targetJid,
-        {
+        const id = crypto.randomUUID();
+        const timestamp = new Date(msg.createdTimestamp).toISOString();
+        const senderId = `discord:${msg.author.id}`;
+        storeChatMetadata(targetJid, timestamp);
+        storeMessageDirect(
           id,
-          chat_jid: targetJid,
-          source_jid: jid,
-          sender: senderId,
-          sender_name: senderName,
+          targetJid,
+          senderId,
+          senderName,
           content,
           timestamp,
-          attachments: attachmentsJson,
-          is_from_me: false,
-        },
-        agentRouting?.agentId ?? undefined,
-      );
-
-      // Ack reaction: confirm receipt with eyes emoji
-      attachAckReaction(msg, jid).catch(() => {});
-
-      notifyNewImMessage();
-
-      if (agentRouting?.agentId) {
-        opts.onAgentMessage?.(jid, agentRouting.agentId);
-        logger.info(
-          { jid, effectiveJid: targetJid, agentId: agentRouting.agentId },
-          'Discord message routed to agent',
+          false,
+          {
+            attachments: attachmentsJson,
+            sourceJid: jid,
+          },
         );
-      } else {
-        logger.info(
-          { jid, sender: senderName, msgId },
-          'Discord message stored',
+
+        broadcastNewMessage(
+          targetJid,
+          {
+            id,
+            chat_jid: targetJid,
+            source_jid: jid,
+            sender: senderId,
+            sender_name: senderName,
+            content,
+            timestamp,
+            attachments: attachmentsJson,
+            is_from_me: false,
+          },
+          agentRouting?.agentId ?? undefined,
         );
-      }
+
+        // Exact-input ack reaction: install ownership before the async
+        // provider call so a fast terminal clear cannot race past attach.
+        const ackChatId = extractProviderTarget(jid);
+        ackReactions
+          .attach(
+            processingIndicatorKey(ackChatId, id),
+            async () => {
+              try {
+                await msg.react('\u{1F440}'); // eyes emoji
+                logger.debug(
+                  { msgId: msg.id, inputMessageId: id, jid },
+                  'Discord ack reaction attached',
+                );
+                return {
+                  messageId: msg.id,
+                  channelId: msg.channelId,
+                };
+              } catch (err) {
+                logger.debug(
+                  { err, msgId: msg.id, inputMessageId: id, jid },
+                  'Discord ack reaction attach failed',
+                );
+                return null;
+              }
+            },
+            recallAckReaction,
+          )
+          .catch(() => {});
+
+        notifyNewImMessage();
+
+        if (agentRouting?.agentId) {
+          opts.onAgentMessage?.(jid, agentRouting.agentId);
+          logger.info(
+            { jid, effectiveJid: targetJid, agentId: agentRouting.agentId },
+            'Discord message routed to agent',
+          );
+        } else {
+          logger.info(
+            { jid, sender: senderName, msgId },
+            'Discord message stored',
+          );
+        }
       } finally {
         processingLock.release(msgId);
       }
@@ -648,8 +724,11 @@ export function createDiscordConnection(
   ): Promise<void> {
     const channel = await resolveChannel(chatId);
     if (!channel) {
-      logger.error({ chatId }, 'Discord sendMessage: failed to resolve channel');
-      return;
+      logger.error(
+        { chatId },
+        'Discord sendMessage: failed to resolve channel',
+      );
+      throw new Error(`Discord sendMessage: unknown chat ${chatId}`);
     }
 
     const chunks = splitDiscordChunks(text);
@@ -665,10 +744,11 @@ export function createDiscordConnection(
             const name = path.basename(imgPath);
             files.push(new AttachmentBuilder(buffer, { name }));
           } catch (err) {
-            logger.warn(
+            logger.error(
               { err, imgPath },
               'Discord sendMessage: failed to read local image',
             );
+            throw err;
           }
         }
         if (files.length > 0) {
@@ -691,6 +771,7 @@ export function createDiscordConnection(
 
       stopping = false;
       readyFired = false;
+      let readyTimeout: ReturnType<typeof setTimeout> | null = null;
 
       try {
         discordClient = new Client({
@@ -721,27 +802,46 @@ export function createDiscordConnection(
               { name: 'status', description: '查看当前工作区/对话状态' },
               { name: 'recall', description: '总结最近的对话内容' },
               {
+                name: 'pair',
+                description: '使用 Web 设置页生成的配对码连接当前聊天',
+                options: [
+                  {
+                    name: 'code',
+                    description: '6 位配对码',
+                    type: 3, // STRING
+                    required: true,
+                  },
+                ],
+              },
+              {
                 name: 'require_mention',
                 description: '切换群聊响应模式（需要 @Bot 才响应）',
-                options: [{
-                  name: 'enabled',
-                  description: 'true 或 false',
-                  type: 3, // STRING
-                  required: true,
-                  choices: [
-                    { name: 'true - 需要 @Bot', value: 'true' },
-                    { name: 'false - 全量响应', value: 'false' },
-                  ],
-                }],
+                options: [
+                  {
+                    name: 'enabled',
+                    description: 'true 或 false',
+                    type: 3, // STRING
+                    required: true,
+                    choices: [
+                      { name: 'true - 需要 @Bot', value: 'true' },
+                      { name: 'false - 全量响应', value: 'false' },
+                    ],
+                  },
+                ],
               },
             ]);
             // Clear guild-level commands (remove any stale ones from other apps)
             for (const guild of readyClient.guilds.cache.values()) {
-              try { await guild.commands.set([]); } catch {}
+              try {
+                await guild.commands.set([]);
+              } catch {}
             }
             logger.info('Discord application commands registered');
           } catch (err: any) {
-            logger.warn({ err: err.message }, 'Failed to register application commands');
+            logger.warn(
+              { err: err.message },
+              'Failed to register application commands',
+            );
           }
         });
 
@@ -749,29 +849,77 @@ export function createDiscordConnection(
         discordClient.on(Events.InteractionCreate, async (interaction) => {
           if (!interaction.isChatInputCommand()) return;
           if (stopping) return;
+          if (interaction.channel?.type === ChannelType.GroupDM) return;
 
           const isDM = !interaction.guildId;
-          const jid = isDM
+          const rawJid = isDM
             ? `discord:dm:${interaction.user.id}`
             : `discord:${interaction.channelId}`;
+          const jid = opts.normalizeIncomingJid?.(rawJid) ?? rawJid;
 
-          // Build command string matching HappyClaw's text command format
+          // Build command string matching HappyClaw's text command format.
           let cmdBody = interaction.commandName;
-          const enabledOpt = interaction.options.getString('enabled');
+          const enabledOpt =
+            interaction.commandName === 'require_mention'
+              ? interaction.options.getString('enabled')
+              : null;
           if (enabledOpt) cmdBody += ' ' + enabledOpt;
+          const pairCode =
+            interaction.commandName === 'pair'
+              ? interaction.options.getString('code')
+              : null;
+          if (pairCode) cmdBody += ' ' + pairCode;
 
           try {
             await interaction.deferReply();
-            const reply = await opts.onCommand?.(jid, cmdBody, interaction.user.id);
+            const chatName = isDM
+              ? interaction.user.displayName
+              : interaction.channel && 'name' in interaction.channel
+                ? interaction.channel.name
+                : `Discord #${interaction.channelId}`;
+            const admission = await evaluateChannelAdmission({
+              jid,
+              chatName,
+              text: `/${cmdBody}`,
+              isChatAuthorized: opts.isChatAuthorized,
+              onPairAttempt: opts.onPairAttempt,
+            });
+            if (admission.kind === 'paired') {
+              await interaction.editReply(
+                '配对成功！此聊天已连接到你的工作区。',
+              );
+              return;
+            }
+            if (admission.kind === 'pair_rejected') {
+              await interaction.editReply(
+                '配对码无效或已过期，请在 Web 设置页重新生成。',
+              );
+              return;
+            }
+            if (admission.kind === 'deny') {
+              await interaction.editReply(
+                '此聊天尚未配对。请先在 Web 设置页生成配对码。',
+              );
+              return;
+            }
+            const reply = await opts.onCommand?.(
+              jid,
+              cmdBody,
+              interaction.user.id,
+            );
             if (reply) {
               // Discord interaction replies have 2000 char limit
-              const truncated = reply.length > 2000 ? reply.slice(0, 1997) + '...' : reply;
+              const truncated =
+                reply.length > 2000 ? reply.slice(0, 1997) + '...' : reply;
               await interaction.editReply(truncated);
             } else {
               await interaction.editReply('命令已执行');
             }
           } catch (err: any) {
-            logger.error({ jid, cmd: cmdBody, err: err.message }, 'Discord slash command failed');
+            logger.error(
+              { jid, cmd: cmdBody, err: err.message },
+              'Discord slash command failed',
+            );
             try {
               await interaction.editReply('命令执行失败');
             } catch {}
@@ -805,21 +953,19 @@ export function createDiscordConnection(
 
         // Guild delete (bot removed from a server) — log only
         discordClient.on(Events.GuildDelete, (guild) => {
-          logger.info(
-            { guildId: guild.id },
-            'Discord bot removed from guild',
-          );
+          logger.info({ guildId: guild.id }, 'Discord bot removed from guild');
         });
 
         // Login and wait for ClientReady before returning
         // (login() resolves before ClientReady fires, so isConnected()
         // would return false if we returned immediately after login)
         const readyPromise = new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => {
+          readyTimeout = setTimeout(() => {
             reject(new Error('Discord ClientReady timeout (15s)'));
           }, 15000);
           discordClient!.once(Events.ClientReady, () => {
-            clearTimeout(timeout);
+            if (readyTimeout) clearTimeout(readyTimeout);
+            readyTimeout = null;
             resolve();
           });
         });
@@ -827,14 +973,27 @@ export function createDiscordConnection(
         await readyPromise;
         return true;
       } catch (err) {
+        if (readyTimeout) clearTimeout(readyTimeout);
         logger.error({ err }, 'Discord initial connection failed');
+        const failedClient = discordClient;
         discordClient = null;
+        if (failedClient) {
+          try {
+            failedClient.destroy();
+          } catch (cleanupError) {
+            logger.warn(
+              { cleanupError },
+              'Discord failed client cleanup threw',
+            );
+          }
+        }
         return false;
       }
     },
 
     async disconnect(): Promise<void> {
       stopping = true;
+      await ackReactions.clearAll();
       if (discordClient) {
         try {
           discordClient.destroy();
@@ -846,7 +1005,6 @@ export function createDiscordConnection(
       readyFired = false;
       dedup.clear();
       lastMessageIds.clear();
-      ackReactionByChat.clear();
       processingLock.dispose();
       logger.info('Discord bot disconnected');
     },
@@ -862,7 +1020,10 @@ export function createDiscordConnection(
     ): Promise<void> {
       const channel = await resolveChannel(chatId);
       if (!channel) {
-        logger.error({ chatId }, 'Discord sendImage: failed to resolve channel');
+        logger.error(
+          { chatId },
+          'Discord sendImage: failed to resolve channel',
+        );
         throw new Error(`Discord sendImage: unknown chat ${chatId}`);
       }
 
@@ -920,8 +1081,8 @@ export function createDiscordConnection(
       }
     },
 
-    clearAckReaction(chatId: string): void {
-      recallAckReaction(chatId).catch(() => {});
+    clearAckReaction(chatId: string, inputMessageId: string): Promise<void> {
+      return ackReactions.clear(processingIndicatorKey(chatId, inputMessageId));
     },
 
     isConnected(): boolean {
@@ -942,9 +1103,8 @@ export function createDiscordConnection(
       const channel = await resolveChannel(chatId);
       if (!channel) return undefined;
 
-      const { DiscordStreamingEditController } = await import(
-        './discord-streaming-edit.js'
-      );
+      const { DiscordStreamingEditController } =
+        await import('./discord-streaming-edit.js');
       return new DiscordStreamingEditController(
         channel as TextChannel | DMChannel,
         {
@@ -973,8 +1133,8 @@ export function createDiscordConnection(
 
       const collection = await channel.messages.fetch(fetchOpts);
       // Collection is keyed by snowflake; sort newest-first → oldest-first for readability.
-      const messages = Array.from(collection.values()).sort((a, b) =>
-        a.createdTimestamp - b.createdTimestamp,
+      const messages = Array.from(collection.values()).sort(
+        (a, b) => a.createdTimestamp - b.createdTimestamp,
       );
 
       return messages.map((m) => ({
@@ -1035,7 +1195,10 @@ export function createDiscordConnection(
         id: guildChannel.id,
         type: typeLabel,
         name: guildChannel.name,
-        topic: 'topic' in guildChannel ? guildChannel.topic ?? undefined : undefined,
+        topic:
+          'topic' in guildChannel
+            ? (guildChannel.topic ?? undefined)
+            : undefined,
         nsfw: 'nsfw' in guildChannel ? guildChannel.nsfw : undefined,
         guildId: guildChannel.guildId,
         parentId: guildChannel.parentId ?? undefined,

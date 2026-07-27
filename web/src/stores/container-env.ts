@@ -20,14 +20,17 @@ interface ContainerEnvState {
   error: string | null;
 
   loadConfig: (jid: string) => Promise<void>;
-  saveConfig: (jid: string, data: {
-    anthropicBaseUrl?: string;
-    anthropicAuthToken?: string;
-    anthropicApiKey?: string;
-    claudeCodeOauthToken?: string;
-    anthropicModel?: string;
-    customEnv?: Record<string, string>;
-  }) => Promise<boolean>;
+  saveConfig: (
+    jid: string,
+    data: {
+      anthropicBaseUrl?: string;
+      anthropicAuthToken?: string;
+      anthropicApiKey?: string;
+      claudeCodeOauthToken?: string;
+      anthropicModel?: string;
+      customEnv?: Record<string, string>;
+    },
+  ) => Promise<boolean>;
 }
 
 export const useContainerEnvStore = create<ContainerEnvState>((set) => ({
@@ -40,7 +43,7 @@ export const useContainerEnvStore = create<ContainerEnvState>((set) => ({
     set({ loading: true, error: null });
     try {
       const data = await api.get<ContainerEnvPublicConfig>(
-        `/api/groups/${encodeURIComponent(jid)}/env`
+        `/api/groups/${encodeURIComponent(jid)}/env`,
       );
       set((s) => ({
         configs: { ...s.configs, [jid]: data },
@@ -54,7 +57,7 @@ export const useContainerEnvStore = create<ContainerEnvState>((set) => ({
   },
 
   saveConfig: async (jid, data) => {
-    set({ saving: true });
+    set({ saving: true, error: null });
     try {
       const result = await api.put<ContainerEnvPublicConfig>(
         `/api/groups/${encodeURIComponent(jid)}/env`,
@@ -63,6 +66,7 @@ export const useContainerEnvStore = create<ContainerEnvState>((set) => ({
       set((s) => ({
         configs: { ...s.configs, [jid]: result },
         saving: false,
+        error: null,
       }));
       return true;
     } catch (err) {

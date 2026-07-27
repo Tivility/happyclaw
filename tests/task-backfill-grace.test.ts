@@ -25,11 +25,14 @@ const {
   createTask,
   getTaskById,
   getDueTasks,
+  claimTaskForRun,
   advanceSkippedTask,
   updateTaskAfterRun,
+  clearStaleTaskLeases,
 } = await import('../src/db.js');
 
-const { shouldSkipBackfill } = await import('../src/task-scheduler.js');
+const { shouldSkipBackfill, validateCronMinimumInterval } =
+  await import('../src/task-scheduler.js');
 
 beforeAll(() => {
   initDatabase();
@@ -68,6 +71,17 @@ function makeTask(overrides: Partial<Parameters<typeof createTask>[0]> = {}) {
 }
 
 describe('task backfill grace — db helpers', () => {
+  test('cron minimum interval is deterministic from the complete seconds field', () => {
+    for (const value of ['* * * * * *', '0,30 0 * * * *', '@secondly']) {
+      expect(() => validateCronMinimumInterval(value)).toThrow(
+        'at least 60 seconds',
+      );
+    }
+    for (const value of ['* * * * *', '0 * * * * *', '*/60 * * * * *']) {
+      expect(() => validateCronMinimumInterval(value)).not.toThrow();
+    }
+  });
+
   test('getDueTasks returns all tasks with next_run <= now (regardless of how overdue)', () => {
     const id1 = makeTask({
       next_run: new Date(Date.now() - 60_000).toISOString(), // 1 min overdue
@@ -111,10 +125,64 @@ describe('task backfill grace — db helpers', () => {
 
   test('updateTaskAfterRun continues to set last_run (sanity check the helpers stay distinct)', () => {
     const id = makeTask();
-    updateTaskAfterRun(id, new Date(Date.now() + 60_000).toISOString(), 'ran ok');
+    updateTaskAfterRun(
+      id,
+      new Date(Date.now() + 60_000).toISOString(),
+      'ran ok',
+    );
     const after = getTaskById(id)!;
     expect(after.last_run).toBeTruthy(); // contrast with advanceSkippedTask
     expect(after.last_result).toBe('ran ok');
+  });
+
+  test('claimTaskForRun gives a due task to only one scheduler runner and hides it from getDueTasks until released', () => {
+    const id = makeTask({
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+    });
+
+    expect(claimTaskForRun(id, 'runner-a', 60_000)).toBe(true);
+    expect(claimTaskForRun(id, 'runner-b', 60_000)).toBe(false);
+    expect(getDueTasks().map((t) => t.id)).not.toContain(id);
+
+    updateTaskAfterRun(
+      id,
+      new Date(Date.now() + 60_000).toISOString(),
+      'claimed run done',
+    );
+    const after = getTaskById(id)!;
+    expect(after.running_until).toBeNull();
+    expect(after.runner_id).toBeNull();
+  });
+
+  test('clearStaleTaskLeases releases a lease abandoned by a crashed runner so the task becomes due again', () => {
+    const id = makeTask({
+      next_run: new Date(Date.now() - 60_000).toISOString(),
+    });
+    // Simulate a runner claiming the task, then crashing before it can call
+    // updateTaskAfterRun/advanceSkippedTask — running_until/runner_id are
+    // left set in the DB, exactly as they would be after a process kill.
+    expect(claimTaskForRun(id, 'crashed-runner', 30 * 60_000)).toBe(true);
+    expect(getDueTasks().map((t) => t.id)).not.toContain(id);
+
+    const cleared = clearStaleTaskLeases();
+    expect(cleared).toBeGreaterThanOrEqual(1);
+
+    const after = getTaskById(id)!;
+    expect(after.running_until).toBeNull();
+    expect(after.runner_id).toBeNull();
+    // The task must be immediately claimable again by the restarted
+    // scheduler, not hidden until the old (now-meaningless) lease expiry.
+    expect(getDueTasks().map((t) => t.id)).toContain(id);
+    expect(claimTaskForRun(id, 'new-runner', 30 * 60_000)).toBe(true);
+  });
+
+  test('clearStaleTaskLeases is a no-op when no task holds a lease', () => {
+    // A task with no lease at all must not be touched/counted.
+    makeTask({ next_run: new Date(Date.now() - 60_000).toISOString() });
+    const clearedFirst = clearStaleTaskLeases();
+    expect(clearedFirst).toBeGreaterThanOrEqual(0);
+    const clearedSecond = clearStaleTaskLeases();
+    expect(clearedSecond).toBe(0);
   });
 });
 
@@ -123,7 +191,9 @@ describe('task backfill grace — decision predicate', () => {
   // breaks the test rather than silently drifting from a local mirror.
 
   test('graceMs=0 disables skipping (legacy behavior preserved)', () => {
-    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    const tenDaysAgo = new Date(
+      Date.now() - 10 * 24 * 60 * 60 * 1000,
+    ).toISOString();
     expect(shouldSkipBackfill(tenDaysAgo, Date.now(), 0)).toBe(false);
   });
 

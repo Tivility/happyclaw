@@ -29,12 +29,22 @@ import { GROUPS_DIR } from './config.js';
 import { saveDownloadedFile, MAX_FILE_SIZE } from './im-downloader.js';
 import { extractFileText } from './file-text-extractor.js';
 import { detectImageMimeType } from './image-detector.js';
-import { markdownToPlainText, splitTextChunks, createDedupCache } from './im-utils.js';
 import {
-  extractRepliedMsg,
-  type RepliedMsg,
-} from './dingtalk-reply-parser.js';
+  markdownToPlainText,
+  splitTextChunks,
+  createDedupCache,
+} from './im-utils.js';
+import { extractRepliedMsg, type RepliedMsg } from './dingtalk-reply-parser.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
+import {
+  evaluateChannelAdmission,
+  resolveAdmittedChannelRoute,
+} from './channel-admission.js';
+import { extractProviderTarget } from './channel-address.js';
+import {
+  ExactAsyncIndicatorRegistry,
+  processingIndicatorKey,
+} from './processing-indicator.js';
 
 // ─── Constants ──────────────────────────────────────────────────
 
@@ -62,7 +72,11 @@ export interface DingTalkConnectOpts {
     chatName: string,
     code: string,
   ) => Promise<boolean>;
-  onCommand?: (chatJid: string, command: string, senderImId?: string) => Promise<string | null>;
+  onCommand?: (
+    chatJid: string,
+    command: string,
+    senderImId?: string,
+  ) => Promise<string | null>;
   resolveGroupFolder?: (jid: string) => string | undefined;
   resolveEffectiveChatJid?: (
     chatJid: string,
@@ -73,7 +87,10 @@ export interface DingTalkConnectOpts {
   shouldProcessGroupMessage?: (chatJid: string, senderImId?: string) => boolean;
   isGroupOwnerMessage?: (chatJid: string, senderImId?: string) => boolean;
   /** Resolve registered group for a jid (should return { activation_mode?: string }) */
-  resolveRegisteredGroup?: (jid: string) => { activation_mode?: string } | undefined;
+  resolveRegisteredGroup?: (
+    jid: string,
+  ) => { activation_mode?: string } | undefined;
+  normalizeIncomingJid?: (jid: string) => string;
 }
 
 export interface DingTalkConnection {
@@ -93,8 +110,8 @@ export interface DingTalkConnection {
   ): Promise<void>;
   sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendReaction(chatId: string, isTyping: boolean): Promise<void>;
-  /** Clear the ack reaction for a chat (e.g. when streaming card handled the reply) */
-  clearAckReaction(chatId: string): void;
+  /** Clear the ack reaction owned by one exact inbound input. */
+  clearAckReaction(chatId: string, inputMessageId: string): Promise<void>;
   isConnected(): boolean;
   getLastMessageId?(chatId: string): string | undefined;
   createStreamingSession?(
@@ -104,6 +121,64 @@ export interface DingTalkConnection {
     | import('./dingtalk-streaming-card.js').DingTalkStreamingCardController
     | undefined
   >;
+}
+
+export interface DingTalkGroupMessageSuccess {
+  processQueryKey?: string;
+  errcode?: number;
+  errmsg?: string;
+  code?: string | number;
+  message?: string;
+}
+
+/** Validate the persistent groupMessages endpoint's transport and envelope. */
+export function parseDingTalkGroupMessageResponse(
+  statusCode: number | undefined,
+  body: string,
+): DingTalkGroupMessageSuccess {
+  if (!statusCode || statusCode < 200 || statusCode >= 300) {
+    throw new Error(
+      `DingTalk groupMessages API HTTP failed (${statusCode ?? 'unknown'}): ${body.slice(0, 200)}`,
+    );
+  }
+  if (!body.trim()) {
+    throw new Error('DingTalk groupMessages API returned an empty response');
+  }
+  let data: DingTalkGroupMessageSuccess;
+  try {
+    data = JSON.parse(body) as DingTalkGroupMessageSuccess;
+  } catch {
+    throw new Error('DingTalk groupMessages API returned invalid JSON');
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('DingTalk groupMessages API returned an invalid envelope');
+  }
+  if (data.errcode !== undefined && Number(data.errcode) !== 0) {
+    throw new Error(
+      `DingTalk groupMessages API error: ${data.errcode} ${data.errmsg ?? data.message ?? ''}`,
+    );
+  }
+  const successCodes = new Set(['0', 'ok', 'success']);
+  if (
+    data.code !== undefined &&
+    !successCodes.has(String(data.code).toLowerCase())
+  ) {
+    throw new Error(
+      `DingTalk groupMessages API error: ${String(data.code)} ${data.message ?? data.errmsg ?? ''}`,
+    );
+  }
+  const hasSuccessMarker =
+    (typeof data.processQueryKey === 'string' &&
+      data.processQueryKey.length > 0) ||
+    data.errcode === 0 ||
+    (data.code !== undefined &&
+      successCodes.has(String(data.code).toLowerCase()));
+  if (!hasSuccessMarker) {
+    throw new Error(
+      'DingTalk groupMessages API returned an unrecognized success envelope',
+    );
+  }
+  return data;
 }
 
 interface DingTalkAccessToken {
@@ -149,6 +224,21 @@ interface DingTalkRobotMessage {
 }
 
 type RobotMessage = DTRobotMessage | DingTalkRobotMessage;
+
+function extractDingTalkAdmissionText(data: RobotMessage): string {
+  if (data.msgtype === 'text' && 'text' in data) {
+    return (data as DingTalkRobotMessage).text?.content?.trim() || '';
+  }
+  if (data.msgtype === 'richText' && 'content' in data) {
+    return (
+      (data as DingTalkRobotMessage).content?.richText
+        ?.map((entry) => entry.text || '')
+        .join('')
+        .trim() || ''
+    );
+  }
+  return '';
+}
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -213,7 +303,7 @@ function parseDingTalkChatId(
   if (chatId.startsWith('cid')) {
     return { type: 'group', conversationId: chatId };
   }
-return null;
+  return null;
 }
 
 /**
@@ -312,10 +402,7 @@ export function createDingTalkConnection(
 
   // Group name cache: openConversationId → { name, expiresAt }
   // TTL: 1 hour to avoid hitting API on every message
-  const groupNameCache = new Map<
-    string,
-    { name: string; expiresAt: number }
-  >();
+  const groupNameCache = new Map<string, { name: string; expiresAt: number }>();
   const GROUP_NAME_CACHE_TTL = 60 * 60 * 1000;
 
   // ── Streaming card helper (shared between sendMessage fallback and createStreamingSession) ──
@@ -324,7 +411,10 @@ export function createDingTalkConnection(
     chatId: string,
     onCardCreated?: (messageId: string) => void,
     fallbackSend?: (text: string) => Promise<void>,
-  ): Promise<import('./dingtalk-streaming-card.js').DingTalkStreamingCardController | undefined> {
+  ): Promise<
+    | import('./dingtalk-streaming-card.js').DingTalkStreamingCardController
+    | undefined
+  > {
     const parsed = parseDingTalkChatId(chatId);
     if (!parsed) return undefined;
 
@@ -352,13 +442,10 @@ export function createDingTalkConnection(
     });
   }
 
-  // Ack reaction per chat (emoji reaction on user's message to confirm receipt)
-  const ackReactionByChat = new Map<
-    string,
-    { msgId: string; conversationId: string }
-  >();
-
-
+  const ackReactions = new ExactAsyncIndicatorRegistry<{
+    msgId: string;
+    conversationId: string;
+  }>();
 
   // ─── Token Management ──────────────────────────────────────
 
@@ -521,25 +608,15 @@ export function createDingTalkConnection(
 
   const ACK_REACTION_ATTACH_DELAYS = [0, 400, 1200];
 
-  /** Track in-flight attach promises so clearAckReaction can await them. */
-  const pendingAttaches = new Map<string, Promise<void>>();
-
   /**
    * Attach "🤔思考中" emoji reaction to user's message as ack confirmation.
    * Retries up to 3 times with backoff for transient failures.
-   * @param chatId raw JID (e.g. "dingtalk:c2c:xxx") — will be stripped to
-   *   bare chatId for storage, matching the key used by recallAckReaction.
    */
   async function attachAckReaction(
     msgId: string,
     conversationId: string,
-    rawJid: string,
-  ): Promise<void> {
-    // Strip the "dingtalk:" prefix so the Map key matches what
-    // recallAckReaction receives (which comes through extractChatId).
-    const chatId = rawJid.startsWith('dingtalk:')
-      ? rawJid.slice('dingtalk:'.length)
-      : rawJid;
+    chatId: string,
+  ): Promise<{ msgId: string; conversationId: string } | null> {
     const body = {
       robotCode: config.clientId,
       openMsgId: msgId,
@@ -560,15 +637,8 @@ export function createDingTalkConnection(
       }
       try {
         await apiRequest('POST', '/v1.0/robot/emotion/reply', body);
-        // Recall previous reaction before overwriting (e.g. second message
-        // arrives before the first is replied — prevents orphaned emoji)
-        const existing = ackReactionByChat.get(chatId);
-        if (existing) {
-          recallAckReaction(chatId).catch(() => {});
-        }
-        ackReactionByChat.set(chatId, { msgId, conversationId });
         logger.debug({ msgId, chatId }, 'DingTalk ack reaction attached');
-        return;
+        return { msgId, conversationId };
       } catch (err: any) {
         // apiRequest throws plain Error objects (no .response property),
         // so parse the status code from the error message string.
@@ -580,41 +650,33 @@ export function createDingTalkConnection(
             { err: err.message, msgId, chatId },
             'DingTalk ack reaction attach failed',
           );
-          return;
+          return null;
         }
       }
     }
+    return null;
   }
 
-  /**
-   * Recall the ack reaction emoji from user's message.
-   * Silent on failure — the emoji will naturally expire.
-   */
-  async function recallAckReaction(chatId: string): Promise<void> {
-    const stored = ackReactionByChat.get(chatId);
-    if (!stored) return;
-    ackReactionByChat.delete(chatId);
-    try {
-      await apiRequest('POST', '/v1.0/robot/emotion/recall', {
-        robotCode: config.clientId,
-        openMsgId: stored.msgId,
-        openConversationId: stored.conversationId,
-        emotionType: 2,
+  /** Recall the exact ack reaction. Failures propagate so registry ownership
+   * remains retryable instead of silently orphaning the provider handle. */
+  async function recallAckReaction(stored: {
+    msgId: string;
+    conversationId: string;
+  }): Promise<void> {
+    await apiRequest('POST', '/v1.0/robot/emotion/recall', {
+      robotCode: config.clientId,
+      openMsgId: stored.msgId,
+      openConversationId: stored.conversationId,
+      emotionType: 2,
+      emotionName: '🤔思考中',
+      textEmotion: {
+        emotionId: '2659900',
         emotionName: '🤔思考中',
-        textEmotion: {
-          emotionId: '2659900',
-          emotionName: '🤔思考中',
-          text: '🤔思考中',
-          backgroundId: 'im_bg_1',
-        },
-      });
-      logger.debug({ chatId }, 'DingTalk ack reaction recalled');
-    } catch (err: any) {
-      logger.debug(
-        { err: err.message, chatId },
-        'DingTalk ack reaction recall failed (non-critical)',
-      );
-    }
+        text: '🤔思考中',
+        backgroundId: 'im_bg_1',
+      },
+    });
+    logger.debug({ msgId: stored.msgId }, 'DingTalk ack reaction recalled');
   }
 
   // ─── Message Sending ──────────────────────────────────────
@@ -817,16 +879,11 @@ export function createDingTalkConnection(
           res.on('data', (chunk: Buffer) => chunks.push(chunk));
           res.on('end', () => {
             const respBody = Buffer.concat(chunks).toString('utf8');
-            if (res.statusCode && res.statusCode >= 400) {
-              reject(
-                new Error(
-                  `DingTalk groupMessages API HTTP failed (${res.statusCode}): ${respBody}`,
-                ),
-              );
-              return;
-            }
             try {
-              const data = JSON.parse(respBody);
+              const data = parseDingTalkGroupMessageResponse(
+                res.statusCode,
+                respBody,
+              );
               logger.info(
                 {
                   statusCode: res.statusCode,
@@ -836,16 +893,9 @@ export function createDingTalkConnection(
                 },
                 'DingTalk sendViaGroupMessagesAPI response',
               );
-              if (data.errcode && data.errcode !== 0) {
-                reject(
-                  new Error(
-                    `DingTalk groupMessages API error: ${data.errcode} ${data.errmsg}`,
-                  ),
-                );
-                return;
-              }
-            } catch {
-              // Not JSON, ignore
+            } catch (err) {
+              reject(err);
+              return;
             }
             resolve();
           });
@@ -1398,95 +1448,394 @@ export function createDingTalkConnection(
       }
       dedup.markSeen(msgId);
       try {
+        // Skip stale messages from before connection (hot-reload scenario)
+        if (opts.ignoreMessagesBefore && data.createAt) {
+          const msgTime = data.createAt;
+          if (msgTime < opts.ignoreMessagesBefore) {
+            logger.info(
+              { msgId, msgTime, ignoreBefore: opts.ignoreMessagesBefore },
+              'DingTalk dropped: stale message',
+            );
+            return;
+          }
+        }
 
-      // Skip stale messages from before connection (hot-reload scenario)
-      if (opts.ignoreMessagesBefore && data.createAt) {
-        const msgTime = data.createAt;
-        if (msgTime < opts.ignoreMessagesBefore) {
-          logger.info(
-            { msgId, msgTime, ignoreBefore: opts.ignoreMessagesBefore },
-            'DingTalk dropped: stale message',
+        const conversationId = data.conversationId;
+        const conversationType = data.conversationType;
+        const isGroup = conversationType === '2'; // 1=C2C, 2=Group
+
+        const rawJid = isGroup
+          ? `dingtalk:group:${conversationId}`
+          : `dingtalk:c2c:${data.senderId}`;
+        const jid = opts.normalizeIncomingJid?.(rawJid) ?? rawJid;
+        const senderName = data.senderNick || '钉钉用户';
+        let chatName = isGroup
+          ? `钉钉群 ${conversationId.slice(0, 8)}`
+          : senderName;
+
+        const admission = await evaluateChannelAdmission({
+          jid,
+          chatName,
+          text: extractDingTalkAdmissionText(data),
+          isChatAuthorized: opts.isChatAuthorized,
+          onPairAttempt: opts.onPairAttempt,
+        });
+        if (admission.kind === 'paired') {
+          if (data.sessionWebhook) {
+            await sendViaSessionWebhook(
+              data.sessionWebhook,
+              '配对成功！此聊天已连接到你的账号。',
+              isGroup,
+            );
+          }
+          return;
+        }
+        if (admission.kind === 'pair_rejected') {
+          if (data.sessionWebhook) {
+            await sendViaSessionWebhook(
+              data.sessionWebhook,
+              '配对码无效或已过期，请在 Web 设置页重新生成。',
+              isGroup,
+            );
+          }
+          return;
+        }
+        if (admission.kind === 'deny') {
+          logger.debug({ jid }, 'DingTalk chat not authorized');
+          return;
+        }
+
+        // Mention/owner gating runs before routing, registration, cache writes,
+        // or attachment download. A rejected group message has zero business
+        // side effects.
+        if (isGroup && opts.shouldProcessGroupMessage) {
+          const shouldProcess = opts.shouldProcessGroupMessage(
+            jid,
+            data.senderId,
+          );
+          if (!shouldProcess) {
+            const group = opts.resolveRegisteredGroup?.(jid);
+            const mode = group?.activation_mode ?? 'auto';
+            if (mode !== 'owner_mentioned') return;
+            if (
+              opts.isGroupOwnerMessage &&
+              !opts.isGroupOwnerMessage(jid, data.senderId)
+            ) {
+              return;
+            }
+          }
+        }
+
+        const resolvedRoute = resolveAdmittedChannelRoute(
+          jid,
+          opts.resolveEffectiveChatJid,
+        );
+        if (!resolvedRoute) {
+          logger.warn(
+            { jid },
+            'DingTalk message dropped: binding resolver rejected route',
           );
           return;
         }
-      }
+        const { targetJid, routing: agentRouting } = resolvedRoute;
 
-      const conversationId = data.conversationId;
-      const conversationType = data.conversationType;
-      const isGroup = conversationType === '2'; // 1=C2C, 2=Group
-
-      const jid = isGroup
-        ? `dingtalk:group:${conversationId}`
-        : `dingtalk:c2c:${data.senderId}`;
-      const senderName = data.senderNick || '钉钉用户';
-      const chatName = isGroup
-        ? (await fetchGroupNameByOpenConversationId(conversationId)) ||
-          `钉钉群 ${conversationId.slice(0, 8)}`
-        : senderName;
-
-      // Store last message ID for reply context
-      lastMessageIds.set(jid, msgId);
-
-      // Store session webhook for sending replies
-      logger.debug(
-        {
-          jid,
-          hasSessionWebhook: !!data.sessionWebhook,
-        },
-        'DingTalk message sessionWebhook',
-      );
-      if (data.sessionWebhook) {
-        lastSessionWebhooks.set(jid, data.sessionWebhook);
-        if (data.sessionWebhookExpiredTime) {
-          sessionWebhookExpiry.set(jid, data.sessionWebhookExpiredTime);
+        if (isGroup) {
+          chatName =
+            (await fetchGroupNameByOpenConversationId(conversationId)) ||
+            chatName;
         }
-      }
 
-      // Store sender ID for file sending
-      if (data.senderId) {
-        lastSenderIds.set(jid, data.senderId);
-      }
+        // Only admitted and routable chats may be registered or influence
+        // filesystem routing. Pairing already registered the base upstream.
+        storeChatMetadata(jid, new Date().toISOString());
+        opts.onNewChat(jid, chatName);
 
-      // Store sender staff ID (enterprise user ID) for batchSend API
-      if (data.senderStaffId) {
-        lastSenderStaffIds.set(jid, data.senderStaffId);
-      }
-      // Get message content and attachments
-      let content = '';
-      let attachmentsJson: string | undefined;
+        // Store last message ID for reply context
+        lastMessageIds.set(jid, msgId);
+        lastMessageIds.set(rawJid, msgId);
 
-      if (data.msgtype === 'text' && 'text' in data) {
-        const textBlock = (data as DingTalkRobotMessage).text;
-        const userText = textBlock?.content?.trim() || '';
-        const reply = textBlock?.isReplyMsg
-          ? extractRepliedMsg(
-              textBlock.repliedMsg,
-              (data as DingTalkRobotMessage).originalMsgId,
-            )
-          : null;
+        // Store session webhook for sending replies
+        logger.debug(
+          {
+            jid,
+            hasSessionWebhook: !!data.sessionWebhook,
+          },
+          'DingTalk message sessionWebhook',
+        );
+        if (data.sessionWebhook) {
+          lastSessionWebhooks.set(jid, data.sessionWebhook);
+          lastSessionWebhooks.set(rawJid, data.sessionWebhook);
+          if (data.sessionWebhookExpiredTime) {
+            sessionWebhookExpiry.set(jid, data.sessionWebhookExpiredTime);
+            sessionWebhookExpiry.set(rawJid, data.sessionWebhookExpiredTime);
+          }
+        }
 
-        if (reply) {
-          const groupFolder = opts.resolveGroupFolder?.(jid);
+        // Store sender ID for file sending
+        if (data.senderId) {
+          lastSenderIds.set(jid, data.senderId);
+          lastSenderIds.set(rawJid, data.senderId);
+        }
+
+        // Store sender staff ID (enterprise user ID) for batchSend API
+        if (data.senderStaffId) {
+          lastSenderStaffIds.set(jid, data.senderStaffId);
+          lastSenderStaffIds.set(rawJid, data.senderStaffId);
+        }
+        // Get message content and attachments
+        let content = '';
+        let attachmentsJson: string | undefined;
+
+        if (data.msgtype === 'text' && 'text' in data) {
+          const textBlock = (data as DingTalkRobotMessage).text;
+          const userText = textBlock?.content?.trim() || '';
+          const reply = textBlock?.isReplyMsg
+            ? extractRepliedMsg(
+                textBlock.repliedMsg,
+                (data as DingTalkRobotMessage).originalMsgId,
+              )
+            : null;
+
+          if (reply) {
+            const groupFolder = opts.resolveGroupFolder?.(jid);
+            logger.info(
+              {
+                msgId,
+                replyKind: reply.kind,
+                fileName: reply.fileName,
+                hasDownloadCode: !!(
+                  reply.downloadCode || reply.pictureDownloadCode
+                ),
+              },
+              'DingTalk reply-to message detected',
+            );
+
+            if (reply.kind === 'file' && reply.downloadCode) {
+              const fileName = reply.fileName || 'file';
+              const safeFileName = sanitizeFileName(fileName);
+              const fileBuffer = await downloadDingTalkFileByDownloadCode(
+                reply.downloadCode,
+                data.robotCode ?? '',
+              );
+              if (fileBuffer && groupFolder) {
+                try {
+                  const ext = path.extname(fileName).slice(1).toLowerCase();
+                  const savedFilename = ext
+                    ? `file_${Date.now()}.${ext}`
+                    : `file_${Date.now()}`;
+                  const savedPath = await saveDownloadedFile(
+                    groupFolder,
+                    'dingtalk',
+                    savedFilename,
+                    fileBuffer,
+                  );
+                  const fileBlock = await buildFileContentBlock({
+                    fileName,
+                    savedRelPath: savedPath,
+                    groupFolder,
+                    prefixLabel: '引用文件',
+                  });
+                  content = userText
+                    ? `${fileBlock}\n\n用户问: ${userText}`
+                    : fileBlock;
+                } catch (err) {
+                  logger.warn(
+                    { err, msgId, fileName },
+                    'Failed to save DingTalk replied file',
+                  );
+                  content = userText
+                    ? `[引用文件: ${safeFileName}（保存失败）]\n${userText}`
+                    : `[引用文件: ${safeFileName}（保存失败）]`;
+                }
+              } else {
+                // Distinguish actual failure cases for easier debugging:
+                // - fileBuffer missing → DingTalk download API returned nothing
+                // - groupFolder missing → chat not registered / resolver didn't match
+                const reason = !fileBuffer ? '下载失败' : '未注册群组';
+                content = userText
+                  ? `[引用文件: ${safeFileName}（${reason}）]\n${userText}`
+                  : `[引用文件: ${safeFileName}（${reason}）]`;
+              }
+            } else if (reply.kind === 'picture') {
+              const code = reply.downloadCode || reply.pictureDownloadCode;
+              if (code) {
+                const normalized = await normalizeDingTalkImage(jid, opts, () =>
+                  downloadDingTalkImageByDownloadCode(
+                    code,
+                    data.robotCode ?? '',
+                  ),
+                );
+                if (normalized?.attachmentsJson) {
+                  attachmentsJson = normalized.attachmentsJson;
+                  content = userText
+                    ? `[引用图片]\n${userText}`
+                    : normalized.content;
+                } else {
+                  content = userText
+                    ? `[引用图片（下载失败）]\n${userText}`
+                    : `[引用图片（下载失败）]`;
+                }
+              } else {
+                content = userText
+                  ? `[引用图片（缺少 downloadCode）]\n${userText}`
+                  : `[引用图片（缺少 downloadCode）]`;
+              }
+            } else {
+              // text / other — include replied body as context
+              const quoted = reply.textContent
+                ? reply.textContent
+                    .split('\n')
+                    .map((line) => `> ${line}`)
+                    .join('\n')
+                : '> [无法解析的引用内容]';
+              content = userText ? `${quoted}\n\n${userText}` : quoted;
+            }
+          } else {
+            content = userText;
+          }
+        } else if (data.msgtype === 'richText' && data.content) {
+          // richText: mixed content array with text segments and picture objects
+          // e.g. [{text:"hi"},{type:"picture",downloadCode:"...",pictureDownloadCode:"..."}]
+          const richText: Array<{
+            text?: string;
+            type?: string;
+            downloadCode?: string;
+            pictureDownloadCode?: string;
+          }> = data.content.richText ?? [];
+          const textParts: string[] = [];
+          const imageEntries: {
+            downloadCode: string;
+            pictureDownloadCode: string;
+          }[] = [];
+
+          for (const entry of richText) {
+            if (entry.text) {
+              textParts.push(entry.text);
+            } else if (
+              entry.type === 'picture' &&
+              (entry.downloadCode || entry.pictureDownloadCode)
+            ) {
+              imageEntries.push({
+                downloadCode:
+                  entry.downloadCode || entry.pictureDownloadCode || '',
+                pictureDownloadCode: entry.pictureDownloadCode || '',
+              });
+            }
+          }
+
+          logger.info(
+            { msgId, textParts, imageEntriesCount: imageEntries.length },
+            'DingTalk richText parsed',
+          );
+          content = textParts.join('').trim();
+          if (imageEntries.length > 0) {
+            // Download each image; first one's base64 goes to Vision, all saved to disk
+            const allAttachments: Array<{
+              type: 'image';
+              data: string;
+              mimeType: string;
+            }> = [];
+            for (let i = 0; i < imageEntries.length; i++) {
+              const entry = imageEntries[i];
+              logger.info(
+                { msgId, downloadCode: entry.downloadCode, index: i },
+                'DingTalk richText downloading image',
+              );
+              const normalized = await normalizeDingTalkImage(jid, opts, () =>
+                downloadDingTalkImageByDownloadCode(
+                  entry.downloadCode || entry.pictureDownloadCode || '',
+                  data.robotCode ?? '',
+                ),
+              );
+              logger.info(
+                { msgId, index: i, hasResult: !!normalized },
+                'DingTalk richText image download complete',
+              );
+              if (normalized?.attachmentsJson) {
+                const parsed = JSON.parse(normalized.attachmentsJson) as Array<{
+                  type: 'image';
+                  data: string;
+                  mimeType: string;
+                }>;
+                allAttachments.push(...parsed);
+              }
+            }
+            if (allAttachments.length > 0) {
+              attachmentsJson = JSON.stringify(allAttachments);
+              // Prepend first image content if available
+              const firstImgContent = allAttachments[0] ? `[图片: base64]` : '';
+              content = (
+                firstImgContent + (content ? ' ' + content : '')
+              ).trim();
+            }
+          }
           logger.info(
             {
               msgId,
-              replyKind: reply.kind,
-              fileName: reply.fileName,
-              hasDownloadCode: !!(
-                reply.downloadCode || reply.pictureDownloadCode
-              ),
+              contentLen: content?.length,
+              hasAttachments: !!attachmentsJson,
             },
-            'DingTalk reply-to message detected',
+            'DingTalk richText processing complete',
           );
-
-          if (reply.kind === 'file' && reply.downloadCode) {
-            const fileName = reply.fileName || 'file';
-            const safeFileName = sanitizeFileName(fileName);
-            const fileBuffer = await downloadDingTalkFileByDownloadCode(
-              reply.downloadCode,
-              data.robotCode ?? '',
+          if (!content && !attachmentsJson) {
+            // All richText entries were pictures with no text
+            content = attachmentsJson ? '[图片]' : '';
+          }
+        } else if (data.msgtype === 'picture' && 'content' in data) {
+          // Picture message: download via downloadCode API (short or long form)
+          interface PictureContent {
+            downloadCode?: string;
+            pictureDownloadCode?: string;
+          }
+          const pictureContent = (data as { content: PictureContent }).content;
+          const downloadCode =
+            pictureContent?.downloadCode || pictureContent?.pictureDownloadCode;
+          if (!downloadCode) {
+            logger.warn(
+              { msgId },
+              'DingTalk picture message missing both downloadCode and pictureDownloadCode',
             );
-            if (fileBuffer && groupFolder) {
+            return;
+          }
+          const normalized = await normalizeDingTalkImage(jid, opts, () =>
+            downloadDingTalkImageByDownloadCode(
+              downloadCode,
+              data.robotCode ?? '',
+            ),
+          );
+          if (!normalized) {
+            logger.warn(
+              { msgId },
+              'DingTalk picture download failed, skipping',
+            );
+            return;
+          }
+          content = normalized.content;
+          attachmentsJson = normalized.attachmentsJson;
+        } else if (data.msgtype === 'file' && 'content' in data) {
+          // File message: download via downloadCode, same API as picture
+          interface FileContent {
+            downloadCode?: string;
+            fileName?: string;
+            fileSize?: number;
+          }
+          const fileContent = (data as { content: FileContent }).content;
+          const downloadCode = fileContent?.downloadCode;
+          const fileName = fileContent?.fileName || 'file';
+          if (!downloadCode) {
+            logger.warn(
+              { msgId },
+              'DingTalk file message missing downloadCode',
+            );
+            return;
+          }
+          const fileBuffer = await downloadDingTalkFileByDownloadCode(
+            downloadCode,
+            data.robotCode ?? '',
+          );
+          if (fileBuffer) {
+            const groupFolder = opts.resolveGroupFolder?.(jid);
+            if (groupFolder) {
               try {
                 const ext = path.extname(fileName).slice(1).toLowerCase();
                 const savedFilename = ext
@@ -1498,397 +1847,131 @@ export function createDingTalkConnection(
                   savedFilename,
                   fileBuffer,
                 );
-                const fileBlock = await buildFileContentBlock({
+                content = await buildFileContentBlock({
                   fileName,
                   savedRelPath: savedPath,
                   groupFolder,
-                  prefixLabel: '引用文件',
+                  prefixLabel: '文件',
                 });
-                content = userText
-                  ? `${fileBlock}\n\n用户问: ${userText}`
-                  : fileBlock;
               } catch (err) {
-                logger.warn(
-                  { err, msgId, fileName },
-                  'Failed to save DingTalk replied file',
-                );
-                content = userText
-                  ? `[引用文件: ${safeFileName}（保存失败）]\n${userText}`
-                  : `[引用文件: ${safeFileName}（保存失败）]`;
+                logger.warn({ err }, 'Failed to save DingTalk file to disk');
+                content = `[文件: ${sanitizeFileName(fileName)}（保存失败）]`;
               }
             } else {
-              // Distinguish actual failure cases for easier debugging:
-              // - fileBuffer missing → DingTalk download API returned nothing
-              // - groupFolder missing → chat not registered / resolver didn't match
-              const reason = !fileBuffer ? '下载失败' : '未注册群组';
-              content = userText
-                ? `[引用文件: ${safeFileName}（${reason}）]\n${userText}`
-                : `[引用文件: ${safeFileName}（${reason}）]`;
-            }
-          } else if (reply.kind === 'picture') {
-            const code = reply.downloadCode || reply.pictureDownloadCode;
-            if (code) {
-              const normalized = await normalizeDingTalkImage(jid, opts, () =>
-                downloadDingTalkImageByDownloadCode(code, data.robotCode ?? ''),
-              );
-              if (normalized?.attachmentsJson) {
-                attachmentsJson = normalized.attachmentsJson;
-                content = userText
-                  ? `[引用图片]\n${userText}`
-                  : normalized.content;
-              } else {
-                content = userText
-                  ? `[引用图片（下载失败）]\n${userText}`
-                  : `[引用图片（下载失败）]`;
-              }
-            } else {
-              content = userText
-                ? `[引用图片（缺少 downloadCode）]\n${userText}`
-                : `[引用图片（缺少 downloadCode）]`;
+              content = `[文件: ${sanitizeFileName(fileName)}（未注册群组）]`;
             }
           } else {
-            // text / other — include replied body as context
-            const quoted = reply.textContent
-              ? reply.textContent
-                  .split('\n')
-                  .map((line) => `> ${line}`)
-                  .join('\n')
-              : '> [无法解析的引用内容]';
-            content = userText ? `${quoted}\n\n${userText}` : quoted;
+            logger.warn({ msgId }, 'DingTalk file download failed, skipping');
+            return;
           }
-        } else {
-          content = userText;
-        }
-      } else if (data.msgtype === 'richText' && data.content) {
-        // richText: mixed content array with text segments and picture objects
-        // e.g. [{text:"hi"},{type:"picture",downloadCode:"...",pictureDownloadCode:"..."}]
-        const richText: Array<{
-          text?: string;
-          type?: string;
-          downloadCode?: string;
-          pictureDownloadCode?: string;
-        }> = data.content.richText ?? [];
-        const textParts: string[] = [];
-        const imageEntries: {
-          downloadCode: string;
-          pictureDownloadCode: string;
-        }[] = [];
-
-        for (const entry of richText) {
-          if (entry.text) {
-            textParts.push(entry.text);
-          } else if (
-            entry.type === 'picture' &&
-            (entry.downloadCode || entry.pictureDownloadCode)
-          ) {
-            imageEntries.push({
-              downloadCode:
-                entry.downloadCode || entry.pictureDownloadCode || '',
-              pictureDownloadCode: entry.pictureDownloadCode || '',
-            });
+        } else if (data.msgtype === 'image' && 'image' in data) {
+          // Image message via contentUrl (legacy/native format)
+          const contentUrl = (data as DingTalkRobotMessage).image?.contentUrl;
+          if (!contentUrl) {
+            logger.warn({ msgId }, 'DingTalk image message missing contentUrl');
+            return;
           }
-        }
-
-        logger.info(
-          { msgId, textParts, imageEntriesCount: imageEntries.length },
-          'DingTalk richText parsed',
-        );
-        content = textParts.join('').trim();
-        if (imageEntries.length > 0) {
-          // Download each image; first one's base64 goes to Vision, all saved to disk
-          const allAttachments: Array<{
-            type: 'image';
-            data: string;
-            mimeType: string;
-          }> = [];
-          for (let i = 0; i < imageEntries.length; i++) {
-            const entry = imageEntries[i];
-            logger.info(
-              { msgId, downloadCode: entry.downloadCode, index: i },
-              'DingTalk richText downloading image',
-            );
-            const normalized = await normalizeDingTalkImage(jid, opts, () =>
-              downloadDingTalkImageByDownloadCode(
-                entry.downloadCode || entry.pictureDownloadCode || '',
-                data.robotCode ?? '',
-              ),
-            );
-            logger.info(
-              { msgId, index: i, hasResult: !!normalized },
-              'DingTalk richText image download complete',
-            );
-            if (normalized?.attachmentsJson) {
-              const parsed = JSON.parse(normalized.attachmentsJson) as Array<{
-                type: 'image';
-                data: string;
-                mimeType: string;
-              }>;
-              allAttachments.push(...parsed);
-            }
-          }
-          if (allAttachments.length > 0) {
-            attachmentsJson = JSON.stringify(allAttachments);
-            // Prepend first image content if available
-            const firstImgContent = allAttachments[0] ? `[图片: base64]` : '';
-            content = (firstImgContent + (content ? ' ' + content : '')).trim();
-          }
-        }
-        logger.info(
-          {
-            msgId,
-            contentLen: content?.length,
-            hasAttachments: !!attachmentsJson,
-          },
-          'DingTalk richText processing complete',
-        );
-        if (!content && !attachmentsJson) {
-          // All richText entries were pictures with no text
-          content = attachmentsJson ? '[图片]' : '';
-        }
-      } else if (data.msgtype === 'picture' && 'content' in data) {
-        // Picture message: download via downloadCode API (short or long form)
-        interface PictureContent {
-          downloadCode?: string;
-          pictureDownloadCode?: string;
-        }
-        const pictureContent = (data as { content: PictureContent }).content;
-        const downloadCode =
-          pictureContent?.downloadCode || pictureContent?.pictureDownloadCode;
-        if (!downloadCode) {
-          logger.warn(
-            { msgId },
-            'DingTalk picture message missing both downloadCode and pictureDownloadCode',
+          const normalized = await normalizeDingTalkImage(jid, opts, () =>
+            downloadDingTalkImageAsBase64(contentUrl),
           );
+          if (!normalized) {
+            logger.warn({ msgId }, 'DingTalk image download failed, skipping');
+            return;
+          }
+          content = normalized.content;
+          attachmentsJson = normalized.attachmentsJson;
+        }
+
+        // Skip empty messages (text without content, or failed image)
+        if (!content && !attachmentsJson) {
           return;
         }
-        const normalized = await normalizeDingTalkImage(jid, opts, () =>
-          downloadDingTalkImageByDownloadCode(
-            downloadCode,
-            data.robotCode ?? '',
-          ),
-        );
-        if (!normalized) {
-          logger.warn({ msgId }, 'DingTalk picture download failed, skipping');
-          return;
-        }
-        content = normalized.content;
-        attachmentsJson = normalized.attachmentsJson;
-      } else if (data.msgtype === 'file' && 'content' in data) {
-        // File message: download via downloadCode, same API as picture
-        interface FileContent {
-          downloadCode?: string;
-          fileName?: string;
-          fileSize?: number;
-        }
-        const fileContent = (data as { content: FileContent }).content;
-        const downloadCode = fileContent?.downloadCode;
-        const fileName = fileContent?.fileName || 'file';
-        if (!downloadCode) {
-          logger.warn({ msgId }, 'DingTalk file message missing downloadCode');
-          return;
-        }
-        const fileBuffer = await downloadDingTalkFileByDownloadCode(
-          downloadCode,
-          data.robotCode ?? '',
-        );
-        if (fileBuffer) {
-          const groupFolder = opts.resolveGroupFolder?.(jid);
-          if (groupFolder) {
-            try {
-              const ext = path.extname(fileName).slice(1).toLowerCase();
-              const savedFilename = ext
-                ? `file_${Date.now()}.${ext}`
-                : `file_${Date.now()}`;
-              const savedPath = await saveDownloadedFile(
-                groupFolder,
-                'dingtalk',
-                savedFilename,
-                fileBuffer,
-              );
-              content = await buildFileContentBlock({
-                fileName,
-                savedRelPath: savedPath,
-                groupFolder,
-                prefixLabel: '文件',
-              });
-            } catch (err) {
-              logger.warn({ err }, 'Failed to save DingTalk file to disk');
-              content = `[文件: ${sanitizeFileName(fileName)}（保存失败）]`;
+
+        // ── Authorized: process message ──
+
+        // Handle slash commands
+        const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
+        if (slashMatch && opts.onCommand) {
+          const cmdBody = (
+            slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
+          ).trim();
+          try {
+            const reply = await opts.onCommand(jid, cmdBody, data.senderId);
+            if (reply) {
+              const plainText = markdownToPlainText(reply);
+              if (data.sessionWebhook) {
+                await sendViaSessionWebhook(
+                  data.sessionWebhook,
+                  plainText,
+                  isGroup,
+                );
+              }
+              return;
             }
-          } else {
-            content = `[文件: ${sanitizeFileName(fileName)}（未注册群组）]`;
-          }
-        } else {
-          logger.warn({ msgId }, 'DingTalk file download failed, skipping');
-          return;
-        }
-      } else if (data.msgtype === 'image' && 'image' in data) {
-        // Image message via contentUrl (legacy/native format)
-        const contentUrl = (data as DingTalkRobotMessage).image?.contentUrl;
-        if (!contentUrl) {
-          logger.warn({ msgId }, 'DingTalk image message missing contentUrl');
-          return;
-        }
-        const normalized = await normalizeDingTalkImage(jid, opts, () =>
-          downloadDingTalkImageAsBase64(contentUrl),
-        );
-        if (!normalized) {
-          logger.warn({ msgId }, 'DingTalk image download failed, skipping');
-          return;
-        }
-        content = normalized.content;
-        attachmentsJson = normalized.attachmentsJson;
-      }
-
-      // Skip empty messages (text without content, or failed image)
-      if (!content && !attachmentsJson) {
-        return;
-      }
-
-      // ── /pair <code> command ──
-      const pairMatch = content.match(/^\/pair\s+(\S+)/i);
-      if (pairMatch && opts.onPairAttempt) {
-        const code = pairMatch[1];
-        try {
-          const success = await opts.onPairAttempt(jid, chatName, code);
-          const reply = success
-            ? '配对成功！此聊天已连接到你的账号。'
-            : '配对码无效或已过期，请在 Web 设置页重新生成。';
-          if (data.sessionWebhook) {
-            await sendViaSessionWebhook(data.sessionWebhook, reply, isGroup);
-          }
-        } catch (err) {
-          logger.error({ err, jid }, 'DingTalk pair attempt error');
-        }
-        return;
-      }
-
-      // ── Store metadata early (chats table only — no user isolation concern) ──
-      storeChatMetadata(jid, new Date().toISOString());
-
-      // ── Authorization check ──
-      if (opts.isChatAuthorized && !opts.isChatAuthorized(jid)) {
-        logger.debug({ jid }, 'DingTalk chat not authorized');
-        return;
-      }
-
-      // ── Auto-register / update group name after authorization ──
-      // buildOnNewChat handles both new group registration AND existing group
-      // name updates (with proper created_by guard — no cross-user pollution)
-      opts.onNewChat(jid, chatName);
-
-      // ── Group mention check ──
-      // Gate 1: 非 owner_mentioned 模式下，根据 shouldProcessGroupMessage 决定是否放行
-      // Gate 2: owner_mentioned 模式下，检查发送者是否为 owner
-      if (isGroup && opts.shouldProcessGroupMessage) {
-        const shouldProcess = opts.shouldProcessGroupMessage(jid, data.senderId);
-        if (!shouldProcess) {
-          // 非 owner_mentioned 模式：直接丢弃（Gate 1）
-          // owner_mentioned 模式：交给 Gate 2 检查 owner
-          const group = opts.resolveRegisteredGroup?.(jid);
-          const mode = group?.activation_mode ?? 'auto';
-          if (mode !== 'owner_mentioned') {
-            logger.debug({ jid }, 'DingTalk group message dropped (mention required)');
-            return;
-          }
-          // owner_mentioned 模式：Gate 2 检查 sender
-          if (opts.isGroupOwnerMessage && !opts.isGroupOwnerMessage(jid, data.senderId)) {
-            logger.debug({ jid, senderId: data.senderId }, 'DingTalk group message dropped (owner_mentioned mode)');
+          } catch (err) {
+            logger.error({ jid, err }, 'DingTalk slash command failed');
             return;
           }
         }
-      }
 
-      // ── Authorized: process message ──
-
-      // Handle slash commands
-      const slashMatch = content.match(/^\/(\S+)(?:\s+(.*))?$/i);
-      if (slashMatch && opts.onCommand) {
-        const cmdBody = (
-          slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
-        ).trim();
-        try {
-          const reply = await opts.onCommand(jid, cmdBody, data.senderId);
-          if (reply) {
-            const plainText = markdownToPlainText(reply);
-            if (data.sessionWebhook) {
-              await sendViaSessionWebhook(
-                data.sessionWebhook,
-                plainText,
-                isGroup,
-              );
-            }
-            return;
-          }
-        } catch (err) {
-          logger.error({ jid, err }, 'DingTalk slash command failed');
-          return;
-        }
-      }
-
-      // Route and store message
-      const agentRouting = opts.resolveEffectiveChatJid?.(jid);
-      const targetJid = agentRouting?.effectiveJid ?? jid;
-
-      const id = crypto.randomUUID();
-      const timestamp = data.createAt
-        ? new Date(data.createAt).toISOString()
-        : new Date().toISOString();
-      const senderId = `dingtalk:${data.senderId}`;
-      storeChatMetadata(targetJid, timestamp);
-      storeMessageDirect(
-        id,
-        targetJid,
-        senderId,
-        senderName,
-        content,
-        timestamp,
-        false,
-        { attachments: attachmentsJson, sourceJid: jid },
-      );
-
-      broadcastNewMessage(
-        targetJid,
-        {
+        // Route was resolved before registration and media download.
+        const id = crypto.randomUUID();
+        const timestamp = data.createAt
+          ? new Date(data.createAt).toISOString()
+          : new Date().toISOString();
+        const senderId = `dingtalk:${data.senderId}`;
+        storeChatMetadata(targetJid, timestamp);
+        storeMessageDirect(
           id,
-          chat_jid: targetJid,
-          source_jid: jid,
-          sender: senderId,
-          sender_name: senderName,
+          targetJid,
+          senderId,
+          senderName,
           content,
           timestamp,
-          attachments: attachmentsJson,
-          is_from_me: false,
-        },
-        agentRouting?.agentId ?? undefined,
-      );
-
-      // ── Ack Reaction：确认已收到消息 ──
-      const chatId = jid.startsWith('dingtalk:')
-        ? jid.slice('dingtalk:'.length)
-        : jid;
-      const attachPromise = attachAckReaction(
-        msgId,
-        conversationId,
-        jid,
-      ).catch(() => {});
-      pendingAttaches.set(chatId, attachPromise);
-      attachPromise.finally(() => pendingAttaches.delete(chatId));
-
-      notifyNewImMessage();
-
-      if (agentRouting?.agentId) {
-        opts.onAgentMessage?.(jid, agentRouting.agentId);
-        logger.info(
-          { jid, effectiveJid: targetJid, agentId: agentRouting.agentId },
-          'DingTalk message routed to agent',
+          false,
+          { attachments: attachmentsJson, sourceJid: jid },
         );
-      } else {
-        logger.info(
-          { jid, sender: senderName, msgId },
-          'DingTalk message stored',
+
+        broadcastNewMessage(
+          targetJid,
+          {
+            id,
+            chat_jid: targetJid,
+            source_jid: jid,
+            sender: senderId,
+            sender_name: senderName,
+            content,
+            timestamp,
+            attachments: attachmentsJson,
+            is_from_me: false,
+          },
+          agentRouting?.agentId ?? undefined,
         );
-      }
+
+        // ── Ack Reaction：确认已收到消息 ──
+        const chatId = extractProviderTarget(jid);
+        ackReactions
+          .attach(
+            processingIndicatorKey(chatId, id),
+            () => attachAckReaction(msgId, conversationId, chatId),
+            recallAckReaction,
+          )
+          .catch(() => {});
+
+        notifyNewImMessage();
+
+        if (agentRouting?.agentId) {
+          opts.onAgentMessage?.(jid, agentRouting.agentId);
+          logger.info(
+            { jid, effectiveJid: targetJid, agentId: agentRouting.agentId },
+            'DingTalk message routed to agent',
+          );
+        } else {
+          logger.info(
+            { jid, sender: senderName, msgId },
+            'DingTalk message stored',
+          );
+        }
       } finally {
         processingLock.release(msgId);
       }
@@ -1916,24 +1999,24 @@ export function createDingTalkConnection(
         // other modules (e.g., @larksuiteoapi/node-sdk) that also use axios.
         const axios = (await import('axios')).default;
         const originalProxy = axios.defaults?.proxy;
-        if (axios.defaults) {
-          axios.defaults.proxy = false;
-          logger.debug(
-            'Temporarily disabled axios global proxy for dingtalk-stream SDK',
-          );
-        }
+        try {
+          if (axios.defaults) {
+            axios.defaults.proxy = false;
+            logger.debug(
+              'Temporarily disabled axios global proxy for dingtalk-stream SDK',
+            );
+          }
 
-        // Create DWClient
-        client = new DWClient({
-          clientId: config.clientId,
-          clientSecret: config.clientSecret,
-          debug: false,
-          keepAlive: true,
-        });
-
-        // Restore original axios proxy setting after DWClient creation
-        if (axios.defaults && originalProxy !== undefined) {
-          axios.defaults.proxy = originalProxy;
+          // Create DWClient
+          client = new DWClient({
+            clientId: config.clientId,
+            clientSecret: config.clientSecret,
+            debug: false,
+            keepAlive: true,
+          });
+        } finally {
+          // Restore the exact process-global value, including `undefined`.
+          if (axios.defaults) axios.defaults.proxy = originalProxy;
         }
 
         // Register robot message callback using registerCallbackListener (not registerAllEventListener)
@@ -1979,12 +2062,24 @@ export function createDingTalkConnection(
         return true;
       } catch (err) {
         logger.error({ err }, 'DingTalk initial connection failed');
+        if (client) {
+          try {
+            client.disconnect();
+          } catch (cleanupError) {
+            logger.warn(
+              { cleanupError },
+              'DingTalk failed client cleanup threw',
+            );
+          }
+          client = null;
+        }
         return false;
       }
     },
 
     async disconnect(): Promise<void> {
       stopping = true;
+      await ackReactions.clearAll();
 
       if (client) {
         try {
@@ -2015,7 +2110,7 @@ export function createDingTalkConnection(
       const parsed = parseDingTalkChatId(chatId);
       if (!parsed) {
         logger.error({ chatId }, 'Invalid DingTalk chat ID format');
-        return;
+        throw new Error(`Invalid DingTalk chat ID format: ${chatId}`);
       }
 
       // Reconstruct the full jid to match how sessionWebhook/senderStaffId was stored
@@ -2057,8 +2152,11 @@ export function createDingTalkConnection(
               { chatId, cardErr },
               'DingTalk sendMessage: AI Card fallback also failed',
             );
+            throw cardErr;
           }
-          return;
+          throw new Error(
+            `DingTalk sendMessage: no outbound route for C2C chat ${chatId}`,
+          );
         }
         const plainText = markdownToPlainText(text);
         const chunks = splitTextChunks(plainText, MSG_SPLIT_LIMIT);
@@ -2329,15 +2427,8 @@ export function createDingTalkConnection(
       // DingTalk doesn't support typing indicators via Stream
     },
 
-    clearAckReaction(chatId: string): void {
-      const pending = pendingAttaches.get(chatId);
-      if (pending) {
-        pending
-          .then(() => recallAckReaction(chatId).catch(() => {}))
-          .catch(() => {});
-      } else {
-        recallAckReaction(chatId).catch(() => {});
-      }
+    clearAckReaction(chatId: string, inputMessageId: string): Promise<void> {
+      return ackReactions.clear(processingIndicatorKey(chatId, inputMessageId));
     },
 
     isConnected(): boolean {

@@ -7,11 +7,12 @@ import {
   invalidateSessionCache,
   type Variables,
 } from '../web-context.js';
+import { updateSessionLastActive, deleteUserSession } from '../db.js';
 import {
-  updateSessionLastActive,
-  deleteUserSession,
-} from '../db.js';
-import { isSessionExpired, verifySessionToken, setSessionCookie } from '../auth.js';
+  isSessionExpired,
+  verifySessionToken,
+  setSessionCookie,
+} from '../auth.js';
 import type { AuthUser, Permission } from '../types.js';
 import { hasPermission } from '../permissions.js';
 import {
@@ -26,7 +27,10 @@ import { logger } from '../logger.js';
  * when old and new cookies coexist. parseCookie() only keeps one value,
  * but we need to try all of them to handle migration scenarios.
  */
-export function getAllCookieValues(cookieHeader: string | undefined, name: string): string[] {
+export function getAllCookieValues(
+  cookieHeader: string | undefined,
+  name: string,
+): string[] {
   if (!cookieHeader) return [];
   const values: string[] = [];
   const prefix = name + '=';
@@ -44,7 +48,9 @@ export function getAllCookieValues(cookieHeader: string | undefined, name: strin
  * Returns { token, legacy } where `legacy` is true when an unsigned
  * legacy cookie was accepted (caller should re-issue the cookie).
  */
-export function tryVerifyAny(values: string[]): { token: string; legacy: boolean } | null {
+export function tryVerifyAny(
+  values: string[],
+): { token: string; legacy: boolean } | null {
   for (const v of values) {
     const verified = verifySessionToken(v);
     if (verified) return verified;
@@ -104,7 +110,10 @@ export const authMiddleware = async (c: any, next: any) => {
   // Transparently upgrade unsigned legacy cookie to HMAC-signed
   if (legacy) {
     c.header('Set-Cookie', setSessionCookie(c, token));
-    logger.info('Upgraded unsigned session cookie to HMAC-signed for user %s', session.username);
+    logger.info(
+      'Upgraded unsigned session cookie to HMAC-signed for user %s',
+      session.username,
+    );
   }
 
   const requestPath = c.req.path;
@@ -161,14 +170,9 @@ export const requireAnyPermission =
   };
 
 export const systemConfigMiddleware = requirePermission('manage_system_config');
-
-// Stricter than a permission check: requires the admin ROLE. Use for routes
-// that write host-global files (e.g. ~/.claude/agents) which affect every
-// host-mode agent — a member with manage_system_config (ops_manager template)
-// must not be able to mutate them.
 export const adminRoleMiddleware = async (c: any, next: any) => {
   const user = c.get('user') as AuthUser;
-  if (!user || user.role !== 'admin') {
+  if (user.role !== 'admin') {
     return c.json({ error: 'Forbidden: admin role required' }, 403);
   }
   await next();

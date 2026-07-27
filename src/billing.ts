@@ -126,10 +126,7 @@ export function assignPlan(
   });
 }
 
-export function cancelSubscription(
-  userId: string,
-  actorId: string,
-): void {
+export function cancelSubscription(userId: string, actorId: string): void {
   dbCancelSubscription(userId);
   invalidateUserBillingCache(userId);
   logBillingAudit('subscription_cancelled', userId, actorId, {});
@@ -179,10 +176,7 @@ export function invalidateAllBillingCaches(): void {
   _accessCache.clear();
 }
 
-export function checkQuota(
-  userId: string,
-  userRole: string,
-): QuotaCheckResult {
+export function checkQuota(userId: string, userRole: string): QuotaCheckResult {
   // Admin bypasses all billing
   if (userRole === 'admin') {
     return { allowed: true };
@@ -326,9 +320,10 @@ export function formatBillingAccessDeniedMessage(
     const diffMs = resetDate.getTime() - Date.now();
     if (diffMs > 0) {
       const hours = Math.ceil(diffMs / (1000 * 60 * 60));
-      resetHint = hours >= 24
-        ? `，约 ${Math.ceil(hours / 24)} 天后重置`
-        : `，约 ${hours} 小时后重置`;
+      resetHint =
+        hours >= 24
+          ? `，约 ${Math.ceil(hours / 24)} 天后重置`
+          : `，约 ${hours} 小时后重置`;
     }
   }
   const actionHint =
@@ -421,20 +416,32 @@ function _checkQuotaInternal(userId: string): QuotaCheckResult {
   // Calculate reset times
   // Check daily → weekly → monthly (first exceeded wins)
   const dailyExceeded = checkWindow(
-    dailyCost, plan.daily_cost_quota, dailyTokens, plan.daily_token_quota,
-    'daily', usageSnapshot.dailyResetAt,
+    dailyCost,
+    plan.daily_cost_quota,
+    dailyTokens,
+    plan.daily_token_quota,
+    'daily',
+    usageSnapshot.dailyResetAt,
   );
   if (dailyExceeded) return dailyExceeded;
 
   const weeklyExceeded = checkWindow(
-    weeklyCost, plan.weekly_cost_quota, weeklyTokens, plan.weekly_token_quota,
-    'weekly', usageSnapshot.weeklyResetAt,
+    weeklyCost,
+    plan.weekly_cost_quota,
+    weeklyTokens,
+    plan.weekly_token_quota,
+    'weekly',
+    usageSnapshot.weeklyResetAt,
   );
   if (weeklyExceeded) return weeklyExceeded;
 
   const monthlyExceeded = checkWindow(
-    monthlyCost, plan.monthly_cost_quota, monthlyTokens, plan.monthly_token_quota,
-    'monthly', usageSnapshot.monthlyResetAt,
+    monthlyCost,
+    plan.monthly_cost_quota,
+    monthlyTokens,
+    plan.monthly_token_quota,
+    'monthly',
+    usageSnapshot.monthlyResetAt,
   );
   if (monthlyExceeded) return monthlyExceeded;
 
@@ -595,11 +602,16 @@ export function applyAdminBalanceAdjustment(
   );
   invalidateUserBillingCache(userId);
   const after = checkBillingAccess(userId, userRole);
-  logBillingAudit(amountUSD > 0 ? 'manual_recharge' : 'manual_deduct', userId, actorId, {
-    amount: amountUSD,
-    description,
-    newBalance: tx.balance_after,
-  });
+  logBillingAudit(
+    amountUSD > 0 ? 'manual_recharge' : 'manual_deduct',
+    userId,
+    actorId,
+    {
+      amount: amountUSD,
+      description,
+      newBalance: tx.balance_after,
+    },
+  );
   logAccessTransition(userId, actorId, before, after);
   return tx;
 }
@@ -634,7 +646,14 @@ export function updateUsage(
 
   // 走 atomic helper 让 monthly + daily 在同一 SQLite 事务里写入，
   // 避免进程在两次 UPSERT 之间崩溃留下永久 drift（quota 计算两边依赖一致性）。
-  incrementUsageBoth(userId, month, date, inputTokens, outputTokens, effectiveCost);
+  incrementUsageBoth(
+    userId,
+    month,
+    date,
+    inputTokens,
+    outputTokens,
+    effectiveCost,
+  );
 
   // Invalidate quota cache
   invalidateUserBillingCache(userId);
@@ -645,7 +664,7 @@ export function updateUsage(
 export function deductUsageCost(
   userId: string,
   costUSD: number,
-  msgId: string,
+  eventId: string,
   cachedEffective?: ReturnType<typeof getUserEffectivePlan>,
 ): void {
   if (!isBillingEnabled() || costUSD <= 0) return;
@@ -665,14 +684,14 @@ export function deductUsageCost(
     -effectiveCost,
     'deduction',
     'AI 调用消费扣费',
-    'message',
-    msgId,
+    'usage_event',
+    eventId,
     null,
-    msgId ? `usage_${msgId}` : null,
+    eventId ? `usage_event_${eventId}` : null,
     {
       source: 'usage_charge',
       operatorType: 'system',
-      notes: `消息消费扣费: ${msgId}`,
+      notes: `用量事件消费扣费: ${eventId}`,
       allowNegative: true,
     },
   );
@@ -680,7 +699,7 @@ export function deductUsageCost(
   const after = checkBillingAccess(userId, userRole);
   logBillingAudit('balance_deducted', userId, null, {
     amount: effectiveCost,
-    messageId: msgId,
+    usageEventId: eventId,
     balanceUsd: after.balanceUsd,
   });
   logAccessTransition(userId, null, before, after);
@@ -717,8 +736,10 @@ export function redeemCode(
     return { success: false, message: '兑换码金额无效' };
   }
   if (rc.type === 'subscription') {
-    if (!rc.plan_id) return { success: false, message: '兑换码配置错误（无套餐）' };
-    if (!getBillingPlan(rc.plan_id)) return { success: false, message: '兑换码关联的套餐不存在' };
+    if (!rc.plan_id)
+      return { success: false, message: '兑换码配置错误（无套餐）' };
+    if (!getBillingPlan(rc.plan_id))
+      return { success: false, message: '兑换码关联的套餐不存在' };
   }
 
   // Optimistic lock: try to increment usage count atomically
@@ -810,7 +831,9 @@ export function redeemTrial(userId: string, days: number): boolean {
 
   // Re-assign the same plan with extended trial
   assignPlan(userId, effective.plan.id, userId, undefined, {
-    trialDays: Math.ceil((newTrialEnd.getTime() - now.getTime()) / (24 * 60 * 60 * 1000)),
+    trialDays: Math.ceil(
+      (newTrialEnd.getTime() - now.getTime()) / (24 * 60 * 60 * 1000),
+    ),
     notes: `试用延长 ${days} 天`,
   });
   return true;
@@ -845,10 +868,7 @@ export function checkAndExpireSubscriptions(): void {
  * Used as a periodic safety net to fix drift when incrementMonthlyUsage was missed.
  * If drift exceeds threshold, corrects monthly_usage to match daily_usage sum.
  */
-export function reconcileMonthlyUsage(
-  userId: string,
-  month: string,
-): void {
+export function reconcileMonthlyUsage(userId: string, month: string): void {
   try {
     const dailySum = getDailyUsageSumForMonth(userId, month);
     const existing = getMonthlyUsage(userId, month);
@@ -866,7 +886,9 @@ export function reconcileMonthlyUsage(
           recorded: recordedCost,
           actual: actualCost,
           drift,
-          recordedTokens: (existing?.total_input_tokens ?? 0) + (existing?.total_output_tokens ?? 0),
+          recordedTokens:
+            (existing?.total_input_tokens ?? 0) +
+            (existing?.total_output_tokens ?? 0),
           actualTokens: dailySum.totalInputTokens + dailySum.totalOutputTokens,
         },
         'Monthly usage drift detected, correcting',

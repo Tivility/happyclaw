@@ -1,7 +1,24 @@
-import { useState, useEffect } from 'react';
-import { File, Folder, Loader2, Lock, Trash2, RefreshCw, Package } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import {
+  File,
+  Folder,
+  Loader2,
+  Lock,
+  Trash2,
+  RefreshCw,
+  Package,
+} from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
-import { useSkillsStore, type SkillDetail as SkillDetailType } from '../../stores/skills';
+import { Badge } from '@/components/ui/badge';
+import {
+  useSkillsStore,
+  type SkillDetail as SkillDetailType,
+} from '../../stores/skills';
+import {
+  createLatestRequestGate,
+  isSelectionCurrent,
+  type LatestRequestTicket,
+} from '../../utils/latest-request';
 import { MarkdownRenderer } from '../chat/MarkdownRenderer';
 
 interface SkillDetailProps {
@@ -10,44 +27,106 @@ interface SkillDetailProps {
 }
 
 export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
-  const [detail, setDetail] = useState<SkillDetailType | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [deleting, setDeleting] = useState(false);
-  const [reinstalling, setReinstalling] = useState(false);
+  const [detailState, setDetailState] = useState<{
+    sourceKey: string | null;
+    detail: SkillDetailType | null;
+    loading: boolean;
+    error: string | null;
+  }>({ sourceKey: null, detail: null, loading: false, error: null });
+  const [pendingActions, setPendingActions] = useState<
+    Record<string, 'delete' | 'reinstall'>
+  >({});
+  const requestGateRef = useRef(createLatestRequestGate());
+  const currentSkillIdRef = useRef(skillId);
+  currentSkillIdRef.current = skillId;
   const getSkillDetail = useSkillsStore((state) => state.getSkillDetail);
   const deleteSkill = useSkillsStore((state) => state.deleteSkill);
   const reinstallSkill = useSkillsStore((state) => state.reinstallSkill);
 
+  const loadDetail = useCallback(
+    (sourceKey: string): LatestRequestTicket => {
+      const ticket = requestGateRef.current.begin(sourceKey);
+      setDetailState({
+        sourceKey,
+        detail: null,
+        loading: true,
+        error: null,
+      });
+      void getSkillDetail(sourceKey).then(
+        (detail) => {
+          if (
+            !requestGateRef.current.isCurrent(ticket, currentSkillIdRef.current)
+          ) {
+            return;
+          }
+          setDetailState({
+            sourceKey,
+            detail,
+            loading: false,
+            error: null,
+          });
+        },
+        (error: unknown) => {
+          if (
+            !requestGateRef.current.isCurrent(ticket, currentSkillIdRef.current)
+          ) {
+            return;
+          }
+          setDetailState({
+            sourceKey,
+            detail: null,
+            loading: false,
+            error: error instanceof Error ? error.message : '加载失败',
+          });
+        },
+      );
+      return ticket;
+    },
+    [getSkillDetail],
+  );
+
   useEffect(() => {
     if (!skillId) {
-      setDetail(null);
-      setError(null);
+      requestGateRef.current.invalidate();
+      setDetailState({
+        sourceKey: null,
+        detail: null,
+        loading: false,
+        error: null,
+      });
       return;
     }
+    const ticket = loadDetail(skillId);
+    return () => requestGateRef.current.cancel(ticket);
+  }, [loadDetail, skillId]);
 
-    const loadDetail = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const data = await getSkillDetail(skillId);
-        setDetail(data);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : '加载失败');
-        setDetail(null);
-      } finally {
-        setLoading(false);
-      }
-    };
+  const stateMatchesSelection = detailState.sourceKey === skillId;
+  const detail = stateMatchesSelection ? detailState.detail : null;
+  const loading = !stateMatchesSelection || detailState.loading;
+  const error = stateMatchesSelection ? detailState.error : null;
+  const deleting = !!skillId && pendingActions[skillId] === 'delete';
+  const reinstalling = !!skillId && pendingActions[skillId] === 'reinstall';
 
-    loadDetail();
-  }, [skillId, getSkillDetail]);
+  const setActionPending = (
+    sourceKey: string,
+    action: 'delete' | 'reinstall' | null,
+  ) => {
+    setPendingActions((current) => {
+      if (action) return { ...current, [sourceKey]: action };
+      if (!(sourceKey in current)) return current;
+      const next = { ...current };
+      delete next[sourceKey];
+      return next;
+    });
+  };
 
   if (!skillId) {
     return (
       <Card>
         <CardContent className="flex items-center justify-center py-8">
-          <p className="text-muted-foreground text-center">选择一个技能查看详情</p>
+          <p className="text-muted-foreground text-center">
+            选择一个技能查看详情
+          </p>
         </CardContent>
       </Card>
     );
@@ -79,7 +158,9 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
         <div className="flex items-start justify-between gap-4 mb-3">
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 mb-2">
-              <h2 className="text-xl font-bold text-foreground">{detail.name}</h2>
+              <h2 className="text-xl font-bold text-foreground">
+                {detail.name}
+              </h2>
               <span
                 className={`px-2 py-0.5 rounded text-xs font-medium ${
                   detail.source === 'user'
@@ -87,7 +168,11 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
                     : 'bg-muted text-muted-foreground'
                 }`}
               >
-                {detail.source === 'user' ? '用户级' : detail.source === 'external' ? '宿主机' : '项目级'}
+                {detail.source === 'user'
+                  ? '我的 Skills'
+                  : detail.source === 'external'
+                    ? '宿主机'
+                    : 'HappyClaw 内置'}
               </span>
               {detail.userInvocable && (
                 <span className="px-2 py-0.5 rounded text-xs font-medium bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300">
@@ -95,23 +180,20 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
                 </span>
               )}
             </div>
-            <p className="text-sm text-muted-foreground">{detail.description}</p>
+            <p className="text-sm text-muted-foreground">
+              {detail.description}
+            </p>
           </div>
 
-          {detail.source === 'project' ? (
-            <div className="flex items-center gap-2">
+          {detail.source !== 'user' ? (
+            <div
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+              title="此来源由系统或宿主机管理"
+            >
               <Lock size={16} className="text-muted-foreground" />
-              <div
-                className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                  detail.enabled ? 'bg-primary' : 'bg-muted-foreground/40'
-                } opacity-50`}
-              >
-                <span
-                  className={`inline-block h-4 w-4 rounded-full bg-white dark:bg-foreground transition-transform ${
-                    detail.enabled ? 'translate-x-6' : 'translate-x-1'
-                  }`}
-                />
-              </div>
+              <Badge variant="outline">
+                只读 · 由{detail.source === 'external' ? '宿主机' : '系统'}管理
+              </Badge>
             </div>
           ) : (
             <div className="flex items-center gap-2">
@@ -119,37 +201,68 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
                 <button
                   disabled={reinstalling || deleting}
                   onClick={async () => {
-                    if (!confirm(`确认重新安装技能「${detail.name}」？`)) return;
-                    setReinstalling(true);
+                    const actionSourceKey = skillId;
+                    const actionDetail = detail;
+                    if (
+                      !actionSourceKey ||
+                      detailState.sourceKey !== actionSourceKey ||
+                      !confirm(`确认重新安装技能「${actionDetail.name}」？`)
+                    ) {
+                      return;
+                    }
+                    setActionPending(actionSourceKey, 'reinstall');
                     try {
-                      await reinstallSkill(detail.id);
-                      // Reload detail after reinstall
-                      const data = await getSkillDetail(detail.id);
-                      setDetail(data);
+                      await reinstallSkill(actionDetail.id);
+                      if (
+                        isSelectionCurrent(
+                          actionSourceKey,
+                          currentSkillIdRef.current,
+                        )
+                      ) {
+                        loadDetail(actionSourceKey);
+                      }
                     } catch {
                       // error handled by store
                     } finally {
-                      setReinstalling(false);
+                      setActionPending(actionSourceKey, null);
                     }
                   }}
                   className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-950 transition-colors disabled:opacity-50"
                 >
-                  <RefreshCw size={16} className={reinstalling ? 'animate-spin' : ''} />
+                  <RefreshCw
+                    size={16}
+                    className={reinstalling ? 'animate-spin' : ''}
+                  />
                   {reinstalling ? '重装中...' : '重新安装'}
                 </button>
               )}
               <button
                 disabled={deleting || reinstalling}
                 onClick={async () => {
-                  if (!confirm(`确认删除技能「${detail.name}」？`)) return;
-                  setDeleting(true);
+                  const actionSourceKey = skillId;
+                  const actionDetail = detail;
+                  if (
+                    !actionSourceKey ||
+                    detailState.sourceKey !== actionSourceKey ||
+                    !confirm(`确认删除技能「${actionDetail.name}」？`)
+                  ) {
+                    return;
+                  }
+                  setActionPending(actionSourceKey, 'delete');
                   try {
-                    await deleteSkill(detail.id);
-                    onDeleted?.();
+                    await deleteSkill(actionDetail.id);
+                    if (
+                      isSelectionCurrent(
+                        actionSourceKey,
+                        currentSkillIdRef.current,
+                      )
+                    ) {
+                      onDeleted?.();
+                    }
                   } catch {
                     // error is handled by the store
                   } finally {
-                    setDeleting(false);
+                    setActionPending(actionSourceKey, null);
                   }
                 }}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-error hover:bg-error-bg transition-colors disabled:opacity-50"
@@ -167,7 +280,41 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
             <div className="flex items-center gap-1.5">
               <Package size={14} className="text-muted-foreground" />
               <span className="text-muted-foreground">来源：</span>
-              <span className="text-foreground font-mono text-xs">{detail.packageName}</span>
+              <span className="text-foreground font-mono text-xs">
+                {detail.packageName}
+              </span>
+            </div>
+          )}
+          {!detail.packageName && detail.sourceUrl && (
+            <div className="flex items-center gap-1.5">
+              <Package size={14} className="text-muted-foreground" />
+              <span className="text-muted-foreground">导入来源：</span>
+              <span className="text-foreground font-mono text-xs break-all">
+                {detail.sourceUrl}
+              </span>
+            </div>
+          )}
+          {detail.installSource && (
+            <div>
+              <span className="text-muted-foreground">安装方式：</span>
+              <span className="text-foreground ml-1">
+                {detail.installSource === 'git'
+                  ? 'Git'
+                  : detail.installSource === 'zip'
+                    ? 'ZIP'
+                    : 'skills.sh'}
+              </span>
+            </div>
+          )}
+          {detail.version && (
+            <div>
+              <span className="text-muted-foreground">版本：</span>
+              <span
+                className="text-foreground ml-1 font-mono text-xs"
+                title={detail.version}
+              >
+                {detail.version.slice(0, 12)}
+              </span>
             </div>
           )}
           {detail.installedAt && (
@@ -196,7 +343,9 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
           {detail.argumentHint && (
             <div>
               <span className="text-muted-foreground">参数提示：</span>
-              <span className="text-foreground ml-2">{detail.argumentHint}</span>
+              <span className="text-foreground ml-2">
+                {detail.argumentHint}
+              </span>
             </div>
           )}
         </div>
@@ -213,7 +362,9 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
       {/* 文件列表 */}
       {detail.files && detail.files.length > 0 && (
         <div className="p-6 border-b border-border">
-          <h3 className="text-sm font-semibold text-foreground mb-3">文件列表</h3>
+          <h3 className="text-sm font-semibold text-foreground mb-3">
+            文件列表
+          </h3>
           <div className="space-y-1">
             {detail.files.map((file) => (
               <div
@@ -227,7 +378,9 @@ export function SkillDetail({ skillId, onDeleted }: SkillDetailProps) {
                 )}
                 <span>{file.name}</span>
                 {file.type === 'file' && (
-                  <span className="text-xs text-muted-foreground">({file.size} B)</span>
+                  <span className="text-xs text-muted-foreground">
+                    ({file.size} B)
+                  </span>
                 )}
               </div>
             ))}

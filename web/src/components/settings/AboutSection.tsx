@@ -1,5 +1,12 @@
 import { useState } from 'react';
-import { Github, ExternalLink, Heart, Code2, Lightbulb, Bug } from 'lucide-react';
+import {
+  Github,
+  ExternalLink,
+  Heart,
+  Code2,
+  Lightbulb,
+  Bug,
+} from 'lucide-react';
 import { BugReportDialog } from '@/components/common/BugReportDialog';
 import { Button } from '@/components/ui/button';
 
@@ -10,8 +17,15 @@ export function AboutSection() {
     <div className="space-y-6">
       {/* 项目信息 */}
       <div>
-        <h2 className="text-lg font-semibold text-foreground mb-1">HappyClaw</h2>
-        <p className="text-sm text-muted-foreground">自托管个人 AI Agent 系统</p>
+        <h2 className="text-lg font-semibold text-foreground mb-1">
+          HappyClaw
+        </h2>
+        <p className="text-sm text-muted-foreground">
+          基于 Claude Agent SDK 的自托管多 Agent 工作平台
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          版本 1.0.0 · MIT License
+        </p>
       </div>
 
       {/* 开源地址 & 作者 & 报告问题 */}
@@ -70,7 +84,9 @@ export function AboutSection() {
               <ExternalLink className="w-3 h-3" />
             </a>
             <p className="mt-1 leading-relaxed">
-              我接触到的第一个类似项目。它是 Claude Code 的网页 Web 版，让你可以在任何地方通过浏览器使用 Claude Code，不再受限于本地终端。这个理念深深吸引了我，但遗憾的是项目维护更新不够及时，许多问题长期得不到修复。
+              Claude Code Web
+              化方向的重要启发项目，让用户可以通过浏览器在不同设备上继续使用
+              Claude Code 工作流。
             </p>
           </div>
           <div>
@@ -84,7 +100,8 @@ export function AboutSection() {
               <ExternalLink className="w-3 h-3" />
             </a>
             <p className="mt-1 leading-relaxed">
-              当下最火爆、最流行的个人 Agent 项目。但我认为它的架构存在根本性的缺陷——它自己从头实现了一个 Agent。而 Claude Code 已经是世界上最好的 Agent 了，为什么不站在巨人的肩膀上去构建呢？
+              自托管个人 Agent 产品方向的重要参考。HappyClaw 选择复用 Claude
+              Agent SDK，并在此基础上构建工作区、渠道与多 Agent 管理能力。
             </p>
           </div>
         </div>
@@ -99,10 +116,10 @@ export function AboutSection() {
           <h3 className="text-sm font-medium text-foreground">设计哲学</h3>
         </div>
         <p className="text-sm text-muted-foreground leading-relaxed">
-          站在巨人的肩膀上，基于 Claude Code（全世界最好的 Agent）构建。
+          复用成熟的 Claude Agent
+          SDK，把产品重心放在工作区、渠道连接、能力治理和多用户协作体验上。
         </p>
       </div>
-
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   RefreshCw,
-  Trash2,
+  PowerOff,
   Puzzle,
   AlertTriangle,
   Info,
@@ -25,18 +25,13 @@ import { toast } from 'sonner';
 import { usePluginsStore, type PluginEntry } from '../stores/plugins';
 import { useAuthStore } from '../stores/auth';
 
-function WarningBadge({
-  warnings,
-}: {
-  warnings: PluginEntry['warnings'];
-}) {
+function WarningBadge({ warnings }: { warnings: PluginEntry['warnings'] }) {
   if (!warnings.missing || warnings.missing.length === 0) return null;
   return (
     <span
       className="inline-flex items-center gap-1 rounded-md border border-warning/30 bg-warning-bg px-2 py-0.5 text-xs text-warning"
       title={
-        warnings.note ||
-        `Missing binaries: ${warnings.missing.join(', ')}`
+        warnings.note || `Missing binaries: ${warnings.missing.join(', ')}`
       }
     >
       <AlertTriangle size={12} />
@@ -58,15 +53,19 @@ export function PluginsPage() {
   } = usePluginsStore();
 
   const isAdmin = useAuthStore((s) => s.user?.role === 'admin');
-  const [deleteTarget, setDeleteTarget] = useState<{ name: string; enabledCount: number } | null>(
-    null,
-  );
+  const [deleteTarget, setDeleteTarget] = useState<{
+    name: string;
+    enabledCount: number;
+  } | null>(null);
 
   useEffect(() => {
     loadPlugins();
   }, [loadPlugins]);
 
-  const totalPlugins = marketplaces.reduce((acc, mp) => acc + mp.plugins.length, 0);
+  const totalPlugins = marketplaces.reduce(
+    (acc, mp) => acc + mp.plugins.length,
+    0,
+  );
   const enabledPlugins = marketplaces.reduce(
     (acc, mp) => acc + mp.plugins.filter((p) => p.enabled).length,
     0,
@@ -84,7 +83,9 @@ export function PluginsPage() {
         toast.success(`已禁用 ${plugin.fullId}。下次新会话生效。`);
       }
     } catch (err) {
-      toast.error(`切换失败：${err instanceof Error ? err.message : String(err)}`);
+      toast.error(
+        `切换失败：${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   };
 
@@ -98,7 +99,9 @@ export function PluginsPage() {
         toast.warning(`扫描告警:\n${report.warnings.join('\n')}`);
       }
     } catch (err) {
-      toast.error(`扫描失败：${err instanceof Error ? err.message : String(err)}`);
+      toast.error(
+        `扫描失败：${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   };
 
@@ -107,11 +110,13 @@ export function PluginsPage() {
     try {
       const result = await deleteMarketplace(deleteTarget.name);
       toast.success(
-        `已删除 ${deleteTarget.name}。清理了 ${result.removedEnabled.length} 条启用项。`,
+        `已清除 ${deleteTarget.name} 下 ${result.removedEnabled.length} 个个人启用项。`,
       );
       setDeleteTarget(null);
     } catch (err) {
-      toast.error(`删除失败：${err instanceof Error ? err.message : String(err)}`);
+      toast.error(
+        `删除失败：${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   };
 
@@ -131,12 +136,22 @@ export function PluginsPage() {
                     disabled={scanning}
                     title="扫描宿主机 ~/.claude/plugins/marketplaces/ 并导入 catalog"
                   >
-                    <RefreshCw size={18} className={scanning ? 'animate-spin' : ''} />
-                    扫描宿主机
+                    <RefreshCw
+                      size={18}
+                      className={scanning ? 'animate-spin' : ''}
+                    />
+                    扫描宿主机 Catalog
                   </Button>
                 )}
-                <Button variant="outline" onClick={loadPlugins} disabled={loading}>
-                  <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+                <Button
+                  variant="outline"
+                  onClick={loadPlugins}
+                  disabled={loading}
+                >
+                  <RefreshCw
+                    size={18}
+                    className={loading ? 'animate-spin' : ''}
+                  />
                   刷新
                 </Button>
               </div>
@@ -147,8 +162,9 @@ export function PluginsPage() {
         <div className="mx-6 mt-4 p-3 bg-info-bg border border-info/20 rounded-lg text-xs text-info flex gap-2">
           <Info size={16} className="flex-shrink-0 mt-0.5" />
           <div>
-            Plugin 通过 SDK <code>options.plugins</code> 注入（session-local 加载）。
-            启用/禁用后需要新建会话才生效；已运行的 agent 进程不会热加载插件变化。
+            Plugin Catalog
+            由管理员从宿主机导入并全局共享；下方启用状态仅属于当前用户。
+            更改会在新建会话时生效，已运行的 Agent 不会热加载。
           </div>
         </div>
 
@@ -190,14 +206,20 @@ export function PluginsPage() {
                   <div className="flex items-center justify-between mb-3 pb-3 border-b border-border">
                     <div>
                       <div className="flex items-center gap-2">
-                        <span className="font-semibold text-base">{mp.name}</span>
+                        <span className="font-semibold text-base">
+                          {mp.name}
+                        </span>
                         {mp.version && (
-                          <span className="text-xs text-muted-foreground">v{mp.version}</span>
+                          <span className="text-xs text-muted-foreground">
+                            v{mp.version}
+                          </span>
                         )}
                       </div>
                       <div className="text-xs text-muted-foreground mt-0.5">
                         {mp.hostSourcePath && (
-                          <>同步自 <code>{mp.hostSourcePath}</code> · </>
+                          <>
+                            同步自 <code>{mp.hostSourcePath}</code> ·{' '}
+                          </>
                         )}
                         {mp.plugins.length} 个 plugin
                       </div>
@@ -208,19 +230,21 @@ export function PluginsPage() {
                       onClick={() =>
                         setDeleteTarget({
                           name: mp.name,
-                          enabledCount: mp.plugins.filter((p) => p.enabled).length,
+                          enabledCount: mp.plugins.filter((p) => p.enabled)
+                            .length,
                         })
                       }
                       className="text-destructive hover:bg-destructive/10"
                     >
-                      <Trash2 size={14} />
-                      删除
+                      <PowerOff size={14} />
+                      清除我的启用项
                     </Button>
                   </div>
 
                   {mp.plugins.length === 0 ? (
                     <div className="text-sm text-muted-foreground py-3">
-                      该 marketplace 目录下没有有效的 plugin（缺少 .claude-plugin/plugin.json）
+                      该 marketplace 目录下没有有效的 plugin（缺少
+                      .claude-plugin/plugin.json）
                     </div>
                   ) : (
                     <div className="space-y-2">
@@ -269,15 +293,18 @@ export function PluginsPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>清除 marketplace 启用项</DialogTitle>
+            <DialogTitle>清除我的启用项</DialogTitle>
             <DialogDescription>
-              将清除你账户下所有属于 <strong>{deleteTarget?.name}</strong> 的启用项。
+              将停用你账户下所有属于 <strong>{deleteTarget?.name}</strong> 的
+              Plugin。
               {deleteTarget && deleteTarget.enabledCount > 0 && (
                 <>
-                  {' '}会一次性禁用 <strong>{deleteTarget.enabledCount}</strong> 个 plugin。
+                  {' '}
+                  会一次性禁用 <strong>{deleteTarget.enabledCount}</strong> 个
+                  plugin。
                 </>
               )}
-              宿主机 marketplace 目录与 catalog 快照不受影响。
+              不会删除共享 Catalog、宿主机 marketplace 或其他用户的启用状态。
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -286,8 +313,8 @@ export function PluginsPage() {
               取消
             </Button>
             <Button variant="destructive" onClick={handleDelete}>
-              <Trash2 size={14} />
-              确认删除
+              <PowerOff size={14} />
+              全部停用
             </Button>
           </DialogFooter>
         </DialogContent>

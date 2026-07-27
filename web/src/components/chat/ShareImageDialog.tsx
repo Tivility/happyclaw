@@ -3,7 +3,6 @@ import { createPortal } from 'react-dom';
 import { X, Download, RefreshCw, Copy, Check } from 'lucide-react';
 import { toCanvas } from 'html-to-image';
 import { Message } from '../../stores/chat';
-import { useAuthStore } from '../../stores/auth';
 import { downloadFromDataUrl } from '../../utils/download';
 import { showToast } from '../../utils/toast';
 import { isIOSDevice } from '../../utils/url';
@@ -13,10 +12,16 @@ import {
   SHARE_CARD_MAX_WIDTH,
   SHARE_CARD_PADDING,
 } from './ShareCardRenderer';
+import { resolveAgentDisplayIdentity } from '../../utils/agent-identity';
+import { useAuthStore } from '../../stores/auth';
 
 interface ShareImageDialogProps {
   onClose: () => void;
   message: Message;
+  agentName?: string;
+  agentAvatarUrl?: string | null;
+  agentAvatarEmoji?: string | null;
+  agentAvatarColor?: string | null;
 }
 
 type GenerateState = 'generating' | 'preview' | 'error';
@@ -37,7 +42,9 @@ const MIN_EXPORT_PIXEL_RATIO = 0.6;
 
 function computeExportPixelRatio(el: HTMLElement): number {
   const rect = el.getBoundingClientRect();
-  const width = Math.ceil(rect.width || el.scrollWidth || SHARE_CARD_DEFAULT_WIDTH);
+  const width = Math.ceil(
+    rect.width || el.scrollWidth || SHARE_CARD_DEFAULT_WIDTH,
+  );
   const height = Math.ceil(rect.height || el.scrollHeight || 1);
   const ios = isIOSDevice();
   const maxPixels = ios ? IOS_CANVAS_MAX_PIXELS : DESKTOP_CANVAS_MAX_PIXELS;
@@ -52,7 +59,10 @@ function computeExportPixelRatio(el: HTMLElement): number {
     ratio = Math.min(ratio, IOS_CANVAS_MAX_SIDE / Math.max(width, height, 1));
   }
 
-  return Math.max(MIN_EXPORT_PIXEL_RATIO, Math.min(DEFAULT_EXPORT_PIXEL_RATIO, ratio));
+  return Math.max(
+    MIN_EXPORT_PIXEL_RATIO,
+    Math.min(DEFAULT_EXPORT_PIXEL_RATIO, ratio),
+  );
 }
 
 /**
@@ -132,7 +142,8 @@ function inferImageMimeType(src: string, fallback?: string): string {
     }
   })().toLowerCase();
 
-  if (pathSegment.endsWith('.jpg') || pathSegment.endsWith('.jpeg')) return 'image/jpeg';
+  if (pathSegment.endsWith('.jpg') || pathSegment.endsWith('.jpeg'))
+    return 'image/jpeg';
   if (pathSegment.endsWith('.webp')) return 'image/webp';
   if (pathSegment.endsWith('.gif')) return 'image/gif';
   if (pathSegment.endsWith('.svg')) return 'image/svg+xml';
@@ -184,7 +195,10 @@ async function waitForImageReady(img: HTMLImageElement): Promise<void> {
   });
 }
 
-async function setImageSrcAndWait(img: HTMLImageElement, src: string): Promise<void> {
+async function setImageSrcAndWait(
+  img: HTMLImageElement,
+  src: string,
+): Promise<void> {
   await new Promise<void>((resolve) => {
     const done = () => resolve();
     img.addEventListener('load', done, { once: true });
@@ -222,7 +236,10 @@ async function inlineImagesAsDataUrls(container: HTMLElement): Promise<void> {
   );
 }
 
-function getImageContentRect(img: HTMLImageElement, rootRect: DOMRect): ImageOverlay | null {
+function getImageContentRect(
+  img: HTMLImageElement,
+  rootRect: DOMRect,
+): ImageOverlay | null {
   const rect = img.getBoundingClientRect();
   if (rect.width <= 0 || rect.height <= 0) return null;
 
@@ -254,7 +271,9 @@ function isSafeOverlayImageSrc(src: string): boolean {
   }
 }
 
-function isSafeImageOverlay(overlay: ImageOverlay | null): overlay is ImageOverlay {
+function isSafeImageOverlay(
+  overlay: ImageOverlay | null,
+): overlay is ImageOverlay {
   return overlay !== null && isSafeOverlayImageSrc(overlay.src);
 }
 
@@ -274,7 +293,11 @@ function loadOverlayImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-async function paintImageOverlays(canvas: HTMLCanvasElement, root: HTMLElement, overlays: ImageOverlay[]): Promise<void> {
+async function paintImageOverlays(
+  canvas: HTMLCanvasElement,
+  root: HTMLElement,
+  overlays: ImageOverlay[],
+): Promise<void> {
   if (overlays.length === 0) return;
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -308,18 +331,37 @@ async function paintImageOverlays(canvas: HTMLCanvasElement, root: HTMLElement, 
   }
 }
 
-export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
+export function ShareImageDialog({
+  onClose,
+  message,
+  agentName,
+  agentAvatarUrl,
+  agentAvatarEmoji,
+  agentAvatarColor,
+}: ShareImageDialogProps) {
   const [state, setState] = useState<GenerateState>('generating');
   const [dataUrl, setDataUrl] = useState<string | null>(null);
+  const [previewWidth, setPreviewWidth] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const cardRef = useRef<HTMLDivElement>(null);
-  const currentUser = useAuthStore((s) => s.user);
-  const appearance = useAuthStore((s) => s.appearance);
-
-  const senderName = currentUser?.ai_name || appearance?.aiName || message.sender_name || 'AI';
-  const aiEmoji = currentUser?.ai_avatar_emoji || appearance?.aiAvatarEmoji;
-  const aiColor = currentUser?.ai_avatar_color || appearance?.aiAvatarColor;
-  const aiImageUrl = currentUser?.ai_avatar_url;
+  const appearance = useAuthStore((state) => state.appearance);
+  const agentIdentity = resolveAgentDisplayIdentity({
+    agentName,
+    messageSenderName: message.sender_name,
+    avatarUrl: agentAvatarUrl,
+    avatarEmoji: agentAvatarEmoji,
+    avatarColor: agentAvatarColor,
+    mainAvatarUrl: appearance?.aiAvatarUrl,
+    mainAvatarEmoji:
+      appearance?.aiAvatarMode === 'emoji'
+        ? appearance.aiAvatarEmoji
+        : undefined,
+    mainAvatarColor:
+      appearance?.aiAvatarMode === 'emoji'
+        ? appearance.aiAvatarColor
+        : undefined,
+  });
+  const senderName = agentIdentity.name;
 
   const timestamp = new Date(message.timestamp)
     .toLocaleString('zh-CN', {
@@ -335,6 +377,7 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
   const generate = useCallback(async () => {
     setState('generating');
     setDataUrl(null);
+    setPreviewWidth(null);
     setErrorMsg('');
 
     // Wait a tick for offscreen card to mount
@@ -372,6 +415,8 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
       await new Promise((r) => requestAnimationFrame(r));
 
       await waitForRenderComplete(el);
+      const previewRect = el.getBoundingClientRect();
+      setPreviewWidth(Math.ceil(previewRect.width || cardWidth));
       const imageOverlays = collectImageOverlays(el);
       const canvas = await toCanvas(el, {
         pixelRatio: computeExportPixelRatio(el),
@@ -400,7 +445,10 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
     if (!dataUrl) return;
     downloadFromDataUrl(dataUrl, `share-${Date.now()}.png`).catch((err) => {
       console.error('Share image download failed:', err);
-      showToast('保存失败', err instanceof Error ? err.message : '图片保存出错，请重试');
+      showToast(
+        '保存失败',
+        err instanceof Error ? err.message : '图片保存出错，请重试',
+      );
     });
   };
 
@@ -427,12 +475,15 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
     >
       {/* Dialog card */}
       <div
-        className="relative bg-card rounded-2xl shadow-2xl border border-border w-[90vw] max-w-2xl max-h-[85vh] flex flex-col animate-in zoom-in-95 fade-in duration-200"
+        className="relative flex max-h-[88vh] flex-col rounded-2xl border border-border bg-card shadow-2xl animate-in zoom-in-95 fade-in duration-200"
+        style={{ width: 'min(94vw, 1280px)' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-border">
-          <h2 className="text-base font-semibold text-foreground">生成分享图片</h2>
+        <div className="flex items-center justify-between border-b border-border px-4 py-3 sm:px-5 sm:py-4">
+          <h2 className="text-base font-semibold text-foreground">
+            生成分享图片
+          </h2>
           <button
             onClick={onClose}
             className="w-8 h-8 rounded-lg flex items-center justify-center text-muted-foreground hover:text-foreground hover:bg-foreground/10 transition-colors cursor-pointer"
@@ -442,11 +493,13 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
         </div>
 
         {/* Body */}
-        <div className="flex-1 overflow-auto p-5">
+        <div className="flex-1 overflow-auto p-3 sm:p-5">
           {state === 'generating' && (
             <div className="flex flex-col items-center justify-center py-16 gap-3">
               <RefreshCw className="w-6 h-6 text-primary animate-spin" />
-              <span className="text-sm text-muted-foreground">正在渲染图片...</span>
+              <span className="text-sm text-muted-foreground">
+                正在渲染图片...
+              </span>
             </div>
           )}
 
@@ -463,22 +516,33 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
           )}
 
           {state === 'preview' && dataUrl && (
-            <img
-              src={dataUrl}
-              alt="分享预览"
-              className="w-full rounded-lg border border-border"
-            />
+            <div className="flex justify-center">
+              <img
+                src={dataUrl}
+                alt="分享预览"
+                className="block rounded-lg border border-border shadow-sm"
+                style={{
+                  width: previewWidth ? `${previewWidth}px` : undefined,
+                  maxWidth: '100%',
+                  height: 'auto',
+                }}
+              />
+            </div>
           )}
         </div>
 
         {/* Footer */}
         {state === 'preview' && (
-          <div className="flex gap-3 px-5 py-4 border-t border-border">
+          <div className="flex flex-col gap-2 border-t border-border px-4 py-3 sm:flex-row sm:gap-3 sm:px-5 sm:py-4">
             <button
               onClick={handleCopy}
               className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium border border-border rounded-lg hover:bg-accent transition-colors cursor-pointer"
             >
-              {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
+              {copied ? (
+                <Check className="w-4 h-4 text-emerald-500" />
+              ) : (
+                <Copy className="w-4 h-4" />
+              )}
               {copied ? '已复制' : '复制图片'}
             </button>
             <button
@@ -492,17 +556,25 @@ export function ShareImageDialog({ onClose, message }: ShareImageDialogProps) {
         )}
       </div>
 
-      {/* Hidden render area — keep it paintable for iOS PWA image rasterization. */}
-      <div style={{ position: 'fixed', left: 0, top: 0, zIndex: -1, pointerEvents: 'none' }}>
+      {/* Hidden render area — offscreen but still layouted/paintable for iOS PWA rasterization. */}
+      <div
+        aria-hidden="true"
+        style={{
+          position: 'fixed',
+          left: -10000,
+          top: 0,
+          pointerEvents: 'none',
+        }}
+      >
         <ShareCardRenderer
           ref={cardRef}
           content={message.content}
           senderName={senderName}
           timestamp={timestamp}
           groupJid={message.chat_jid}
-          aiEmoji={aiEmoji}
-          aiColor={aiColor}
-          aiImageUrl={aiImageUrl}
+          aiImageUrl={agentIdentity.imageUrl}
+          aiEmoji={agentIdentity.emoji}
+          aiColor={agentIdentity.color}
         />
       </div>
     </div>,

@@ -16,8 +16,14 @@
  *       keeps working unchanged.
  */
 
-import { optimizeMarkdownStyle } from '../feishu-markdown-style.js';
-import type { AgentCardInput, CardMeta, FeishuCardV2 } from './types.js';
+import {
+  optimizeMarkdownStyle,
+} from '../feishu-markdown-style.js';
+import type {
+  AgentCardInput,
+  CardMeta,
+  FeishuCardV2,
+} from './types.js';
 import {
   buildHeader,
   buildMetaRow,
@@ -119,8 +125,25 @@ export function buildAgentReplyCard(input: AgentCardInput): FeishuCardV2 {
   // ── Main content (Body) ──
   elements.push(...buildBodyChunks(body || optimizedText.trim()));
 
-  // ── Footer: metaRow carries timestamp (replaces the old standalone footer) ──
+  // ── Footer: metaRow 携带时间戳（取代旧的独立 footer 时间戳）──
   elements.push(...metaRow);
+  // input.footer 折叠进 metaRow 之后作为同一行的续行，不另起 FOOTER 元素
+  // （本地契约：终态卡只有一个紧凑元信息行）。它承载 metaRow 覆盖不到的内容，
+  // 典型是执行轨迹链接 [查看完整运行轨迹](...)。
+  const footerText = input.footer?.trim();
+  if (footerText) {
+    if (metaRow.length > 0) {
+      const last = metaRow[metaRow.length - 1] as { content?: string };
+      last.content = `${last.content ?? ''}\n${footerText}`;
+    } else {
+      elements.push({
+        tag: 'markdown',
+        text_size: 'notation',
+        content: `<font color='grey'>${footerText}</font>`,
+        element_id: CARD_ELEMENT_IDS.META_ROW,
+      });
+    }
+  }
 
   const config: Record<string, unknown> = {
     update_multi: true,
@@ -171,6 +194,9 @@ export function buildStreamingAgentCard(
   opts: StreamingCardBuildOptions = {},
 ): FeishuCardV2 {
   const initialText = opts.initialText ?? '';
+  // 空正文时给占位，避免飞书 markdown 元素内容为空导致整卡渲染失败（upstream）
+  const visibleInitialText =
+    initialText.trim() || '> 正在分析请求，最终结论完成后会显示在这里。';
   const { title: autoTitle } = extractTitle(initialText);
   const baseTitle = opts.title ?? autoTitle ?? 'Agent 回复';
   const displayTitle = `${baseTitle} · 生成中`;
@@ -187,12 +213,12 @@ export function buildStreamingAgentCard(
 
   const mainContentEl = {
     tag: 'markdown',
-    content: initialText || '...',
+    content: visibleInitialText,
     element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
   };
   const interruptBtn = {
     tag: 'button',
-    text: { tag: 'plain_text', content: '⏹ 中断回复' },
+    text: { tag: 'plain_text', content: '⏹ 停止回复' },
     type: 'danger',
     value: { action: 'interrupt_stream' },
     element_id: CARD_ELEMENT_IDS.INTERRUPT_BTN,
@@ -279,4 +305,81 @@ export function buildStreamingAgentCard(
       ],
     },
   };
+}
+
+export interface QueuedFollowUpCardInput {
+  content: string;
+  position: number;
+  sourceJid: string;
+  targetJid: string;
+  messageId: string;
+  expectedRunId: string;
+}
+
+/** Compact action card shown only when a message is durably queued. */
+export function buildQueuedFollowUpCard(
+  input: QueuedFollowUpCardInput,
+): FeishuCardV2 {
+  const preview = optimizeMarkdownStyle(input.content.trim(), 2).slice(0, 300);
+  const actionValue = {
+    sourceJid: input.sourceJid,
+    targetJid: input.targetJid,
+    messageId: input.messageId,
+    expectedRunId: input.expectedRunId,
+  };
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      enable_forward: false,
+      width_mode: 'fill',
+      summary: { content: `消息已排队 · 第 ${input.position} 位` },
+    },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `消息已排队 · 第 ${input.position} 位`,
+      },
+      template: 'grey',
+    },
+    body: {
+      direction: 'vertical',
+      vertical_spacing: 'small',
+      elements: [
+        {
+          tag: 'markdown',
+          content: preview || '（空消息）',
+        },
+        {
+          tag: 'markdown',
+          content:
+            "<font color='grey'>默认会在当前回复结束后发送。点击立即发送，会先停止当前回复，再优先处理这条消息。</font>",
+          text_size: 'notation',
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '↪ 立即发送' },
+          type: 'primary',
+          value: { ...actionValue, action: 'steer_queued' },
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '删除' },
+          type: 'default',
+          value: { ...actionValue, action: 'cancel_queued' },
+        },
+      ],
+    },
+  };
+}
+
+export function buildFollowUpActionResultCard(
+  message: string,
+  ok: boolean,
+): FeishuCardV2 {
+  return buildAgentReplyCard({
+    status: ok ? 'done' : 'warning',
+    title: ok ? '操作已完成' : '操作未执行',
+    text: message,
+  });
 }

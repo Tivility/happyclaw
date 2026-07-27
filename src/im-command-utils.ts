@@ -3,6 +3,8 @@
  * Extracted from index.ts to enable unit testing without DB/state dependencies.
  */
 
+import { resolveChannelConversationKind } from './channel-conversation-kind.js';
+
 // ─── Types ──────────────────────────────────────────────────────
 
 export interface AgentInfo {
@@ -75,7 +77,7 @@ export function formatWorkspaceList(
     lines.push(`${marker} ${ws.name} (${ws.folder})`);
 
     const mainMarker = isCurrent && currentOnMain ? ' ← 当前' : '';
-    lines.push(`  · 主对话${mainMarker}`);
+    lines.push(`  · 主会话${mainMarker}`);
 
     for (const agent of ws.agents) {
       const agentMarker =
@@ -141,17 +143,18 @@ export function resolveLocationInfo(
     folder = parent?.folder || group.folder;
   } else if (group.target_main_jid) {
     const target = getRegisteredGroup(group.target_main_jid);
-    locationLine = `${target?.name || group.target_main_jid} / 主对话`;
+    locationLine = `${target?.name || group.target_main_jid} / 主会话`;
     folder = target?.folder || group.folder;
   } else {
     const folderName = findGroupNameByFolder(group.folder);
-    locationLine = `${folderName} / 主对话`;
+    locationLine = `${folderName} / 主会话`;
     folder = group.folder;
   }
 
-  const replyPolicy = group.target_main_jid || group.target_agent_id
-    ? (group.reply_policy || 'source_only')
-    : null;
+  const replyPolicy =
+    group.target_main_jid || group.target_agent_id
+      ? group.reply_policy || 'source_only'
+      : null;
 
   return { locationLine, folder, replyPolicy };
 }
@@ -168,30 +171,36 @@ export function resolveBoundChatTarget(
   getRegisteredGroup: (jid: string) => RegisteredGroupLike | undefined,
   getAgent: (id: string) => AgentLike | undefined,
   findGroupNameByFolder: (folder: string) => string,
-): BoundChatTarget {
+  resolveWorkspaceJid?: (jid: string) => string | null,
+): BoundChatTarget | null {
   if (group.target_agent_id) {
     const agent = getAgent(group.target_agent_id);
-    const parent = agent ? getRegisteredGroup(agent.chat_jid) : undefined;
+    if (!agent?.chat_jid) return null;
+    const parent = getRegisteredGroup(agent.chat_jid);
+    if (!parent) return null;
     const workspaceName =
-      parent?.name || findGroupNameByFolder(parent?.folder || group.folder);
-    const baseChatJid = agent?.chat_jid || sourceChatJid;
+      parent.name || findGroupNameByFolder(parent.folder || group.folder);
+    const baseChatJid = agent.chat_jid;
     return {
       baseChatJid,
       targetChatJid: `${baseChatJid}#agent:${group.target_agent_id}`,
-      folder: parent?.folder || group.folder,
+      folder: parent.folder,
       agentId: group.target_agent_id,
-      locationLine: `${workspaceName} / ${agent?.name || group.target_agent_id}`,
+      locationLine: `${workspaceName} / ${agent.name || group.target_agent_id}`,
     };
   }
 
   if (group.target_main_jid) {
-    const target = getRegisteredGroup(group.target_main_jid);
+    const baseChatJid =
+      resolveWorkspaceJid?.(group.target_main_jid) ?? group.target_main_jid;
+    const target = getRegisteredGroup(baseChatJid);
+    if (!target) return null;
     return {
-      baseChatJid: group.target_main_jid,
-      targetChatJid: group.target_main_jid,
-      folder: target?.folder || group.folder,
+      baseChatJid,
+      targetChatJid: baseChatJid,
+      folder: target.folder,
       agentId: null,
-      locationLine: `${target?.name || group.target_main_jid} / 主对话`,
+      locationLine: `${target.name || baseChatJid} / 主会话`,
     };
   }
 
@@ -201,7 +210,7 @@ export function resolveBoundChatTarget(
     targetChatJid: sourceChatJid,
     folder: group.folder,
     agentId: null,
-    locationLine: `${workspaceName} / 主对话`,
+    locationLine: `${workspaceName} / 主会话`,
   };
 }
 
@@ -211,7 +220,6 @@ export interface QueueStatusInfo {
   activeContainerCount: number;
   activeHostProcessCount: number;
   maxContainers: number;
-  maxHostProcesses: number;
   waitingCount: number;
   waitingGroupJids: string[];
 }
@@ -236,7 +244,7 @@ export function formatSystemStatus(
     '━━━━━━━━━━',
     `📍 位置: ${location.locationLine}`,
     `⚡ 状态: ${statusText}`,
-    `📦 负载: ${queueStatus.activeContainerCount}/${queueStatus.maxContainers} 容器, ${queueStatus.activeHostProcessCount}/${queueStatus.maxHostProcesses} 进程`,
+    `📦 负载: ${queueStatus.activeContainerCount}/${queueStatus.maxContainers} 容器, ${queueStatus.activeHostProcessCount} 个宿主机进程（不同会话不设并发上限）`,
     '',
     '💡 /sw <消息> 并行任务 · /where 绑定 · /list 全部',
   ];
@@ -331,15 +339,7 @@ export function checkImOwnerCommand(
  * a group and the user falls back to `/owner_mention`.
  */
 export function isDirectMessageJid(chatJid: string): boolean {
-  if (chatJid.startsWith('qq:')) return chatJid.startsWith('qq:c2c:');
-  if (chatJid.startsWith('dingtalk:')) return chatJid.startsWith('dingtalk:c2c:');
-  if (chatJid.startsWith('discord:')) return chatJid.startsWith('discord:dm:');
-  if (chatJid.startsWith('whatsapp:')) return chatJid.endsWith('@s.whatsapp.net');
-  if (chatJid.startsWith('wechat:')) return true; // WeChat integration is 1:1 only
-  if (chatJid.startsWith('telegram:')) {
-    const id = Number(chatJid.slice('telegram:'.length));
-    return Number.isFinite(id) && id > 0;
-  }
-  // feishu / web / unknown → not eligible for DM auto-claim.
-  return false;
+  // Kept structural-only for the owner gate. Feishu remains false here
+  // because this helper intentionally has no metadata parameter.
+  return resolveChannelConversationKind(chatJid) === 'direct';
 }

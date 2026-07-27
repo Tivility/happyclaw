@@ -13,7 +13,11 @@ import {
 import { cn } from '@/lib/utils';
 import { api } from '../../api/client';
 import { showToast } from '../../utils/toast';
-import { INTERVAL_UNITS, CHANNEL_OPTIONS, toggleNotifyChannel } from '../../utils/task-utils';
+import {
+  INTERVAL_UNITS,
+  CHANNEL_OPTIONS,
+  toggleNotifyChannel,
+} from '../../utils/task-utils';
 import { useConnectedChannels } from '../../hooks/useConnectedChannels';
 import { useTasksStore } from '../../stores/tasks';
 import { useGroupsStore } from '../../stores/groups';
@@ -36,8 +40,13 @@ interface CreateTaskFormProps {
 }
 
 type CreateMode = 'ai' | 'manual';
+const MODAL_SELECT_CONTENT_CLASS = 'z-[11020]';
 
-export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormProps) {
+export function CreateTaskForm({
+  onSubmit,
+  onClose,
+  isAdmin,
+}: CreateTaskFormProps) {
   const [mode, setMode] = useState<CreateMode>('ai');
 
   // --- AI mode state ---
@@ -62,8 +71,11 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
   // --- Shared state ---
   const [notifyChannels, setNotifyChannels] = useState<string[] | null>(null);
   const [chatJid, setChatJid] = useState<string>('');
-  const [contextMode, setContextMode] = useState<'group' | 'isolated'>('group');
-  const [executionModeExplicit, setExecutionModeExplicit] = useState<boolean>(false);
+  const [contextMode, setContextMode] = useState<'group' | 'isolated'>(
+    'isolated',
+  );
+  const [executionModeExplicit, setExecutionModeExplicit] =
+    useState<boolean>(false);
   const connectedChannels = useConnectedChannels();
 
   const groupNames = useTasksStore((s) => s.groupNames);
@@ -101,53 +113,94 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
     if (aWeb !== bWeb) return aWeb - bWeb;
     return a.localeCompare(b);
   });
+  const scriptGroupEntries = sortedGroupEntries.filter(
+    ([jid]) => groups[jid]?.execution_mode === 'host',
+  );
+  const defaultWorkspaceMode = Object.values(groups).find(
+    (group) => group.is_my_home,
+  )?.execution_mode;
+
+  useEffect(() => {
+    if (!isScript) return;
+    setExecutionModeExplicit(true);
+    setFormData((previous) =>
+      previous.executionMode === 'host'
+        ? previous
+        : { ...previous, executionMode: 'host' },
+    );
+    const selectedMode = chatJid
+      ? groups[chatJid]?.execution_mode
+      : defaultWorkspaceMode;
+    if (selectedMode === 'host') return;
+    const firstHostJid = Object.keys(groupNames).find(
+      (jid) => groups[jid]?.execution_mode === 'host',
+    );
+    if (firstHostJid && firstHostJid !== chatJid) setChatJid(firstHostJid);
+  }, [isScript, chatJid, groups, groupNames, defaultWorkspaceMode]);
 
   const renderTargetWorkspace = () => (
     <div>
-      <label className="block text-sm font-medium text-foreground mb-2">消息目标</label>
+      <label className="block text-sm font-medium text-foreground mb-2">
+        所属工作区
+      </label>
       <Select
         value={chatJid || '__default__'}
-        onValueChange={(value) => setChatJid(value === '__default__' ? '' : value)}
+        onValueChange={(value) =>
+          setChatJid(value === '__default__' ? '' : value)
+        }
       >
         <SelectTrigger className="w-full">
           <SelectValue />
         </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="__default__">默认（我的主工作区）</SelectItem>
-          {sortedGroupEntries.map(([jid, name]) => (
-            <SelectItem key={jid} value={jid}>
-              {formatGroupLabel(jid, name)}
-            </SelectItem>
-          ))}
+        <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
+          {(!isScript || defaultWorkspaceMode === 'host') && (
+            <SelectItem value="__default__">默认工作区</SelectItem>
+          )}
+          {(isScript ? scriptGroupEntries : sortedGroupEntries).map(
+            ([jid, name]) => (
+              <SelectItem key={jid} value={jid}>
+                {formatGroupLabel(jid, name)}
+              </SelectItem>
+            ),
+          )}
         </SelectContent>
       </Select>
       <p className="mt-1 text-xs text-muted-foreground">
-        选择任务结果投递的目标工作区；默认落到你的主工作区
+        {isScript
+          ? '脚本仅可选择管理员宿主机工作区，并直接在该宿主机目录中执行。'
+          : '任务会在这个工作区的目录和环境中执行，并继承该工作区的 Agent。'}
       </p>
     </div>
   );
 
   const renderContextMode = () => (
     <div>
-      <label className="block text-sm font-medium text-foreground mb-2">上下文模式</label>
-      <Select value={contextMode} onValueChange={(value) => setContextMode(value as 'group' | 'isolated')}>
+      <label className="block text-sm font-medium text-foreground mb-2">
+        上下文模式
+      </label>
+      <Select
+        value={contextMode}
+        onValueChange={(value) => setContextMode(value as 'group' | 'isolated')}
+      >
         <SelectTrigger className="w-full">
           <SelectValue />
         </SelectTrigger>
-        <SelectContent>
-          <SelectItem value="group">复用源工作区（group）</SelectItem>
-          <SelectItem value="isolated">独立临时工作区（isolated）</SelectItem>
+        <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
+          <SelectItem value="isolated">独立任务会话（默认）</SelectItem>
+          <SelectItem value="group">主会话执行</SelectItem>
         </SelectContent>
       </Select>
       <p className="mt-1 text-xs text-muted-foreground">
-        {contextMode === 'group'
-          ? '任务复用源工作区的会话、记忆和 skills，prompt 作为新消息注入'
-          : '每次执行创建新的 task-xxxx 工作区，fresh session，与源工作区隔离'}
+        {contextMode === 'isolated'
+          ? '在所属工作区内使用任务专属会话执行，不影响主会话上下文。'
+          : '把任务作为消息注入主会话，适合需要主会话连续上下文的任务。'}
       </p>
     </div>
   );
 
-  const connectedKeys = CHANNEL_OPTIONS.filter((c) => connectedChannels[c.key]).map((c) => c.key);
+  const connectedKeys = CHANNEL_OPTIONS.filter(
+    (c) => connectedChannels[c.key],
+  ).map((c) => c.key);
 
   const isChannelSelected = (key: string) => {
     if (notifyChannels === null) return true;
@@ -178,7 +231,10 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
       showToast('任务已创建', 'AI 正在后台解析调度参数，稍后自动激活');
       onClose();
     } catch (error) {
-      showToast('创建失败', error instanceof Error ? error.message : '请稍后重试');
+      showToast(
+        '创建失败',
+        error instanceof Error ? error.message : '请稍后重试',
+      );
     } finally {
       setAiSubmitting(false);
     }
@@ -188,7 +244,17 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
   const validateForm = () => {
     const newErrors: Record<string, string> = {};
     if (isScript) {
-      if (!formData.scriptCommand.trim()) newErrors.scriptCommand = '请输入脚本命令';
+      if (!formData.scriptCommand.trim())
+        newErrors.scriptCommand = '请输入脚本命令';
+      if (formData.executionMode !== 'host') {
+        newErrors.executionMode = '脚本任务只能使用宿主机模式';
+      }
+      const selectedMode = chatJid
+        ? groups[chatJid]?.execution_mode
+        : defaultWorkspaceMode;
+      if (selectedMode && selectedMode !== 'host') {
+        newErrors.executionMode = '请选择管理员宿主机工作区';
+      }
     } else {
       if (!formData.prompt.trim()) newErrors.prompt = '请输入 Prompt';
     }
@@ -203,7 +269,8 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
         newErrors.scheduleValue = '请输入间隔数值';
       } else {
         const num = parseInt(intervalNumber);
-        if (isNaN(num) || num <= 0) newErrors.scheduleValue = '间隔必须是正整数';
+        if (isNaN(num) || num <= 0)
+          newErrors.scheduleValue = '间隔必须是正整数';
       }
     } else if (formData.scheduleType === 'once') {
       if (!onceDateTime) {
@@ -224,7 +291,9 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
     if (!validateForm()) return;
     let finalScheduleValue = formData.scheduleValue;
     if (formData.scheduleType === 'interval') {
-      finalScheduleValue = String(parseInt(intervalNumber, 10) * parseInt(intervalUnit, 10));
+      finalScheduleValue = String(
+        parseInt(intervalNumber, 10) * parseInt(intervalUnit, 10),
+      );
     } else if (formData.scheduleType === 'once') {
       finalScheduleValue = new Date(onceDateTime).toISOString();
     }
@@ -237,7 +306,9 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
         scheduleType: formData.scheduleType,
         scheduleValue: finalScheduleValue,
         executionType: formData.executionType,
-        executionMode: executionModeExplicit ? formData.executionMode : undefined,
+        executionMode: executionModeExplicit
+          ? formData.executionMode
+          : undefined,
         scriptCommand: formData.scriptCommand,
         notifyChannels,
         chatJid: chatJid || undefined,
@@ -258,11 +329,15 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
   };
 
   // --- Notify channels UI (shared) ---
-  const connectedOptions = CHANNEL_OPTIONS.filter((ch) => connectedChannels[ch.key]);
+  const connectedOptions = CHANNEL_OPTIONS.filter(
+    (ch) => connectedChannels[ch.key],
+  );
 
   const renderNotifyChannels = () => (
     <div>
-      <label className="block text-sm font-medium text-foreground mb-2">通知渠道</label>
+      <label className="block text-sm font-medium text-foreground mb-2">
+        通知渠道
+      </label>
       <div className="flex flex-wrap gap-3">
         <label className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
           <input type="checkbox" checked disabled className="rounded" />
@@ -297,8 +372,8 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
   );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="bg-card rounded-xl shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+    <div className="fixed inset-0 z-[11000] flex items-end justify-center bg-black/50 p-0 sm:items-center sm:p-4">
+      <div className="flex max-h-[94vh] w-full max-w-2xl flex-col overflow-hidden rounded-t-xl bg-card shadow-xl sm:max-h-[90vh] sm:rounded-xl">
         {/* Header */}
         <div className="flex items-center justify-between p-6 border-b border-border">
           <h2 className="text-xl font-bold text-foreground">创建定时任务</h2>
@@ -340,7 +415,7 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
 
         {/* AI Mode */}
         {mode === 'ai' && (
-          <div className="p-6 space-y-4">
+          <div className="space-y-4 overflow-y-auto p-4 sm:p-6">
             {/* Description */}
             <div>
               <label className="block text-sm font-medium text-foreground mb-2">
@@ -364,7 +439,7 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
             {renderNotifyChannels()}
 
             {/* Actions */}
-            <div className="flex items-center justify-end gap-3 pt-4 border-t border-border">
+            <div className="sticky bottom-0 -mx-4 flex items-center justify-end gap-3 border-t border-border bg-card px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:-mx-6 sm:px-6 sm:pb-0">
               <Button type="button" variant="outline" onClick={onClose}>
                 取消
               </Button>
@@ -390,7 +465,10 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
 
         {/* Manual Mode */}
         {mode === 'manual' && (
-          <form onSubmit={handleManualSubmit} className="p-6 space-y-4">
+          <form
+            onSubmit={handleManualSubmit}
+            className="space-y-4 overflow-y-auto p-4 sm:p-6"
+          >
             {/* Execution Type */}
             {isAdmin && (
               <div>
@@ -400,13 +478,16 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
                 <Select
                   value={formData.executionType}
                   onValueChange={(value) =>
-                    setFormData({ ...formData, executionType: value as 'agent' | 'script' })
+                    setFormData({
+                      ...formData,
+                      executionType: value as 'agent' | 'script',
+                    })
                   }
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
                     <SelectItem value="agent">Agent（AI 代理）</SelectItem>
                     <SelectItem value="script">脚本（Shell 命令）</SelectItem>
                   </SelectContent>
@@ -427,24 +508,37 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
                 </label>
                 <Select
                   value={formData.executionMode}
+                  disabled={isScript}
                   onValueChange={(value) => {
                     setExecutionModeExplicit(true);
-                    setFormData({ ...formData, executionMode: value as 'host' | 'container' });
+                    setFormData({
+                      ...formData,
+                      executionMode: value as 'host' | 'container',
+                    });
                   }}
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue />
                   </SelectTrigger>
-                  <SelectContent>
+                  <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
                     <SelectItem value="host">宿主机</SelectItem>
-                    <SelectItem value="container">Docker 容器</SelectItem>
+                    {!isScript && (
+                      <SelectItem value="container">Docker 容器</SelectItem>
+                    )}
                   </SelectContent>
                 </Select>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {executionModeExplicit
-                    ? '已手动指定执行模式，不再跟随源工作区'
-                    : '默认继承源工作区的执行模式，选择后将锁定不再自动同步'}
+                  {isScript
+                    ? '脚本固定使用宿主机模式；Docker 容器脚本不会被执行。'
+                    : executionModeExplicit
+                      ? '已手动指定执行模式，不再跟随源工作区'
+                      : '默认继承源工作区的执行模式，选择后将锁定不再自动同步'}
                 </p>
+                {errors.executionMode && (
+                  <p className="mt-1 text-sm text-red-600 dark:text-red-400">
+                    {errors.executionMode}
+                  </p>
+                )}
               </div>
             )}
 
@@ -459,17 +553,24 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
                 </label>
                 <Textarea
                   value={formData.scriptCommand}
-                  onChange={(e) => setFormData({ ...formData, scriptCommand: e.target.value })}
+                  onChange={(e) =>
+                    setFormData({ ...formData, scriptCommand: e.target.value })
+                  }
                   rows={3}
                   maxLength={4096}
-                  className={cn("resize-none font-mono text-sm", errors.scriptCommand && "border-red-500")}
+                  className={cn(
+                    'resize-none font-mono text-sm',
+                    errors.scriptCommand && 'border-red-500',
+                  )}
                   placeholder="例如: curl -s https://api.example.com/health | jq .status"
                 />
                 {errors.scriptCommand && (
-                  <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.scriptCommand}</p>
+                  <p className="mt-1 text-sm text-red-600 dark:text-red-400">
+                    {errors.scriptCommand}
+                  </p>
                 )}
                 <p className="mt-1 text-xs text-muted-foreground">
-                  命令在群组工作目录下执行，最大 4096 字符
+                  命令在所属工作区目录下执行，最大 4096 字符
                 </p>
               </div>
             )}
@@ -482,13 +583,19 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
               </label>
               <Textarea
                 value={formData.prompt}
-                onChange={(e) => setFormData({ ...formData, prompt: e.target.value })}
+                onChange={(e) =>
+                  setFormData({ ...formData, prompt: e.target.value })
+                }
                 rows={isScript ? 2 : 4}
-                className={cn("resize-none", errors.prompt && "border-red-500")}
-                placeholder={isScript ? '可选的任务描述...' : '输入任务的提示词...'}
+                className={cn('resize-none', errors.prompt && 'border-red-500')}
+                placeholder={
+                  isScript ? '可选的任务描述...' : '输入任务的提示词...'
+                }
               />
               {errors.prompt && (
-                <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.prompt}</p>
+                <p className="mt-1 text-sm text-red-600 dark:text-red-400">
+                  {errors.prompt}
+                </p>
               )}
             </div>
 
@@ -502,13 +609,17 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
                 onValueChange={(value) => {
                   setIntervalNumber('');
                   setOnceDateTime('');
-                  setFormData({ ...formData, scheduleType: value as 'cron' | 'interval' | 'once', scheduleValue: '' });
+                  setFormData({
+                    ...formData,
+                    scheduleType: value as 'cron' | 'interval' | 'once',
+                    scheduleValue: '',
+                  });
                 }}
               >
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
-                <SelectContent>
+                <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
                   <SelectItem value="cron">Cron 表达式</SelectItem>
                   <SelectItem value="interval">间隔执行</SelectItem>
                   <SelectItem value="once">单次执行</SelectItem>
@@ -526,12 +637,22 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
                   <Input
                     type="text"
                     value={formData.scheduleValue}
-                    onChange={(e) => setFormData({ ...formData, scheduleValue: e.target.value })}
-                    className={cn(errors.scheduleValue && "border-red-500")}
+                    onChange={(e) =>
+                      setFormData({
+                        ...formData,
+                        scheduleValue: e.target.value,
+                      })
+                    }
+                    className={cn(errors.scheduleValue && 'border-red-500')}
                     placeholder="例如: 0 9 * * * (每天 9 点)"
                   />
                   <p className="mt-1 text-xs text-muted-foreground">
-                    格式: 分 时 日 月 星期（北京时间 UTC+8）。常用: <code className="bg-muted px-1 rounded">*/5 * * * *</code> 每5分钟, <code className="bg-muted px-1 rounded">0 9 * * 1-5</code> 工作日9点, <code className="bg-muted px-1 rounded">@daily</code> 每天
+                    格式: 分 时 日 月 星期（北京时间 UTC+8）。常用:{' '}
+                    <code className="bg-muted px-1 rounded">*/5 * * * *</code>{' '}
+                    每5分钟,{' '}
+                    <code className="bg-muted px-1 rounded">0 9 * * 1-5</code>{' '}
+                    工作日9点,{' '}
+                    <code className="bg-muted px-1 rounded">@daily</code> 每天
                   </p>
                 </>
               )}
@@ -543,14 +664,20 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
                       min="1"
                       value={intervalNumber}
                       onChange={(e) => setIntervalNumber(e.target.value)}
-                      className={cn("flex-1", errors.scheduleValue && "border-red-500")}
+                      className={cn(
+                        'flex-1',
+                        errors.scheduleValue && 'border-red-500',
+                      )}
                       placeholder="数值"
                     />
-                    <Select value={intervalUnit} onValueChange={setIntervalUnit}>
+                    <Select
+                      value={intervalUnit}
+                      onValueChange={setIntervalUnit}
+                    >
                       <SelectTrigger className="w-28">
                         <SelectValue />
                       </SelectTrigger>
-                      <SelectContent>
+                      <SelectContent className={MODAL_SELECT_CONTENT_CLASS}>
                         {INTERVAL_UNITS.map((u) => (
                           <SelectItem key={u.ms} value={String(u.ms)}>
                             {u.label}
@@ -559,7 +686,9 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
                       </SelectContent>
                     </Select>
                   </div>
-                  <p className="mt-1 text-xs text-muted-foreground">设置任务执行间隔</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    设置任务执行间隔
+                  </p>
                 </>
               )}
               {formData.scheduleType === 'once' && (
@@ -568,20 +697,24 @@ export function CreateTaskForm({ onSubmit, onClose, isAdmin }: CreateTaskFormPro
                     type="datetime-local"
                     value={onceDateTime}
                     onChange={(e) => setOnceDateTime(e.target.value)}
-                    className={cn(errors.scheduleValue && "border-red-500")}
+                    className={cn(errors.scheduleValue && 'border-red-500')}
                   />
-                  <p className="mt-1 text-xs text-muted-foreground">选择任务的执行时间</p>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    选择任务的执行时间
+                  </p>
                 </>
               )}
               {errors.scheduleValue && (
-                <p className="mt-1 text-sm text-red-600 dark:text-red-400">{errors.scheduleValue}</p>
+                <p className="mt-1 text-sm text-red-600 dark:text-red-400">
+                  {errors.scheduleValue}
+                </p>
               )}
             </div>
 
             {renderNotifyChannels()}
 
             {/* Actions */}
-            <div className="flex items-center justify-end gap-3 pt-4 border-t border-border">
+            <div className="sticky bottom-0 -mx-4 flex items-center justify-end gap-3 border-t border-border bg-card px-4 pt-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:-mx-6 sm:px-6 sm:pb-0">
               <Button type="button" variant="outline" onClick={onClose}>
                 取消
               </Button>

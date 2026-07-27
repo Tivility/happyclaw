@@ -13,17 +13,29 @@
  * - Code-block-safe text splitting (no truncation inside fenced code blocks)
  * - Schema 2.0 card format with body.elements
  * - Multi-card support for extremely long outputs (auto-split at ~45 elements)
- * - 100K character single-element support in streaming mode
+ * - Conservative 30K character live-element budget with full-content finalization
  */
 import * as lark from '@larksuiteoapi/node-sdk';
-import { createHash } from 'crypto';
-import { logger } from './logger.js';
-import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
+import {
+  createHash,
+} from 'crypto';
+import {
+  logger,
+} from './logger.js';
+import {
+  optimizeMarkdownStyle,
+} from './feishu-markdown-style.js';
 import {
   buildAgentReplyCard,
   buildStreamingAgentCard,
 } from './feishu-cards/builder.js';
-import type { CardStatus, ToolCallStat } from './feishu-cards/types.js';
+import type {
+  CardStatus,
+  ToolCallStat,
+} from './feishu-cards/types.js';
+import {
+  formatFeishuUsageNote,
+} from './feishu-usage-display.js';
 import {
   CARD_ELEMENT_IDS,
   statusHeadline,
@@ -39,6 +51,7 @@ import {
   type StreamingPhase,
   type TodoItemView,
   type ToolCallView,
+  type StreamingPanelsInit,
 } from './feishu-cards/sections.js';
 
 // ─── Types ────────────────────────────────────────────────────
@@ -66,6 +79,8 @@ export interface StreamingCardOptions {
   onCardCreated?: (messageId: string) => void;
   /** Runtime profile for card wording. Defaults to Claude-compatible. */
   runtimeProfile?: StreamingCardRuntimeProfile;
+  /** Durable lifecycle observer. Failures are isolated from provider delivery. */
+  lifecycle?: StreamingCardLifecycle;
 }
 
 interface UsageNoteData {
@@ -76,13 +91,127 @@ interface UsageNoteData {
   costUSD: number;
   durationMs: number;
   numTurns: number;
-  modelUsage?: Record<string, {
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadInputTokens: number;
-    cacheCreationInputTokens: number;
-    costUSD: number;
-  }>;
+  /** 各模型的分项用量。字段全可选：StreamEvent 侧允许部分缺省，
+   *  渲染时按 ?? 0 兜底（决策 66：分列显示，不相加）。 */
+  modelUsage?: Record<
+    string,
+    {
+      inputTokens?: number;
+      outputTokens?: number;
+      cacheReadInputTokens?: number;
+      cacheCreationInputTokens?: number;
+      reasoningTokens?: number;
+      costUSD?: number;
+    }
+  >;
+  /** 决策 40：推理 token 单列，不并入 output。 */
+  reasoningTokens?: number;
+}
+
+export interface StreamingCardLifecycleSnapshot {
+  text: string;
+  thinking: string;
+  state: StreamingState;
+  backendMode: 'streaming' | 'v1' | 'legacy';
+}
+
+export interface StreamingCardLifecycleEvent {
+  status:
+    | 'creating'
+    | 'streaming'
+    | 'waiting_user'
+    | 'running'
+    | 'finalizing'
+    | 'completed'
+    | 'aborted'
+    | 'failed';
+  messageId: string | null;
+  cardId: string | null;
+  version: number;
+  snapshot: StreamingCardLifecycleSnapshot;
+  error?: string;
+}
+
+export interface StreamingCardLifecycle {
+  onEvent(event: StreamingCardLifecycleEvent): void;
+}
+
+export interface InterruptedStreamingCardInput {
+  messageId: string | null;
+  cardId: string | null;
+  version: number;
+  snapshot?: unknown;
+  reason?: string;
+}
+
+/** Extract the platform error code from both rejected SDK calls and resolved
+ * error envelopes. Lark SDK versions differ in where they expose this field. */
+function feishuErrorCode(value: unknown): number | undefined {
+  const error = value as {
+    code?: unknown;
+    data?: { code?: unknown };
+    response?: { data?: { code?: unknown } };
+    message?: unknown;
+  };
+  const raw =
+    error?.response?.data?.code ??
+    error?.data?.code ??
+    error?.code ??
+    undefined;
+  if (typeof raw === 'number') return raw;
+  if (typeof raw === 'string' && /^\d+$/.test(raw)) return Number(raw);
+  const match =
+    typeof error?.message === 'string'
+      ? error.message.match(/\b(230071|230072)\b/)
+      : null;
+  return match ? Number(match[1]) : undefined;
+}
+
+function isReplyInThreadUnsupported(value: unknown): boolean {
+  const code = feishuErrorCode(value);
+  return code === 230071 || code === 230072;
+}
+
+/**
+ * Reply in a topic when requested. Some Feishu chat/message combinations
+ * reject `reply_in_thread` with 230071/230072 even though an ordinary reply to
+ * the same message is legal. Retry exactly once without the flag; all other
+ * errors remain fail-closed and bubble to the existing degradation/fallback.
+ */
+async function replyInteractiveCard(
+  client: lark.Client,
+  messageId: string,
+  content: string,
+  replyInThread: boolean,
+): Promise<any> {
+  const send = (inThread: boolean) =>
+    client.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        content,
+        msg_type: 'interactive',
+        ...(inThread ? { reply_in_thread: true } : {}),
+      },
+    });
+
+  try {
+    const response = await send(replyInThread);
+    if (replyInThread && isReplyInThreadUnsupported(response)) {
+      logger.warn(
+        { messageId, code: feishuErrorCode(response) },
+        'reply_in_thread unsupported for streaming card, retrying plain reply',
+      );
+      return send(false);
+    }
+    return response;
+  } catch (error) {
+    if (!replyInThread || !isReplyInThreadUnsupported(error)) throw error;
+    logger.warn(
+      { messageId, code: feishuErrorCode(error) },
+      'reply_in_thread unsupported for streaming card, retrying plain reply',
+    );
+    return send(false);
+  }
 }
 
 // ─── Code-Block-Safe Splitting ───────────────────────────────
@@ -315,7 +444,25 @@ const STREAMING_CONFIG = {
   print_strategy: 'fast' as const,
 };
 
-const MAX_STREAMING_CONTENT = 100000; // cardElement.content() supports 100K chars
+/**
+ * CardKit may accept larger values, but the official SDK uses a conservative
+ * 30K live-element budget. Staying below it also leaves room for Markdown
+ * fence repair and avoids a late provider rejection after a long run.
+ * Finalization still renders the complete accumulated text across cards.
+ */
+const MAX_STREAMING_CONTENT = 30000;
+const STREAMING_PLACEHOLDER = '> 正在分析请求，最终结论完成后会显示在这里。';
+
+function limitStreamingContent(text: string): string {
+  if (text.length <= MAX_STREAMING_CONTENT) return text;
+  const hint = '\n\n> ⚠️ 内容较长，完成后将展示完整结果';
+  // Reserve space for splitCodeBlockSafe's synthetic closing fence.
+  const [head] = splitCodeBlockSafe(
+    text,
+    MAX_STREAMING_CONTENT - hint.length - 16,
+  );
+  return `${head}${hint}`;
+}
 
 // ─── Tool Progress & Elapsed Helpers ─────────────────────────
 
@@ -480,15 +627,28 @@ function buildAuxiliaryElements(aux: AuxiliaryState): {
       .slice(0, 8);
     const lines = tasks.map((task) => {
       const icon =
-        task.status === 'running' ? '🔄' : task.status === 'completed' ? '✅' : task.status === 'backgrounded' ? '🌙' : '❌';
-      const type = task.subagentType ? ` <font color='grey'>${task.subagentType}</font>` : '';
+        task.status === 'running'
+          ? '🔄'
+          : task.status === 'completed'
+            ? '✅'
+            : task.status === 'backgrounded'
+              ? '🌙'
+              : '❌';
+      const type = task.subagentType
+        ? ` <font color='grey'>${task.subagentType}</font>`
+        : '';
       const last = task.lastToolName ? ` [${task.lastToolName}]` : '';
-      const summary = task.summary ? `\n  <font color='grey'>${task.summary.slice(0, 160)}</font>` : '';
+      const summary = task.summary
+        ? `\n  <font color='grey'>${task.summary.slice(0, 160)}</font>`
+        : '';
       return `${icon} **${task.title.slice(0, 80)}**${type}${last}${summary}`;
     });
     before.push({
       tag: 'markdown',
-      content: `🤖 **子 Agent / Task**\n${lines.join('\n')}`.slice(0, MAX_ELEMENT_CHARS),
+      content: `🤖 **子 Agent / Task**\n${lines.join('\n')}`.slice(
+        0,
+        MAX_ELEMENT_CHARS,
+      ),
       text_size: 'notation',
     });
   }
@@ -585,7 +745,9 @@ function buildStreamingCard(
   // a fixed status word ("生成中"), never the reply's first line: keeping the
   // body intact (first line stays in MAIN_CONTENT) means the streaming→terminal
   // transition no longer shuffles the first line between header and body.
-  const optimized = optimizeMarkdownStyle(text || '...', 2);
+  // 空正文用完整占位文案而非 '...'：流式卡片首帧就要让用户知道 Agent 在干活，
+  // 且 retract（撤回临时旁白）后主槽必须回落到这个中性占位，不能留空。
+  const optimized = optimizeMarkdownStyle(text || STREAMING_PLACEHOLDER, 2);
   const { title } = extractTitleAndBody(optimized);
   const streamingTitle = titleWithStreamingStatus(title || 'Agent 回复');
   const elements: Array<Record<string, unknown>> = [
@@ -664,6 +826,17 @@ function buildSchema2Card(
     state === 'streaming'
       ? titleWithStreamingStatus(baseDisplayTitle)
       : baseDisplayTitle;
+  if (
+    state === 'streaming' &&
+    text === STREAMING_PLACEHOLDER &&
+    contentElements.length === 0
+  ) {
+    contentElements.push({
+      tag: 'markdown',
+      content: STREAMING_PLACEHOLDER,
+      element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
+    });
+  }
 
   // Build final elements array with auxiliary sections
   const elements: Array<Record<string, unknown>> = [];
@@ -735,9 +908,7 @@ function formatUsageNote(usage: UsageNoteData): string {
  * not a cheap summarizer/router model). Falls back to the first key.
  */
 function pickPrimaryModel(
-  modelUsage:
-    | Record<string, { outputTokens?: number }>
-    | undefined,
+  modelUsage: Record<string, { outputTokens?: number }> | undefined,
 ): string | undefined {
   if (!modelUsage) return undefined;
   const entries = Object.entries(modelUsage);
@@ -759,6 +930,7 @@ function pickPrimaryModel(
 function buildStreamingModeCard(
   initialText: string,
   runtimeProfile: StreamingCardRuntimeProfile,
+  panels?: StreamingPanelsInit,
 ): object {
   // Delegate to the shared rich skeleton: runtime collapsible panels +
   // MAIN_CONTENT (typewriter) + INTERRUPT button + FOOTER_NOTE. Each panel
@@ -768,6 +940,10 @@ function buildStreamingModeCard(
     initialText,
     rich: true,
     runtimeProfile,
+    // 用当前 panel 状态建卡，而不是恒定的 idle 骨架：richSlotHashes 的种子
+    // 取自建出来的 cardJson，种子若与首次 buildRichPanelPatches() 不同源，
+    // 建卡后第一次 flush 必然「有变更」，幂等去重就白做了一轮请求。
+    ...(panels ? { panels } : {}),
   });
 }
 
@@ -879,10 +1055,68 @@ function quickHash(data: string): string {
   return createHash('md5').update(data).digest('hex');
 }
 
+class CardKitRejectedError extends Error {
+  readonly code: number;
+
+  constructor(operation: string, code: number, message: string) {
+    super(
+      `${operation} was rejected by CardKit (code=${code}, msg=${message})`,
+    );
+    this.name = 'CardKitRejectedError';
+    this.code = code;
+  }
+}
+
+function assertCardKitAcknowledged(response: unknown, operation: string): void {
+  const envelope = response as { code?: unknown; msg?: unknown } | undefined;
+  if (
+    envelope?.code !== undefined &&
+    envelope.code !== null &&
+    Number(envelope.code) !== 0
+  ) {
+    throw new CardKitRejectedError(
+      operation,
+      Number(envelope.code),
+      String(envelope.msg ?? ''),
+    );
+  }
+}
+
+function cardMutationUuid(
+  cardId: string,
+  sequence: number,
+  operation: string,
+  payloadHash: string,
+): string {
+  return `hc_${quickHash(`${cardId}:${sequence}:${operation}:${payloadHash}`)}`;
+}
+
+function collectElementContentHashes(
+  value: unknown,
+  hashes: Map<string, string>,
+): void {
+  if (Array.isArray(value)) {
+    for (const item of value) collectElementContentHashes(item, hashes);
+    return;
+  }
+  if (!value || typeof value !== 'object') return;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.element_id === 'string' &&
+    typeof record.content === 'string'
+  ) {
+    hashes.set(record.element_id, quickHash(record.content));
+  }
+  for (const child of Object.values(record)) {
+    collectElementContentHashes(child, hashes);
+  }
+}
+
 class CardKitBackend {
   private cardId: string | null = null;
   private _messageId: string | null = null;
   private sequence = 0;
+  private acknowledgedSequence = 0;
   private lastContentHash = '';
   private readonly client: lark.Client;
   /**
@@ -910,6 +1144,14 @@ class CardKitBackend {
     return this._messageId;
   }
 
+  getCardId(): string | null {
+    return this.cardId;
+  }
+
+  getSequence(): number {
+    return this.acknowledgedSequence;
+  }
+
   /**
    * Create a CardKit card instance.
    * Returns the card_id for subsequent updates.
@@ -933,6 +1175,7 @@ class CardKitBackend {
 
     this.cardId = cardId;
     this.sequence = 1;
+    this.acknowledgedSequence = 1;
     this.lastContentHash = quickHash(JSON.stringify(cardJson));
     logger.debug({ cardId }, 'CardKit card created');
     return cardId;
@@ -958,14 +1201,12 @@ class CardKitBackend {
 
     let resp: any;
     if (replyToMsgId) {
-      resp = await this.client.im.message.reply({
-        path: { message_id: replyToMsgId },
-        data: {
-          content,
-          msg_type: 'interactive',
-          ...(replyInThread ? { reply_in_thread: true } : {}),
-        },
-      });
+      resp = await replyInteractiveCard(
+        this.client,
+        replyToMsgId,
+        content,
+        replyInThread,
+      );
     } else {
       resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
@@ -998,14 +1239,17 @@ class CardKitBackend {
       const hash = quickHash(dataStr);
       if (hash === this.lastContentHash) return; // no change
 
-      this.sequence++;
-      await this.client.cardkit.v1.card.update({
+      const sequence = ++this.sequence;
+      const response = await this.client.cardkit.v1.card.update({
         path: { card_id: this.cardId! },
         data: {
           card: { type: 'card_json', data: dataStr },
-          sequence: this.sequence,
+          sequence,
+          uuid: cardMutationUuid(this.cardId!, sequence, 'card.update', hash),
         },
       });
+      assertCardKitAcknowledged(response, 'card.update');
+      this.acknowledgedSequence = sequence;
 
       this.lastContentHash = hash;
     });
@@ -1018,6 +1262,7 @@ class CardKitBackend {
     this.cardId = cardId;
     this._messageId = messageId;
     this.sequence = sequence;
+    this.acknowledgedSequence = sequence;
   }
 }
 
@@ -1027,6 +1272,8 @@ class StreamingModeBackend {
   private cardId: string | null = null;
   private _messageId: string | null = null;
   private sequence = 0;
+  /** Highest provider-acknowledged sequence exposed to durable lifecycle. */
+  private acknowledgedSequence = 0;
   private lastMainHash = '';
   private lastAuxBeforeHash = '';
   private lastAuxAfterHash = '';
@@ -1063,11 +1310,22 @@ class StreamingModeBackend {
   }
 
   getSequence(): number {
-    return this.sequence;
+    return this.acknowledgedSequence;
   }
 
   private nextSequence(): number {
     return ++this.sequence;
+  }
+
+  private mutationIdentity(
+    operation: string,
+    payloadHash: string,
+  ): { sequence: number; uuid: string } {
+    const sequence = this.nextSequence();
+    return {
+      sequence,
+      uuid: cardMutationUuid(this.cardId!, sequence, operation, payloadHash),
+    };
   }
 
   /**
@@ -1092,6 +1350,13 @@ class StreamingModeBackend {
 
     this.cardId = cardId;
     this.sequence = 1;
+    this.acknowledgedSequence = 1;
+    collectElementContentHashes(cardJson, this.richSlotHashes);
+    this.lastMainHash = this.richSlotHashes.get(ELEMENT_IDS.MAIN_CONTENT) ?? '';
+    this.lastAuxBeforeHash =
+      this.richSlotHashes.get(ELEMENT_IDS.AUX_BEFORE) ?? '';
+    this.lastAuxAfterHash =
+      this.richSlotHashes.get(ELEMENT_IDS.AUX_AFTER) ?? '';
     logger.debug({ cardId }, 'Streaming mode card created');
     return cardId;
   }
@@ -1113,14 +1378,12 @@ class StreamingModeBackend {
 
     let resp: any;
     if (replyToMsgId) {
-      resp = await this.client.im.message.reply({
-        path: { message_id: replyToMsgId },
-        data: {
-          content,
-          msg_type: 'interactive',
-          ...(replyInThread ? { reply_in_thread: true } : {}),
-        },
-      });
+      resp = await replyInteractiveCard(
+        this.client,
+        replyToMsgId,
+        content,
+        replyInThread,
+      );
     } else {
       resp = await this.client.im.v1.message.create({
         params: { receive_id_type: 'chat_id' },
@@ -1144,22 +1407,25 @@ class StreamingModeBackend {
   async streamContent(text: string): Promise<void> {
     if (!this.cardId) return;
 
-    // Truncate at 100K char limit (hint at end, slice adjusted for hint length)
-    const truncHint = `\n\n> ⚠️ 输出已截断（超过 ${MAX_STREAMING_CONTENT} 字符）`;
-    const content =
-      text.length > MAX_STREAMING_CONTENT
-        ? text.slice(0, MAX_STREAMING_CONTENT - truncHint.length) + truncHint
-        : text;
+    // Bound the live element conservatively. Finalization uses accumulatedText
+    // and therefore still publishes the complete answer across cards.
+    const content = limitStreamingContent(text);
 
     return this.enqueue(async () => {
       const hash = quickHash(content);
       if (hash === this.lastMainHash) return;
+      const mutation = this.mutationIdentity(
+        `cardElement.content:${ELEMENT_IDS.MAIN_CONTENT}`,
+        hash,
+      );
 
       try {
-        await this.client.cardkit.v1.cardElement.content({
+        const response = await this.client.cardkit.v1.cardElement.content({
           path: { card_id: this.cardId!, element_id: ELEMENT_IDS.MAIN_CONTENT },
-          data: { content, sequence: this.nextSequence() },
+          data: { content, ...mutation },
         });
+        assertCardKitAcknowledged(response, 'cardElement.content');
+        this.acknowledgedSequence = mutation.sequence;
         this.lastMainHash = hash;
       } catch (err: any) {
         const code = err?.code ?? err?.response?.data?.code;
@@ -1172,14 +1438,24 @@ class StreamingModeBackend {
           // Raw call (not the public wrapper) — we're already inside the chain;
           // enqueueing here would deadlock on ourselves.
           await this.enableStreamingModeRaw();
-          // Retry once
-          await this.client.cardkit.v1.cardElement.content({
+          // Re-enabling consumed a newer sequence, so the replacement content
+          // must use a sequence after that settings mutation. Error 200850 /
+          // 300309 is an explicit "streaming closed" rejection, not an
+          // ambiguous transport timeout; the first content mutation was not
+          // accepted.
+          const retryMutation = this.mutationIdentity(
+            `cardElement.content:${ELEMENT_IDS.MAIN_CONTENT}:reenabled`,
+            hash,
+          );
+          const response = await this.client.cardkit.v1.cardElement.content({
             path: {
               card_id: this.cardId!,
               element_id: ELEMENT_IDS.MAIN_CONTENT,
             },
-            data: { content, sequence: this.nextSequence() },
+            data: { content, ...retryMutation },
           });
+          assertCardKitAcknowledged(response, 'cardElement.content retry');
+          this.acknowledgedSequence = retryMutation.sequence;
           this.lastMainHash = hash;
         } else {
           throw err;
@@ -1212,10 +1488,16 @@ class StreamingModeBackend {
         text_size: 'notation',
       });
 
-      await this.client.cardkit.v1.cardElement.update({
+      const mutation = this.mutationIdentity(
+        `cardElement.update:${elementId}`,
+        hash,
+      );
+      const response = await this.client.cardkit.v1.cardElement.update({
         path: { card_id: this.cardId!, element_id: elementId },
-        data: { element, sequence: this.nextSequence() },
+        data: { element, ...mutation },
       });
+      assertCardKitAcknowledged(response, 'cardElement.update');
+      this.acknowledgedSequence = mutation.sequence;
       this[hashField] = hash;
     });
   }
@@ -1233,11 +1515,132 @@ class StreamingModeBackend {
     return this.enqueue(async () => {
       const hash = quickHash(content);
       if (this.richSlotHashes.get(elementId) === hash) return;
-      await this.client.cardkit.v1.cardElement.content({
+      const mutation = this.mutationIdentity(
+        `cardElement.content:${elementId}`,
+        hash,
+      );
+      const response = await this.client.cardkit.v1.cardElement.content({
         path: { card_id: this.cardId!, element_id: elementId },
-        data: { content, sequence: this.nextSequence() },
+        data: { content, ...mutation },
       });
+      assertCardKitAcknowledged(response, 'cardElement.content');
+      this.acknowledgedSequence = mutation.sequence;
       this.richSlotHashes.set(elementId, hash);
+    });
+  }
+
+  /**
+   * Update a set of rich markdown slots on the shared per-card queue. Each
+   * slot is acknowledged independently so one malformed optional panel cannot
+   * suppress later critical status/footer updates.
+   */
+  async updateMarkdownContents(
+    patches: ReadonlyArray<{ elementId: string; content: string }>,
+  ): Promise<{ updated: string[]; failed: string[] }> {
+    if (!this.cardId) return { updated: [], failed: [] };
+    return this.enqueue(async () => {
+      const changed = patches
+        .map((patch) => ({ ...patch, hash: quickHash(patch.content) }))
+        .filter(
+          (patch) => this.richSlotHashes.get(patch.elementId) !== patch.hash,
+        );
+      if (changed.length === 0) return { updated: [], failed: [] };
+
+      // Normal path: one CardKit mutation for every auxiliary slot. This
+      // prevents a single semantic event from becoming an 8-request QPS burst.
+      const actions = JSON.stringify(
+        changed.map((patch) => ({
+          action: 'partial_update_element',
+          params: {
+            element_id: patch.elementId,
+            partial_element: JSON.stringify({ content: patch.content }),
+          },
+        })),
+      );
+      const mutation = this.mutationIdentity(
+        'card.batchUpdate:rich-slots',
+        quickHash(actions),
+      );
+      const runBatch = async (): Promise<void> => {
+        const response = await this.client.cardkit.v1.card.batchUpdate({
+          path: { card_id: this.cardId! },
+          data: { actions, ...mutation },
+        });
+        assertCardKitAcknowledged(response, 'card.batchUpdate');
+      };
+
+      let batchFailure: unknown;
+      try {
+        await runBatch();
+      } catch (firstError) {
+        if (firstError instanceof CardKitRejectedError) {
+          // A non-zero response code is a deterministic provider rejection.
+          // Sending the identical batch again only burns QPS.
+          batchFailure = firstError;
+        } else {
+          try {
+            // Same logical request, same sequence and UUID: safe when the first
+            // call reached CardKit but its acknowledgement was lost.
+            await runBatch();
+          } catch (retryError) {
+            batchFailure = retryError;
+          }
+        }
+      }
+
+      if (batchFailure !== undefined) {
+        logger.debug(
+          {
+            err: batchFailure,
+            cardId: this.cardId,
+            slots: changed.map((patch) => patch.elementId),
+          },
+          'CardKit rich-slot batch failed; isolating slots',
+        );
+        // Diagnostic fallback: update slots independently. One invalid
+        // optional panel then cannot block status/footer visibility.
+        const updated: string[] = [];
+        const failed: string[] = [];
+        for (const patch of changed) {
+          const slotMutation = this.mutationIdentity(
+            `cardElement.content:${patch.elementId}:batch-fallback`,
+            patch.hash,
+          );
+          try {
+            const response = await this.client.cardkit.v1.cardElement.content({
+              path: {
+                card_id: this.cardId!,
+                element_id: patch.elementId,
+              },
+              data: { content: patch.content, ...slotMutation },
+            });
+            assertCardKitAcknowledged(response, 'cardElement.content');
+            this.acknowledgedSequence = slotMutation.sequence;
+            this.richSlotHashes.set(patch.elementId, patch.hash);
+            updated.push(patch.elementId);
+          } catch (error) {
+            failed.push(patch.elementId);
+            logger.debug(
+              {
+                err: error,
+                cardId: this.cardId,
+                elementId: patch.elementId,
+              },
+              'CardKit rich slot update failed; continuing remaining slots',
+            );
+          }
+        }
+        return { updated, failed };
+      }
+
+      this.acknowledgedSequence = mutation.sequence;
+      for (const patch of changed) {
+        this.richSlotHashes.set(patch.elementId, patch.hash);
+      }
+      return {
+        updated: changed.map((patch) => patch.elementId),
+        failed: [],
+      };
     });
   }
 
@@ -1245,37 +1648,48 @@ class StreamingModeBackend {
    * Replace a whole element (structure + content) via cardElement.update().
    * Used to toggle collapsible_panel expanded state mid-stream.
    */
-  async replaceElement(
-    elementId: string,
-    elementJson: object,
-  ): Promise<void> {
+  async replaceElement(elementId: string, elementJson: object): Promise<void> {
     if (!this.cardId) return;
     return this.enqueue(async () => {
-      await this.client.cardkit.v1.cardElement.update({
+      const element = JSON.stringify(elementJson);
+      const mutation = this.mutationIdentity(
+        `cardElement.update:${elementId}`,
+        quickHash(element),
+      );
+      const response = await this.client.cardkit.v1.cardElement.update({
         path: { card_id: this.cardId!, element_id: elementId },
         data: {
-          element: JSON.stringify(elementJson),
-          sequence: this.nextSequence(),
+          element,
+          ...mutation,
         },
       });
+      assertCardKitAcknowledged(response, 'cardElement.update');
+      this.acknowledgedSequence = mutation.sequence;
     });
   }
 
   /** Enable streaming mode via card.settings() — chain-internal raw call. */
   private async enableStreamingModeRaw(): Promise<void> {
     if (!this.cardId) return;
-    await this.client.cardkit.v1.card.settings({
-      path: { card_id: this.cardId },
-      data: {
-        settings: JSON.stringify({
-          config: {
-            streaming_mode: true,
-            streaming_config: STREAMING_CONFIG,
-          },
-        }),
-        sequence: this.nextSequence(),
+    const settings = JSON.stringify({
+      config: {
+        streaming_mode: true,
+        streaming_config: STREAMING_CONFIG,
       },
     });
+    const mutation = this.mutationIdentity(
+      'card.settings:enable',
+      quickHash(settings),
+    );
+    const response = await this.client.cardkit.v1.card.settings({
+      path: { card_id: this.cardId },
+      data: {
+        settings,
+        ...mutation,
+      },
+    });
+    assertCardKitAcknowledged(response, 'card.settings enable');
+    this.acknowledgedSequence = mutation.sequence;
   }
 
   /**
@@ -1292,15 +1706,22 @@ class StreamingModeBackend {
   async disableStreamingMode(): Promise<void> {
     if (!this.cardId) return;
     return this.enqueue(async () => {
-      await this.client.cardkit.v1.card.settings({
+      const settings = JSON.stringify({
+        config: { streaming_mode: false },
+      });
+      const mutation = this.mutationIdentity(
+        'card.settings:disable',
+        quickHash(settings),
+      );
+      const response = await this.client.cardkit.v1.card.settings({
         path: { card_id: this.cardId! },
         data: {
-          settings: JSON.stringify({
-            config: { streaming_mode: false },
-          }),
-          sequence: this.nextSequence(),
+          settings,
+          ...mutation,
         },
       });
+      assertCardKitAcknowledged(response, 'card.settings disable');
+      this.acknowledgedSequence = mutation.sequence;
     });
   }
 
@@ -1310,14 +1731,22 @@ class StreamingModeBackend {
   async updateCardFull(cardJson: object): Promise<void> {
     if (!this.cardId) return;
     return this.enqueue(async () => {
-      await this.client.cardkit.v1.card.update({
+      const data = JSON.stringify(cardJson);
+      const mutation = this.mutationIdentity('card.update', quickHash(data));
+      const response = await this.client.cardkit.v1.card.update({
         path: { card_id: this.cardId! },
         data: {
-          card: { type: 'card_json', data: JSON.stringify(cardJson) },
-          sequence: this.nextSequence(),
+          card: { type: 'card_json', data },
+          ...mutation,
         },
       });
+      assertCardKitAcknowledged(response, 'card.update');
+      this.acknowledgedSequence = mutation.sequence;
     });
+  }
+
+  async drain(): Promise<void> {
+    await this.chain;
   }
 }
 
@@ -1455,10 +1884,7 @@ class MultiCardManager {
     // states render the tail across as many cards as needed so nothing is
     // dropped and no single card overflows.
     const activeText = this.activeView(text);
-    if (
-      state !== 'streaming' &&
-      byteLen(activeText) > FREEZE_SLICE_BYTES
-    ) {
+    if (state !== 'streaming' && byteLen(activeText) > FREEZE_SLICE_BYTES) {
       await this.renderTerminalTail(
         activeText,
         state,
@@ -1558,7 +1984,10 @@ class MultiCardManager {
     footerNote?: string,
   ): boolean {
     const activeText = this.activeView(fullText);
-    const { contentElements } = buildCardContent(activeText, splitCodeBlockSafe);
+    const { contentElements } = buildCardContent(
+      activeText,
+      splitCodeBlockSafe,
+    );
     const auxCount = auxiliaryState
       ? (() => {
           const { before, after } = buildAuxiliaryElements(auxiliaryState);
@@ -1704,6 +2133,14 @@ class MultiCardManager {
     }
     return null;
   }
+
+  getLatestCardId(): string | null {
+    return this.cards[this.cards.length - 1]?.getCardId() ?? null;
+  }
+
+  getLatestVersion(): number {
+    return this.cards[this.cards.length - 1]?.getSequence() ?? 0;
+  }
 }
 
 // ─── Streaming Card Controller ────────────────────────────────
@@ -1722,6 +2159,7 @@ export class StreamingCardController {
   private readonly onFallback?: () => void;
   private readonly onCardCreated?: (messageId: string) => void;
   private runtimeProfile: StreamingCardRuntimeProfile;
+  private readonly lifecycle?: StreamingCardLifecycle;
 
   // CardKit mode
   private useCardKit = false;
@@ -1731,6 +2169,7 @@ export class StreamingCardController {
   private streamingBackend: StreamingModeBackend | null = null;
   private textFlushCtrl: FlushController | null = null;
   private auxFlushCtrl: FlushController | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   /** True when finalize split content across multiple cards — patchUsageNote
    * must not rebuild a single card or it would overwrite the first card. */
   private finalizedAsSplit = false;
@@ -1744,15 +2183,19 @@ export class StreamingCardController {
   private creationPromise: Promise<void> | null = null;
 
   // Streaming state
-    private thinking = false;
-    private thinkingText = '';
-    private toolCalls = new Map<string, ToolCallState>();
-    private tasks = new Map<string, TaskRunState>();
-    private startTime = 0;
+  private thinking = false;
+  private thinkingText = '';
+  private toolCalls = new Map<string, ToolCallState>();
+  private tasks = new Map<string, TaskRunState>();
+  private startTime = 0;
   private backendMode: 'streaming' | 'v1' | 'legacy' = 'v1';
 
   // Auxiliary display state
   private systemStatus: string | null = null;
+  /** 挂起完成状态：本 turn 回复已送达但后台任务/截断续写未结束，卡片保持
+   * 打开等待追加。pendingTasks=null 表示截断自动续写中。任何新 turn 活动
+   * （append/appendThinking/startTool）自动清除。 */
+  private heldOpen: { pendingTasks: number | null } | null = null;
   private activeHook: { hookName: string; hookEvent: string } | null = null;
   private todos: Array<{ id: string; content: string; status: string }> | null =
     null;
@@ -1801,7 +2244,74 @@ export class StreamingCardController {
     this.onFallback = opts.onFallback;
     this.onCardCreated = opts.onCardCreated;
     this.runtimeProfile = opts.runtimeProfile ?? 'claude';
+    this.lifecycle = opts.lifecycle;
     this.flushCtrl = new FlushController();
+  }
+
+  private lifecycleIdentity(): {
+    messageId: string | null;
+    cardId: string | null;
+    version: number;
+  } {
+    if (this.streamingBackend) {
+      return {
+        messageId: this.streamingBackend.messageId,
+        cardId: this.streamingBackend.getCardId(),
+        version: this.streamingBackend.getSequence(),
+      };
+    }
+    if (this.multiCard) {
+      return {
+        messageId: this.multiCard.getLatestMessageId(),
+        cardId: this.multiCard.getLatestCardId(),
+        version: this.multiCard.getLatestVersion(),
+      };
+    }
+    return { messageId: this.messageId, cardId: null, version: 0 };
+  }
+
+  private emitLifecycle(
+    status: StreamingCardLifecycleEvent['status'],
+    error?: unknown,
+  ): void {
+    if (!this.lifecycle) return;
+    const identity = this.lifecycleIdentity();
+    try {
+      this.lifecycle.onEvent({
+        status,
+        ...identity,
+        snapshot: {
+          text: this.accumulatedText,
+          thinking: this.thinkingText,
+          state: this.state,
+          backendMode: this.backendMode,
+        },
+        ...(error !== undefined
+          ? { error: error instanceof Error ? error.message : String(error) }
+          : {}),
+      });
+    } catch (lifecycleError) {
+      logger.error(
+        { err: lifecycleError, chatId: this.chatId, status },
+        'Streaming card lifecycle hook failed; stopping provider mutation',
+      );
+      throw lifecycleError;
+    }
+  }
+
+  private beginCreation(): void {
+    this.state = 'creating';
+    this.emitLifecycle('creating');
+    this.creationPromise = this.createInitialCard();
+    this.creationPromise.catch((err) => {
+      logger.warn(
+        { err, chatId: this.chatId },
+        'Streaming card: initial create failed, will use fallback',
+      );
+      this.state = 'error';
+      this.emitLifecycle('failed', err);
+      this.onFallback?.();
+    });
   }
 
   get currentState(): StreamingState {
@@ -1842,6 +2352,9 @@ export class StreamingCardController {
   private ensureCardCreating(reason: string): void {
     if (this.state !== 'idle') return;
     this.state = 'creating';
+    // 与 beginCreation() 同口径：状态机进入 creating 就必须发事件，否则从
+    // thinking/tool 起头的这条路径会让订阅方漏掉整个 creating 阶段。
+    this.emitLifecycle('creating');
     // Track the in-flight creation so complete()'s `state === 'creating'`
     // guard can await it. Without assigning to creationPromise, a turn that
     // first creates the card via ensureCardCreating() (e.g. thinking/tool
@@ -1895,6 +2408,10 @@ export class StreamingCardController {
     this.recordCardActivity();
     this.thinking = true;
     this.ensureCardCreating('thinking');
+    if (this.state === 'idle') {
+      // Create card immediately with thinking placeholder.
+      this.beginCreation();
+    }
   }
 
   /**
@@ -1902,6 +2419,14 @@ export class StreamingCardController {
    */
   startTool(toolId: string, toolName: string): void {
     this.recordCardActivity();
+    this.heldOpen = null; // 新 turn 活动，退出挂起态
+    if (toolName === 'AskUserQuestion') {
+      // The model has yielded control to the user. Preserve thinkingText for
+      // the terminal audit panel, but do not leave the live state marked as
+      // thinking while the card is explicitly waiting for input.
+      this.thinking = false;
+      this.emitLifecycle('waiting_user');
+    }
     this.toolCalls.set(toolId, {
       name: toolName,
       status: 'running',
@@ -1944,7 +2469,10 @@ export class StreamingCardController {
     const tc = this.toolCalls.get(toolId);
     if (tc) {
       this.recordCardActivity();
+      const wasWaiting =
+        tc.name === 'AskUserQuestion' && tc.status === 'running';
       tc.status = isError ? 'error' : 'complete';
+      if (wasWaiting) this.emitLifecycle('running');
       this.stateVersion++;
       this.purgeOldTools();
       if (this.state === 'streaming') {
@@ -1972,6 +2500,7 @@ export class StreamingCardController {
    */
   appendThinking(text: string): void {
     this.recordCardActivity();
+    this.heldOpen = null; // 新 turn 活动，退出挂起态
     this.thinkingText += text;
     if (this.thinkingText.length > MAX_THINKING_CHARS) {
       this.thinkingText =
@@ -1984,6 +2513,7 @@ export class StreamingCardController {
     this.stateVersion++;
     if (this.state === 'idle') {
       this.ensureCardCreating('thinking_delta');
+      this.beginCreation();
     } else if (this.state === 'streaming') {
       this.backendMode === 'streaming'
         ? this.scheduleAuxFlush()
@@ -2061,6 +2591,23 @@ export class StreamingCardController {
   }
 
   /**
+   * 标记卡片进入「挂起完成」态：本 turn 回复已送达，但后台任务（异步 Agent /
+   * backgrounded Bash）或截断自动续写仍在进行，卡片不定稿、状态横幅切到
+   * 「后台任务运行中 ⏳」。pendingTasks 为后台任务数，null 表示截断续写中。
+   * 下一 turn 的任何活动（append/appendThinking/startTool）自动清除该态，
+   * 恢复正常的 phase 推导。
+   */
+  setHeldOpen(pendingTasks: number | null): void {
+    this.heldOpen = { pendingTasks };
+    this.stateVersion++;
+    if (this.state === 'streaming') {
+      this.backendMode === 'streaming'
+        ? this.scheduleAuxFlush()
+        : this.schedulePatch();
+    }
+  }
+
+  /**
    * Set or clear active hook state.
    */
   setHook(hook: { hookName: string; hookEvent: string } | null): void {
@@ -2111,9 +2658,7 @@ export class StreamingCardController {
     };
     this.tasks.set(taskId, next);
     this.stateVersion++;
-    if (this.state === 'idle') {
-      this.ensureCardCreating('task_update');
-    } else if (this.state === 'streaming') {
+    if (this.state === 'streaming') {
       this.backendMode === 'streaming'
         ? this.scheduleAuxFlush()
         : this.schedulePatch();
@@ -2128,6 +2673,7 @@ export class StreamingCardController {
     this.recordCardActivity();
     const event = { text };
     this.recentEvents.push(event);
+    this.recentEvents.push({ text });
     if (this.recentEvents.length > MAX_RECENT_EVENTS) {
       this.recentEvents = this.recentEvents.slice(-MAX_RECENT_EVENTS);
     }
@@ -2205,21 +2751,25 @@ export class StreamingCardController {
 
     const prevState = this.state;
     this.accumulatedText = finalText;
+    this.emitLifecycle('finalizing');
     this.state = 'completed';
     this.stopLivenessHeartbeat();
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
+    this.stopHeartbeat();
 
     try {
-        if (this.backendMode === 'streaming' && this.streamingBackend) {
-          await this.finalizeStreamingCard('completed');
-        } else if (this.messageId || this.multiCard) {
-          await this.patchCard('completed', this.traceFooterLink());
-        }
+      if (this.backendMode === 'streaming' && this.streamingBackend) {
+        await this.finalizeStreamingCard('completed');
+      } else if (this.messageId || this.multiCard) {
+        await this.patchCard('completed', this.traceFooterLink());
+      }
+      this.emitLifecycle('completed');
     } catch (err) {
       // Revert state so abort() doesn't bail on the 'completed' check
       this.state = prevState;
+      this.emitLifecycle('failed', err);
       throw err;
     }
   }
@@ -2228,8 +2778,17 @@ export class StreamingCardController {
    * Patch a completed card to append a usage note at the bottom.
    * Called AFTER complete() because agent-runner emits usage after the final result.
    */
-  async patchUsageNote(usage: UsageNoteData): Promise<void> {
-    this.usageNote = usage;
+  async patchUsageNote(usage: {
+    inputTokens: number;
+    outputTokens: number;
+    costUSD: number;
+    durationMs: number;
+    numTurns: number;
+    cacheReadInputTokens?: number;
+    cacheCreationInputTokens?: number;
+    reasoningTokens?: number;
+    modelUsage?: Record<string, { outputTokens?: number }>;
+  }): Promise<void> {
     if (this.state !== 'completed') return;
 
     try {
@@ -2239,28 +2798,20 @@ export class StreamingCardController {
         // cards remain. The explicit flag matters: for ASCII long replies the
         // truncated JSON is small, so a byte-size check alone never trips.
         if (this.finalizedAsSplit) return;
-        const cardJson = this.buildStructuredFinalCard('completed', usage);
+        const cardJson = this.buildStructuredFinalCard('completed', {
+          ...usage,
+          cacheReadInputTokens: usage.cacheReadInputTokens ?? 0,
+          cacheCreationInputTokens: usage.cacheCreationInputTokens ?? 0,
+        });
         const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
         if (cardSize > CARD_SIZE_LIMIT) return;
         await this.streamingBackend.updateCardFull(cardJson);
-      } else if (this.messageId) {
-        // Legacy / CardKit v1: rebuild the full structured card (same shape as
-        // streaming mode) so the metaRow shows model/tokens/cost. Previously
-        // we only patched a footer note, which didn't populate the metaRow.
-        const cardJson = this.buildStructuredFinalCard('completed', usage);
-        const content = JSON.stringify(cardJson);
-        const cardSize = Buffer.byteLength(content, 'utf-8');
-        if (cardSize > CARD_SIZE_LIMIT) {
-          // Card too large — fall back to the text-note patch to preserve some
-          // info rather than silently drop it.
-          const note = formatUsageNote(usage);
-          if (note) await this.patchCard('completed', note);
-          return;
-        }
-        await this.client.im.v1.message.patch({
-          path: { message_id: this.messageId },
-          data: { content },
-        });
+      } else if (this.messageId || this.multiCard) {
+        // For CardKit v1 / legacy: skip if multiCard has split content
+        if (this.multiCard && this.multiCard.getCardCount() > 1) return;
+        const note = this.mergeFooterNote(formatFeishuUsageNote(usage));
+        if (!note) return;
+        await this.patchCard('completed', note);
       }
     } catch (err) {
       logger.debug(
@@ -2277,17 +2828,36 @@ export class StreamingCardController {
     if (this.state === 'completed' || this.state === 'aborted') return;
 
     const wasActive = this.isActive();
+    const creationInFlight =
+      this.state === 'creating' ? this.creationPromise : null;
     this.state = 'aborted';
     this.stopLivenessHeartbeat();
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
+    this.stopHeartbeat();
 
     if (reason) {
       this.accumulatedText += `\n\n---\n*${reason}*`;
     }
 
+    this.emitLifecycle('finalizing');
+    let finalizationError: unknown;
+
+    // If provider creation was in-flight, finishCardCreation observes the
+    // aborted state and leaves finalization to this method. Awaiting it closes
+    // the crash window where persistence said "aborted" while Feishu still
+    // showed a newly-created "生成中" card.
+    if (creationInFlight) {
+      try {
+        await creationInFlight;
+      } catch (error) {
+        finalizationError = error;
+      }
+    }
+
     if (
+      finalizationError === undefined &&
       this.backendMode === 'streaming' &&
       this.streamingBackend &&
       wasActive
@@ -2295,21 +2865,31 @@ export class StreamingCardController {
       try {
         await this.finalizeStreamingCard('aborted');
       } catch (err) {
+        finalizationError = err;
         logger.debug(
           { err, chatId: this.chatId },
           'Streaming card: abort finalize failed',
         );
       }
-    } else if ((this.messageId || this.multiCard) && wasActive) {
+    } else if (
+      finalizationError === undefined &&
+      (this.messageId || this.multiCard) &&
+      wasActive
+    ) {
       try {
         await this.patchCard('aborted');
       } catch (err) {
+        finalizationError = err;
         logger.debug(
           { err, chatId: this.chatId },
           'Streaming card: abort patch failed',
         );
       }
     }
+    this.emitLifecycle(
+      finalizationError === undefined ? 'aborted' : 'failed',
+      finalizationError,
+    );
   }
 
   dispose(): void {
@@ -2317,12 +2897,15 @@ export class StreamingCardController {
     this.flushCtrl.dispose();
     this.textFlushCtrl?.dispose();
     this.auxFlushCtrl?.dispose();
+    this.stopHeartbeat();
   }
 
   // ─── Internal Methods ──────────────────────────────────
 
   private async createInitialCard(): Promise<void> {
-    const initialText = this.accumulatedText || (this.thinking ? '' : '...');
+    const initialText = limitStreamingContent(
+      this.accumulatedText || STREAMING_PLACEHOLDER,
+    );
 
     // ── Level 0: Try streaming mode (cardElement.content typewriter) ──
     try {
@@ -2330,6 +2913,7 @@ export class StreamingCardController {
       const cardJson = buildStreamingModeCard(
         initialText,
         this.runtimeProfile,
+        this.buildRichPanelPatches(),
       );
       await backend.createCard(cardJson);
       const messageId = await backend.sendCard(
@@ -2430,14 +3014,12 @@ export class StreamingCardController {
       let resp: any;
 
       if (this.replyToMsgId) {
-        resp = await this.client.im.message.reply({
-          path: { message_id: this.replyToMsgId },
-          data: {
-            content,
-            msg_type: 'interactive',
-            ...(this.replyInThread ? { reply_in_thread: true } : {}),
-          },
-        });
+        resp = await replyInteractiveCard(
+          this.client,
+          this.replyToMsgId,
+          content,
+          this.replyInThread,
+        );
       } else {
         resp = await this.client.im.v1.message.create({
           params: { receive_id_type: 'chat_id' },
@@ -2495,13 +3077,24 @@ export class StreamingCardController {
           );
         });
       }
+      // abort() owns and awaits the provider finalization after this creation
+      // promise resolves. Starting an untracked patch here would let durable
+      // state reach terminal before the provider update is acknowledged.
       return;
     }
 
     this.state = 'streaming';
     this.startLivenessHeartbeat();
+    if (this.backendMode === 'streaming') this.startHeartbeat();
+    this.emitLifecycle('streaming');
     if (this.messageId) {
       this.onCardCreated?.(this.messageId);
+    }
+
+    if (this.backendMode === 'streaming') {
+      // Replace the skeleton's neutral preparation state with the current
+      // deterministic phase even when the model has emitted no text delta.
+      this.scheduleAuxFlush();
     }
 
     // If text accumulated while creating, schedule a flush/patch
@@ -2550,6 +3143,7 @@ export class StreamingCardController {
         'Streaming card: too many patch failures, falling back',
       );
       this.state = 'error';
+      this.emitLifecycle('failed', 'too many streaming card patch failures');
       this.flushCtrl.dispose();
       this.stopLivenessHeartbeat();
       // Best-effort terminal patch — without it the card stays frozen on
@@ -2591,6 +3185,33 @@ export class StreamingCardController {
     };
   }
 
+  /**
+   * The canonical reducer is allowed to retract provisional narration back to
+   * an empty string when the same assistant message turns into a tool call.
+   * Provider projections must keep a visible neutral surface during that
+   * transition without mutating canonical accumulatedText.
+   */
+  private liveDisplayText(): string {
+    return this.accumulatedText || STREAMING_PLACEHOLDER;
+  }
+
+  private startHeartbeat(): void {
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      if (this.state !== 'streaming') return;
+      // Elapsed time is bucketed by buildRichPanelPatches(), so this remains a
+      // low-frequency liveness signal rather than an update storm.
+      this.scheduleAuxFlush();
+    }, 5000);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private stopHeartbeat(): void {
+    if (!this.heartbeatTimer) return;
+    clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+  }
+
   setTraceUrl(url: string | null): void {
     this.traceUrl = url;
   }
@@ -2611,17 +3232,6 @@ export class StreamingCardController {
    * Schedule a text content flush for streaming mode.
    * Falls back to schedulePatch() if streaming backend is not available.
    */
-  private scheduleTextFlush(): void {
-    if (!this.streamingBackend || !this.textFlushCtrl) {
-      this.schedulePatch();
-      return;
-    }
-
-    this.textFlushCtrl.schedule(this.accumulatedText.length, async () => {
-      await this.pushStreamingText('scheduled');
-    });
-  }
-
   private async pushStreamingText(reason: 'initial' | 'scheduled'): Promise<void> {
     if (!this.streamingBackend || !this.textFlushCtrl) {
       this.schedulePatch();
@@ -2629,7 +3239,10 @@ export class StreamingCardController {
     }
 
     try {
-      await this.streamingBackend.streamContent(this.accumulatedText);
+      // 用 liveDisplayText() 而非裸 accumulatedText：canonical reducer 会在
+      // 同一条 assistant 消息转成工具调用时把临时旁白撤回成空串，此刻主槽
+      // 必须保持中性占位可见，不能推一个空内容上去。
+      await this.streamingBackend.streamContent(this.liveDisplayText());
       this.textFlushCtrl.markFlushed(this.accumulatedText.length);
       this.patchFailCount = 0;
       if (!this.firstTextFlushLogged || reason === 'initial') {
@@ -2669,11 +3282,32 @@ export class StreamingCardController {
     }
   }
 
-  /**
-   * Schedule an auxiliary content flush for streaming mode.
-   * Falls back to schedulePatch() if streaming backend is not available.
-   */
+  private scheduleTextFlush(): void {
+    if (!this.streamingBackend || !this.textFlushCtrl) {
+      this.schedulePatch();
+      return;
+    }
+
+    this.textFlushCtrl.schedule(this.accumulatedText.length, async () => {
+      await this.pushStreamingText('scheduled');
+    });
+  }
+
   private derivePhase(): StreamingPhase {
+    // 挂起完成态优先：本 turn 已答复、等后台任务/续写。放在最前是有意的——
+    // backgrounded Bash 等工具的 tool_use 可能永远等不到 end 事件而滞留
+    // 'running'，若 tooling 优先会把挂起期一直显示成「调用工具」。
+    // 新 turn 的任何活动（append/appendThinking/startTool）会清除 heldOpen。
+    if (this.heldOpen) return 'waiting_bg';
+    // A live AskUserQuestion is not an ordinary tool call. It is a protocol
+    // boundary where the agent has yielded and is waiting for the user. Keep
+    // it ahead of tooling/thinking so the banner can never claim 「思考中」and
+    // 「等待输入」both at once.
+    for (const tc of this.toolCalls.values()) {
+      if (tc.name === 'AskUserQuestion' && tc.status === 'running') {
+        return 'waiting';
+      }
+    }
     // Priority: active tool > hook > thinking > streaming text > working > idle
     for (const tc of this.toolCalls.values()) {
       if (tc.status === 'running') return 'tooling';
@@ -2702,6 +3336,10 @@ export class StreamingCardController {
       const extra =
         running.length > 1 ? ` <text_tag color='blue'>+${running.length - 1}</text_tag>` : '';
       return this.withLivenessSilence(`\`${name}\`${summary}${extra}`);
+        running.length > 1
+          ? ` <text_tag color='blue'>+${running.length - 1}</text_tag>`
+          : '';
+      return `\`${name}\`${summary}${extra}`;
     }
     if (phase === 'hook') {
       return this.withLivenessSilence(
@@ -2713,6 +3351,11 @@ export class StreamingCardController {
     if (phase === 'streaming') {
       const chars = this.accumulatedText.length;
       return this.withLivenessSilence(`已输出 ${chars} 字`);
+    }
+    if (phase === 'waiting_bg') {
+      if (this.systemStatus) return this.systemStatus;
+      const n = this.heldOpen?.pendingTasks;
+      return n ? `${n} 个后台任务运行中，完成后将继续汇总` : '自动续写中…';
     }
     if (phase === 'working') {
       return this.withLivenessSilence(this.systemStatus ?? undefined);
@@ -2729,6 +3372,7 @@ export class StreamingCardController {
   }
 
   private buildRichPanelPatches(): {
+    statusBanner: string;
     progressContent?: string;
     taskContent: string;
     toolsContent: string;
@@ -2749,22 +3393,45 @@ export class StreamingCardController {
           )
         : undefined;
 
-      const now = Date.now();
-      const taskViews = Array.from(this.tasks.values())
-        .sort((a, b) => b.updatedAt - a.updatedAt)
-        .slice(0, 10);
-      const taskContent = taskViews.length > 0
-        ? taskViews.map((task) => {
-            const tagColor = task.status === 'running' ? 'blue' : task.status === 'completed' ? 'green' : task.status === 'backgrounded' ? 'grey' : 'red';
-            const tagText = task.status === 'running' ? '运行' : task.status === 'completed' ? '完成' : task.status === 'backgrounded' ? '后台' : '失败';
-            const type = task.subagentType ? ` <font color='grey'>${task.subagentType}</font>` : '';
-            const last = task.lastToolName ? ` <font color='grey'>[${task.lastToolName}]</font>` : '';
-            const summary = task.summary ? `\n  <font color='grey'>${task.summary.slice(0, 180)}</font>` : '';
-            return `<text_tag color='${tagColor}'>${tagText}</text_tag> **${task.title.slice(0, 80)}**${type}${last}${summary}`;
-          }).join('\n')
-        : '<font color=\'grey\'>暂无子任务</font>';
+    const now = Date.now();
+    const taskViews = Array.from(this.tasks.values())
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 10);
+    const taskContent =
+      taskViews.length > 0
+        ? taskViews
+            .map((task) => {
+              const tagColor =
+                task.status === 'running'
+                  ? 'blue'
+                  : task.status === 'completed'
+                    ? 'green'
+                    : task.status === 'backgrounded'
+                      ? 'grey'
+                      : 'red';
+              const tagText =
+                task.status === 'running'
+                  ? '运行'
+                  : task.status === 'completed'
+                    ? '完成'
+                    : task.status === 'backgrounded'
+                      ? '后台'
+                      : '失败';
+              const type = task.subagentType
+                ? ` <font color='grey'>${task.subagentType}</font>`
+                : '';
+              const last = task.lastToolName
+                ? ` <font color='grey'>[${task.lastToolName}]</font>`
+                : '';
+              const summary = task.summary
+                ? `\n  <font color='grey'>${task.summary.slice(0, 180)}</font>`
+                : '';
+              return `<text_tag color='${tagColor}'>${tagText}</text_tag> **${task.title.slice(0, 80)}**${type}${last}${summary}`;
+            })
+            .join('\n')
+        : "<font color='grey'>暂无子任务</font>";
 
-      // Filter out AskUserQuestion from the tools timeline — it gets its own panel.
+    // Filter out AskUserQuestion from the tools timeline — it gets its own panel.
     const toolViews: ToolCallView[] = Array.from(this.toolCalls.values())
       .filter((tc) => tc.name !== 'AskUserQuestion')
       .map((tc) => ({
@@ -2792,16 +3459,35 @@ export class StreamingCardController {
       .filter((tc) => tc.name === 'AskUserQuestion' && tc.status === 'running')
       .flatMap((tc) => collectAskQuestions(tc.toolInput));
     const askContent =
-      askQuestions.length > 0 ? buildAskQuestionText(askQuestions) : undefined;
+      askQuestions.length > 0
+        ? `**❓ 等待你的回复**\n${buildAskQuestionText(askQuestions)}`
+        : undefined;
+
+    // 状态横幅（upstream 的 STATUS_BANNER 槽位内容），与 buildLiveFooterNote 同源。
+
+    const phase = this.derivePhase();
+
+    // elapsedMs 必须按 5 秒分桶：这个值进 statusBanner 文本、再进内容 hash。
+    // 用裸 Date.now() 会让每次 flush 的 hash 都不同，幂等去重完全失效，
+    // 心跳（每 5s 一次）就会变成持续的 CardKit 请求流。
+    const elapsedMs =
+      this.startTime > 0
+        ? Math.floor((Date.now() - this.startTime) / 5000) * 5000
+        : 0;
+    const statusBanner = buildStatusBannerText({
+      phase,
+      detail: this.deriveBannerDetail(phase),
+      elapsedMs,
+      runtimeProfile: this.runtimeProfile,
+    });
 
     const timelineContent =
       this.recentEvents.length > 0
-        ? buildTimelineText(
-            this.recentEvents.map((e) => ({ text: e.text })),
-          )
+        ? buildTimelineText(this.recentEvents.map((e) => ({ text: e.text })))
         : undefined;
 
     return {
+      statusBanner,
       progressContent,
       taskContent,
       toolsContent,
@@ -2814,7 +3500,13 @@ export class StreamingCardController {
 
   private buildLiveFooterNote(): string {
     const phase = this.derivePhase();
-    const elapsedMs = this.startTime > 0 ? Date.now() - this.startTime : 0;
+    // 与 buildRichPanelPatches 同口径按 5 秒分桶：footer 的内容会进 hash，
+    // 裸 Date.now() 会让每次 flush 都「有变更」，幂等去重失效。
+    const nowBucket = Math.floor(Date.now() / 5000) * 5000;
+    const elapsedMs =
+      this.startTime > 0
+        ? Math.floor((Date.now() - this.startTime) / 5000) * 5000
+        : 0;
     const statusBanner = buildStatusBannerText({
       phase,
       detail: this.deriveBannerDetail(phase),
@@ -2824,7 +3516,7 @@ export class StreamingCardController {
     // Footer is the single live status line — recent events have their own
     // panel. <local_datetime> renders in each viewer's local timezone.
     const statusText = statusBanner.replace(/<[^>]+>/g, '').trim();
-    return `<font color='grey'>${statusText} · 更新 ${buildLocalDatetimeWithSeconds(Date.now())}</font>`;
+    return `<font color='grey'>${statusText} · 更新 ${buildLocalDatetimeWithSeconds(nowBucket)}</font>`;
   }
 
   private scheduleAuxFlush(): void {
@@ -2928,6 +3620,7 @@ export class StreamingCardController {
     this.textFlushCtrl = null;
     this.auxFlushCtrl?.dispose();
     this.auxFlushCtrl = null;
+    this.stopHeartbeat();
     this.patchFailCount = 0;
 
     // Set up v1 flush controller
@@ -3012,6 +3705,7 @@ export class StreamingCardController {
         outputTokens: usage?.outputTokens,
         cacheReadInputTokens: usage?.cacheReadInputTokens,
         cacheCreationInputTokens: usage?.cacheCreationInputTokens,
+        reasoningTokens: usage?.reasoningTokens,
         costUSD: usage?.costUSD,
         numTurns: usage?.numTurns,
       },
@@ -3081,7 +3775,11 @@ export class StreamingCardController {
     const backend = this.streamingBackend!;
 
     try {
-      // 1. Disable streaming mode (allows header/button changes)
+      // 1. Let any provider mutation already accepted by the shared queue
+      // settle before crossing the terminal boundary.
+      await backend.drain();
+
+      // 2. Disable streaming mode (allows header/button changes)
       await backend.disableStreamingMode();
 
       // 2. Build structured final card.  Usage usually arrives after the final
@@ -3091,6 +3789,8 @@ export class StreamingCardController {
       // overwrite a usage-patched card with a usage-less final card.
       const usageForFinal =
         finalState === 'completed' ? this.usageNote ?? undefined : undefined;
+      // 3. 结构化终态卡片。usage 从 controller 缓存取（决策 66 配套：
+      //    防止创建期的迟到 finalize 用无 usage 的卡覆盖已打过补丁的卡）。
       const cardJson = this.buildStructuredFinalCard(finalState, usageForFinal);
       const cardSize = Buffer.byteLength(JSON.stringify(cardJson), 'utf-8');
 
@@ -3098,7 +3798,7 @@ export class StreamingCardController {
         cardSize <= CARD_SIZE_LIMIT &&
         this.accumulatedText.length <= MAX_FINAL_SINGLE_CARD_CHARS
       ) {
-        // 3a. Single card fits (both built JSON and RAW text length — the
+        // 4a. Single card fits (both built JSON and RAW text length — the
         // latter catches ASCII replies whose truncated JSON looks small)
         await backend.updateCardFull(cardJson);
         if (
@@ -3111,7 +3811,7 @@ export class StreamingCardController {
           );
         }
       } else {
-        // 3b. Too large for single card — split on finalize (full content).
+        // 4b. Too large for single card — split on finalize (full content).
         // Set the flag BEFORE awaiting: patchUsageNote may fire mid-split and
         // must not rebuild a single card over the just-created continuations.
         this.finalizedAsSplit = true;
@@ -3254,19 +3954,24 @@ export class StreamingCardController {
       footerNote ??
       (displayState === 'streaming' ? this.buildLiveFooterNote() : undefined);
 
+    const displayText =
+      displayState === 'streaming'
+        ? this.liveDisplayText()
+        : this.accumulatedText;
     if (this.useCardKit && this.multiCard) {
       // CardKit v1 path — pass auxiliary state for rich display
       const auxState =
         displayState === 'streaming' ? this.getAuxiliaryState() : undefined;
       try {
         await this.multiCard.commitContent(
-          this.accumulatedText,
+          displayText,
           displayState,
           auxState,
           effectiveFooterNote,
         );
         this.flushCtrl.markFlushed(this.accumulatedText.length);
         this.patchFailCount = 0;
+        if (displayState === 'streaming') this.emitLifecycle('streaming');
       } catch (err) {
         this.patchFailCount++;
         logger.debug(
@@ -3306,6 +4011,7 @@ export class StreamingCardController {
         await run;
         this.flushCtrl.markFlushed(this.accumulatedText.length);
         this.patchFailCount = 0;
+        if (displayState === 'streaming') this.emitLifecycle('streaming');
       } catch (err) {
         this.patchFailCount++;
         logger.debug(
@@ -3321,6 +4027,83 @@ export class StreamingCardController {
       }
     }
   }
+}
+
+/**
+ * Close a card left non-terminal by a dead process. This deliberately updates
+ * the original card/message; creating a replacement would leave two active
+ * cards for the same logical turn after SIGKILL recovery.
+ */
+export async function reconcileInterruptedStreamingCard(
+  client: lark.Client,
+  input: InterruptedStreamingCardInput,
+): Promise<{ version: number; method: 'cardkit' | 'message_patch' }> {
+  const saved = input.snapshot as
+    | { text?: unknown; thinking?: unknown }
+    | null
+    | undefined;
+  const partial = typeof saved?.text === 'string' ? saved.text.trim() : '';
+  const reason = input.reason?.trim() || '上次服务中断，本次任务未完成';
+  const text = partial ? `${partial}\n\n---\n> ⚠️ ${reason}` : `> ⚠️ ${reason}`;
+  const card = buildAgentReplyCard({ status: 'warning', text });
+
+  if (input.cardId) {
+    let version = Math.max(0, Math.trunc(input.version));
+    try {
+      const settings = JSON.stringify({ config: { streaming_mode: false } });
+      const sequence = ++version;
+      const response = await client.cardkit.v1.card.settings({
+        path: { card_id: input.cardId },
+        data: {
+          settings,
+          sequence,
+          uuid: cardMutationUuid(
+            input.cardId,
+            sequence,
+            'reconcile:settings',
+            quickHash(settings),
+          ),
+        },
+      });
+      assertCardKitAcknowledged(response, 'card.settings reconcile');
+    } catch (error) {
+      // A provider may report that streaming already expired. The original
+      // card can still accept a full update, so do not create a second card.
+      logger.debug(
+        { err: error, cardId: input.cardId },
+        'Interrupted card streaming disable failed; trying full update',
+      );
+    }
+    const data = JSON.stringify(card);
+    const sequence = ++version;
+    const response = await client.cardkit.v1.card.update({
+      path: { card_id: input.cardId },
+      data: {
+        card: { type: 'card_json', data },
+        sequence,
+        uuid: cardMutationUuid(
+          input.cardId,
+          sequence,
+          'reconcile:update',
+          quickHash(data),
+        ),
+      },
+    });
+    assertCardKitAcknowledged(response, 'card.update reconcile');
+    return { version, method: 'cardkit' };
+  }
+
+  if (!input.messageId) {
+    throw new Error('Interrupted streaming card has no cardId or messageId');
+  }
+  await client.im.v1.message.patch({
+    path: { message_id: input.messageId },
+    data: { content: JSON.stringify(card) },
+  });
+  return {
+    version: Math.max(0, Math.trunc(input.version)),
+    method: 'message_patch',
+  };
 }
 
 // ─── MessageId → ChatJid Mapping ─────────────────────────────

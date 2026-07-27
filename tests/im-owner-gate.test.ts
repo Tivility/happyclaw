@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { describe, expect, test } from 'vitest';
 
 import {
@@ -33,7 +34,15 @@ describe('OWNER_REQUIRED_IM_COMMANDS set', () => {
   });
 
   test('excludes read-only utilities', () => {
-    for (const cmd of ['list', 'ls', 'status', 'recall', 'rc', 'where', 'allowlist']) {
+    for (const cmd of [
+      'list',
+      'ls',
+      'status',
+      'recall',
+      'rc',
+      'where',
+      'allowlist',
+    ]) {
       expect(OWNER_REQUIRED_IM_COMMANDS.has(cmd)).toBe(false);
     }
   });
@@ -45,7 +54,9 @@ describe('checkImOwnerCommand', () => {
     expect(checkImOwnerCommand('status', UNOWNED_GROUP, undefined)).toEqual({
       ok: true,
     });
-    expect(checkImOwnerCommand('owner_mention', UNOWNED_GROUP, STRANGER)).toEqual({
+    expect(
+      checkImOwnerCommand('owner_mention', UNOWNED_GROUP, STRANGER),
+    ).toEqual({
       ok: true,
     });
   });
@@ -72,9 +83,15 @@ describe('checkImOwnerCommand', () => {
   });
 
   test('owner-required command: senderImId equals owner allowed', () => {
-    expect(checkImOwnerCommand('clear', OWNED_GROUP, OWNER)).toEqual({ ok: true });
-    expect(checkImOwnerCommand('bind', OWNED_GROUP, OWNER)).toEqual({ ok: true });
-    expect(checkImOwnerCommand('spawn', OWNED_GROUP, OWNER)).toEqual({ ok: true });
+    expect(checkImOwnerCommand('clear', OWNED_GROUP, OWNER)).toEqual({
+      ok: true,
+    });
+    expect(checkImOwnerCommand('bind', OWNED_GROUP, OWNER)).toEqual({
+      ok: true,
+    });
+    expect(checkImOwnerCommand('spawn', OWNED_GROUP, OWNER)).toEqual({
+      ok: true,
+    });
   });
 
   test('null/undefined group treated as unowned (bootstrap message)', () => {
@@ -92,10 +109,18 @@ describe('isDirectMessageJid', () => {
     expect(isDirectMessageJid('qq:c2c:user_openid_abc')).toBe(true);
     expect(isDirectMessageJid('dingtalk:c2c:staff123')).toBe(true);
     expect(isDirectMessageJid('discord:dm:8675309')).toBe(true);
-    expect(isDirectMessageJid('whatsapp:15551234567@s.whatsapp.net')).toBe(true);
+    expect(isDirectMessageJid('whatsapp:15551234567@s.whatsapp.net')).toBe(
+      true,
+    );
     expect(isDirectMessageJid('wechat:wxid_abc123')).toBe(true);
     // Telegram private chats have positive ids
     expect(isDirectMessageJid('telegram:123456789')).toBe(true);
+    expect(
+      isDirectMessageJid('telegram:123456789#account:bot-a#thread:topic-1'),
+    ).toBe(true);
+    expect(
+      isDirectMessageJid('whatsapp:15551234567@s.whatsapp.net#account:bot-a'),
+    ).toBe(true);
   });
 
   test('group jids → false (no auto-claim in groups)', () => {
@@ -118,5 +143,62 @@ describe('isDirectMessageJid', () => {
     expect(isDirectMessageJid('something-weird')).toBe(false);
     expect(isDirectMessageJid('telegram:notanumber')).toBe(false);
     expect(isDirectMessageJid('telegram:')).toBe(false);
+  });
+});
+
+describe('credential-transfer owner boundary', () => {
+  test('resets previous IM trust before moving a chat to another user', () => {
+    const source = fs.readFileSync(
+      new URL('../src/index.ts', import.meta.url),
+      'utf8',
+    );
+    const start = source.indexOf(
+      '// Credential transfer: previous owner no longer connected on this channel',
+    );
+    const end = source.indexOf(
+      "'Re-routed IM chat to new user (IM credentials transferred)'",
+      start,
+    );
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const transfer = source.slice(start, end);
+    expect(transfer).toContain('releaseOwner(existing)');
+    expect(transfer).toContain("owner_claim_source: 'transfer_reset' as const");
+    expect(transfer).not.toContain("owner_claim_source: 'configured'");
+    expect(transfer).not.toContain("owner_claim_source: 'trusted_direct'");
+  });
+
+  test('only a successful pairing can replace transfer quarantine with trusted direct', () => {
+    const source = fs.readFileSync(
+      new URL('../src/index.ts', import.meta.url),
+      'utf8',
+    );
+    const start = source.indexOf('function buildOnPairAttempt(');
+    const end = source.indexOf(
+      'function resolveOrCreateNativeThreadAgent(',
+      start,
+    );
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const pairing = source.slice(start, end);
+    expect(pairing).toContain('verifyPairingCode(code)');
+    expect(pairing).toContain('ownerImIdFromDirectConversationJid(jid)');
+    expect(pairing).toContain("'trusted_direct'");
+
+    const commandStart = source.indexOf('async function handleCommand(');
+    const commandEnd = source.indexOf(
+      'function handleOwnerMentionCommand(',
+      commandStart,
+    );
+    const commands = source.slice(commandStart, commandEnd);
+    expect(commands).toContain("group.owner_claim_source !== 'transfer_reset'");
+    const mentionEnd = source.indexOf(
+      'function handleReleaseOwnerCommand(',
+      commandEnd,
+    );
+    const ownerMention = source.slice(commandEnd, mentionEnd);
+    expect(ownerMention).toContain(
+      "if (group.owner_claim_source === 'transfer_reset')",
+    );
   });
 });

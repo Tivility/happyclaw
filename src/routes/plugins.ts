@@ -23,10 +23,7 @@ import {
 } from '../plugin-utils.js';
 import { checkPluginDependencies } from '../plugin-dependency-check.js';
 import { getUserHomeGroup } from '../db.js';
-import {
-  scanHostMarketplaces,
-  isScanInFlight,
-} from '../plugin-importer.js';
+import { scanHostMarketplaces, isScanInFlight } from '../plugin-importer.js';
 import {
   readCatalogIndex,
   type CatalogIndex,
@@ -64,7 +61,7 @@ pluginsRoutes.get('/', authMiddleware, async (c) => {
   const v2 = readUserPluginsV2(authUser.id);
   const catalog = readCatalogIndex();
   // Choose dep-check runtime based on the viewer's home group executionMode:
-  //   admin (host home, folder=main)        → check host PATH
+  //   admin (host home)                     → check host PATH
   //   member (container home, home-{userId}) → check docker image PATH
   // The home is where the plugin will run in the common path; reporting the
   // wrong runtime produces false "缺少 X" badges (admin sees docker missing
@@ -100,7 +97,10 @@ pluginsRoutes.get('/', authMiddleware, async (c) => {
 
   const byMarketplace = new Map<string, MarketplaceRow>();
 
-  function ensureMarketplaceRow(name: string, fallbackSyncedAt: string): MarketplaceRow {
+  function ensureMarketplaceRow(
+    name: string,
+    fallbackSyncedAt: string,
+  ): MarketplaceRow {
     const existing = byMarketplace.get(name);
     if (existing) return existing;
     const mpCat = catalog.marketplaces[name];

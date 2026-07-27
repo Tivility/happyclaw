@@ -20,6 +20,8 @@ export function SkillsPage() {
     installing,
     loadSkills,
     installSkill,
+    importSkillFromGit,
+    importSkillArchive,
     deleteAllUserSkills,
   } = useSkillsStore();
 
@@ -27,6 +29,9 @@ export function SkillsPage() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showInstallDialog, setShowInstallDialog] = useState(false);
   const [deletingAll, setDeletingAll] = useState(false);
+  const [sourceFilter, setSourceFilter] = useState<
+    'all' | 'user' | 'project' | 'external'
+  >('all');
 
   useEffect(() => {
     loadSkills();
@@ -36,11 +41,12 @@ export function SkillsPage() {
     const q = searchQuery.toLowerCase();
     return skills.filter(
       (s) =>
-        !q ||
-        s.name.toLowerCase().includes(q) ||
-        s.description.toLowerCase().includes(q)
+        (sourceFilter === 'all' || s.source === sourceFilter) &&
+        (!q ||
+          s.name.toLowerCase().includes(q) ||
+          s.description.toLowerCase().includes(q)),
     );
-  }, [skills, searchQuery]);
+  }, [skills, searchQuery, sourceFilter]);
 
   const userSkills = filtered.filter((s) => s.source === 'user');
   const externalSkills = filtered.filter((s) => s.source === 'external');
@@ -58,12 +64,19 @@ export function SkillsPage() {
         {/* Header */}
         <div className="bg-background border-b border-border px-6 py-4">
           <PageHeader
-            title="技能(Skill)管理"
-            subtitle={`用户级 ${userSkills.length}${externalSkills.length > 0 ? ` · 宿主机 ${externalSkills.length}` : ''} · 项目级 ${projectSkills.length} · 启用 ${enabledCount}`}
+            title="Skills"
+            subtitle={`我的 ${skills.filter((item) => item.source === 'user').length} · HappyClaw 内置 ${skills.filter((item) => item.source === 'project').length} · 宿主机 ${skills.filter((item) => item.source === 'external').length} · 启用 ${enabledCount}`}
             actions={
               <div className="flex items-center gap-3">
-                <Button variant="outline" onClick={loadSkills} disabled={loading}>
-                  <RefreshCw size={18} className={loading ? 'animate-spin' : ''} />
+                <Button
+                  variant="outline"
+                  onClick={loadSkills}
+                  disabled={loading}
+                >
+                  <RefreshCw
+                    size={18}
+                    className={loading ? 'animate-spin' : ''}
+                  />
                   刷新
                 </Button>
                 <Button onClick={() => setShowInstallDialog(true)}>
@@ -73,6 +86,13 @@ export function SkillsPage() {
               </div>
             }
           />
+        </div>
+
+        <div className="mx-6 mt-4 rounded-lg bg-muted px-4 py-3 text-xs leading-5 text-muted-foreground">
+          “我的 Skills”可安装和管理；HappyClaw 内置与宿主机 Skills 只读。 Agent
+          可以独立选择不使用、使用部分或使用全部宿主机
+          Skills，不必同时继承宿主机 Prompt 或
+          Rules。不同来源的同名项会并列显示。
         </div>
 
         {/* Content */}
@@ -85,6 +105,28 @@ export function SkillsPage() {
                 onChange={setSearchQuery}
                 placeholder="搜索技能名称或描述"
               />
+              <div
+                className="mt-3 flex gap-1 overflow-x-auto"
+                aria-label="Skill 来源筛选"
+              >
+                {(
+                  [
+                    ['all', '全部'],
+                    ['user', '我的'],
+                    ['project', 'HappyClaw 内置'],
+                    ['external', '宿主机'],
+                  ] as const
+                ).map(([value, label]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    onClick={() => setSourceFilter(value)}
+                    className={`shrink-0 rounded-full px-3 py-1.5 text-xs transition-colors ${sourceFilter === value ? 'bg-primary text-primary-foreground' : 'bg-muted text-muted-foreground hover:text-foreground'}`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
             </div>
 
             <div className="space-y-6">
@@ -107,33 +149,40 @@ export function SkillsPage() {
                     <div>
                       <div className="flex items-center justify-between mb-3">
                         <h2 className="text-sm font-semibold text-muted-foreground">
-                          用户级技能 ({userSkills.length})
+                          我的 Skills ({userSkills.length})
                         </h2>
                         <button
                           className="text-xs text-muted-foreground hover:text-error flex items-center gap-1 cursor-pointer"
                           disabled={deletingAll}
                           onClick={async () => {
-                            if (!confirm('确定删除所有用户级技能？宿主机技能不受影响。')) return;
+                            if (
+                              !confirm(
+                                '确定删除所有用户级技能？宿主机技能不受影响。',
+                              )
+                            )
+                              return;
                             setDeletingAll(true);
                             try {
                               const n = await deleteAllUserSkills();
                               setSelectedId(null);
                               toast.success(`已删除 ${n} 个用户级技能`);
-                            } catch { /* handled by store */ }
+                            } catch {
+                              /* handled by store */
+                            }
                             setDeletingAll(false);
                           }}
                         >
                           <Trash2 size={12} />
-                          {deletingAll ? '删除中...' : '清空'}
+                          {deletingAll ? '删除中...' : '删除全部用户 Skills'}
                         </button>
                       </div>
                       <div className="space-y-2">
                         {userSkills.map((skill) => (
                           <SkillCard
-                            key={skill.id}
+                            key={skill.sourceKey}
                             skill={skill}
-                            selected={selectedId === skill.id}
-                            onSelect={() => setSelectedId(skill.id)}
+                            selected={selectedId === skill.sourceKey}
+                            onSelect={() => setSelectedId(skill.sourceKey)}
                           />
                         ))}
                       </div>
@@ -143,15 +192,15 @@ export function SkillsPage() {
                   {externalSkills.length > 0 && (
                     <div>
                       <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-                        宿主机技能 ({externalSkills.length})
+                        宿主机 Skills ({externalSkills.length})
                       </h2>
                       <div className="space-y-2">
                         {externalSkills.map((skill) => (
                           <SkillCard
-                            key={skill.id}
+                            key={skill.sourceKey}
                             skill={skill}
-                            selected={selectedId === skill.id}
-                            onSelect={() => setSelectedId(skill.id)}
+                            selected={selectedId === skill.sourceKey}
+                            onSelect={() => setSelectedId(skill.sourceKey)}
                           />
                         ))}
                       </div>
@@ -161,15 +210,15 @@ export function SkillsPage() {
                   {projectSkills.length > 0 && (
                     <div>
                       <h2 className="text-sm font-semibold text-muted-foreground mb-3">
-                        项目级技能 ({projectSkills.length})
+                        HappyClaw 内置 ({projectSkills.length})
                       </h2>
                       <div className="space-y-2">
                         {projectSkills.map((skill) => (
                           <SkillCard
-                            key={skill.id}
+                            key={skill.sourceKey}
                             skill={skill}
-                            selected={selectedId === skill.id}
-                            onSelect={() => setSelectedId(skill.id)}
+                            selected={selectedId === skill.sourceKey}
+                            onSelect={() => setSelectedId(skill.sourceKey)}
                           />
                         ))}
                       </div>
@@ -182,14 +231,20 @@ export function SkillsPage() {
 
           {/* 右侧详情（桌面端） */}
           <div className="hidden lg:block lg:w-1/2 xl:w-3/5">
-            <SkillDetail skillId={selectedId} onDeleted={() => setSelectedId(null)} />
+            <SkillDetail
+              skillId={selectedId}
+              onDeleted={() => setSelectedId(null)}
+            />
           </div>
         </div>
 
         {/* 移动端详情 */}
         {selectedId && (
           <div className="lg:hidden p-4">
-            <SkillDetail skillId={selectedId} onDeleted={() => setSelectedId(null)} />
+            <SkillDetail
+              skillId={selectedId}
+              onDeleted={() => setSelectedId(null)}
+            />
           </div>
         )}
       </div>
@@ -198,6 +253,8 @@ export function SkillsPage() {
         open={showInstallDialog}
         onClose={() => setShowInstallDialog(false)}
         onInstall={handleInstall}
+        onImportGit={importSkillFromGit}
+        onImportArchive={importSkillArchive}
         installing={installing}
       />
     </div>

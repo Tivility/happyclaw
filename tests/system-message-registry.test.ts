@@ -17,10 +17,10 @@ describe('resolveSystemMessage', () => {
     });
   });
 
-  test('query_interrupted 返回固定中文 divider', () => {
+  test('query_interrupted 返回中性的停止状态', () => {
     expect(resolveSystemMessage('query_interrupted')).toEqual({
       style: 'divider',
-      text: '已中断',
+      text: '已停止',
     });
   });
 

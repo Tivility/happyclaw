@@ -10,6 +10,10 @@ import { authMiddleware } from '../middleware/auth.js';
 import { getClientIp } from '../utils.js';
 import { DATA_DIR } from '../config.js';
 import {
+  avatarUploadBodyLimit,
+  AVATAR_MAX_FILE_BYTES,
+} from '../http-upload-policy.js';
+import {
   LoginSchema,
   RegisterSchema,
   ProfileUpdateSchema,
@@ -51,7 +55,11 @@ import {
 } from '../auth.js';
 import type { AuthUser, User, UserPublic } from '../types.js';
 import { logger } from '../logger.js';
-import { lastActiveCache, invalidateSessionCache, invalidateUserSessions } from '../web-context.js';
+import {
+  lastActiveCache,
+  invalidateSessionCache,
+  invalidateUserSessions,
+} from '../web-context.js';
 import { getSystemSettings } from '../runtime-config.js';
 
 const authRoutes = new Hono<{ Variables: Variables }>();
@@ -106,8 +114,7 @@ function buildSetupStatus() {
       !!p.claudeOAuthCredentials ||
       !!p.anthropicApiKey?.trim();
     const hasThirdParty = !!(
-      p.anthropicBaseUrl?.trim() &&
-      p.anthropicAuthToken?.trim()
+      p.anthropicBaseUrl?.trim() && p.anthropicAuthToken?.trim()
     );
     return hasOfficial || hasThirdParty;
   });
@@ -759,9 +766,7 @@ const ALLOWED_AVATAR_TYPES: Record<string, string> = {
   'image/gif': '.gif',
   'image/webp': '.webp',
 };
-const MAX_AVATAR_SIZE = 3 * 1024 * 1024; // 3MB
-
-authRoutes.post('/avatar', authMiddleware, async (c) => {
+authRoutes.post('/avatar', authMiddleware, avatarUploadBodyLimit, async (c) => {
   const user = c.get('user') as AuthUser;
   const contentType = c.req.header('content-type') || '';
 
@@ -775,8 +780,8 @@ authRoutes.post('/avatar', authMiddleware, async (c) => {
     return c.json({ error: 'No avatar file provided' }, 400);
   }
 
-  if (file.size > MAX_AVATAR_SIZE) {
-    return c.json({ error: 'File too large (max 3MB)' }, 400);
+  if (file.size > AVATAR_MAX_FILE_BYTES) {
+    return c.json({ error: 'File too large (max 3MB)' }, 413);
   }
 
   const ext = ALLOWED_AVATAR_TYPES[file.type];

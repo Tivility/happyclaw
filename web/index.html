@@ -1,9 +1,17 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" sizes="192x192" href="%BASE_URL%icons/icon-192.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <link
+      rel="icon"
+      type="image/png"
+      sizes="192x192"
+      href="%BASE_URL%icons/icon-192.png"
+    />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
     <meta name="theme-color" content="#0d9488" />
 
     <!-- PWA iOS Support -->
@@ -11,7 +19,11 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="HappyClaw" />
-    <link rel="apple-touch-icon" href="%BASE_URL%icons/apple-touch-icon-180.png" />
+    <link
+      rel="apple-touch-icon"
+      href="%BASE_URL%icons/apple-touch-icon-180.png"
+    />
+    <link rel="manifest" href="%BASE_URL%manifest.webmanifest" />
 
     <!-- iOS PWA 优化：保留自动识别控制（页面缩放已允许） -->
     <meta name="format-detection" content="telephone=no" />
@@ -22,7 +34,23 @@
     <title>HappyClaw</title>
   </head>
   <body>
-    <script>(function(){var d=document.documentElement,s=localStorage.getItem('happyclaw-theme');if(s==='dark'||(s!=='light'&&window.matchMedia('(prefers-color-scheme: dark)').matches))d.classList.add('dark');var c=localStorage.getItem('happyclaw-color-scheme');if(c==='orange')d.classList.add('theme-orange');if(c==='neutral')d.classList.add('theme-neutral');if(localStorage.getItem('happyclaw-font-style')==='anthropic')d.classList.add('font-anthropic');})();</script>
+    <script>
+      (function () {
+        var d = document.documentElement,
+          s = localStorage.getItem('happyclaw-theme');
+        if (
+          s === 'dark' ||
+          (s === 'system' &&
+            window.matchMedia('(prefers-color-scheme: dark)').matches)
+        )
+          d.classList.add('dark');
+        var c = localStorage.getItem('happyclaw-color-scheme');
+        if (c === 'orange') d.classList.add('theme-orange');
+        if (c === 'neutral') d.classList.add('theme-neutral');
+        if (localStorage.getItem('happyclaw-font-style') === 'anthropic')
+          d.classList.add('font-anthropic');
+      })();
+    </script>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

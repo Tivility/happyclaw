@@ -6,9 +6,20 @@
  * strict); colors are always v2 enum tokens (never hex).
  */
 
-import type { AgentCardInput, CardMeta, ToolCallStat } from './types.js';
-import { resolveStatusTheme } from './status-theme.js';
-import { splitIntoBodySections } from './length.js';
+import type {
+  AgentCardInput,
+  CardMeta,
+  ToolCallStat,
+} from './types.js';
+import {
+  resolveStatusTheme,
+} from './status-theme.js';
+import {
+  splitIntoBodySections,
+} from './length.js';
+import {
+  formatFeishuTokenSummary,
+} from '../feishu-usage-display.js';
 
 /** Element ids for both the structured streaming layout and the static terminal card.
  *
@@ -18,8 +29,10 @@ import { splitIntoBodySections } from './length.js';
  *    - Must be unique within a card
  *  Keep every value below under 20 chars.
  *
- *  Streaming runtime panels (each with an outer `*_PANEL` collapsible and an
- *  inner `*_CONTENT` markdown patchable independently via cardElement.content).
+ *  Streaming runtime panels (normally an outer `*_PANEL` collapsible and an
+ *  inner `*_CONTENT` markdown patchable via cardElement.content). ASK_CONTENT
+ *  is intentionally a standalone blank slot so no waiting panel appears
+ *  before a real AskUserQuestion call.
  *  Final card uses a distinct set suffixed `_final` so both can coexist when
  *  transitioning from streaming to completed.
  */
@@ -31,11 +44,11 @@ export const CARD_ELEMENT_IDS = {
 
   // Rich streaming slots (Phase C)
   STATUS_BANNER: 'status_banner',
-    PROGRESS_PANEL: 'progress_panel',
-    PROGRESS_CONTENT: 'progress_md',
-    TASK_PANEL: 'task_live',
-    TASK_CONTENT: 'task_live_md',
-    TOOLS_PANEL: 'tools_live',
+  PROGRESS_PANEL: 'progress_panel',
+  PROGRESS_CONTENT: 'progress_md',
+  TASK_PANEL: 'task_live',
+  TASK_CONTENT: 'task_live_md',
+  TOOLS_PANEL: 'tools_live',
   TOOLS_CONTENT: 'tools_live_md',
   THINKING_PANEL: 'thinking_live',
   THINKING_CONTENT: 'thinking_live_md',
@@ -79,8 +92,8 @@ const PANEL_ICON = {
  */
 const PANEL_TINT = {
   thinking: 'blue-50', // light blue
+  ask: 'yellow-50', // ASK 面板（本地 runtime-aware，指引 H3）
   tools: 'wathet-50', // light cyan/sky
-  ask: 'orange-50', // light amber
 } as const;
 
 type El = Record<string, unknown>;
@@ -229,12 +242,17 @@ export function buildMetaRow(
   const parts: string[] = [];
   if (meta.model) parts.push(`🤖 ${shortModel(meta.model)}`);
   if (meta.durationMs !== undefined) parts.push(`⏱ ${formatDuration(meta.durationMs)}`);
-  const newInput = (meta.inputTokens ?? 0) + (meta.cacheCreationInputTokens ?? 0);
-  const cachedInput = meta.cacheReadInputTokens ?? 0;
-  const output = meta.outputTokens ?? 0;
-  if (newInput > 0) parts.push(`🆕 ${formatTokens(newInput)} new`);
-  if (cachedInput > 0) parts.push(`🗂 ${formatTokens(cachedInput)} cached`);
-  if (output > 0) parts.push(`💡 ${formatTokens(output)} out`);
+  // Token 明细走 formatFeishuTokenSummary（单一真相源）：卡片与纯文本回复必须
+  // 给出同一份 breakdown，且它额外覆盖推理 token 与「全零 = 未上报」判定。
+  if (
+    meta.inputTokens !== undefined ||
+    meta.outputTokens !== undefined ||
+    meta.cacheReadInputTokens !== undefined ||
+    meta.cacheCreationInputTokens !== undefined ||
+    meta.reasoningTokens !== undefined
+  ) {
+    parts.push(`💡 ${formatFeishuTokenSummary(meta)}`);
+  }
   if (meta.costUSD !== undefined && meta.costUSD > 0) {
     parts.push(`💰 $${meta.costUSD.toFixed(4)}`);
   }
@@ -256,7 +274,7 @@ export function buildBodyChunks(bodyText: string): El[] {
     return [
       {
         tag: 'markdown',
-        content: '...',
+        content: '> 暂无可展示的内容。',
         element_id: CARD_ELEMENT_IDS.MAIN_CONTENT,
       },
     ];
@@ -475,6 +493,7 @@ export type StreamingPhase =
   | 'hook'
   | 'streaming'
   | 'waiting'
+  | 'waiting_bg'
   | 'completed'
   | 'aborted'
   | 'error';
@@ -517,6 +536,10 @@ export function buildStatusBannerText(input: {
       return `${tag('生成回复', 'violet')} ✨${detailPart}${elapsed}`;
     case 'waiting':
       return `${tag('等待输入', 'grey')} ⏸${detailPart}`;
+    case 'waiting_bg':
+      // 本 turn 回复已送达，但后台任务（异步 Agent / 截断自动续写）仍在跑，
+      // 卡片保持打开等待追加——不能显示成绿色「已完成」误导用户。
+      return `${tag('后台任务运行中', 'violet')} ⏳${detailPart}${elapsed}`;
     case 'completed':
       return `${tag('已完成', 'green')} ✅${detailPart}${elapsed}`;
     case 'aborted':
@@ -536,7 +559,7 @@ export interface TodoItemView {
 
 /** TodoWrite list with pseudo progress bar. */
 export function buildProgressListText(todos: TodoItemView[]): string {
-  if (todos.length === 0) return '<font color=\'grey\'>暂无任务计划</font>';
+  if (todos.length === 0) return "<font color='grey'>暂无任务计划</font>";
   const total = todos.length;
   const done = todos.filter((t) => t.status === 'completed').length;
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
@@ -546,7 +569,11 @@ export function buildProgressListText(todos: TodoItemView[]): string {
   const MAX_VISIBLE = 12;
   const items = todos.slice(0, MAX_VISIBLE).map((t) => {
     const icon =
-      t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⏳';
+      t.status === 'completed'
+        ? '✅'
+        : t.status === 'in_progress'
+          ? '🔄'
+          : '⏳';
     const styled =
       t.status === 'in_progress'
         ? `**${t.content}** <font color='blue'>_(进行中)_</font>`
@@ -602,8 +629,7 @@ export function buildToolsTimelineText(
   tools: ToolCallView[],
   opts: { maxVisible?: number } = {},
 ): string {
-  if (tools.length === 0)
-    return '<font color=\'grey\'>尚未调用任何工具</font>';
+  if (tools.length === 0) return "<font color='grey'>尚未调用任何工具</font>";
   const maxVisible = opts.maxVisible ?? 8;
   const running = tools.filter((t) => t.status === 'running');
   const recent = tools.filter((t) => t.status !== 'running').slice(-maxVisible);
@@ -639,7 +665,7 @@ export function buildToolsTimelineText(
  *  markdown element supports ≤4000 chars; leave headroom for blockquote prefix). */
 export function buildThinkingBlockquote(text: string): string {
   const MAX = 2000;
-  if (!text.trim()) return '<font color=\'grey\'>暂无思考记录</font>';
+  if (!text.trim()) return "<font color='grey'>暂无思考记录</font>";
   const sliced = text.length > MAX ? '…' + text.slice(-(MAX - 1)) : text;
   return sliced
     .split('\n')
@@ -704,15 +730,13 @@ export interface TimelineEventView {
 }
 
 export function buildTimelineText(events: TimelineEventView[]): string {
-  if (events.length === 0) return '<font color=\'grey\'>暂无调用记录</font>';
+  if (events.length === 0) return "<font color='grey'>暂无调用记录</font>";
   const MAX = 20;
   const tail = events.slice(-MAX);
   const hidden = events.length - tail.length;
   const lines = tail.map((e) => `- ${e.text}`);
   const more =
-    hidden > 0
-      ? `\n<font color='grey'>… 较早 ${hidden} 条已省略</font>`
-      : '';
+    hidden > 0 ? `\n<font color='grey'>… 较早 ${hidden} 条已省略</font>` : '';
   return `${lines.join('\n')}${more}`;
 }
 
@@ -734,7 +758,10 @@ export interface StreamingPanelsInit {
   /** Show panels expanded (true) or folded (false) at creation time. */
   expandProgress?: boolean;
   expandTools?: boolean;
+  /** upstream 的状态横幅内容（决策 34：与本地 ask 面板并存）。 */
+  statusBanner?: string;
   expandThinking?: boolean;
+  /** 本地 runtime-aware ASK 面板是否展开（指引 H3 / 决策 34）。 */
   expandAsk?: boolean;
   expandTimeline?: boolean;
   runtimeProfile?: StreamingCardRuntimeProfile;
@@ -744,7 +771,8 @@ export interface StreamingPanelsInit {
  * Build the full runtime panel column for the streaming skeleton (ordered).
  *
  * Panel order aligns with the web StreamingDisplay component:
- *   ask (if any) → progress → tasks → tools → thinking → timeline
+ *   status banner → ask slot (invisible until a real question exists) →
+ *   progress → tasks → tools → thinking → timeline
  * Each panel's inner markdown has its own element_id so the controller can
  * patch it via cardElement.content() without touching the panel structure.
  * The live status/heartbeat line is rendered in FOOTER_NOTE instead of a top
@@ -778,15 +806,25 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
     "<font color='grey'>暂无运行日志</font>",
   );
   return [
-    buildRuntimePanel({
-      elementId: CARD_ELEMENT_IDS.ASK_PANEL,
-      contentElementId: CARD_ELEMENT_IDS.ASK_CONTENT,
-      title: askTitle,
-      expanded: init.expandAsk ?? profile === 'claude',
-      backgroundColor: PANEL_TINT.ask,
-      content:
-        init.askContent ?? "<font color='grey'>暂无提问</font>",
-    }),
+    // 刻意不渲染 ASK 折叠面板（upstream 的做法）：CardKit 流式模式只能 patch
+    // 元素内容，不能安全插入/删除折叠面板；预渲染一个「暂无提问」面板会在
+    // Agent 从未调用 AskUserQuestion 时留下假面板。改用下方 ASK_CONTENT
+    // markdown 空槽，真提问（含标题）直接写进去。
+    {
+      tag: 'markdown',
+      element_id: CARD_ELEMENT_IDS.STATUS_BANNER,
+      content: init.statusBanner ?? buildStatusBannerText({ phase: 'idle' }),
+    },
+    // Keep one patchable markdown slot in the streaming skeleton, but do not
+    // render a fake 「等待你的回复 / 暂无提问」panel before the agent
+    // has actually invoked AskUserQuestion. CardKit streaming mode can patch
+    // element content but cannot safely insert/remove a collapsible panel, so
+    // the real prompt (including its heading) is written into this blank slot.
+    {
+      tag: 'markdown',
+      element_id: CARD_ELEMENT_IDS.ASK_CONTENT,
+      content: init.askContent ?? '',
+    },
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.PROGRESS_PANEL,
       contentElementId: CARD_ELEMENT_IDS.PROGRESS_CONTENT,
@@ -799,7 +837,7 @@ export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
       contentElementId: CARD_ELEMENT_IDS.TASK_CONTENT,
       title: '**🤖 子 Agent / Task**',
       expanded: init.expandProgress ?? false,
-      content: init.taskContent ?? '<font color=\'grey\'>暂无子任务…</font>',
+      content: init.taskContent ?? "<font color='grey'>暂无子任务…</font>",
     }),
     buildRuntimePanel({
       elementId: CARD_ELEMENT_IDS.TOOLS_PANEL,

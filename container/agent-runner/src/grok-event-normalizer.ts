@@ -110,6 +110,8 @@ function emitUsage(
         inputTokens: num(src.inputTokens),
         outputTokens: num(src.outputTokens),
         cacheReadInputTokens: num(src.cachedReadTokens),
+        // xAI 口径：outputTokens 已含 reasoning，不另计（CLAUDE.md §8.14）
+        reasoningTokens: 0,
         cacheCreationInputTokens: 0, // grok 无此概念
         costUSD: 0, // 订阅制无 per-token 价 → 上层标 cost_status='unavailable'
         durationMs: Date.now() - startedAt,

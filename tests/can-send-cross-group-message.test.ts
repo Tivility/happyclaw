@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from 'vitest';
 
 import { canSendCrossGroupMessage } from '../src/cross-group-acl.js';
+import { resolveIpcDeliveryTargetGroup } from '../src/ipc-delivery-routing.js';
 import type { RegisteredGroup } from '../src/types.js';
 
 /**
@@ -33,8 +34,13 @@ describe('canSendCrossGroupMessage', () => {
   test('admin home can send to any target', () => {
     const target = makeGroup({ folder: 'other', created_by: 'someoneelse' });
     expect(
-      canSendCrossGroupMessage(true, true, 'main', undefined, target, () =>
+      canSendCrossGroupMessage(
+        true,
+        true,
+        'main',
         undefined,
+        target,
+        () => undefined,
       ),
     ).toBe(true);
   });
@@ -43,8 +49,13 @@ describe('canSendCrossGroupMessage', () => {
     const source = makeGroup({ folder: 'flow-x', created_by: 'u1' });
     const target = makeGroup({ folder: 'flow-x', created_by: 'u1' });
     expect(
-      canSendCrossGroupMessage(false, false, 'flow-x', source, target, () =>
-        undefined,
+      canSendCrossGroupMessage(
+        false,
+        false,
+        'flow-x',
+        source,
+        target,
+        () => undefined,
       ),
     ).toBe(true);
   });
@@ -53,8 +64,13 @@ describe('canSendCrossGroupMessage', () => {
     const source = makeGroup({ folder: 'home-u1', created_by: 'u1' });
     const target = makeGroup({ folder: 'flow-x', created_by: 'u1' });
     expect(
-      canSendCrossGroupMessage(false, true, 'home-u1', source, target, () =>
-        undefined,
+      canSendCrossGroupMessage(
+        false,
+        true,
+        'home-u1',
+        source,
+        target,
+        () => undefined,
       ),
     ).toBe(true);
   });
@@ -63,8 +79,13 @@ describe('canSendCrossGroupMessage', () => {
     const source = makeGroup({ folder: 'flow-x', created_by: 'u1' });
     const target = makeGroup({ folder: 'flow-y', created_by: 'u2' });
     expect(
-      canSendCrossGroupMessage(false, false, 'flow-x', source, target, () =>
-        undefined,
+      canSendCrossGroupMessage(
+        false,
+        false,
+        'flow-x',
+        source,
+        target,
+        () => undefined,
       ),
     ).toBe(false);
   });
@@ -86,9 +107,49 @@ describe('canSendCrossGroupMessage', () => {
         : undefined,
     );
     expect(
-      canSendCrossGroupMessage(false, false, 'flow-x', source, imTarget, lookupGroup),
+      canSendCrossGroupMessage(
+        false,
+        false,
+        'flow-x',
+        source,
+        imTarget,
+        lookupGroup,
+      ),
     ).toBe(true);
     expect(lookupGroup).toHaveBeenCalledWith('web:flow-x');
+  });
+
+  test('Feishu native topic route inherits its bound conversation ACL', () => {
+    const source = makeGroup({ folder: 'flow-x', created_by: 'u1' });
+    const topicRoute =
+      'feishu:oc_topic#thread:omt_current#root:om_current_root';
+    const imTarget = makeGroup({
+      folder: 'main',
+      target_main_jid: 'web:flow-x',
+    });
+    const lookupGroup = vi.fn((jid: string) => {
+      if (jid === 'feishu:oc_topic') return imTarget;
+      if (jid === 'web:flow-x') {
+        return makeGroup({ folder: 'flow-x', created_by: 'u1' });
+      }
+      return undefined;
+    });
+    const resolvedTarget = resolveIpcDeliveryTargetGroup(
+      topicRoute,
+      lookupGroup,
+    );
+
+    expect(
+      canSendCrossGroupMessage(
+        false,
+        false,
+        'flow-x',
+        source,
+        resolvedTarget,
+        lookupGroup,
+      ),
+    ).toBe(true);
+    expect(lookupGroup).toHaveBeenCalledWith('feishu:oc_topic');
   });
 
   test('IM chat bound to a DIFFERENT workspace → denied', () => {
@@ -103,7 +164,14 @@ describe('canSendCrossGroupMessage', () => {
         : undefined,
     );
     expect(
-      canSendCrossGroupMessage(false, false, 'flow-x', source, imTarget, lookupGroup),
+      canSendCrossGroupMessage(
+        false,
+        false,
+        'flow-x',
+        source,
+        imTarget,
+        lookupGroup,
+      ),
     ).toBe(false);
   });
 
@@ -115,14 +183,26 @@ describe('canSendCrossGroupMessage', () => {
     });
     const lookupGroup = vi.fn(() => undefined);
     expect(
-      canSendCrossGroupMessage(false, false, 'flow-x', source, imTarget, lookupGroup),
+      canSendCrossGroupMessage(
+        false,
+        false,
+        'flow-x',
+        source,
+        imTarget,
+        lookupGroup,
+      ),
     ).toBe(false);
   });
 
   test('undefined target → denied (regardless of source flags)', () => {
     expect(
-      canSendCrossGroupMessage(false, false, 'flow-x', undefined, undefined, () =>
+      canSendCrossGroupMessage(
+        false,
+        false,
+        'flow-x',
         undefined,
+        undefined,
+        () => undefined,
       ),
     ).toBe(false);
   });

@@ -30,6 +30,7 @@ vi.mock('../src/middleware/auth.js', () => ({
     await next();
   },
   systemConfigMiddleware: async (_c: any, next: any) => next(),
+  adminRoleMiddleware: async (_c: any, next: any) => next(),
   requirePermission: () => async (_c: any, next: any) => next(),
   requireAnyPermission: () => async (_c: any, next: any) => next(),
 }));
@@ -44,6 +45,10 @@ vi.mock('node:child_process', () => ({
 }));
 
 vi.mock('../src/db.js', () => ({
+  getJidsByFolder: () => [],
+  getRouterState: () => undefined,
+  getRouterStateByPrefix: () => [],
+  isDatabaseInitialized: () => true,
   VALID_ACTIVATION_MODES: new Set([
     'auto',
     'always',
@@ -154,6 +159,18 @@ describe('Codex provider config routes', () => {
       }),
       queue: {
         stopGroup: mocks.stopGroup,
+        // provider 变更会牵动运行中的 runner：按子树暂停 → 丢弃 → 恢复。
+        // 本用例只验证配置路由本身，全部返回中性值。
+        listDescendantJids: () => [],
+        pauseGroupsForMutation: () => ({ id: 1 }),
+        resumeGroupsAfterMutation: () => {},
+        discardGroupsAfterMutation: () => {},
+        blockGroupsForRuntimeSafety: () => {},
+        unblockGroupsForRuntimeSafety: () => {},
+        requestGracefulRestart: () => {},
+        restartGroup: () => {},
+        interruptQuery: () => false,
+        getStatus: () => ({ activeContainers: 0, queuedGroups: 0 }),
       },
     });
     mockCodexDeviceLogin();
@@ -303,7 +320,12 @@ describe('Codex provider config routes', () => {
       stoppedCount: 1,
       failedCount: 0,
     });
-    expect(mocks.stopGroup).toHaveBeenCalledWith('web:test');
+    // 本地在 stopGroup 上加了选项：provider 变更属配置类停机，强制停止但
+    // 保留已排队消息（preserveQueuedWork），避免切 provider 丢用户消息。
+    expect(mocks.stopGroup).toHaveBeenCalledWith('web:test', {
+      force: true,
+      preserveQueuedWork: true,
+    });
     // Toggling enabled state must NOT wipe sessions: it does not change any
     // protocol-level provider field, so sticky session→provider bindings stay
     // intact (narrowed cleanup via deleteSessionsByProviderId, only triggered

@@ -7,7 +7,7 @@ plugin command frontmatter. This is a **trusted parser path**:
 
 - Frontmatter content originates from plugin trees in the shared catalog
   (catalog target dir: `data/plugins/catalog/marketplaces/{mp}/plugins/{plugin}/versions/...`;
-   scan source dir is described below)
+  scan source dir is described below)
 - The catalog is populated by the backend's `scanHostMarketplaces()`
   (`src/plugin-importer.ts`), which is invoked from three places:
   - server startup (5s after boot, when `pluginAutoScan` is true)
@@ -22,7 +22,7 @@ plugin command frontmatter. This is a **trusted parser path**:
 `yaml` is **NOT** used to parse user-supplied input from:
 
 - Web UI request bodies
-- IM channel messages (Feishu, Telegram, QQ, DingTalk, Discord)
+- IM channel messages (Feishu, Telegram, QQ, WeChat, DingTalk, Discord, WhatsApp)
 - Any HTTP API request body
 
 If a future code path adds user-supplied YAML parsing, that path must be

@@ -16,11 +16,13 @@ function getSystemTheme(): 'light' | 'dark' {
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
 }
 
+// 默认浅色：未设置过主题的用户不再跟随系统深色模式。
+// 存储语义与之对称——无 key = light；「深色」「跟随系统」都显式落 key。
 function readTheme(): Theme {
-  if (typeof window === 'undefined') return 'system';
+  if (typeof window === 'undefined') return 'light';
   const stored = window.localStorage.getItem(THEME_KEY);
   if (stored === 'light' || stored === 'dark' || stored === 'system') return stored;
-  return 'system';
+  return 'light';
 }
 
 function readColorScheme(): ColorScheme {
@@ -79,7 +81,7 @@ function subscribe(cb: () => void) {
 }
 
 export function useTheme() {
-  const theme = useSyncExternalStore(subscribe, readTheme, () => 'system' as Theme);
+  const theme = useSyncExternalStore(subscribe, readTheme, () => 'light' as Theme);
   const colorScheme = useSyncExternalStore(subscribe, readColorScheme, () => 'orange' as ColorScheme);
   const fontStyle = useSyncExternalStore(subscribe, readFontStyle, () => 'default' as FontStyle);
 
@@ -97,7 +99,7 @@ export function useTheme() {
   }, []);
 
   const setTheme = useCallback((t: Theme) => {
-    if (t === 'system') window.localStorage.removeItem(THEME_KEY);
+    if (t === 'light') window.localStorage.removeItem(THEME_KEY);
     else window.localStorage.setItem(THEME_KEY, t);
     applyTheme(t);
     notify();

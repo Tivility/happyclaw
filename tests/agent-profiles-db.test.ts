@@ -1,283 +1,609 @@
+import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { afterAll, beforeAll, describe, expect, test, vi } from 'vitest';
+import Database from 'better-sqlite3';
 
-const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'happyclaw-profiles-'));
+const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-profiles-db-'));
+const tmpStoreDir = path.join(tmpDir, 'db');
+const tmpGroupsDir = path.join(tmpDir, 'groups');
+fs.mkdirSync(tmpStoreDir, { recursive: true });
+fs.mkdirSync(tmpGroupsDir, { recursive: true });
 
-vi.mock('../src/config.js', async () => {
-  const actual =
-    await vi.importActual<typeof import('../src/config.js')>('../src/config.js');
-  return {
-    ...actual,
-    STORE_DIR: path.join(tmpRoot, 'db'),
-    GROUPS_DIR: path.join(tmpRoot, 'groups'),
-  };
-});
-vi.mock('../src/logger.js', () => ({
-  logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+vi.mock('../src/config.js', async () => ({
+  STORE_DIR: tmpStoreDir,
+  GROUPS_DIR: tmpGroupsDir,
 }));
 
-const db = await import('../src/db.ts');
+const {
+  initDatabase,
+  createUser,
+  listAgentProfilesForUser,
+  createAgentProfile,
+  updateAgentProfile,
+  archiveAgentProfile,
+  assignWorkspaceAgentProfile,
+  deleteWorkspaceAgentProfile,
+  getAgentProfileForWorkspace,
+  getWorkspaceAgentProfileId,
+  setRegisteredGroup,
+  setSession,
+  getSessionAgentIdentity,
+  computeAgentProfileIdentityHash,
+  normalizeAgentProfileRuntimePolicy,
+  migrateAgentProfileAutoCompactWindow,
+  getAgentChannelMount,
+  listAgentProfilePromptVersions,
+} = await import('../src/db.js');
 
 beforeAll(() => {
-  db.initDatabase();
+  initDatabase();
 });
 
 afterAll(() => {
-  fs.rmSync(tmpRoot, { recursive: true, force: true });
+  fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-let seq = 0;
-const mkProfile = (over: Record<string, unknown> = {}) =>
-  db.createAgentProfile({
-    id: `p${++seq}`,
-    ownerUserId: 'u1',
-    name: `Profile ${seq}`,
-    identityPrompt: 'base identity',
-    ...over,
-  } as Parameters<typeof db.createAgentProfile>[0]);
+function seedUser(id: string, role: 'admin' | 'member' = 'member'): void {
+  const now = new Date().toISOString();
+  createUser({
+    id,
+    username: id,
+    password_hash: 'hash',
+    display_name: id,
+    role,
+    status: 'active',
+    created_at: now,
+    updated_at: now,
+    must_change_password: false,
+  });
+}
 
-describe('computeAgentIdentityHash', () => {
-  test('is stable for identical prompt content', () => {
-    const parts = {
-      identityPrompt: 'a',
-      soulPrompt: 'b',
-      agentsPrompt: 'c',
-      toolsPrompt: 'd',
-      promptMode: 'append',
-    };
-    expect(db.computeAgentIdentityHash(parts)).toBe(
-      db.computeAgentIdentityHash({ ...parts }),
+describe('AgentProfile DB model', () => {
+  test('creates one default AgentProfile for every new user', () => {
+    seedUser('agent-profile-user-a');
+
+    const profiles = listAgentProfilesForUser('agent-profile-user-a');
+
+    expect(profiles).toHaveLength(1);
+    expect(profiles[0].is_default).toBe(true);
+    expect(profiles[0].name).toBe('HappyClaw');
+    expect(profiles[0].identity_prompt).toBe('');
+    expect(profiles[0].include_claude_preset).toBe(true);
+    expect(profiles[0].runtime_policy).toEqual({
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
+      skills: { mode: 'inherit', ids: [] },
+      mcp: { mode: 'inherit', ids: [] },
+    });
+    expect(profiles[0].identity_hash).toBe(
+      computeAgentProfileIdentityHash('', true, undefined, 'HappyClaw'),
     );
   });
 
-  test('changes when any prompt section changes', () => {
-    const base = {
-      identityPrompt: 'a',
-      soulPrompt: 'b',
-      agentsPrompt: 'c',
-      toolsPrompt: 'd',
-      promptMode: 'append',
+  test('persists admin HappyClaw as managed; global host policy is resolved at runtime', () => {
+    const userId = 'agent-profile-admin-context';
+    seedUser(userId, 'admin');
+
+    const original = listAgentProfilesForUser(userId)[0];
+    expect(original).toMatchObject({
+      is_default: true,
+      runtime_policy: { context: { source: 'managed' } },
+    });
+
+    const managed = updateAgentProfile(original.id, userId, {
+      runtimePolicy: { context: { source: 'managed' } },
+    });
+    expect(managed?.version).toBe(original.version);
+    expect(managed?.runtime_policy.context.source).toBe('managed');
+
+    const reread = listAgentProfilesForUser(userId)[0];
+    expect(reread.version).toBe(managed?.version);
+    expect(reread.runtime_policy.context.source).toBe('managed');
+  });
+
+  test('does not rewrite legacy admin context policy during profile reads', () => {
+    const userId = 'agent-profile-admin-legacy-context';
+    seedUser(userId, 'admin');
+    const original = listAgentProfilesForUser(userId)[0];
+    const legacyPolicy = {
+      provider_id: null,
+      skills: { mode: 'inherit', ids: [] },
+      mcp: { mode: 'inherit', ids: [] },
     };
-    const h = db.computeAgentIdentityHash(base);
-    for (const key of [
-      'identityPrompt',
-      'soulPrompt',
-      'agentsPrompt',
-      'toolsPrompt',
-      'promptMode',
-    ] as const) {
-      expect(db.computeAgentIdentityHash({ ...base, [key]: 'changed' })).not.toBe(h);
-    }
+    const rawDb = new Database(path.join(tmpStoreDir, 'messages.db'));
+    rawDb
+      .prepare('UPDATE agent_profiles SET runtime_policy = ? WHERE id = ?')
+      .run(JSON.stringify(legacyPolicy), original.id);
+    rawDb.close();
+
+    const migrated = listAgentProfilesForUser(userId).find(
+      (candidate) => candidate.id === original.id,
+    )!;
+    expect(migrated.runtime_policy.context.source).toBe('managed');
+    expect(migrated.version).toBe(original.version);
+    expect(migrated.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        migrated.identity_prompt,
+        migrated.include_claude_preset,
+        migrated.runtime_policy,
+        migrated.name,
+      ),
+    );
+
+    const reread = listAgentProfilesForUser(userId)[0];
+    expect(reread.version).toBe(migrated.version);
   });
 
-  test('does not mix sections — moving text between them changes the hash', () => {
-    // A naive concatenation without separators would collide here.
-    const a = db.computeAgentIdentityHash({
-      identityPrompt: 'ab',
-      soulPrompt: '',
-      agentsPrompt: '',
-      toolsPrompt: '',
-      promptMode: 'append',
+  test('renames the legacy built-in Agent without changing custom default names', () => {
+    const userId = 'agent-profile-user-legacy-name';
+    seedUser(userId);
+    const original = listAgentProfilesForUser(userId)[0];
+
+    const legacy = updateAgentProfile(original.id, userId, {
+      name: 'Default Agent',
     });
-    const b = db.computeAgentIdentityHash({
-      identityPrompt: 'a',
-      soulPrompt: 'b',
-      agentsPrompt: '',
-      toolsPrompt: '',
-      promptMode: 'append',
+    expect(legacy?.name).toBe('Default Agent');
+
+    const migrated = listAgentProfilesForUser(userId)[0];
+    expect(migrated.name).toBe('HappyClaw');
+    expect(migrated.version).toBe((legacy?.version ?? 0) + 1);
+    expect(listAgentProfilePromptVersions(migrated.id, userId)).toHaveLength(1);
+    expect(migrated.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        migrated.identity_prompt,
+        migrated.include_claude_preset,
+        migrated.runtime_policy,
+        'HappyClaw',
+      ),
+    );
+
+    const custom = updateAgentProfile(migrated.id, userId, {
+      name: '我的默认助手',
     });
-    expect(a).not.toBe(b);
-  });
-});
-
-describe('create / update / archive', () => {
-  test('create stores prompts, fills the hash, and snapshots version 1', () => {
-    const p = mkProfile({ soulPrompt: 'terse' });
-    expect(p.version).toBe(1);
-    expect(p.identityHash).toHaveLength(32);
-    expect(db.getAgentProfile(p.id)?.soulPrompt).toBe('terse');
+    expect(listAgentProfilesForUser(userId)[0].name).toBe(custom?.name);
   });
 
-  test('update bumps the version and the hash', () => {
-    const p = mkProfile();
-    const updated = db.updateAgentProfilePrompts(p.id, {
-      soulPrompt: 'now blunt',
+  test('ignores retired provider, model and tool policies when normalizing', () => {
+    expect(
+      normalizeAgentProfileRuntimePolicy({
+        provider_id: 'provider-a',
+        model: 'claude-opus-4-1',
+        tools: { mode: 'readonly' },
+      } as any),
+    ).toEqual({
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
+      skills: { mode: 'inherit', ids: [] },
+      mcp: { mode: 'inherit', ids: [] },
+    });
+  });
+
+  test('maps a workspace to the selected AgentProfile', () => {
+    seedUser('agent-profile-user-b');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-user-b',
+      name: 'Research Agent',
+      identityPrompt: '以研究员身份回答。',
+      includeClaudePreset: false,
+    });
+    const folder = 'agent-profile-workspace-b';
+    setRegisteredGroup('web:agent-profile-workspace-b', {
+      name: 'Workspace B',
+      folder,
+      added_at: new Date().toISOString(),
+      executionMode: 'container',
+      created_by: 'agent-profile-user-b',
+    });
+
+    assignWorkspaceAgentProfile(folder, profile.id);
+
+    expect(getWorkspaceAgentProfileId(folder)).toBe(profile.id);
+    const mapped = getAgentProfileForWorkspace(folder, 'agent-profile-user-b');
+    expect(mapped?.id).toBe(profile.id);
+    expect(mapped?.include_claude_preset).toBe(false);
+    expect(mapped?.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        '以研究员身份回答。',
+        false,
+        undefined,
+        'Research Agent',
+      ),
+    );
+  });
+
+  test('updates identity hash and version when name, prompt, or preset mode changes', () => {
+    seedUser('agent-profile-user-c');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-user-c',
+      name: 'Coder',
+      identityPrompt: '写代码前先读上下文。',
+    });
+
+    const renamed = updateAgentProfile(profile.id, 'agent-profile-user-c', {
+      name: 'Coder Renamed',
+    });
+    expect(renamed?.version).toBe(profile.version + 1);
+    expect(renamed?.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        '写代码前先读上下文。',
+        true,
+        undefined,
+        'Coder Renamed',
+      ),
+    );
+    const sameName = updateAgentProfile(profile.id, 'agent-profile-user-c', {
+      name: 'Coder Renamed',
+    });
+    expect(sameName?.version).toBe(renamed?.version);
+    expect(sameName?.identity_hash).toBe(renamed?.identity_hash);
+
+    const updated = updateAgentProfile(profile.id, 'agent-profile-user-c', {
+      identityPrompt: '先读上下文，再给最小可行改动。',
+    });
+    expect(updated?.version).toBe((renamed?.version ?? 0) + 1);
+    expect(updated?.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        '先读上下文，再给最小可行改动。',
+        true,
+        undefined,
+        'Coder Renamed',
+      ),
+    );
+
+    const presetToggled = updateAgentProfile(
+      profile.id,
+      'agent-profile-user-c',
+      {
+        includeClaudePreset: false,
+      },
+    );
+    expect(presetToggled?.version).toBe((updated?.version ?? 0) + 1);
+    expect(presetToggled?.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        '先读上下文，再给最小可行改动。',
+        false,
+        undefined,
+        'Coder Renamed',
+      ),
+    );
+  });
+
+  test('stores avatar overrides without changing runtime identity version', () => {
+    seedUser('agent-profile-avatar-user');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-avatar-user',
+      name: 'Designer',
+    });
+
+    const updated = updateAgentProfile(
+      profile.id,
+      'agent-profile-avatar-user',
+      {
+        avatarEmoji: '🎨',
+        avatarColor: '#123456',
+        avatarUrl: '/api/auth/avatars/agent-profile-test.png',
+      },
+    );
+
+    expect(updated).toMatchObject({
+      avatar_emoji: '🎨',
+      avatar_color: '#123456',
+      avatar_url: '/api/auth/avatars/agent-profile-test.png',
+      version: profile.version,
+      identity_hash: profile.identity_hash,
+    });
+  });
+
+  test('versions AgentProfile runtime policy changes', () => {
+    seedUser('agent-profile-user-policy');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-user-policy',
+      name: 'Policy Agent',
+      identityPrompt: '按策略运行。',
+      runtimePolicy: {
+        skills: { mode: 'custom', ids: ['review', 'research', 'review'] },
+        mcp: { mode: 'disabled', ids: ['ignored'] },
+      },
+    });
+
+    expect(profile.runtime_policy).toEqual({
+      context: {
+        source: 'managed',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
+      skills: { mode: 'custom', ids: ['review', 'research'] },
+      mcp: { mode: 'disabled', ids: ['ignored'] },
+    });
+    expect(profile.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        '按策略运行。',
+        true,
+        profile.runtime_policy,
+        'Policy Agent',
+      ),
+    );
+
+    const samePolicy = updateAgentProfile(
+      profile.id,
+      'agent-profile-user-policy',
+      {
+        runtimePolicy: profile.runtime_policy,
+      },
+    );
+    expect(samePolicy?.version).toBe(profile.version);
+
+    const updated = updateAgentProfile(
+      profile.id,
+      'agent-profile-user-policy',
+      {
+        runtimePolicy: {
+          context: { source: 'host_claude' },
+          skills: { mode: 'inherit', ids: [] },
+          mcp: { mode: 'custom', ids: ['github'] },
+        },
+      },
+    );
+    expect(updated?.version).toBe(profile.version + 1);
+    expect(updated?.runtime_policy).toEqual({
+      context: {
+        source: 'host_claude',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
+      skills: { mode: 'inherit', ids: [] },
+      mcp: { mode: 'custom', ids: ['github'] },
+    });
+    expect(updated?.identity_hash).toBe(
+      computeAgentProfileIdentityHash(
+        '按策略运行。',
+        true,
+        updated?.runtime_policy,
+        'Policy Agent',
+      ),
+    );
+  });
+
+  test('records prompt history only when prompt sections or mode change', () => {
+    const userId = 'agent-profile-prompt-history-scope';
+    seedUser(userId);
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'History Scope',
+      identityPrompt: 'Identity v1',
+      soulPrompt: 'Soul v1',
+    });
+
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(1);
+
+    const renamed = updateAgentProfile(profile.id, userId, {
+      name: 'History Scope Renamed',
     })!;
-    expect(updated.version).toBe(2);
-    expect(updated.identityHash).not.toBe(p.identityHash);
-    expect(updated.soulPrompt).toBe('now blunt');
-    // Unspecified fields survive the patch.
-    expect(updated.identityPrompt).toBe('base identity');
+    expect(renamed.version).toBe(profile.version + 1);
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(1);
+
+    const policyUpdated = updateAgentProfile(profile.id, userId, {
+      runtimePolicy: { skills: { mode: 'disabled' } },
+    })!;
+    expect(policyUpdated.version).toBe(renamed.version + 1);
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(1);
+
+    const promptUpdated = updateAgentProfile(profile.id, userId, {
+      toolsPrompt: 'Tools v2',
+    })!;
+    expect(promptUpdated.version).toBe(policyUpdated.version + 1);
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toMatchObject([
+      {
+        version: promptUpdated.version,
+        name: 'History Scope Renamed',
+        identity_prompt: 'Identity v1',
+        soul_prompt: 'Soul v1',
+        tools_prompt: 'Tools v2',
+        change_source: 'update',
+      },
+      {
+        version: profile.version,
+        name: 'History Scope',
+        tools_prompt: '',
+        change_source: 'create',
+      },
+    ]);
+
+    const modeUpdated = updateAgentProfile(profile.id, userId, {
+      promptMode: 'replace',
+    })!;
+    expect(modeUpdated.version).toBe(promptUpdated.version + 1);
+    expect(listAgentProfilePromptVersions(profile.id, userId)).toHaveLength(3);
   });
 
-  test('updating a missing profile returns null rather than throwing', () => {
-    expect(db.updateAgentProfilePrompts('nope', { soulPrompt: 'x' })).toBeNull();
-  });
-
-  test('only one active default per owner', () => {
-    const first = mkProfile({ isDefault: true });
-    const second = mkProfile({ isDefault: true });
-    expect(db.getAgentProfile(second.id)?.isDefault).toBe(true);
-    expect(db.getAgentProfile(first.id)?.isDefault).toBe(false);
-  });
-
-  test('archive soft-deletes so version history stays resolvable', () => {
-    const p = mkProfile();
-    db.archiveAgentProfile(p.id);
-    expect(db.getAgentProfile(p.id)).toBeNull();
-    expect(db.listAgentProfiles('u1').map((x) => x.id)).not.toContain(p.id);
-  });
-
-  test('archiving also unbinds any workspace pointing at it', () => {
-    const p = mkProfile();
-    db.setWorkspaceAgentProfile('ws-archive', p.id);
-    db.archiveAgentProfile(p.id);
-    expect(db.getWorkspaceAgentProfile('ws-archive')).toBeNull();
-  });
-});
-
-describe('workspace binding is N workspaces : 1 profile (decision O1-a)', () => {
-  test('one profile serves several workspaces', () => {
-    const shared = mkProfile({ identityPrompt: 'shared brain' });
-    db.setWorkspaceAgentProfile('ws-a', shared.id);
-    db.setWorkspaceAgentProfile('ws-b', shared.id);
-
-    expect(db.getWorkspaceAgentProfile('ws-a')?.id).toBe(shared.id);
-    expect(db.getWorkspaceAgentProfile('ws-b')?.id).toBe(shared.id);
-  });
-
-  test('editing the shared profile is visible from every bound workspace', () => {
-    // This is the accepted consequence of the shared semantics: one edit lands
-    // everywhere. The UI must say so; the data model does not fan out copies.
-    const shared = mkProfile();
-    db.setWorkspaceAgentProfile('ws-c', shared.id);
-    db.setWorkspaceAgentProfile('ws-d', shared.id);
-    db.updateAgentProfilePrompts(shared.id, { soulPrompt: 'edited once' });
-
-    expect(db.getWorkspaceAgentProfile('ws-c')?.soulPrompt).toBe('edited once');
-    expect(db.getWorkspaceAgentProfile('ws-d')?.soulPrompt).toBe('edited once');
-  });
-
-  test('rebinding replaces rather than duplicating', () => {
-    const a = mkProfile();
-    const b = mkProfile();
-    db.setWorkspaceAgentProfile('ws-rebind', a.id);
-    db.setWorkspaceAgentProfile('ws-rebind', b.id);
-    expect(db.getWorkspaceAgentProfile('ws-rebind')?.id).toBe(b.id);
-  });
-
-  test('an unbound workspace falls back to the owner default', () => {
-    const def = mkProfile({ isDefault: true, identityPrompt: 'the default' });
-    expect(db.getWorkspaceAgentProfile('never-bound', 'u1')?.id).toBe(def.id);
-  });
-
-  test('no profile at all means no persona, not an error', () => {
-    // A deployment that never creates a profile must behave exactly as before.
-    expect(db.getWorkspaceAgentProfile('never-bound', 'user-with-nothing')).toBeNull();
-    expect(db.getWorkspaceAgentProfile('never-bound')).toBeNull();
-  });
-
-  test('clearing a binding falls back to the default again', () => {
-    const def = db.listAgentProfiles('u1').find((p) => p.isDefault)!;
-    const other = mkProfile();
-    db.setWorkspaceAgentProfile('ws-clear', other.id);
-    db.clearWorkspaceAgentProfile('ws-clear');
-    expect(db.getWorkspaceAgentProfile('ws-clear', 'u1')?.id).toBe(def.id);
-  });
-});
-
-describe('session identity — persona change must NOT reset (decision O1-b)', () => {
-  test('mismatch is reported when the identity hash moved', () => {
-    const p = mkProfile();
-    db.setSession('folder-x', 'sess-1');
-    db.setSessionAgentIdentity('folder-x', '', {
-      agentProfileId: p.id,
-      identityHash: p.identityHash,
-      version: p.version,
+  test('deep-merges partial runtime policy patches without reopening siblings', () => {
+    seedUser('agent-profile-user-policy-merge');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-user-policy-merge',
+      name: 'Strict Policy Agent',
+      runtimePolicy: {
+        context: { source: 'host_claude' },
+        skills: { mode: 'disabled', ids: ['kept-for-audit'] },
+        mcp: { mode: 'custom', ids: ['github'] },
+      },
     });
 
-    const updated = db.updateAgentProfilePrompts(p.id, { soulPrompt: 'changed' })!;
-    expect(
-      db.hasSessionAgentProfileMismatch('folder-x', '', {
-        agentProfileId: updated.id,
-        identityHash: updated.identityHash,
-      }),
-    ).toBe(true);
-  });
+    const updated = updateAgentProfile(
+      profile.id,
+      'agent-profile-user-policy-merge',
+      { runtimePolicy: { mcp: { ids: ['github', 'linear'] } } },
+    );
 
-  test('the session itself survives the mismatch — context is kept', () => {
-    // The whole point of O1-b: upstream deletes the session here. This codebase
-    // already tolerates prefix drift from memory rewrites without deleting
-    // anything, so a persona edit gets the same treatment.
-    const p = mkProfile();
-    db.setSession('folder-keep', 'sess-keep');
-    db.setSessionAgentIdentity('folder-keep', '', {
-      agentProfileId: p.id,
-      identityHash: p.identityHash,
-      version: p.version,
+    expect(updated?.runtime_policy).toEqual({
+      context: {
+        source: 'host_claude',
+        auto_compact_window: 0,
+        auto_compact_percentage: 0,
+      },
+      skills: { mode: 'disabled', ids: ['kept-for-audit'] },
+      mcp: { mode: 'custom', ids: ['github', 'linear'] },
     });
-    const updated = db.updateAgentProfilePrompts(p.id, { soulPrompt: 'drifted' })!;
+  });
 
-    db.hasSessionAgentProfileMismatch('folder-keep', '', {
-      agentProfileId: updated.id,
-      identityHash: updated.identityHash,
+  test('preserves legacy missing host Skill policy and deep-merges explicit host selection', () => {
+    const legacy = normalizeAgentProfileRuntimePolicy({
+      context: { source: 'host_claude' },
+      skills: { mode: 'custom', ids: ['managed-a'] },
+    });
+    expect(legacy.skills.host).toBeUndefined();
+
+    const userId = 'agent-profile-host-skills-merge';
+    seedUser(userId, 'admin');
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'Host Skill Agent',
+      runtimePolicy: {
+        skills: {
+          mode: 'custom',
+          ids: ['managed-a'],
+          host: {
+            mode: 'custom',
+            ids: ['host-a', 'host-b'],
+          },
+        },
+      },
     });
 
-    expect(db.getSession('folder-keep')).toBe('sess-keep');
-  });
-
-  test('no mismatch when the persona is unchanged', () => {
-    const p = mkProfile();
-    db.setSession('folder-same', 'sess-2');
-    db.setSessionAgentIdentity('folder-same', '', {
-      agentProfileId: p.id,
-      identityHash: p.identityHash,
-      version: p.version,
+    const updated = updateAgentProfile(profile.id, userId, {
+      runtimePolicy: { skills: { host: { mode: 'disabled' } } },
+    })!;
+    expect(updated.runtime_policy.skills).toEqual({
+      mode: 'custom',
+      ids: ['managed-a'],
+      host: { mode: 'disabled', ids: ['host-a', 'host-b'] },
     });
-    expect(
-      db.hasSessionAgentProfileMismatch('folder-same', '', {
-        agentProfileId: p.id,
-        identityHash: p.identityHash,
-      }),
-    ).toBe(false);
+    expect(updated.version).toBe(profile.version + 1);
+    expect(updated.identity_hash).not.toBe(profile.identity_hash);
   });
 
-  test('switching to a different profile counts as a mismatch', () => {
-    const a = mkProfile();
-    const b = mkProfile();
-    db.setSession('folder-swap', 'sess-3');
-    db.setSessionAgentIdentity('folder-swap', '', {
-      agentProfileId: a.id,
-      identityHash: a.identityHash,
-      version: a.version,
+  test('migrates the legacy system compact threshold without bumping identity metadata', () => {
+    const userId = 'agent-profile-auto-compact-migration';
+    seedUser(userId);
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'Legacy Compact Agent',
     });
-    expect(
-      db.hasSessionAgentProfileMismatch('folder-swap', '', {
-        agentProfileId: b.id,
-        identityHash: b.identityHash,
-      }),
-    ).toBe(true);
+    const rawDb = new Database(path.join(tmpStoreDir, 'messages.db'));
+    rawDb
+      .prepare('UPDATE agent_profiles SET runtime_policy = ? WHERE id = ?')
+      .run(JSON.stringify({ context: { source: 'managed' } }), profile.id);
+    rawDb.close();
+
+    expect(migrateAgentProfileAutoCompactWindow(240_000)).toBeGreaterThan(0);
+    const migrated = listAgentProfilesForUser(userId).find(
+      (candidate) => candidate.id === profile.id,
+    )!;
+    expect(migrated.runtime_policy.context.auto_compact_window).toBe(240_000);
+    expect(migrated.version).toBe(profile.version);
+    expect(migrated.identity_hash).toBe(profile.identity_hash);
+    expect(migrateAgentProfileAutoCompactWindow(240_000)).toBe(0);
   });
 
-  test('a session with no recorded identity is not a mismatch', () => {
-    // Pre-existing sessions must not all report drift the moment profiles land.
-    db.setSession('folder-legacy', 'sess-legacy');
-    expect(
-      db.hasSessionAgentProfileMismatch('folder-legacy', '', {
-        agentProfileId: 'p-any',
-        identityHash: 'h-any',
-      }),
-    ).toBe(false);
+  test('updates auto compact policy without bumping Agent identity', () => {
+    const userId = 'agent-profile-auto-compact-update';
+    seedUser(userId);
+    const profile = createAgentProfile({
+      ownerUserId: userId,
+      name: 'Compact Agent',
+    });
+    const updated = updateAgentProfile(profile.id, userId, {
+      runtimePolicy: { context: { auto_compact_window: 300_000 } },
+    });
+    expect(updated?.runtime_policy.context.auto_compact_window).toBe(300_000);
+    expect(updated?.version).toBe(profile.version);
+    expect(updated?.identity_hash).toBe(profile.identity_hash);
   });
 
-  test('an unknown session is not a mismatch', () => {
+  test('model-relative compact percentage takes precedence over a legacy window', () => {
+    const policy = normalizeAgentProfileRuntimePolicy({
+      context: {
+        auto_compact_window: 300_000,
+        auto_compact_percentage: 80,
+      },
+    });
+    expect(policy.context.auto_compact_window).toBe(0);
+    expect(policy.context.auto_compact_percentage).toBe(80);
+  });
+
+  test('stores AgentProfile identity metadata on sessions', () => {
+    seedUser('agent-profile-user-d');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-user-d',
+      name: 'Planner',
+      identityPrompt: '先拆计划再执行。',
+    });
+
+    setSession('agent-profile-workspace-d', 'session-d', undefined, {
+      agentProfileId: profile.id,
+      agentProfileVersion: profile.version,
+      identityHash: profile.identity_hash,
+    });
+
+    expect(getSessionAgentIdentity('agent-profile-workspace-d')).toEqual({
+      agent_profile_id: profile.id,
+      agent_profile_version: profile.version,
+      identity_hash: profile.identity_hash,
+    });
+  });
+
+  test('does not archive an AgentProfile that still owns workspaces', () => {
+    seedUser('agent-profile-user-e');
+    const [defaultProfile] = listAgentProfilesForUser('agent-profile-user-e');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-user-e',
+      name: 'Ops',
+      identityPrompt: '关注运行风险。',
+    });
+    const folder = 'agent-profile-workspace-e';
+    assignWorkspaceAgentProfile(folder, profile.id);
+
+    expect(archiveAgentProfile(profile.id, 'agent-profile-user-e')).toBe(
+      'has_workspaces',
+    );
+
+    assignWorkspaceAgentProfile(folder, defaultProfile.id);
+    expect(archiveAgentProfile(profile.id, 'agent-profile-user-e')).toBe('ok');
+  });
+
+  test('removes stale AgentProfile ownership from channel projections when mapping is deleted', () => {
+    seedUser('agent-profile-user-f');
+    const profile = createAgentProfile({
+      ownerUserId: 'agent-profile-user-f',
+      name: 'Channels',
+      identityPrompt: '负责 IM 渠道。',
+    });
+    const folder = 'agent-profile-workspace-f';
+    setRegisteredGroup('web:agent-profile-workspace-f', {
+      name: 'Workspace F',
+      folder,
+      added_at: new Date().toISOString(),
+      created_by: 'agent-profile-user-f',
+    });
+    assignWorkspaceAgentProfile(folder, profile.id);
+    setRegisteredGroup('telegram:agent-profile-channel-f', {
+      name: 'Telegram F',
+      folder: 'home-f',
+      added_at: new Date().toISOString(),
+      created_by: 'agent-profile-user-f',
+      target_main_jid: 'web:agent-profile-workspace-f',
+    });
+
+    deleteWorkspaceAgentProfile(folder);
     expect(
-      db.hasSessionAgentProfileMismatch('folder-absent', '', {
-        agentProfileId: 'p',
-        identityHash: 'h',
-      }),
-    ).toBe(false);
+      getAgentChannelMount('telegram:agent-profile-channel-f'),
+    ).toMatchObject({ agent_profile_id: null });
+    expect(archiveAgentProfile(profile.id, 'agent-profile-user-f')).toBe('ok');
   });
 });

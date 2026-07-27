@@ -1,22 +1,26 @@
 // Shared state and utilities for web server
 
 import { WebSocket } from 'ws';
-import { RegisteredGroup, UserRole } from './types.js';
-import { GroupQueue } from './group-queue.js';
-import type {
+import { FollowUpActionResult, RegisteredGroup, UserRole } from './types.js';
+import {
+  GroupQueue,
+  type IpcDeliveryReceipt,
+  type IpcPrePublishAdmission,
+} from './group-queue.js';
+import type { ChatProbe,
   AuthUser,
   NewMessage,
   MessageCursor,
   UserSessionWithUser,
 } from './types.js';
-import type { RuntimeOwnerCandidateUser } from './runtime-owner.js';
 import {
   getJidsByFolder,
   getRegisteredGroup,
-  getGroupMemberRole,
   getSessionWithUser,
 } from './db.js';
 import type { WhatsAppConnectionState } from './whatsapp.js';
+import type { ChannelAccount } from './types.js';
+import type { ChannelAccountSecret } from './channel-account-secrets.js';
 
 export interface WsClientInfo {
   sessionId: string;
@@ -29,7 +33,7 @@ export interface WebDeps {
   getRegisteredGroups: () => Record<string, RegisteredGroup>;
   processGroupMessages: (chatJid: string) => Promise<boolean>;
   ensureTerminalContainerStarted: (chatJid: string) => boolean;
-  formatMessages: (messages: NewMessage[], isShared?: boolean) => string;
+  formatMessages: (messages: NewMessage[]) => string;
   getLastAgentTimestamp: () => Record<string, MessageCursor>;
   setLastAgentTimestamp: (jid: string, cursor: MessageCursor) => void;
   /**
@@ -53,6 +57,10 @@ export interface WebDeps {
    * yet, so the recovery cursor must not advance past it.
    */
   advanceNextPullCursorOnly: (jid: string, cursor: MessageCursor) => void;
+  /** Production single chokepoint for direct replies/drops. It advances only
+   * next-pull when an earlier unreceipted message exists. Optional solely for
+   * compatibility with focused route-test fixtures. */
+  completeOutOfBandMessage?: (jid: string, cursor: MessageCursor) => void;
   advanceGlobalCursor: (cursor: MessageCursor) => void;
   /**
    * Returns true iff there exists at least one unprocessed (`is_from_me=0`)
@@ -68,10 +76,7 @@ export interface WebDeps {
    * which means a clean restart after a no-earlier-pending reply would
    * replay the reply on recovery (the same DB row is still <= the cursor).
    */
-  hasEarlierPendingMessages: (
-    jid: string,
-    candidate: MessageCursor,
-  ) => boolean;
+  hasEarlierPendingMessages: (jid: string, candidate: MessageCursor) => boolean;
   reloadFeishuConnection?: (config: {
     appId: string;
     appSecret: string;
@@ -92,6 +97,13 @@ export interface WebDeps {
       | 'discord'
       | 'whatsapp',
   ) => Promise<boolean>;
+  reloadChannelAccount?: (accountId: string) => Promise<boolean>;
+  disconnectChannelAccount?: (accountId: string) => Promise<void>;
+  testChannelAccount?: (
+    account: ChannelAccount,
+    secret: ChannelAccountSecret,
+  ) => Promise<{ success: boolean; unsupported?: boolean; error?: string }>;
+  isChannelAccountConnected?: (accountId: string) => boolean;
   /**
    * Reconnect all of a user's IM channels from their persisted config.
    * Symmetric counterpart to `imManager.disconnectAllUserChannels` — called
@@ -109,13 +121,16 @@ export interface WebDeps {
   isUserDingTalkConnected?: (userId: string) => boolean;
   isUserDiscordConnected?: (userId: string) => boolean;
   isUserWhatsAppConnected?: (userId: string) => boolean;
-  getUserWhatsAppState?: (userId: string) => WhatsAppConnectionState;
+  getUserWhatsAppState?: (
+    userId: string,
+    accountId?: string,
+  ) => WhatsAppConnectionState;
   /** Hard logout: clears WhatsApp auth state on disk so next enable starts fresh. */
   logoutUserWhatsApp?: (userId: string, accountId?: string) => Promise<void>;
   processAgentConversation?: (
     chatJid: string,
     agentId: string,
-  ) => Promise<void>;
+  ) => Promise<void | boolean>;
   getFeishuChatInfo?: (
     userId: string,
     chatId: string,
@@ -127,6 +142,14 @@ export interface WebDeps {
     chat_mode?: string;
     group_message_type?: string;
   } | null>;
+  /**
+   * 探测渠道会话元数据。返回 ChatProbe 而非裸对象：必须能区分
+   * `gone`（404/被踢，确定性否定）与 `unknown`（token/网络/429/5xx，我方故障），
+   * 否则瞬时故障会被当成群失效而误触自动解绑。
+   */
+  getChannelChatInfo?: (jid: string) => Promise<ChatProbe>;
+  /** Refresh the current user's discoverable IM chats from connected bots. */
+  syncUserImGroups?: (userId: string) => Promise<{ feishuAccounts: number }>;
   clearImFailCounts?: (jid: string) => void;
   /**
    * Fully remove an IM group's registered_groups entry (plus jid-scoped data
@@ -136,8 +159,33 @@ export interface WebDeps {
    * imHealthCheckFailCounts.
    */
   removeImGroupRecord?: (jid: string, reason: string) => void;
-  updateReplyRoute?: (folder: string, sourceJid: string | null) => void;
-  triggerTaskRun?: (taskId: string) => { success: boolean; error?: string };
+  updateReplyRoute?: (
+    folder: string,
+    sourceJid: string | null,
+    inputTurnId?: string,
+    inputCursor?: { timestamp: string; id: string },
+    inputChatJid?: string,
+    inputTaskId?: string,
+    runtimeAgentId?: string,
+  ) => void;
+  /** Acquire the immutable Turn/Card/Outbox fence before an IPC file becomes
+   * visible to the SDK runner. Returning false rejects the warm injection. */
+  preAdmitReplyRoute?: (
+    folder: string,
+    sourceJid: string | null,
+    receipt: IpcDeliveryReceipt | undefined,
+    runtimeAgentId?: string,
+  ) => IpcPrePublishAdmission | false;
+  /** 用户消息注入运行中 Sub-Agent 时，先把该 agent 挂起中的流式卡片定稿轮换。
+   * key 为 virtualChatJid（`web:{folder}#agent:{id}`）。主会话路径无需调用
+   * ——updateReplyRoute 触发的 route updater 已内置同样的收口。 */
+  finalizeHeldCard?: (key: string) => void;
+  triggerTaskRun?: (
+    taskId: string,
+    idempotencyKey?: string,
+  ) => { success: boolean; error?: string; runId?: string };
+  /** Stop one occurrence only; future schedule remains unchanged. */
+  cancelTaskRun?: (runId: string) => { success: boolean; error?: string };
   handleSpawnCommand?: (
     chatJid: string,
     message: string,
@@ -157,14 +205,27 @@ export interface WebDeps {
     effectiveGroup: RegisteredGroup;
     isHome: boolean;
   };
-  /**
-   * User-by-id lookup used by plugin-runtime owner resolution. Web eager-expand
-   * delegates to `resolvePerMessageRuntimeOwner` (#24 round-16 P2-1) so the
-   * web fast-path applies the same admin-gating as the cold-start path —
-   * non-admin / disabled / unknown senders on `web:main + isHome` fall back
-   * to `created_by` instead of being treated as the runtime owner.
-   */
-  getUserById?: (id: string) => RuntimeOwnerCandidateUser | null | undefined;
+  promoteFollowUp?: (
+    chatJid: string,
+    messageId: string,
+    expectedRunId: string,
+  ) => Promise<FollowUpActionResult> | FollowUpActionResult;
+  cancelFollowUp?: (chatJid: string, messageId: string) => FollowUpActionResult;
+  editFollowUp?: (
+    chatJid: string,
+    messageId: string,
+    content: string,
+  ) => FollowUpActionResult;
+  reorderFollowUp?: (
+    chatJid: string,
+    messageId: string,
+    direction: 'up' | 'down',
+  ) => FollowUpActionResult;
+  interruptAndRunFollowUp?: (
+    chatJid: string,
+    messageId: string,
+    expectedRunId: string,
+  ) => FollowUpActionResult;
 }
 
 export type Variables = {
@@ -278,9 +339,8 @@ export function hasHostExecutionPermission(user: AuthUser): boolean {
  * Check if a user can access (view messages, send messages to) a group.
  * All users (including admin) follow the same visibility rules:
  * - is_home groups → only the owner (created_by) can access
- * - IM groups (jid does not start with 'web:') → owner or group_members
- * - folder === 'main' → only the admin who owns it
- * - Web groups → created_by matches user.id, or user is in group_members
+ * - IM groups → only the owner
+ * - Web groups → only the creator
  */
 export function canAccessGroup(
   user: { id: string; role: UserRole },
@@ -291,8 +351,6 @@ export function canAccessGroup(
   // For legacy rows without created_by, resolve owner from sibling home group.
   if (!group.jid.startsWith('web:')) {
     if (group.created_by === user.id) return true;
-    // Check membership for IM groups sharing a non-home folder
-    if (getGroupMemberRole(group.folder, user.id) !== null) return true;
     if (group.created_by) return false;
     const siblingJids = getJidsByFolder(group.folder);
     for (const jid of siblingJids) {
@@ -305,14 +363,7 @@ export function canAccessGroup(
     // Ownership cannot be resolved for this IM group → deny by default.
     return false;
   }
-  // folder === 'main': only accessible by the admin who owns it (via created_by or group_members)
-  if (group.folder === 'main') {
-    if (group.created_by === user.id) return true;
-    return getGroupMemberRole(group.folder, user.id) !== null;
-  }
-  if (group.created_by === user.id) return true;
-  // Check group_members table for shared workspaces
-  return getGroupMemberRole(group.folder, user.id) !== null;
+  return group.created_by === user.id;
 }
 
 /**
@@ -328,14 +379,6 @@ export function canModifyGroup(
   if (group.is_home) return group.created_by === user.id;
   if (!group.jid.startsWith('web:')) {
     if (group.created_by) return group.created_by === user.id;
-    // Legacy IM group (created_by=null): resolve owner via group_members first.
-    // Necessary for legacy IM groups bound to a non-home shared workspace —
-    // they have no is_home sibling so the sibling fallback alone returns false
-    // and the real owner (group_members role='owner') gets 403 on every
-    // destructive op despite canAccessGroup letting them through.
-    // owner-only here is stricter than canAccessGroup (which accepts 'member').
-    const memberRole = getGroupMemberRole(group.folder, user.id);
-    if (memberRole === 'owner') return true;
     // Sibling home group fallback for legacy IM groups auto-bound to a home folder.
     const siblingJids = getJidsByFolder(group.folder);
     for (const jid of siblingJids) {
@@ -347,19 +390,6 @@ export function canModifyGroup(
     }
     return false;
   }
-  return group.created_by === user.id;
-}
-
-/**
- * Check if a user can manage members (add/remove) of a group.
- * - Home groups cannot have members managed.
- * - Only the group creator (owner) can manage members.
- */
-export function canManageGroupMembers(
-  user: { id: string; role: UserRole },
-  group: RegisteredGroup & { jid: string },
-): boolean {
-  if (group.is_home) return false;
   return group.created_by === user.id;
 }
 

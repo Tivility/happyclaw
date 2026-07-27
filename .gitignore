@@ -16,6 +16,11 @@ dist/
 /store/
 /groups/
 
+# Backup archives from `make backup` — contain the session-secret key, the
+# Claude provider encryption key and the full user SQLite database, i.e. the
+# same secrets as /data/. Written to BACKUP_DIR (repo root by default).
+happyclaw-backup-*.tar.gz
+
 # Environment variables (may contain API keys and secrets)
 .env
 .env.*
@@ -31,10 +36,7 @@ dist/
 *.db-shm
 *.sqlite
 
-# Lockfiles（子项目的 package-lock 由构建生成，不需要跟踪）
-package-lock.json
-container/agent-runner/package-lock.json
-web/package-lock.json
+# npm lockfiles are build inputs and must be version-controlled for reproducible installs.
 bun.lock
 bun.lockb
 
@@ -42,6 +44,13 @@ bun.lockb
 .build-sentinel
 .docker-build-sentinel
 *.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+
+# Local verification artifacts (not product/documentation assets)
+/admin-mail-*.png
+/inbox-after-readall.png
 
 # Local tooling metadata
 .claude/
@@ -53,7 +62,6 @@ bun.lockb
 .agents/
 skills-lock.json
 --connect
-log/
 .playwright-mcp/
 
 # Unrelated local probes / experiments

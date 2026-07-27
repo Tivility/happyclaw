@@ -1,43 +1,55 @@
 import { useState } from 'react';
 import { Loader2, Plus, X } from 'lucide-react';
 import { toast } from 'sonner';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
+import type { McpServerCreate } from '../../stores/mcp-servers';
+import type { McpServerSource } from '../../utils/mcp-servers';
 
 interface AddMcpServerDialogProps {
   open: boolean;
+  isAdmin: boolean;
   onClose: () => void;
-  onAdd: (server: {
-    id: string;
-    command?: string;
-    args?: string[];
-    env?: Record<string, string>;
-    type?: 'http' | 'sse';
-    url?: string;
-    headers?: Record<string, string>;
-    description?: string;
-  }) => Promise<void>;
+  onAdd: (server: McpServerCreate) => Promise<void>;
 }
 
 const ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_-]*$/;
 
 type ServerType = 'stdio' | 'http' | 'sse';
 
-export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogProps) {
+export function AddMcpServerDialog({
+  open,
+  isAdmin,
+  onClose,
+  onAdd,
+}: AddMcpServerDialogProps) {
   const [id, setId] = useState('');
+  const [scope, setScope] = useState<McpServerSource>('user');
+  const [memberAccess, setMemberAccess] = useState<'admin_only' | 'shared'>(
+    'admin_only',
+  );
   const [serverType, setServerType] = useState<ServerType>('stdio');
   const [command, setCommand] = useState('');
   const [args, setArgs] = useState<string[]>([]);
   const [env, setEnv] = useState<Array<{ key: string; value: string }>>([]);
   const [url, setUrl] = useState('');
-  const [headers, setHeaders] = useState<Array<{ key: string; value: string }>>([]);
+  const [headers, setHeaders] = useState<Array<{ key: string; value: string }>>(
+    [],
+  );
   const [description, setDescription] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
   const reset = () => {
     setId('');
+    setScope('user');
+    setMemberAccess('admin_only');
     setServerType('stdio');
     setCommand('');
     setArgs([]);
@@ -58,8 +70,10 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
 
   const validate = (): string | null => {
     if (!id.trim()) return 'ID 不能为空';
-    if (!ID_PATTERN.test(id.trim())) return 'ID 只能包含字母、数字、短横线和下划线，且不能以符号开头';
-    if (id.trim().toLowerCase() === 'happyclaw') return 'ID 不能为 happyclaw（系统保留）';
+    if (!ID_PATTERN.test(id.trim()))
+      return 'ID 只能包含字母、数字、短横线和下划线，且不能以符号开头';
+    if (id.trim().toLowerCase() === 'happyclaw')
+      return 'ID 不能为 happyclaw（系统保留）';
     if (isHttpType) {
       if (!url.trim()) return 'URL 不能为空';
     } else {
@@ -87,6 +101,8 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
         }
         await onAdd({
           id: id.trim(),
+          scope,
+          ...(scope === 'system' ? { memberAccess } : {}),
           type: serverType as 'http' | 'sse',
           url: url.trim(),
           headers: Object.keys(headersObj).length > 0 ? headersObj : undefined,
@@ -100,6 +116,8 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
         }
         await onAdd({
           id: id.trim(),
+          scope,
+          ...(scope === 'system' ? { memberAccess } : {}),
           command: command.trim(),
           args: args.length > 0 ? args : undefined,
           env: Object.keys(envObj).length > 0 ? envObj : undefined,
@@ -123,6 +141,76 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          {isAdmin && (
+            <div>
+              <Label className="mb-1">归属范围</Label>
+              <div className="grid grid-cols-2 gap-2">
+                {(
+                  [
+                    ['user', '我的 MCP', '仅你和你的 Agents 可用'],
+                    ['system', '系统 MCP', '所有用户可见，管理员维护'],
+                  ] as const
+                ).map(([value, title, description]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    disabled={submitting}
+                    onClick={() => setScope(value)}
+                    className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                      scope === value
+                        ? 'border-primary bg-brand-50 ring-1 ring-primary'
+                        : 'border-border hover:bg-muted/60'
+                    }`}
+                  >
+                    <span className="block text-sm font-medium">{title}</span>
+                    <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                      {description}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {isAdmin && scope === 'system' && (
+            <div>
+              <Label className="mb-1">成员访问</Label>
+              <div className="grid grid-cols-2 gap-2">
+                {(
+                  [
+                    ['admin_only', '仅管理员', '普通成员的 Agent 不可使用'],
+                    ['shared', '共享给成员', '允许普通成员的 Agent 使用'],
+                  ] as const
+                ).map(([value, title, description]) => (
+                  <button
+                    key={value}
+                    type="button"
+                    disabled={submitting}
+                    aria-pressed={memberAccess === value}
+                    onClick={() => setMemberAccess(value)}
+                    className={`rounded-lg border px-3 py-2 text-left transition-colors ${
+                      memberAccess === value
+                        ? 'border-primary bg-brand-50 ring-1 ring-primary'
+                        : 'border-border hover:bg-muted/60'
+                    }`}
+                  >
+                    <span className="block text-sm font-medium">{title}</span>
+                    <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                      {description}
+                    </span>
+                  </button>
+                ))}
+              </div>
+              {memberAccess === 'shared' && (
+                <p className="mt-2 rounded-lg border border-warning/20 bg-warning-bg px-3 py-2 text-xs leading-5 text-warning">
+                  共享会把完整 command、args、url、env 和 headers
+                  配置交给普通成员的 Agent
+                  运行。请确认其中所有凭据都允许成员使用。
+                </p>
+              )}
+            </div>
+          )}
+
           {/* ID */}
           <div>
             <Label htmlFor="mcp-id" className="mb-1">
@@ -197,6 +285,7 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
                         className="w-2/5 font-mono text-sm"
                       />
                       <Input
+                        type="password"
                         value={row.value}
                         onChange={(e) => {
                           const next = [...headers];
@@ -209,7 +298,9 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
                       />
                       <button
                         type="button"
-                        onClick={() => setHeaders(headers.filter((_, j) => j !== i))}
+                        onClick={() =>
+                          setHeaders(headers.filter((_, j) => j !== i))
+                        }
                         disabled={submitting}
                         className="p-1.5 text-muted-foreground hover:text-error transition-colors disabled:opacity-50"
                       >
@@ -221,7 +312,9 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
                     type="button"
                     variant="outline"
                     size="sm"
-                    onClick={() => setHeaders([...headers, { key: '', value: '' }])}
+                    onClick={() =>
+                      setHeaders([...headers, { key: '', value: '' }])
+                    }
                     disabled={submitting}
                   >
                     <Plus size={14} />
@@ -305,6 +398,7 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
                         className="w-2/5 font-mono text-sm"
                       />
                       <Input
+                        type="password"
                         value={row.value}
                         onChange={(e) => {
                           const next = [...env];
@@ -356,10 +450,22 @@ export function AddMcpServerDialog({ open, onClose, onAdd }: AddMcpServerDialogP
 
           {/* Actions */}
           <div className="flex items-center justify-end gap-3 pt-2">
-            <Button type="button" variant="ghost" onClick={handleClose} disabled={submitting}>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={handleClose}
+              disabled={submitting}
+            >
               取消
             </Button>
-            <Button type="submit" disabled={submitting || !id.trim() || (isHttpType ? !url.trim() : !command.trim())}>
+            <Button
+              type="submit"
+              disabled={
+                submitting ||
+                !id.trim() ||
+                (isHttpType ? !url.trim() : !command.trim())
+              }
+            >
               {submitting && <Loader2 className="size-4 animate-spin" />}
               添加
             </Button>

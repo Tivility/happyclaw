@@ -1,7 +1,7 @@
 /**
  * WhatsApp Channel — Baileys integration (M1: QR login + connection state)
  *
- * 基于 @whiskeysockets/baileys 6.17.16 接入 WhatsApp Web 协议。
+ * 基于 OpenClaw 同版本的 baileys 7.0.0-rc13 接入 WhatsApp Web 协议。
  *
  * M1 范围（本提交）：
  *  - useMultiFileAuthState 持久化登录态（多文件 auth state，存在 authDir 下）
@@ -18,6 +18,7 @@
  * 商用场景应使用官方 Cloud API。
  */
 import { mkdir, chmod } from 'node:fs/promises';
+import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import qrcode from 'qrcode';
@@ -31,8 +32,9 @@ import {
   type WASocket,
   type WAMessage,
   type proto,
-} from '@whiskeysockets/baileys';
+} from 'baileys';
 import type { Boom } from '@hapi/boom';
+import { ProxyAgent } from 'proxy-agent';
 import { readFile } from 'node:fs/promises';
 import { logger } from './logger.js';
 import { storeChatMetadata, storeMessageDirect, updateChatName } from './db.js';
@@ -41,6 +43,10 @@ import { broadcastNewMessage } from './web.js';
 import { markdownToPlainText, splitTextChunks } from './im-utils.js';
 import { saveDownloadedFile, FileTooLargeError } from './im-downloader.js';
 import { ProcessingLock, isStale } from './im-safety/index.js';
+import {
+  evaluateChannelAdmission,
+  resolveAdmittedChannelRoute,
+} from './channel-admission.js';
 
 const CHANNEL_PREFIX = 'whatsapp:';
 /** WhatsApp text message safe limit. Baileys allows up to 64KB but UX clamps far below. */
@@ -83,6 +89,12 @@ export interface WhatsAppConnectionState {
 export interface WhatsAppConnectOpts {
   onReady?: () => void;
   onNewChat: (jid: string, name: string) => void;
+  isChatAuthorized?: (jid: string) => boolean;
+  onPairAttempt?: (
+    jid: string,
+    chatName: string,
+    code: string,
+  ) => Promise<boolean>;
   ignoreMessagesBefore?: number;
   onCommand?: (
     chatJid: string,
@@ -106,6 +118,7 @@ export interface WhatsAppConnectOpts {
   isSenderAllowedInGroup?: (chatJid: string, senderImId?: string) => boolean;
   /** WhatsApp 专属：连接状态变化回调（QR 出现、connected、断线等） */
   onConnectionUpdate?: (state: WhatsAppConnectionState) => void;
+  normalizeIncomingJid?: (jid: string) => string;
 }
 
 export interface WhatsAppConnection {
@@ -125,18 +138,24 @@ export interface WhatsAppConnection {
     caption?: string,
     fileName?: string,
   ): Promise<void>;
-  sendFile(
-    chatId: string,
-    filePath: string,
-    fileName: string,
-  ): Promise<void>;
+  sendFile(chatId: string, filePath: string, fileName: string): Promise<void>;
   sendTyping(chatId: string, isTyping: boolean): Promise<void>;
   isConnected(): boolean;
   /** Current connection state snapshot (latest seen) */
   getState(): WhatsAppConnectionState;
 }
 
-const RECONNECT_DELAY_MS = 3_000;
+export function assertWhatsAppSocketConnected(
+  socket: WASocket | null,
+  state: WhatsAppConnectionState,
+): asserts socket is WASocket {
+  if (!socket || state.status !== 'connected') {
+    throw new Error('WhatsApp socket is not connected');
+  }
+}
+
+const RECONNECT_BASE_DELAY_MS = 3_000;
+const RECONNECT_MAX_DELAY_MS = 60_000;
 /** Message dedup cache: matches feishu/qq/dingtalk (1000 entries, 30min TTL). */
 const MSG_DEDUP_MAX = 1000;
 const MSG_DEDUP_TTL_MS = 30 * 60 * 1000;
@@ -154,6 +173,51 @@ const CHUNK_SEND_DELAY_MS = 300;
  */
 let cachedBaileysVersion: [number, number, number] | null = null;
 
+type ClosableWhatsAppSocket = Pick<WASocket, 'end'> & {
+  ws?: {
+    isConnecting?: boolean;
+    close?: () => Promise<void> | void;
+    on?: (event: string, listener: (error: Error) => void) => void;
+  };
+};
+
+/**
+ * Baileys 6.17.x declares `sock.end()` as synchronous, but its WebSocket
+ * client implements `close()` as an async method. While the websocket is
+ * still CONNECTING, `ws.close()` rejects and `sock.end()` does not observe
+ * that promise, which becomes an unhandled rejection and can terminate the
+ * whole HappyClaw process.
+ *
+ * OpenClaw treats socket shutdown as best-effort and contains every failure.
+ * We keep that contract while explicitly awaiting the CONNECTING close path
+ * required by the Baileys version used here.
+ */
+export async function closeWhatsAppSocketSafely(
+  socket: ClosableWhatsAppSocket | null | undefined,
+  reason = 'HappyClaw WhatsApp socket close',
+): Promise<void> {
+  if (!socket) return;
+  if (socket.ws?.isConnecting && typeof socket.ws.close === 'function') {
+    try {
+      await socket.ws.close();
+    } catch (error) {
+      logger.debug(
+        { error, feature: 'whatsapp' },
+        'Ignored WhatsApp CONNECTING socket close failure',
+      );
+    }
+    return;
+  }
+  try {
+    await Promise.resolve(socket.end(new Error(reason)));
+  } catch (error) {
+    logger.debug(
+      { error, feature: 'whatsapp' },
+      'Ignored WhatsApp socket shutdown failure',
+    );
+  }
+}
+
 // ─── Factory ────────────────────────────────────────────────────
 
 export function createWhatsAppConnection(
@@ -164,6 +228,8 @@ export function createWhatsAppConnection(
   let opts: WhatsAppConnectOpts | null = null;
   let intentionalDisconnect = false;
   let reconnectTimer: NodeJS.Timeout | null = null;
+  let reconnectAttempt = 0;
+  let socketGeneration = 0;
   // Cache real group display names (jid → name); fetched lazily per group on
   // first message arrival to avoid blowing up reconnect.
   const groupNameCache = new Map<string, string>();
@@ -172,6 +238,17 @@ export function createWhatsAppConnection(
   // history/notify streams overlap; without this cache the Agent responds twice.
   const msgCache = new Map<string, number>();
   const processingLock = new ProcessingLock();
+  const rejectTimestamps = new Map<string, number>();
+  const hasAmbientProxy = [
+    'https_proxy',
+    'HTTPS_PROXY',
+    'http_proxy',
+    'HTTP_PROXY',
+    'all_proxy',
+    'ALL_PROXY',
+  ].some((name) => !!process.env[name]);
+  const ambientProxyAgent = hasAmbientProxy ? new ProxyAgent() : undefined;
+  let saveCredsQueue: Promise<void> = Promise.resolve();
 
   function isDuplicate(msgKey: string): boolean {
     const now = Date.now();
@@ -203,7 +280,11 @@ export function createWhatsAppConnection(
       if (subject) {
         groupNameCache.set(remoteJid, subject);
         try {
-          updateChatName(`${CHANNEL_PREFIX}${remoteJid}`, subject);
+          const rawJid = `${CHANNEL_PREFIX}${remoteJid}`;
+          updateChatName(
+            opts?.normalizeIncomingJid?.(rawJid) ?? rawJid,
+            subject,
+          );
         } catch (err) {
           logger.debug({ err, remoteJid }, 'Failed to persist group name');
         }
@@ -223,6 +304,7 @@ export function createWhatsAppConnection(
   }
 
   async function startSocket(): Promise<void> {
+    const generation = ++socketGeneration;
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
@@ -266,7 +348,7 @@ export function createWhatsAppConnection(
       'Initialising WhatsApp socket',
     );
 
-    sock = makeWASocket({
+    const nextSock = makeWASocket({
       // Skip version when unavailable so Baileys uses its bundled default
       ...(version ? { version } : {}),
       auth: state,
@@ -275,13 +357,59 @@ export function createWhatsAppConnection(
       logger: logger.child({ feature: 'whatsapp-baileys' }) as never,
       browser: ['HappyClaw', 'Desktop', '1.0.0'],
       markOnlineOnConnect: false,
+      // proxy-agent follows HTTP(S)_PROXY / ALL_PROXY and NO_PROXY. This is
+      // the WebSocket transport path; Baileys' media fetch dispatcher is a
+      // different (undici) type and intentionally remains untouched here.
+      ...(ambientProxyAgent ? { agent: ambientProxyAgent } : {}),
+    });
+    if (generation !== socketGeneration || intentionalDisconnect) {
+      await closeWhatsAppSocketSafely(
+        nextSock,
+        'WhatsApp socket superseded during startup',
+      );
+      return;
+    }
+    sock = nextSock;
+
+    // OpenClaw also observes the WebSocket error surface directly. Baileys
+    // normally translates these to connection.update, but keeping an explicit
+    // listener prevents a transport error from becoming process-fatal when a
+    // socket is being replaced at exactly the same time.
+    nextSock.ws?.on?.('error', (error: Error) => {
+      logger.warn({ error, feature: 'whatsapp' }, 'WhatsApp WebSocket error');
     });
 
     setState({ status: 'connecting' });
 
-    sock.ev.on('creds.update', saveCreds);
+    // Serialize credential writes. Baileys can emit overlapping updates while
+    // pairing; parallel multi-file writes are a common source of corrupt auth
+    // state after a process crash or reconnect boundary.
+    nextSock.ev.on('creds.update', () => {
+      saveCredsQueue = saveCredsQueue
+        .then(() => saveCreds())
+        .catch((error) => {
+          logger.error(
+            { error, authDir: config.authDir },
+            'WhatsApp credential persistence failed',
+          );
+        });
+    });
 
-    sock.ev.on('connection.update', async (update) => {
+    nextSock.ev.on('connection.update', (update) => {
+      void handleConnectionUpdate(update).catch((error) => {
+        logger.error(
+          { error, feature: 'whatsapp' },
+          'WhatsApp connection.update handler failed',
+        );
+      });
+    });
+
+    async function handleConnectionUpdate(
+      update: Parameters<
+        Parameters<typeof nextSock.ev.on<'connection.update'>>[1]
+      >[0],
+    ): Promise<void> {
+      if (generation !== socketGeneration || sock !== nextSock) return;
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -291,6 +419,7 @@ export function createWhatsAppConnection(
             margin: 2,
             scale: 6,
           });
+          if (generation !== socketGeneration || sock !== nextSock) return;
           setState({ status: 'qr', qr, qrDataUrl });
           logger.info(
             { feature: 'whatsapp' },
@@ -303,8 +432,9 @@ export function createWhatsAppConnection(
       }
 
       if (connection === 'open') {
-        const meJid = sock?.user?.id;
-        const meName = sock?.user?.name ?? undefined;
+        reconnectAttempt = 0;
+        const meJid = nextSock.user?.id;
+        const meName = nextSock.user?.name ?? undefined;
         setState({ status: 'connected', meJid, meName });
         logger.info(
           { feature: 'whatsapp', meJid, meName },
@@ -338,23 +468,31 @@ export function createWhatsAppConnection(
         }
 
         setState({ status: 'disconnected', error: reason });
-        sock = null;
+        if (sock === nextSock) sock = null;
 
         if (!intentionalDisconnect) {
+          const delayMs = Math.min(
+            RECONNECT_BASE_DELAY_MS * 2 ** reconnectAttempt,
+            RECONNECT_MAX_DELAY_MS,
+          );
+          reconnectAttempt += 1;
           logger.info(
-            { feature: 'whatsapp', delayMs: RECONNECT_DELAY_MS },
+            { feature: 'whatsapp', delayMs, reconnectAttempt },
             'Scheduling WhatsApp reconnect',
           );
           reconnectTimer = setTimeout(() => {
+            if (generation !== socketGeneration || intentionalDisconnect)
+              return;
             startSocket().catch((err) =>
               logger.error({ err }, 'WhatsApp reconnect failed'),
             );
-          }, RECONNECT_DELAY_MS);
+          }, delayMs);
         }
       }
-    });
+    }
 
-    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    nextSock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (generation !== socketGeneration || sock !== nextSock) return;
       // 'notify' = real-time incoming, 'append' = history sync (skip)
       if (type !== 'notify') return;
       for (const msg of messages) {
@@ -370,16 +508,20 @@ export function createWhatsAppConnection(
     });
 
     // Group membership events: bot added/removed from groups
-    sock.ev.on('group-participants.update', async (update) => {
+    nextSock.ev.on('group-participants.update', async (update) => {
+      if (generation !== socketGeneration || sock !== nextSock) return;
       try {
         const selfJid = sock?.user?.id ? jidNormalizedUser(sock.user.id) : null;
         if (!selfJid) return;
         const involvesSelf = update.participants.some(
-          (p) => jidNormalizedUser(p) === selfJid,
+          (participant) =>
+            jidNormalizedUser(participant.phoneNumber ?? participant.id) ===
+            selfJid,
         );
         if (!involvesSelf) return;
 
-        const chatJid = `${CHANNEL_PREFIX}${update.id}`;
+        const rawJid = `${CHANNEL_PREFIX}${update.id}`;
+        const chatJid = opts?.normalizeIncomingJid?.(rawJid) ?? rawJid;
         if (update.action === 'add') {
           let chatName = update.id;
           try {
@@ -389,9 +531,21 @@ export function createWhatsAppConnection(
               groupNameCache.set(update.id, meta.subject);
             }
           } catch (err) {
-            logger.debug({ err, jid: update.id }, 'group meta fetch failed on add');
+            logger.debug(
+              { err, jid: update.id },
+              'group meta fetch failed on add',
+            );
           }
-          opts?.onBotAddedToGroup?.(chatJid, chatName);
+          // Account-backed WhatsApp groups must pair explicitly. Merely adding
+          // the bot must not silently create/authorize a HappyClaw chat.
+          if (!opts?.isChatAuthorized || opts.isChatAuthorized(chatJid)) {
+            opts?.onBotAddedToGroup?.(chatJid, chatName);
+          } else {
+            logger.info(
+              { chatJid, chatName },
+              'WhatsApp bot added to unpaired group; awaiting /pair',
+            );
+          }
           logger.info({ chatJid, chatName }, 'WhatsApp bot added to group');
         } else if (update.action === 'remove') {
           opts?.onBotRemovedFromGroup?.(chatJid);
@@ -399,7 +553,10 @@ export function createWhatsAppConnection(
           logger.info({ chatJid }, 'WhatsApp bot removed from group');
         }
       } catch (err) {
-        logger.warn({ err }, 'WhatsApp group-participants.update handler threw');
+        logger.warn(
+          { err },
+          'WhatsApp group-participants.update handler threw',
+        );
       }
     });
   }
@@ -518,7 +675,10 @@ export function createWhatsAppConnection(
     const dedupKey = key.id ? `${remoteJid}|${key.id}` : '';
     if (dedupKey) {
       if (isDuplicate(dedupKey)) {
-        logger.debug({ msgId: key.id, remoteJid }, 'WhatsApp duplicate dropped');
+        logger.debug(
+          { msgId: key.id, remoteJid },
+          'WhatsApp duplicate dropped',
+        );
         return;
       }
       if (!processingLock.acquire(dedupKey)) {
@@ -531,179 +691,232 @@ export function createWhatsAppConnection(
       markSeen(dedupKey);
     }
     try {
-
-    // Filter old messages (heat-up after reconnect, history sync stragglers)
-    if (
-      tsMs > 0 &&
-      opts.ignoreMessagesBefore &&
-      tsMs < opts.ignoreMessagesBefore
-    ) {
-      return;
-    }
-
-    // Unwrap ephemeral / view-once envelopes once so text, media, and mention
-    // detection all see the real inner message (they otherwise diverge).
-    const inner = unwrapMessageContent(content);
-    const text = extractMessageText(inner);
-    const chatJid = `${CHANNEL_PREFIX}${remoteJid}`;
-    const isGroup = remoteJid.endsWith('@g.us');
-    const senderRaw = isGroup ? key.participant || remoteJid : remoteJid;
-    const senderImId = jidNormalizedUser(senderRaw);
-    const senderId = `${CHANNEL_PREFIX}${senderRaw}`;
-    const senderName = pushName || (isGroup ? '群成员' : remoteJid);
-    const chatName = groupNameCache.get(remoteJid) || (isGroup ? remoteJid : senderName);
-    const timestampISO = new Date(tsMs > 0 ? tsMs : Date.now()).toISOString();
-
-    // Register the chat BEFORE the group gates so shouldProcessGroupMessage /
-    // isGroupOwnerMessage can resolve it. Without this, a group's first message
-    // hits the mention gate while still unregistered → shouldProcessGroupMessage
-    // returns false → the message is dropped (mirrors Discord's early register).
-    storeChatMetadata(chatJid, timestampISO);
-    updateChatName(chatJid, chatName);
-    opts.onNewChat(chatJid, chatName);
-
-    // ── Group gates: sender allowlist → mention required → owner check ──
-    if (isGroup) {
+      // Filter old messages (heat-up after reconnect, history sync stragglers)
       if (
-        opts.isSenderAllowedInGroup &&
-        !opts.isSenderAllowedInGroup(chatJid, senderImId)
+        tsMs > 0 &&
+        opts.ignoreMessagesBefore &&
+        tsMs < opts.ignoreMessagesBefore
       ) {
-        logger.debug(
-          { chatJid, senderImId },
-          'WhatsApp dropped: sender not allowlisted',
-        );
         return;
       }
 
-      const isBotMentioned = isMentioningBot(inner, sock?.user?.id);
-      if (
-        opts.shouldProcessGroupMessage &&
-        !isBotMentioned &&
-        !opts.shouldProcessGroupMessage(chatJid, senderImId)
-      ) {
-        logger.debug(
-          { chatJid, senderImId },
-          'WhatsApp dropped: mention required but bot not @mentioned',
-        );
+      // Unwrap ephemeral / view-once envelopes once so text, media, and mention
+      // detection all see the real inner message (they otherwise diverge).
+      const inner = unwrapMessageContent(content);
+      let text = extractMessageText(inner);
+      const rawChatJid = `${CHANNEL_PREFIX}${remoteJid}`;
+      const chatJid = opts.normalizeIncomingJid?.(rawChatJid) ?? rawChatJid;
+      const isGroup = remoteJid.endsWith('@g.us');
+      const senderRaw = isGroup ? key.participant || remoteJid : remoteJid;
+      const senderImId = jidNormalizedUser(senderRaw);
+      const senderId = `${CHANNEL_PREFIX}${senderRaw}`;
+      const senderName = pushName || (isGroup ? '群成员' : remoteJid);
+      const chatName =
+        groupNameCache.get(remoteJid) || (isGroup ? remoteJid : senderName);
+      const timestampISO = new Date(tsMs > 0 ? tsMs : Date.now()).toISOString();
+
+      // Pairing/authorization is the first stateful gate. Unpaired traffic must
+      // not create a chat, write metadata, resolve a workspace, or download
+      // media. Pairing itself registers the chat against the account's default
+      // workspace through buildOnPairAttempt.
+      const admission = await evaluateChannelAdmission({
+        jid: chatJid,
+        chatName,
+        text: text ?? '',
+        isChatAuthorized: opts.isChatAuthorized,
+        onPairAttempt: opts.onPairAttempt,
+      });
+      if (admission.kind === 'paired') {
+        await sock?.sendMessage(remoteJid, {
+          text: '配对成功！此聊天已连接到你的工作区。',
+        });
         return;
       }
-      if (
-        isBotMentioned &&
-        opts.isGroupOwnerMessage &&
-        !opts.isGroupOwnerMessage(chatJid, senderImId)
-      ) {
-        logger.debug(
-          { chatJid, senderImId },
-          'WhatsApp dropped: owner_mentioned mode, sender is not group owner',
-        );
+      if (admission.kind === 'pair_rejected') {
+        await sock?.sendMessage(remoteJid, {
+          text: '配对码无效或已过期，请在 Web 设置页重新生成。',
+        });
+        return;
+      }
+      if (admission.kind === 'deny') {
+        const now = Date.now();
+        const lastReject = rejectTimestamps.get(chatJid) ?? 0;
+        if (now - lastReject >= 60_000) {
+          rejectTimestamps.set(chatJid, now);
+          await sock?.sendMessage(remoteJid, {
+            text: '此聊天尚未配对。请在 Web 设置页生成配对码，然后发送 /pair <code>。',
+          });
+        }
+        logger.debug({ chatJid }, 'WhatsApp chat not authorized');
         return;
       }
 
-      // Lazy-fetch real group name and update DB out-of-band
-      if (!groupNameCache.has(remoteJid)) {
-        groupNameCache.set(remoteJid, remoteJid); // tentative, prevents repeat fetches
-        void resolveGroupName(remoteJid);
-      }
-    }
-
-    // Handle media (image/video/audio/document) whenever the message carries
-    // it — NOT only when there's no text. A captioned image/video has non-empty
-    // `text` (extractMessageText reads the caption), so gating on `!finalContent`
-    // would skip the download entirely (media lost + no Vision inlining).
-    // tryHandleMediaMessage already folds the caption into its returned content.
-    // tryHandleMediaMessage returns null only when `inner` carries no supported
-    // media (its first step is detectMedia), so calling it unconditionally folds
-    // the media probe + download into one pass — no second detectMedia, no
-    // duplicated "neither text nor media" branch.
-    let finalContent = text;
-    let attachmentsJson: string | undefined;
-    const media = await tryHandleMediaMessage(
-      msg,
-      inner,
-      opts.resolveGroupFolder?.(chatJid),
-    );
-    if (media) {
-      finalContent = media.content;
-      attachmentsJson = media.attachmentsJson;
-    }
-    if (!finalContent) {
-      logger.debug(
-        { remoteJid, msgId: key.id, types: Object.keys(inner) },
-        'WhatsApp message has neither text nor supported media',
-      );
-      return;
-    }
-
-    // Slash command interception (matches Telegram pattern: `/cmd args`)
-    const trimmed = finalContent.trim();
-    const slashMatch = trimmed.match(/^\/(\S+)(?:\s+(.*))?$/s);
-    if (slashMatch && opts.onCommand) {
-      const cmdBody = (
-        slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
-      ).trim();
-      try {
-        const reply = await opts.onCommand(chatJid, cmdBody, senderImId);
-        if (reply !== null && reply !== undefined) {
-          if (sock) {
-            try {
-              await sock.sendMessage(remoteJid, { text: reply });
-            } catch (err) {
-              logger.warn({ err, chatJid }, 'WhatsApp slash reply send failed');
-            }
-          }
+      // ── Group gates: sender allowlist → mention required → owner check ──
+      if (isGroup) {
+        if (
+          opts.isSenderAllowedInGroup &&
+          !opts.isSenderAllowedInGroup(chatJid, senderImId)
+        ) {
+          logger.debug(
+            { chatJid, senderImId },
+            'WhatsApp dropped: sender not allowlisted',
+          );
           return;
         }
-      } catch (err) {
-        logger.error({ err, chatJid, cmd: slashMatch[1] }, 'WhatsApp slash command failed');
+
+        const isBotMentioned = isMentioningBot(inner, sock?.user?.id);
+        if (
+          opts.shouldProcessGroupMessage &&
+          !isBotMentioned &&
+          !opts.shouldProcessGroupMessage(chatJid, senderImId)
+        ) {
+          logger.debug(
+            { chatJid, senderImId },
+            'WhatsApp dropped: mention required but bot not @mentioned',
+          );
+          return;
+        }
+        if (
+          isBotMentioned &&
+          opts.isGroupOwnerMessage &&
+          !opts.isGroupOwnerMessage(chatJid, senderImId)
+        ) {
+          logger.debug(
+            { chatJid, senderImId },
+            'WhatsApp dropped: owner_mentioned mode, sender is not group owner',
+          );
+          return;
+        }
+        if (isBotMentioned && text) {
+          text = stripLeadingWhatsAppBotMention(text, inner, sock?.user?.id);
+        }
       }
-    }
 
-    // Resolve agent routing (binding to a sub-agent inside a workspace)
-    const routing = opts.resolveEffectiveChatJid?.(chatJid);
-    const targetJid = routing?.effectiveJid ?? chatJid;
-    const id = crypto.randomUUID();
+      // Control commands may repair/change a binding. Consume them before
+      // route validation; media must not be downloaded for a stale route.
+      const commandText = text?.trim() ?? '';
+      const slashMatch = commandText.match(/^\/(\S+)(?:\s+(.*))?$/s);
+      if (slashMatch && opts.onCommand) {
+        const cmdBody = (
+          slashMatch[1] + (slashMatch[2] ? ' ' + slashMatch[2] : '')
+        ).trim();
+        try {
+          const reply = await opts.onCommand(chatJid, cmdBody, senderImId);
+          if (reply !== null && reply !== undefined) {
+            if (sock) {
+              try {
+                await sock.sendMessage(remoteJid, { text: reply });
+              } catch (err) {
+                logger.warn(
+                  { err, chatJid },
+                  'WhatsApp slash reply send failed',
+                );
+              }
+            }
+            return;
+          }
+        } catch (err) {
+          logger.error(
+            { err, chatJid, cmd: slashMatch[1] },
+            'WhatsApp slash command failed',
+          );
+        }
+      }
 
-    storeChatMetadata(targetJid, timestampISO);
-    storeMessageDirect(
-      id,
-      targetJid,
-      senderId,
-      senderName,
-      finalContent,
-      timestampISO,
-      false,
-      { attachments: attachmentsJson, sourceJid: chatJid },
-    );
+      const resolvedRoute = resolveAdmittedChannelRoute(
+        chatJid,
+        opts.resolveEffectiveChatJid,
+      );
+      if (!resolvedRoute) {
+        logger.warn(
+          { chatJid },
+          'WhatsApp message dropped: binding resolver rejected route',
+        );
+        return;
+      }
+      const { targetJid, routing } = resolvedRoute;
 
-    broadcastNewMessage(
-      targetJid,
-      {
+      // Only admitted, policy-approved, routable chats may mutate metadata or
+      // start provider/network side effects.
+      storeChatMetadata(chatJid, timestampISO);
+      updateChatName(chatJid, chatName);
+      opts.onNewChat(chatJid, chatName);
+      if (isGroup && !groupNameCache.has(remoteJid)) {
+        groupNameCache.set(remoteJid, remoteJid);
+        void resolveGroupName(remoteJid);
+      }
+
+      // Handle media (image/video/audio/document) whenever the message carries
+      // it — NOT only when there's no text. A captioned image/video has non-empty
+      // `text` (extractMessageText reads the caption), so gating on `!finalContent`
+      // would skip the download entirely (media lost + no Vision inlining).
+      // tryHandleMediaMessage already folds the caption into its returned content.
+      // tryHandleMediaMessage returns null only when `inner` carries no supported
+      // media (its first step is detectMedia), so calling it unconditionally folds
+      // the media probe + download into one pass — no second detectMedia, no
+      // duplicated "neither text nor media" branch.
+      let finalContent = text;
+      let attachmentsJson: string | undefined;
+      const media = await tryHandleMediaMessage(
+        msg,
+        inner,
+        opts.resolveGroupFolder?.(chatJid),
+      );
+      if (media) {
+        finalContent = media.content;
+        attachmentsJson = media.attachmentsJson;
+      }
+      if (!finalContent) {
+        logger.debug(
+          { remoteJid, msgId: key.id, types: Object.keys(inner) },
+          'WhatsApp message has neither text nor supported media',
+        );
+        return;
+      }
+
+      const id = crypto.randomUUID();
+
+      storeChatMetadata(targetJid, timestampISO);
+      storeMessageDirect(
         id,
-        chat_jid: targetJid,
-        source_jid: chatJid,
-        sender: senderId,
-        sender_name: senderName,
-        content: finalContent,
-        timestamp: timestampISO,
-        attachments: attachmentsJson,
-        is_from_me: false,
-      },
-      routing?.agentId ?? undefined,
-    );
-    notifyNewImMessage();
+        targetJid,
+        senderId,
+        senderName,
+        finalContent,
+        timestampISO,
+        false,
+        { attachments: attachmentsJson, sourceJid: chatJid },
+      );
 
-    if (routing?.agentId) {
-      opts.onAgentMessage?.(chatJid, routing.agentId);
-      logger.info(
-        { chatJid, effectiveJid: targetJid, agentId: routing.agentId },
-        'WhatsApp message routed to conversation agent',
+      broadcastNewMessage(
+        targetJid,
+        {
+          id,
+          chat_jid: targetJid,
+          source_jid: chatJid,
+          sender: senderId,
+          sender_name: senderName,
+          content: finalContent,
+          timestamp: timestampISO,
+          attachments: attachmentsJson,
+          is_from_me: false,
+        },
+        routing?.agentId ?? undefined,
       );
-    } else {
-      logger.info(
-        { chatJid, sender: senderName, msgId: key.id, isGroup },
-        'WhatsApp message stored',
-      );
-    }
+      notifyNewImMessage();
+
+      if (routing?.agentId) {
+        opts.onAgentMessage?.(chatJid, routing.agentId);
+        logger.info(
+          { chatJid, effectiveJid: targetJid, agentId: routing.agentId },
+          'WhatsApp message routed to conversation agent',
+        );
+      } else {
+        logger.info(
+          { chatJid, sender: senderName, msgId: key.id, isGroup },
+          'WhatsApp message stored',
+        );
+      }
     } finally {
       if (dedupKey) processingLock.release(dedupKey);
     }
@@ -718,37 +931,35 @@ export function createWhatsAppConnection(
 
     async disconnect(): Promise<void> {
       intentionalDisconnect = true;
+      socketGeneration += 1;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
-      if (sock) {
-        try {
-          sock.end(undefined);
-        } catch (err) {
-          logger.warn({ err }, 'WhatsApp socket.end threw');
-        }
-        sock = null;
-      }
+      const currentSock = sock;
+      sock = null;
+      await closeWhatsAppSocketSafely(currentSock);
+      await saveCredsQueue;
+      ambientProxyAgent?.destroy();
       processingLock.dispose();
       setState({ status: 'disconnected' });
     },
 
     async logout(): Promise<void> {
       intentionalDisconnect = true;
-      if (sock) {
+      socketGeneration += 1;
+      const currentSock = sock;
+      sock = null;
+      if (currentSock) {
         try {
-          await sock.logout();
+          await currentSock.logout();
         } catch (err) {
           logger.warn({ err }, 'WhatsApp logout threw');
         }
-        try {
-          sock.end(undefined);
-        } catch {
-          /* ignore */
-        }
-        sock = null;
+        await closeWhatsAppSocketSafely(currentSock);
       }
+      await saveCredsQueue;
+      ambientProxyAgent?.destroy();
       // Note: auth files on disk remain; caller (im-manager) wipes authDir if needed
       setState({ status: 'logged_out' });
     },
@@ -758,13 +969,7 @@ export function createWhatsAppConnection(
       text: string,
       localImagePaths?: string[],
     ): Promise<void> {
-      if (!sock) {
-        logger.warn(
-          { feature: 'whatsapp', chatId },
-          'WhatsApp sendMessage skipped: socket not connected',
-        );
-        return;
-      }
+      assertWhatsAppSocketConnected(sock, currentState);
       const jid = stripChannelPrefix(chatId);
 
       // Strip markdown to WhatsApp plain text (matches dingtalk/wechat/qq pattern).
@@ -797,10 +1002,11 @@ export function createWhatsAppConnection(
               const mime = guessMimeType(imgPath) || 'image/jpeg';
               await sock.sendMessage(jid, { image: buf, mimetype: mime });
             } catch (err) {
-              logger.warn(
+              logger.error(
                 { err, imgPath, chatId },
                 'WhatsApp local image attach failed',
               );
+              throw err;
             }
           }
         }
@@ -820,13 +1026,7 @@ export function createWhatsAppConnection(
       caption?: string,
       fileName?: string,
     ): Promise<void> {
-      if (!sock) {
-        logger.warn(
-          { feature: 'whatsapp', chatId },
-          'WhatsApp sendImage skipped: socket not connected',
-        );
-        return;
-      }
+      assertWhatsAppSocketConnected(sock, currentState);
       const jid = stripChannelPrefix(chatId);
       try {
         await sock.sendMessage(jid, {
@@ -849,13 +1049,7 @@ export function createWhatsAppConnection(
       filePath: string,
       fileName: string,
     ): Promise<void> {
-      if (!sock) {
-        logger.warn(
-          { feature: 'whatsapp', chatId },
-          'WhatsApp sendFile skipped: socket not connected',
-        );
-        return;
-      }
+      assertWhatsAppSocketConnected(sock, currentState);
       const jid = stripChannelPrefix(chatId);
       try {
         const buf = await readFile(filePath);
@@ -895,12 +1089,68 @@ export function createWhatsAppConnection(
 }
 
 /** Compute the auth state directory for a given user / account. */
+const SAFE_AUTH_PATH_SEGMENT = /^[A-Za-z0-9_-]{1,64}$/;
+
+function safeAuthPathSegment(
+  value: string | undefined,
+  fallback?: string,
+): string {
+  const resolved = value || fallback;
+  if (!resolved || !SAFE_AUTH_PATH_SEGMENT.test(resolved)) {
+    throw new Error('Invalid WhatsApp auth path segment');
+  }
+  return resolved;
+}
+
 export function getWhatsAppAuthDir(
   dataDir: string,
   userId: string,
   accountId = 'default',
 ): string {
-  return path.join(dataDir, 'config', 'user-im', userId, 'whatsapp-auth', accountId);
+  const safeUserId = safeAuthPathSegment(userId);
+  const safeAccountId = safeAuthPathSegment(accountId, 'default');
+  const root = path.resolve(
+    dataDir,
+    'config',
+    'user-im',
+    safeUserId,
+    'whatsapp-auth',
+  );
+  const candidate = path.resolve(root, safeAccountId);
+  if (!candidate.startsWith(`${root}${path.sep}`)) {
+    throw new Error('WhatsApp auth directory escaped its account root');
+  }
+  return candidate;
+}
+
+/** Move a legacy singleton auth state to the immutable channel-account id. */
+export function migrateLegacyWhatsAppAuthDir(
+  dataDir: string,
+  userId: string,
+  legacyAccountId: string | undefined,
+  channelAccountId: string,
+): boolean {
+  if (!legacyAccountId || legacyAccountId === channelAccountId) return false;
+  let source: string;
+  let destination: string;
+  try {
+    source = getWhatsAppAuthDir(dataDir, userId, legacyAccountId);
+    destination = getWhatsAppAuthDir(dataDir, userId, channelAccountId);
+  } catch {
+    // Legacy config is untrusted. Invalid paths are ignored without touching
+    // any filesystem location, especially paths outside the auth root.
+    return false;
+  }
+  if (!fs.existsSync(source) || fs.existsSync(destination)) return false;
+  fs.mkdirSync(path.dirname(destination), { recursive: true });
+  try {
+    fs.renameSync(source, destination);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EXDEV') throw error;
+    fs.cpSync(source, destination, { recursive: true });
+    fs.rmSync(source, { recursive: true, force: true });
+  }
+  return true;
 }
 
 /**
@@ -939,7 +1189,8 @@ export function unwrapMessageContent(content: proto.IMessage): proto.IMessage {
  */
 export function extractMessageText(content: proto.IMessage): string | null {
   if (content.conversation) return content.conversation;
-  if (content.extendedTextMessage?.text) return content.extendedTextMessage.text;
+  if (content.extendedTextMessage?.text)
+    return content.extendedTextMessage.text;
   // Sometimes ephemeral / view-once wrap the inner content
   if (content.ephemeralMessage?.message) {
     return extractMessageText(content.ephemeralMessage.message);
@@ -1072,6 +1323,26 @@ export function isMentioningBot(
   const mentioned = ctx?.mentionedJid;
   if (!mentioned || mentioned.length === 0) return false;
   return mentioned.some((m) => jidNormalizedUser(m) === selfNorm);
+}
+
+/** Remove a leading WhatsApp display token only when trusted message metadata
+ * says the same account was mentioned. Mention-only messages retain their
+ * original text instead of becoming an empty durable message. */
+export function stripLeadingWhatsAppBotMention(
+  text: string,
+  content: proto.IMessage,
+  selfJid: string | null | undefined,
+): string {
+  if (!selfJid || !isMentioningBot(content, selfJid)) return text;
+  const selfSubject = jidNormalizedUser(selfJid).split('@', 1)[0];
+  if (!selfSubject) return text;
+  const normalized = text.trimStart();
+  const displayToken = `@${selfSubject}`;
+  if (!normalized.startsWith(displayToken)) return text;
+  const next = normalized.charAt(displayToken.length);
+  if (next && !/\s/.test(next)) return text;
+  const remainder = normalized.slice(displayToken.length).trimStart();
+  return remainder || text;
 }
 
 /**

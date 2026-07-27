@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { api, apiFetch } from '../api/client';
-import { clearApiCaches } from '../utils/pwaCache';
 import { clearMessageSnapshotCache } from '../utils/messageSnapshotCache';
+import { useUsageStore } from './usage';
 
 export type Permission =
   | 'manage_system_config'
@@ -40,12 +40,41 @@ export interface AppearanceConfig {
   aiName: string;
   aiAvatarEmoji: string;
   aiAvatarColor: string;
+  aiAvatarUrl: string | null;
+  aiAvatarMode: 'brand' | 'emoji';
 }
 
 export interface SetupStatus {
   needsSetup: boolean;
   claudeConfigured: boolean;
   feishuConfigured: boolean;
+}
+
+/**
+ * 把用户自定义的 per-user AI 外观（CLAUDE.md §8.9）合进全局 appearance。
+ *
+ * 渲染层（MessageBubble / StreamingDisplay 等）只认 appearance，不直接读
+ * currentUser.ai_* —— 身份解析必须收敛在一处（resolveAgentDisplayIdentity），
+ * 否则每加一个渲染点就要重复一遍优先级规则。
+ */
+function mergeUserAiAppearance(
+  appearance: AppearanceConfig | null,
+  user: UserPublic | null,
+): AppearanceConfig | null {
+  if (!appearance) return appearance;
+  if (!user) return appearance;
+  const aiName = user.ai_name?.trim();
+  const aiEmoji = user.ai_avatar_emoji?.trim();
+  const aiColor = user.ai_avatar_color?.trim();
+  const aiUrl = user.ai_avatar_url?.trim();
+  if (!aiName && !aiEmoji && !aiColor && !aiUrl) return appearance;
+  return {
+    ...appearance,
+    ...(aiName ? { aiName } : {}),
+    ...(aiEmoji ? { aiAvatarEmoji: aiEmoji, aiAvatarMode: 'emoji' as const } : {}),
+    ...(aiColor ? { aiAvatarColor: aiColor } : {}),
+    ...(aiUrl ? { aiAvatarUrl: aiUrl } : {}),
+  };
 }
 
 interface AuthState {
@@ -56,13 +85,32 @@ interface AuthState {
   initialized: boolean | null; // null = not checked yet
   checking: boolean;
   login: (username: string, password: string) => Promise<void>;
-  register: (data: { username: string; password: string; display_name?: string; invite_code?: string }) => Promise<void>;
+  register: (data: {
+    username: string;
+    password: string;
+    display_name?: string;
+    invite_code?: string;
+  }) => Promise<void>;
   logout: () => Promise<void>;
   checkAuth: () => Promise<void>;
   checkStatus: () => Promise<void>;
   setupAdmin: (username: string, password: string) => Promise<void>;
-  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
-  updateProfile: (payload: { username?: string; display_name?: string; avatar_emoji?: string | null; avatar_color?: string | null; avatar_url?: string | null; ai_name?: string | null; ai_avatar_emoji?: string | null; ai_avatar_color?: string | null; ai_avatar_url?: string | null; default_require_mention?: boolean }) => Promise<void>;
+  changePassword: (
+    currentPassword: string,
+    newPassword: string,
+  ) => Promise<void>;
+  updateProfile: (payload: {
+    username?: string;
+    display_name?: string;
+    avatar_emoji?: string | null;
+    avatar_color?: string | null;
+    avatar_url?: string | null;
+    ai_name?: string | null;
+    ai_avatar_emoji?: string | null;
+    ai_avatar_color?: string | null;
+    ai_avatar_url?: string | null;
+    default_require_mention?: boolean;
+  }) => Promise<void>;
   uploadAvatar: (file: File, target?: 'user' | 'ai') => Promise<string>;
   fetchAppearance: () => Promise<void>;
   hasPermission: (permission: Permission) => boolean;
@@ -79,30 +127,54 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   checking: true,
 
   login: async (username: string, password: string) => {
-    // Clear API caches BEFORE login: previous user may have left data behind
-    // (e.g. they closed the browser without logout). Without this, the new
-    // user could see the previous user's data on first frame from SWR cache.
-    await Promise.allSettled([clearApiCaches(), clearMessageSnapshotCache()]);
-    const data = await api.post<{ success: boolean; user: UserPublic; setupStatus?: SetupStatus; appearance?: AppearanceConfig }>(
-      '/api/auth/login',
-      { username, password },
-    );
-    set({ authenticated: true, user: data.user, setupStatus: data.setupStatus ?? null, appearance: data.appearance ?? null, initialized: true });
+    // Message snapshots are user-scoped application data. Clear them before
+    // switching users on a shared browser.
+    useUsageStore.getState().reset();
+    await clearMessageSnapshotCache();
+    const data = await api.post<{
+      success: boolean;
+      user: UserPublic;
+      setupStatus?: SetupStatus;
+      appearance?: AppearanceConfig;
+    }>('/api/auth/login', { username, password });
+    set({
+      authenticated: true,
+      user: data.user,
+      setupStatus: data.setupStatus ?? null,
+      appearance: mergeUserAiAppearance(data.appearance ?? null, data.user ?? null),
+      initialized: true,
+    });
   },
 
   register: async (payload) => {
-    // Same rationale as login: belt-and-suspenders cache clear on tenant switch.
-    await Promise.allSettled([clearApiCaches(), clearMessageSnapshotCache()]);
-    const data = await api.post<{ success: boolean; user: UserPublic }>('/api/auth/register', payload);
-    set({ authenticated: true, user: data.user, setupStatus: null, initialized: true });
+    // Same rationale as login: clear user-scoped message snapshots.
+    useUsageStore.getState().reset();
+    await clearMessageSnapshotCache();
+    const data = await api.post<{ success: boolean; user: UserPublic }>(
+      '/api/auth/register',
+      payload,
+    );
+    set({
+      authenticated: true,
+      user: data.user,
+      setupStatus: null,
+      initialized: true,
+    });
   },
 
   logout: async () => {
     await api.post('/api/auth/logout');
-    // Clear AFTER server-side session is invalidated so subsequent users on
-    // this device don't see this user's cached messages/agents/profile.
-    await Promise.allSettled([clearApiCaches(), clearMessageSnapshotCache()]);
-    set({ authenticated: false, user: null, setupStatus: null, appearance: null, initialized: true });
+    // Clear AFTER server-side session invalidation so the next user on this
+    // device cannot see this user's message snapshots.
+    useUsageStore.getState().reset();
+    await clearMessageSnapshotCache();
+    set({
+      authenticated: false,
+      user: null,
+      setupStatus: null,
+      appearance: null,
+      initialized: true,
+    });
   },
 
   checkStatus: async () => {
@@ -116,15 +188,17 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   setupAdmin: async (username: string, password: string) => {
-    const data = await api.post<{ success: boolean; user: UserPublic; setupStatus?: SetupStatus; appearance?: AppearanceConfig }>(
-      '/api/auth/setup',
-      { username, password },
-    );
+    const data = await api.post<{
+      success: boolean;
+      user: UserPublic;
+      setupStatus?: SetupStatus;
+      appearance?: AppearanceConfig;
+    }>('/api/auth/setup', { username, password });
     set({
       authenticated: true,
       user: data.user,
       setupStatus: data.setupStatus ?? null,
-      appearance: data.appearance ?? null,
+      appearance: mergeUserAiAppearance(data.appearance ?? null, data.user ?? null),
       initialized: true,
     });
   },
@@ -136,8 +210,19 @@ export const useAuthStore = create<AuthState>((set, get) => ({
       set({ checking: true });
       for (let attempt = 0; attempt < 3; attempt++) {
         try {
-          const data = await api.get<{ user: UserPublic; setupStatus?: SetupStatus; appearance?: AppearanceConfig }>('/api/auth/me');
-          set({ authenticated: true, user: data.user, setupStatus: data.setupStatus ?? null, appearance: data.appearance ?? null, initialized: true, checking: false });
+          const data = await api.get<{
+            user: UserPublic;
+            setupStatus?: SetupStatus;
+            appearance?: AppearanceConfig;
+          }>('/api/auth/me');
+          set({
+            authenticated: true,
+            user: data.user,
+            setupStatus: data.setupStatus ?? null,
+            appearance: mergeUserAiAppearance(data.appearance ?? null, data.user ?? null),
+            initialized: true,
+            checking: false,
+          });
           return;
         } catch (err) {
           const status =
@@ -148,7 +233,12 @@ export const useAuthStore = create<AuthState>((set, get) => ({
           if (!retryable || attempt === 2) {
             // On auth failure, check if system is initialized
             await get().checkStatus();
-            set({ authenticated: false, user: null, setupStatus: null, checking: false });
+            set({
+              authenticated: false,
+              user: null,
+              setupStatus: null,
+              checking: false,
+            });
             return;
           }
           await new Promise((resolve) => setTimeout(resolve, 1200));
@@ -162,23 +252,34 @@ export const useAuthStore = create<AuthState>((set, get) => ({
   },
 
   changePassword: async (currentPassword: string, newPassword: string) => {
-    const data = await api.put<{ success: boolean; user: UserPublic }>('/api/auth/password', {
-      current_password: currentPassword,
-      new_password: newPassword,
-    });
+    const data = await api.put<{ success: boolean; user: UserPublic }>(
+      '/api/auth/password',
+      {
+        current_password: currentPassword,
+        new_password: newPassword,
+      },
+    );
     set({ user: data.user });
   },
 
   updateProfile: async (payload) => {
-    const data = await api.put<{ success: boolean; user: UserPublic }>('/api/auth/profile', payload);
+    const data = await api.put<{ success: boolean; user: UserPublic }>(
+      '/api/auth/profile',
+      payload,
+    );
     set({ user: data.user });
   },
 
   uploadAvatar: async (file: File, target: 'user' | 'ai' = 'ai') => {
     const formData = new FormData();
     formData.append('avatar', file);
-    const url = target === 'user' ? '/api/auth/avatar?target=user' : '/api/auth/avatar';
-    const data = await apiFetch<{ success: boolean; avatarUrl: string; user: UserPublic }>(url, {
+    const url =
+      target === 'user' ? '/api/auth/avatar?target=user' : '/api/auth/avatar';
+    const data = await apiFetch<{
+      success: boolean;
+      avatarUrl: string;
+      user: UserPublic;
+    }>(url, {
       method: 'POST',
       body: formData,
       headers: {},
@@ -189,7 +290,9 @@ export const useAuthStore = create<AuthState>((set, get) => ({
 
   fetchAppearance: async () => {
     try {
-      const data = await api.get<AppearanceConfig>('/api/config/appearance/public');
+      const data = await api.get<AppearanceConfig>(
+        '/api/config/appearance/public',
+      );
       set({ appearance: data });
     } catch {
       // API not yet available, keep current state

@@ -1,6 +1,11 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
 import { extractErrorMessage } from '../utils/error';
+import {
+  acknowledgeTaskRunKey,
+  getPendingTaskRunKey,
+} from '../utils/task-run-idempotency';
+import { useAuthStore } from './auth';
 
 export interface ScheduledTask {
   id: string;
@@ -21,17 +26,79 @@ export interface ScheduledTask {
   execution_mode?: 'host' | 'container' | null;
   workspace_jid?: string | null;
   workspace_folder?: string | null;
+  revision?: number;
+  updated_at?: string;
+  deleted_at?: string | null;
+  current_run?: TaskRun | null;
+  last_run_summary?: TaskRun | null;
+  permissions?: TaskPermissions;
 }
 
-export interface TaskRunLog {
-  id: number;
+export type TaskRunStatus =
+  | 'queued'
+  | 'running'
+  | 'recovering'
+  | 'retry_wait'
+  | 'success'
+  | 'failed'
+  | 'cancelled'
+  | 'missed'
+  | 'delivered'
+  // Legacy task_run_logs compatibility.
+  | 'error';
+
+export type TaskRunTrigger = 'scheduled' | 'manual' | 'backfill' | 'retry';
+
+export type TaskNotificationStatus =
+  | 'pending'
+  | 'success'
+  | 'partial_failed'
+  | 'failed'
+  | 'skipped';
+
+export interface TaskNotificationSummary {
+  attempted: number;
+  succeeded: number;
+  failed: number;
+  failed_channels: string[];
+}
+
+export interface TaskPermissions {
+  can_edit: boolean;
+  can_run: boolean;
+  can_pause: boolean;
+  can_stop: boolean;
+  can_delete: boolean;
+  can_restore: boolean;
+  execution_scope: 'workspace_container' | 'workspace_host';
+  risk_level: 'normal' | 'high';
+  execution_blocked_reason?: string | null;
+}
+
+export interface TaskRun {
+  id: string | number;
   task_id: string;
-  run_at: string;
+  trigger_type?: TaskRunTrigger;
+  scheduled_for?: string | null;
+  status: TaskRunStatus;
+  attempt?: number;
+  available_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  created_at?: string;
+  updated_at?: string;
+  run_at?: string;
   duration_ms: number;
-  status: 'running' | 'success' | 'error';
   result?: string | null;
   error?: string | null;
+  notification_status?: TaskNotificationStatus;
+  notification_error?: string | null;
+  notification_summary?: TaskNotificationSummary | null;
+  notification_attempt?: number;
+  notification_available_at?: string | null;
 }
+
+export type TaskRunLog = TaskRun;
 
 interface TasksState {
   tasks: ScheduledTask[];
@@ -54,9 +121,11 @@ interface TasksState {
   ) => Promise<void>;
   updateTaskStatus: (id: string, status: 'active' | 'paused') => Promise<void>;
   updateTask: (id: string, fields: Record<string, unknown>) => Promise<void>;
-  deleteTask: (id: string) => Promise<void>;
+  deleteTask: (id: string, revision?: number) => Promise<void>;
+  restoreTask: (id: string, revision?: number) => Promise<void>;
   loadLogs: (taskId: string) => Promise<void>;
-  runTaskNow: (id: string) => Promise<void>;
+  runTaskNow: (id: string, idempotencyKey?: string) => Promise<TaskRun>;
+  stopTaskRun: (runId: string | number) => Promise<void>;
 }
 
 function normalizeOnceScheduleValue(value: string): string {
@@ -79,7 +148,11 @@ export const useTasksStore = create<TasksState>((set, get) => ({
   loadTasks: async () => {
     set({ loading: true });
     try {
-      const data = await api.get<{ tasks: ScheduledTask[]; runningTaskIds?: string[]; groupNames?: Record<string, string> }>('/api/tasks');
+      const data = await api.get<{
+        tasks: ScheduledTask[];
+        runningTaskIds?: string[];
+        groupNames?: Record<string, string>;
+      }>('/api/tasks?include_deleted=1');
       set({
         tasks: data.tasks,
         runningTaskIds: new Set(data.runningTaskIds || []),
@@ -142,7 +215,11 @@ export const useTasksStore = create<TasksState>((set, get) => ({
 
   updateTaskStatus: async (id: string, status: 'active' | 'paused') => {
     try {
-      await api.patch(`/api/tasks/${id}`, { status });
+      const task = get().tasks.find((candidate) => candidate.id === id);
+      await api.patch(`/api/tasks/${id}`, {
+        status,
+        expected_revision: task?.revision,
+      });
       set({ error: null });
       await get().loadTasks();
     } catch (err) {
@@ -152,7 +229,11 @@ export const useTasksStore = create<TasksState>((set, get) => ({
 
   updateTask: async (id: string, fields: Record<string, unknown>) => {
     try {
-      await api.patch(`/api/tasks/${id}`, fields);
+      const task = get().tasks.find((candidate) => candidate.id === id);
+      await api.patch(`/api/tasks/${id}`, {
+        ...fields,
+        expected_revision: task?.revision,
+      });
       set({ error: null });
       await get().loadTasks();
     } catch (err) {
@@ -163,9 +244,15 @@ export const useTasksStore = create<TasksState>((set, get) => ({
     }
   },
 
-  deleteTask: async (id: string) => {
+  deleteTask: async (id: string, revision?: number) => {
     try {
-      await api.delete(`/api/tasks/${id}`);
+      const task = get().tasks.find((candidate) => candidate.id === id);
+      const expectedRevision = revision ?? task?.revision;
+      const query =
+        expectedRevision === undefined
+          ? ''
+          : `?expected_revision=${encodeURIComponent(expectedRevision)}`;
+      await api.delete(`/api/tasks/${id}${query}`);
       set({ error: null });
       await get().loadTasks();
     } catch (err) {
@@ -173,11 +260,27 @@ export const useTasksStore = create<TasksState>((set, get) => ({
     }
   },
 
+  restoreTask: async (id: string, revision?: number) => {
+    try {
+      const task = get().tasks.find((candidate) => candidate.id === id);
+      await api.post(`/api/tasks/${id}/restore`, {
+        expected_revision: revision ?? task?.revision,
+      });
+      set({ error: null });
+      await get().loadTasks();
+    } catch (err) {
+      set({ error: extractErrorMessage(err) });
+      throw err;
+    }
+  },
+
   loadLogs: async (taskId: string) => {
     try {
-      const data = await api.get<{ logs: TaskRunLog[] }>(`/api/tasks/${taskId}/logs`);
+      const data = await api.get<{ runs?: TaskRunLog[]; logs?: TaskRunLog[] }>(
+        `/api/tasks/${taskId}/runs?limit=20`,
+      );
       set((s) => ({
-        logs: { ...s.logs, [taskId]: data.logs },
+        logs: { ...s.logs, [taskId]: data.runs ?? data.logs ?? [] },
         error: null,
       }));
     } catch (err) {
@@ -185,14 +288,39 @@ export const useTasksStore = create<TasksState>((set, get) => ({
     }
   },
 
-  runTaskNow: async (id: string) => {
+  runTaskNow: async (id: string, idempotencyKey?: string) => {
     try {
-      await api.post(`/api/tasks/${id}/run`);
+      const userId = useAuthStore.getState().user?.id ?? 'anonymous';
+      const key = idempotencyKey ?? getPendingTaskRunKey(userId, id);
+      const data = await api.post<{ run?: TaskRun; runId?: string }>(
+        `/api/tasks/${id}/runs`,
+        { idempotency_key: key },
+      );
       set({ error: null });
-      // Refresh immediately to pick up runningTaskIds from backend
+      acknowledgeTaskRunKey(userId, id, key);
+      await get().loadTasks();
+      if (data.run) return data.run;
+      return {
+        id: data.runId ?? key,
+        task_id: id,
+        trigger_type: 'manual',
+        status: 'queued',
+        duration_ms: 0,
+      };
+    } catch (err) {
+      set({ error: extractErrorMessage(err) });
+      throw err;
+    }
+  },
+
+  stopTaskRun: async (runId: string | number) => {
+    try {
+      await api.post(`/api/tasks/runs/${runId}/cancel`);
+      set({ error: null });
       await get().loadTasks();
     } catch (err) {
       set({ error: extractErrorMessage(err) });
+      throw err;
     }
   },
 }));

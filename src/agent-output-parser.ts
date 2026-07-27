@@ -239,9 +239,18 @@ export function attachStdoutHandler(
         if (parsed.newSessionId) {
           state.newSessionId = parsed.newSessionId;
         }
+        if (parsed.providerFailure) {
+          // Current agent-runners derive this from the SDK's structured
+          // rate_limit_event, so it remains authoritative even when the
+          // accompanying result is null or the CLI banner wording changes.
+          state.hasProviderFailureOutput = true;
+        }
         if (parsed.status === 'success') {
           state.hasSuccessOutput = true;
-          if (isProviderFailureResult(parsed.result)) {
+          if (
+            !parsed.providerFailure &&
+            isProviderFailureResult(parsed.result)
+          ) {
             state.hasProviderFailureOutput = true;
             parsed.providerFailure = true;
           }
@@ -525,7 +534,12 @@ export function handleNonZeroExit(
       ctx.groupName,
       `${ctx.filePrefix} interrupt path`,
       () => {
-        ctx.resolvePromise({ status: 'success', result: null, newSessionId });
+        ctx.resolvePromise({
+          status: 'success',
+          result: null,
+          newSessionId,
+          providerFailure: ctx.stdoutState.hasProviderFailureOutput,
+        });
       },
     );
     return true;
@@ -558,6 +572,7 @@ export function handleNonZeroExit(
             status: 'success',
             result: null,
             newSessionId,
+            providerFailure: ctx.stdoutState.hasProviderFailureOutput,
           });
         },
       );
@@ -599,6 +614,7 @@ export function handleNonZeroExit(
       status: 'error',
       result: enriched.result,
       error: enriched.error,
+      providerFailure: ctx.stdoutState.hasProviderFailureOutput,
     });
   };
 
@@ -748,41 +764,94 @@ const API_ERROR_PATTERNS = [
  * conversations ("to avoid hitting the API rate limit…", "disk quota
  * exceeded") and must NEVER be treated as a provider failure here.
  *
- * We therefore require a *structured* Claude account-limit signal:
- *  - a Claude-specific limit phrase ("out of extra usage", "you've hit your
- *    limit", "usage limit reached", "upgrade to increase your usage limit"),
- *    AND
- *  - the message reads as a short system-style notice, not a long answer that
- *    merely quotes the phrase. Real Claude limit notices are a single terse
- *    line; agent replies discussing rate limits are much longer.
- *
- * The strongest, length-independent signal is the reset timestamp Claude
- * appends to genuine limit notices ("· resets 2:10am (Asia/Shanghai)"); when a
- * Claude limit phrase co-occurs with that timestamp we accept regardless of
- * length, since no normal reply produces both together.
+ * Current agent-runners send an explicit providerFailure derived from the
+ * SDK's structured rate_limit_event. This parser remains as compatibility for
+ * older runners, so it accepts only anchored Claude banner grammar and known
+ * account/model labels. Model-only banners are classified separately and must
+ * never make the whole provider profile unhealthy.
  */
 
-/** Claude-specific account/usage-limit phrases (not generic provider errors). */
-const CLAUDE_LIMIT_PHRASE_PATTERNS = [
-  /\bout of extra usage\b/i,
-  /\byou(?:'ve|'re| are)\s+(?:hit|out of)\s+(?:your\s+)?(?:limit|extra usage)\b/i,
-  // "usage limit reached" — anchored on "usage" so a generic "rate limit
-  // reached" / "request limit reached" in a normal reply does not match.
-  /\busage\s+limit\s+reached\b/i,
-  /\bupgrade\s+to\s+(?:increase|raise)\s+your\s+usage\s+limit\b/i,
-  /\byour\s+(?:usage\s+)?limit\s+will\s+reset\b/i,
-];
+export type ProviderLimitScope = 'account' | 'model';
 
-/** The reset-timestamp suffix Claude appends to genuine limit notices. */
-const CLAUDE_LIMIT_RESET_PATTERN =
-  /\bresets?\b[^.\n]*?\d{1,2}(?::\d{2})?\s*(?:am|pm)?\s*\([^)]*\)/i;
+const MODEL_LIMIT_LABELS = new Set(['opus', 'sonnet', 'fable 5']);
+const ACCOUNT_LIMIT_LABELS = new Set([
+  '',
+  'session',
+  'weekly',
+  'usage',
+  'monthly spend',
+  'org monthly',
+  'organization monthly',
+]);
+
+function hasKnownClaudeLimitNoticeTail(tail: string): boolean {
+  const normalized = tail.trim();
+  if (!normalized || /^[.!]$/.test(normalized)) return true;
+  if (/^[.!]?\s*\/model\s+to\s+switch\s+models?[.!]?$/i.test(normalized)) {
+    return true;
+  }
+  return /^[.!]?\s*(?:[·•—–-]\s*)?resets?\b.{0,160}$/i.test(normalized);
+}
 
 /**
- * Upper bound (chars) for treating a Claude limit phrase as a *standalone*
- * system notice. Genuine notices are a single short line; this guards against
- * a long agent reply that merely mentions the phrase mid-answer.
+ * Classify a textual Claude limit banner by blast radius. This is only a
+ * compatibility fallback for older agent-runner/CLI builds; current runners
+ * emit an explicit providerFailure from the SDK's structured rate_limit_event.
+ *
+ * Keep the grammar anchored and label-based. This function runs on normal
+ * assistant replies, so accepting an arbitrary word before "limit" would turn
+ * "You've reached your storage limit" into an account quarantine.
  */
-const CLAUDE_LIMIT_NOTICE_MAX_LEN = 200;
+export function classifyProviderLimitNotice(
+  result: string | null,
+): ProviderLimitScope | null {
+  if (!result) return null;
+  const normalized = result.trim().replace(/\s+/g, ' ');
+  if (!normalized || normalized.length > 400) return null;
+
+  const direct = normalized.match(
+    /^you(?:'ve| have)\s+(?:hit|reached)\s+your(?:\s+(session|weekly|usage|monthly\s+spend|org\s+monthly|organization\s+monthly|opus|sonnet|fable\s+5))?\s+limit\b(.*)$/i,
+  );
+  if (direct && hasKnownClaudeLimitNoticeTail(direct[2] ?? '')) {
+    const label = (direct[1] ?? '').toLowerCase().replace(/\s+/g, ' ');
+    if (MODEL_LIMIT_LABELS.has(label)) return 'model';
+    if (ACCOUNT_LIMIT_LABELS.has(label)) return 'account';
+  }
+
+  if (/^you(?:'re| are)\s+out\s+of\s+extra\s+usage\b(.*)$/i.test(normalized)) {
+    const tail = normalized.replace(
+      /^you(?:'re| are)\s+out\s+of\s+extra\s+usage\b/i,
+      '',
+    );
+    return hasKnownClaudeLimitNoticeTail(tail) ? 'account' : null;
+  }
+  if (
+    /^(?:claude\s+)?usage\s+limit\s+reached\b(?:[.!]?\s+your\s+(?:usage\s+)?limit\s+will\s+reset(?:\s+at)?\b.{0,160})?[.!]?$/i.test(
+      normalized,
+    )
+  ) {
+    return 'account';
+  }
+  if (
+    /^upgrade\s+to\s+(?:increase|raise)\s+your\s+usage\s+limit\b(.*)$/i.test(
+      normalized,
+    )
+  ) {
+    const tail = normalized.replace(
+      /^upgrade\s+to\s+(?:increase|raise)\s+your\s+usage\s+limit\b/i,
+      '',
+    );
+    return hasKnownClaudeLimitNoticeTail(tail) ? 'account' : null;
+  }
+  if (
+    /^your\s+(?:usage\s+)?limit\s+will\s+reset(?:\s+at)?\b.{0,160}$/i.test(
+      normalized,
+    )
+  ) {
+    return 'account';
+  }
+  return null;
+}
 
 /**
  * Classify whether stderr output indicates an API-level error
@@ -802,20 +871,5 @@ export function isApiError(stderr: string): boolean {
  * deliberately avoids generic rate-limit/quota substrings.
  */
 export function isProviderFailureResult(result: string | null): boolean {
-  if (!result) return false;
-  const trimmed = result.trim();
-  if (!trimmed) return false;
-
-  const hasLimitPhrase = CLAUDE_LIMIT_PHRASE_PATTERNS.some((p) =>
-    p.test(trimmed),
-  );
-  if (!hasLimitPhrase) return false;
-
-  // Accept when a Claude reset timestamp accompanies the phrase (length-
-  // independent: no normal reply emits both), or when the whole result is a
-  // short standalone notice rather than a long answer quoting the phrase.
-  return (
-    CLAUDE_LIMIT_RESET_PATTERN.test(trimmed) ||
-    trimmed.length <= CLAUDE_LIMIT_NOTICE_MAX_LEN
-  );
+  return classifyProviderLimitNotice(result) === 'account';
 }

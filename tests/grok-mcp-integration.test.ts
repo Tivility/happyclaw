@@ -177,11 +177,44 @@ describe('P3 grok happyclaw MCP wiring', () => {
     ).map((t) => t.name);
     expect(names).toContain('send_message');
 
-    // mock grok 发 happyclaw__send_message tool_call（MCP 内工具名去命名空间即 send_message）
-    const call = await client.request('tools/call', {
-      name: 'send_message',
-      arguments: { text: '来自 grok 的进度更新' },
-    });
+    // upstream 把 send_message 从 fire-and-forget 改成「等主进程回写投递结果」：
+    // 写完 IPC 后轮询 message-results/send_message_result_{requestId}.json，
+    // 失败会抛错让 Agent 知道消息没送到。这里模拟主进程那一侧的回写。
+    const messagesDirForAck = path.join(ipcDir, 'messages');
+    const resultsDir = path.join(ipcDir, 'message-results');
+    fs.mkdirSync(resultsDir, { recursive: true });
+    const ackTimer = setInterval(() => {
+      if (!fs.existsSync(messagesDirForAck)) return;
+      for (const f of fs.readdirSync(messagesDirForAck)) {
+        if (!f.endsWith('.json')) continue;
+        const payload = JSON.parse(
+          fs.readFileSync(path.join(messagesDirForAck, f), 'utf-8'),
+        ) as { requestId?: string };
+        if (!payload.requestId) continue;
+        const out = path.join(
+          resultsDir,
+          `send_message_result_${payload.requestId}.json`,
+        );
+        if (!fs.existsSync(out)) {
+          fs.writeFileSync(
+            out,
+            JSON.stringify({ success: true, disposition: 'sent' }),
+            'utf-8',
+          );
+        }
+      }
+    }, 20);
+
+    let call;
+    try {
+      // mock grok 发 happyclaw__send_message tool_call（MCP 内工具名去命名空间即 send_message）
+      call = await client.request('tools/call', {
+        name: 'send_message',
+        arguments: { text: '来自 grok 的进度更新' },
+      });
+    } finally {
+      clearInterval(ackTimer);
+    }
     expect(call.error).toBeUndefined();
 
     // 断言 IPC messages 目录落文件

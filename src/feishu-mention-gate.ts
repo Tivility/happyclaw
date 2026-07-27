@@ -16,6 +16,7 @@
  */
 
 export interface MentionGateMention {
+  name?: string;
   id?: { open_id?: string };
 }
 
@@ -31,12 +32,24 @@ export interface MentionGateInput {
   /** 发送者 open_id（用于 owner 判断） */
   senderOpenId?: string;
   /**
+   * Context-aware Feishu plan. When present it supersedes the legacy boolean
+   * callback and can distinguish a hard-disabled chat from an already active
+   * topic whose follow-up messages no longer need another @mention.
+   */
+  conversationPlan?: {
+    disabled: boolean;
+    allowWithoutMention: boolean;
+  };
+  /**
    * 来自 happyclaw 主进程：根据该群 activation_mode / require_mention
    * 决定"是否允许免 @"。
    *   - 返回 true → always 模式，放行；
    *   - 返回 false → when_mentioned / owner_mentioned，必须确认 bot 被 @。
    */
-  shouldProcessGroupMessage?: (chatJid: string, senderOpenId?: string) => boolean;
+  shouldProcessGroupMessage?: (
+    chatJid: string,
+    senderOpenId?: string,
+  ) => boolean;
   /**
    * owner_mentioned 模式专用：判断 sender 是否为该群登记的 owner。
    * 仅在 bot 真的被 @ 的前提下才会被调用。
@@ -45,6 +58,8 @@ export interface MentionGateInput {
 }
 
 export type MentionGateRejectReason =
+  /** activation_mode=disabled is a hard stop, even when the bot is mentioned */
+  | 'disabled'
   /** botOpenId 未知，fail-closed 拒绝（区别于 not_mentioned，调用方应做不同的告警 / 自愈） */
   | 'bot_open_id_missing'
   /** 该群配置要求 @bot 但本条消息没 @ */
@@ -71,6 +86,30 @@ export function isBotMentioned(
 }
 
 /**
+ * Remove only the leading display token for the bot mention identified by
+ * Feishu's trusted mention metadata. This keeps mention-gated messages usable
+ * as exact human commands/confirmation phrases without accepting an arbitrary
+ * user-authored `@name` prefix as proof that the bot was mentioned.
+ */
+export function stripLeadingBotMention(
+  text: string,
+  botOpenId: string | undefined,
+  mentions: MentionGateMention[] | undefined,
+): string {
+  if (!botOpenId) return text;
+  const normalized = text.trimStart();
+  for (const mention of mentions ?? []) {
+    if (mention.id?.open_id !== botOpenId || !mention.name) continue;
+    const displayToken = `@${mention.name}`;
+    if (normalized.startsWith(displayToken)) {
+      const remainder = normalized.slice(displayToken.length).trimStart();
+      return remainder || text;
+    }
+  }
+  return text;
+}
+
+/**
  * 评估单条群聊消息是否通过 mention 门控。
  *
  * 行为表（仅当 chatType==='group' 且传入了 shouldProcessGroupMessage 时启用门控；
@@ -84,15 +123,22 @@ export function isBotMentioned(
  * | false                    | 有        | 是      | 是 / 无 owner 检查 | allow |
  * | false                    | 有        | 是      | 否            | reject:not_owner |
  */
-export function evaluateMentionGate(input: MentionGateInput): MentionGateDecision {
-  if (input.chatType !== 'group' || !input.shouldProcessGroupMessage) {
+export function evaluateMentionGate(
+  input: MentionGateInput,
+): MentionGateDecision {
+  if (input.conversationPlan?.disabled) {
+    return { allow: false, reason: 'disabled' };
+  }
+  if (
+    input.chatType !== 'group' ||
+    (!input.conversationPlan && !input.shouldProcessGroupMessage)
+  ) {
     return ALLOW;
   }
 
-  const mentionNotRequired = input.shouldProcessGroupMessage(
-    input.chatJid,
-    input.senderOpenId,
-  );
+  const mentionNotRequired =
+    input.conversationPlan?.allowWithoutMention ??
+    input.shouldProcessGroupMessage!(input.chatJid, input.senderOpenId);
   if (mentionNotRequired) {
     return ALLOW;
   }

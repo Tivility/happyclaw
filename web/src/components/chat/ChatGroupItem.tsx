@@ -1,4 +1,4 @@
-import { MoreHorizontal, Pencil, Trash2, RotateCcw, Star, Pin, Timer } from 'lucide-react';
+import { MoreHorizontal, Pencil, Trash2, RotateCcw, Pin } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -14,9 +14,6 @@ export interface ChatGroupItemProps {
   folder: string;
   lastMessage?: string;
 
-  isShared?: boolean;
-  memberRole?: 'owner' | 'member';
-  memberCount?: number;
   isActive: boolean;
   isHome: boolean;
   isPinned?: boolean;
@@ -34,10 +31,6 @@ export function ChatGroupItem({
   jid,
   name,
   folder,
-  lastMessage,
-  isShared,
-  memberRole,
-  memberCount,
   isActive,
   isHome,
   isPinned,
@@ -52,65 +45,33 @@ export function ChatGroupItem({
   const currentUser = useAuthStore((s) => s.user);
   const defaultHomeName = '我的工作区';
   // Use actual name if it's been renamed, otherwise fall back to default
-  const isDefaultName = !name || name === 'Main' || name === `${currentUser?.username} Home`;
+  const isDefaultName =
+    !name || name === 'Main' || name === `${currentUser?.username} Home`;
   const displayName = isHome && isDefaultName ? defaultHomeName : name;
-  const truncatedMsg =
-    lastMessage && lastMessage.length > 40
-      ? lastMessage.substring(0, 40) + '...'
-      : lastMessage;
-
   return (
     <div
       className={cn(
-        'group relative rounded-lg mb-0.5 transition-colors',
+        'group relative mb-0.5 rounded-md transition-colors',
         isActive
-          ? 'bg-accent dark:bg-accent max-lg:bg-background/70 max-lg:backdrop-blur-lg max-lg:saturate-[1.8]'
-          : 'hover:bg-accent/50',
+          ? 'bg-accent/80 text-foreground'
+          : 'text-foreground hover:bg-accent/45',
       )}
     >
       <button
         onClick={() => onSelect(jid, folder)}
-        className="w-full text-left px-3 pr-12 py-2.5 cursor-pointer"
+        aria-current={isActive ? 'page' : undefined}
+        className="flex min-h-11 w-full items-center px-2.5 pr-10 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring cursor-pointer"
       >
-        <div className="flex items-center gap-1.5 min-w-0">
-          {isHome && (
-            <Star className="w-3.5 h-3.5 text-yellow-500 fill-yellow-500 flex-shrink-0" />
-          )}
-          {isPinned && !isHome && (
-            <Pin className="w-3 h-3 text-primary flex-shrink-0" />
-          )}
-          {folder?.startsWith('task-') && (
-            <Timer className="w-3.5 h-3.5 text-muted-foreground flex-shrink-0" />
-          )}
-          <span
-            className={cn(
-              'text-sm truncate min-w-0',
-              isActive ? 'font-semibold text-foreground' : 'text-muted-foreground',
-            )}
-          >
-            {displayName}
+        <span className="min-w-0 flex-1 truncate text-[14px] font-normal leading-5">
+          {displayName}
+        </span>
+        {isPinned && !isHome && (
+          <span className="ml-1 shrink-0 text-[10px] text-muted-foreground">
+            固定
           </span>
-          {isRunning && (
-            <span className="relative flex h-2 w-2 flex-shrink-0">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-              <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500" />
-            </span>
-          )}
-          {isShared && memberRole === 'owner' && (memberCount ?? 0) >= 2 && (
-            <span className="flex-shrink-0 whitespace-nowrap inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300">
-              Owner
-            </span>
-          )}
-          {isShared && memberRole !== 'owner' && (memberCount ?? 0) >= 2 && (
-            <span className="flex-shrink-0 whitespace-nowrap inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-violet-100 dark:bg-violet-900/40 text-violet-700 dark:text-violet-300">
-              {memberCount}人协作
-            </span>
-          )}
-        </div>
-        {truncatedMsg && (
-          <p className={cn('text-xs text-muted-foreground/70 truncate mt-0.5', isHome && 'pl-5')}>
-            {truncatedMsg}
-          </p>
+        )}
+        {isRunning && (
+          <span className="ml-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
         )}
       </button>
 
@@ -126,6 +87,8 @@ export function ChatGroupItem({
             <button
               className="p-1.5 rounded-md hover:bg-accent text-muted-foreground hover:text-foreground transition-colors cursor-pointer"
               onClick={(e) => e.stopPropagation()}
+              title={`${displayName}的更多操作`}
+              aria-label={`${displayName}的更多操作`}
             >
               <MoreHorizontal className="w-4 h-4" />
             </button>

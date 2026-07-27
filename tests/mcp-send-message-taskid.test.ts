@@ -11,6 +11,7 @@ function baseCtx(overrides: Partial<McpContext> = {}): McpContext {
     groupFolder: 'ws-x',
     isHome: false,
     isAdminHome: false,
+    agentBuilderEnabled: false,
     isScheduledTask: false,
     currentTaskId: null,
     workspaceIpc: '/tmp/ipc',
@@ -21,6 +22,22 @@ function baseCtx(overrides: Partial<McpContext> = {}): McpContext {
 }
 
 describe('buildSendMessageData — task attribution stamping', () => {
+  test('stamps the exact current input-turn correlation id', () => {
+    const data = buildSendMessageData(
+      baseCtx({ currentInputTurnId: 'delivery-123' }),
+      { type: 'message', text: 'hi' },
+    );
+    expect(data.inputTurnId).toBe('delivery-123');
+  });
+
+  test('omits inputTurnId when no host-correlatable turn exists', () => {
+    const data = buildSendMessageData(baseCtx({ currentInputTurnId: null }), {
+      type: 'message',
+      text: 'hi',
+    });
+    expect('inputTurnId' in data).toBe(false);
+  });
+
   test('currentTaskId set → data includes taskId', () => {
     const ctx = baseCtx({ currentTaskId: 'task-42' });
     const data = buildSendMessageData(ctx, { type: 'message', text: 'hi' });
@@ -111,5 +128,23 @@ describe('buildSendMessageData — task attribution stamping', () => {
     expect(data.mimeType).toBe('image/png');
     expect(data.taskId).toBe('task-42');
     expect(data.isScheduledTask).toBe(true);
+  });
+
+  test('file payload: task metadata follows the file through task IPC', () => {
+    const ctx = baseCtx({ currentTaskId: 'task-file', isScheduledTask: true });
+    const data = buildSendMessageData(ctx, {
+      type: 'send_file',
+      filePath: 'output/report.pdf',
+      fileName: 'report.pdf',
+    });
+    expect(data).toMatchObject({
+      type: 'send_file',
+      chatJid: 'web:ws-x',
+      groupFolder: 'ws-x',
+      filePath: 'output/report.pdf',
+      fileName: 'report.pdf',
+      taskId: 'task-file',
+      isScheduledTask: true,
+    });
   });
 });

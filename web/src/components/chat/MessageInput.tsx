@@ -1,9 +1,15 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
+import {
+  useState,
+  useRef,
+  useEffect,
+  useLayoutEffect,
+  useCallback,
+} from 'react';
 import { useKeyboardHeight } from '@/hooks/useKeyboardHeight';
 import { successTap } from '../../hooks/useHaptic';
 import {
   ArrowUp,
-  Brush,
+  Eraser,
   FileUp,
   FolderUp,
   X,
@@ -11,11 +17,31 @@ import {
   Image as ImageIcon,
   TerminalSquare,
   Loader2,
+  Upload,
+  Clock3,
+  CornerUpLeft,
+  Square,
+  Pencil,
+  ChevronUp,
+  ChevronDown,
+  Check,
+  Trash2,
 } from 'lucide-react';
 import { useFileStore } from '../../stores/files';
-import { useChatStore } from '../../stores/chat';
+import {
+  useChatStore,
+  type FollowUpMode,
+  type FollowUpQueueAction,
+  type QueuedFollowUp,
+} from '../../stores/chat';
 import { useDisplayMode } from '../../hooks/useDisplayMode';
 import { useMediaQuery } from '../../hooks/useMediaQuery';
+import {
+  alternateFollowUpMode,
+  FOLLOW_UP_MODE_KEY,
+  FOLLOW_UP_MODE_CHANGED_EVENT,
+  getDefaultFollowUpMode,
+} from '../../lib/follow-up-preferences';
 
 interface PendingFile {
   /** Display name: relative path for folder uploads, file name otherwise */
@@ -41,19 +67,35 @@ interface MessageInputProps {
   onSend: (
     content: string,
     attachments?: Array<{ data: string; mimeType: string }>,
+    followUpBehavior?: FollowUpMode,
   ) => Promise<boolean> | boolean;
   groupJid?: string;
   disabled?: boolean;
+  contextLabel?: string;
   onResetSession?: () => void;
   onToggleTerminal?: () => void;
+  /** Stop the active run when the composer has no follow-up to send. */
+  onStop?: () => Promise<boolean> | boolean;
+  isRunning?: boolean;
+  queuedFollowUps?: QueuedFollowUp[];
+  onFollowUpAction?: (
+    item: QueuedFollowUp,
+    action: FollowUpQueueAction,
+    content?: string,
+  ) => Promise<boolean> | boolean;
 }
 
 export function MessageInput({
   onSend,
   groupJid,
   disabled = false,
+  contextLabel,
   onResetSession,
   onToggleTerminal,
+  onStop,
+  isRunning = false,
+  queuedFollowUps = [],
+  onFollowUpAction,
 }: MessageInputProps) {
   const [content, setContent] = useState('');
   const [showActions, setShowActions] = useState(false);
@@ -61,12 +103,30 @@ export function MessageInput({
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [stopping, setStopping] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [followUpMode, setFollowUpMode] = useState<FollowUpMode>(() =>
+    getDefaultFollowUpMode(),
+  );
+  const [actingOn, setActingOn] = useState<Set<string>>(() => new Set());
+  const [editingFollowUpId, setEditingFollowUpId] = useState<string | null>(
+    null,
+  );
+  const [editingFollowUpContent, setEditingFollowUpContent] = useState('');
+  const [savingFollowUpId, setSavingFollowUpId] = useState<string | null>(null);
+  const editingFollowUpInitialContentRef = useRef('');
+  const editingFollowUpContentRef = useRef('');
+  const dragCounterRef = useRef(0);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const folderInputRef = useRef<HTMLInputElement>(null);
   const imageInputRef = useRef<HTMLInputElement>(null);
-  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const draftTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
   const prevGroupJidRef = useRef<string | undefined>(groupJid);
+  const groupJidRef = useRef(groupJid);
+  groupJidRef.current = groupJid;
 
   const { uploadFiles, uploading, uploadProgress } = useFileStore();
   const { drafts, saveDraft, clearDraft } = useChatStore();
@@ -76,6 +136,30 @@ export function MessageInput({
 
   // iOS keyboard adaptation
   useKeyboardHeight();
+
+  useEffect(() => {
+    const handlePreferenceChange = (event: Event) => {
+      const mode = (event as CustomEvent<FollowUpMode>).detail;
+      setFollowUpMode(mode === 'steer' ? 'steer' : 'queue');
+    };
+    const handleStorage = (event: StorageEvent) => {
+      if (event.key === FOLLOW_UP_MODE_KEY) {
+        setFollowUpMode(event.newValue === 'steer' ? 'steer' : 'queue');
+      }
+    };
+    window.addEventListener(
+      FOLLOW_UP_MODE_CHANGED_EVENT,
+      handlePreferenceChange,
+    );
+    window.addEventListener('storage', handleStorage);
+    return () => {
+      window.removeEventListener(
+        FOLLOW_UP_MODE_CHANGED_EVENT,
+        handlePreferenceChange,
+      );
+      window.removeEventListener('storage', handleStorage);
+    };
+  }, []);
 
   // Restore draft when groupJid changes (including initial mount)
   useEffect(() => {
@@ -148,7 +232,8 @@ export function MessageInput({
     const maxHeight = lineHeight * 6;
     const newHeight = Math.max(lineHeight, Math.min(scrollHeight, maxHeight));
     textarea.style.height = `${newHeight}px`;
-    textarea.style.overflow = newHeight >= maxHeight ? 'auto' : prevOverflow || '';
+    textarea.style.overflow =
+      newHeight >= maxHeight ? 'auto' : prevOverflow || '';
   }, [content]);
 
   // IME composition state — prevent Enter from sending while composing (e.g. Chinese input)
@@ -159,6 +244,19 @@ export function MessageInput({
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (composingRef.current || e.nativeEvent.isComposing) return;
+    if (
+      e.key === 'Enter' &&
+      e.shiftKey &&
+      (e.metaKey || e.ctrlKey) &&
+      !isMobile
+    ) {
+      if (Date.now() - compositionEndTimeRef.current < 100) return;
+      e.preventDefault();
+      void handleSend(
+        isRunning ? alternateFollowUpMode(followUpMode) : undefined,
+      );
+      return;
+    }
     if (e.key === 'Enter' && !e.shiftKey && !isMobile) {
       if (Date.now() - compositionEndTimeRef.current < 100) return;
       e.preventDefault();
@@ -166,7 +264,7 @@ export function MessageInput({
     }
   };
 
-  const handleSend = async () => {
+  const handleSend = async (modeOverride?: FollowUpMode) => {
     const trimmed = content.trim();
     const hasPending = pendingFiles.length > 0;
     const hasImages = pendingImages.length > 0;
@@ -191,7 +289,11 @@ export function MessageInput({
 
     let ok = false;
     try {
-      ok = await onSend(message, attachments);
+      ok = await onSend(
+        message,
+        attachments,
+        modeOverride ?? (isRunning ? followUpMode : undefined),
+      );
     } catch {
       ok = false;
     }
@@ -217,6 +319,92 @@ export function MessageInput({
     }
     setSending(false);
   };
+
+  const handleFollowUpAction = async (
+    item: QueuedFollowUp,
+    action: FollowUpQueueAction,
+    nextContent?: string,
+  ): Promise<boolean> => {
+    if (!onFollowUpAction || actingOn.has(item.id)) return false;
+    setActingOn((current) => new Set(current).add(item.id));
+    try {
+      return await onFollowUpAction(item, action, nextContent);
+    } finally {
+      setActingOn((current) => {
+        const next = new Set(current);
+        next.delete(item.id);
+        return next;
+      });
+    }
+  };
+
+  const beginEditingFollowUp = (item: QueuedFollowUp) => {
+    setEditingFollowUpId(item.id);
+    setEditingFollowUpContent(item.content);
+    editingFollowUpInitialContentRef.current = item.content;
+    editingFollowUpContentRef.current = item.content;
+  };
+
+  const saveFollowUpEdit = async (item: QueuedFollowUp) => {
+    const nextContent = editingFollowUpContentRef.current.trim();
+    if (!nextContent) return;
+    setSavingFollowUpId(item.id);
+    const saved = await handleFollowUpAction(item, 'edit', nextContent);
+    setSavingFollowUpId(null);
+    if (saved) {
+      setEditingFollowUpId(null);
+      setEditingFollowUpContent('');
+      editingFollowUpInitialContentRef.current = '';
+      editingFollowUpContentRef.current = '';
+    }
+  };
+
+  // A run can finish while the user is editing the next queued message. The
+  // dispatcher is then allowed to claim that item, so it disappears from the
+  // queue before Save can be clicked. Never silently discard what the user
+  // typed: move an unsaved edit back into the main composer and explain why.
+  useEffect(() => {
+    if (!editingFollowUpId || savingFollowUpId === editingFollowUpId) return;
+    if (queuedFollowUps.some((item) => item.id === editingFollowUpId)) return;
+
+    const recovered = editingFollowUpContentRef.current.trim();
+    const initial = editingFollowUpInitialContentRef.current.trim();
+    setEditingFollowUpId(null);
+    setEditingFollowUpContent('');
+    editingFollowUpInitialContentRef.current = '';
+    editingFollowUpContentRef.current = '';
+
+    if (!recovered || recovered === initial) return;
+    const nextContent = content.trim()
+      ? `${content.trimEnd()}\n\n${recovered}`
+      : recovered;
+    setContent(nextContent);
+    debouncedSaveDraft(nextContent);
+    setSendError('这条消息已开始处理，未保存的修改已移到输入框');
+    const timer = window.setTimeout(() => setSendError(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [
+    content,
+    debouncedSaveDraft,
+    editingFollowUpId,
+    queuedFollowUps,
+    savingFollowUpId,
+  ]);
+
+  const handleStop = async () => {
+    if (!onStop || stopping || disabled) return;
+    setStopping(true);
+    try {
+      const stopped = await onStop();
+      if (!stopped) setStopping(false);
+    } catch {
+      setStopping(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!isRunning) setStopping(false);
+  }, [isRunning]);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!groupJid) return;
@@ -300,7 +488,11 @@ export function MessageInput({
 
   const readFileAsBase64 = (file: File): Promise<string> => {
     if (file.size > MAX_IMAGE_SIZE_BYTES) {
-      return Promise.reject(new Error(`图片 ${file.name} 超过 5MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`));
+      return Promise.reject(
+        new Error(
+          `图片 ${file.name} 超过 5MB 限制 (${(file.size / 1024 / 1024).toFixed(1)}MB)`,
+        ),
+      );
     }
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -351,6 +543,194 @@ export function MessageInput({
     }
   };
 
+  // --- Drag and drop helpers ---
+
+  /** Recursively traverse a dropped directory entry and collect all files */
+  const readEntriesRecursively = (
+    entry: FileSystemDirectoryEntry,
+  ): Promise<File[]> => {
+    return new Promise((resolve, reject) => {
+      const reader = entry.createReader();
+      const allFiles: File[] = [];
+
+      const readBatch = () => {
+        reader.readEntries(
+          async (entries) => {
+            if (entries.length === 0) {
+              resolve(allFiles);
+              return;
+            }
+            for (const e of entries) {
+              if (e.isFile) {
+                const file = await new Promise<File>((res, rej) =>
+                  (e as FileSystemFileEntry).file(res, (err) => rej(err)),
+                );
+                // Attach relative path for display
+                Object.defineProperty(file, 'webkitRelativePath', {
+                  value: e.fullPath.slice(1), // remove leading "/"
+                  writable: false,
+                });
+                allFiles.push(file);
+              } else if (e.isDirectory) {
+                const subFiles = await readEntriesRecursively(
+                  e as FileSystemDirectoryEntry,
+                );
+                allFiles.push(...subFiles);
+              }
+            }
+            // readEntries may return partial results; keep reading until empty
+            readBatch();
+          },
+          (err) => reject(err),
+        );
+      };
+      readBatch();
+    });
+  };
+
+  // --- Drag and drop handlers ---
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current += 1;
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragCounterRef.current -= 1;
+    if (dragCounterRef.current === 0) {
+      setIsDragOver(false);
+    }
+  }, []);
+
+  const handleDrop = useCallback(
+    async (e: React.DragEvent) => {
+      // Only handle file drops; let text/URL drops through to the textarea
+      if (!e.dataTransfer.types.includes('Files')) return;
+
+      e.preventDefault();
+      e.stopPropagation();
+      dragCounterRef.current = 0;
+      setIsDragOver(false);
+
+      // Guard: respect disabled/sending/uploading state
+      if (!groupJid || disabled || sending || uploading) return;
+
+      // Capture groupJid at drop time to prevent stale-chat attachment
+      const targetGroupJid = groupJid;
+
+      // Collect files, expanding directories via webkitGetAsEntry.
+      // 同步提取所有 item 的 entry/file，避免 drop 事件结束后 DataTransferItemList
+      // 被浏览器清理（Firefox/Safari）导致后续 item 返回 null 而静默丢失。
+      const items = Array.from(e.dataTransfer.items);
+      const collected: Array<{
+        entry: FileSystemEntry | null;
+        file: File | null;
+      }> = [];
+      for (const item of items) {
+        collected.push({
+          entry: item.webkitGetAsEntry?.() ?? null,
+          file: item.getAsFile(),
+        });
+      }
+
+      const allFiles: File[] = [];
+      let hasDirectory = false;
+
+      for (const { entry, file } of collected) {
+        if (entry?.isDirectory) {
+          hasDirectory = true;
+          try {
+            const dirFiles = await readEntriesRecursively(
+              entry as FileSystemDirectoryEntry,
+            );
+            allFiles.push(...dirFiles);
+          } catch (err) {
+            setSendError('读取文件夹失败');
+            setTimeout(() => setSendError(null), 4000);
+            console.warn('读取文件夹失败:', err);
+            return;
+          }
+        } else if (file) {
+          allFiles.push(file);
+        }
+      }
+
+      if (allFiles.length === 0) return;
+
+      // If a directory was dropped, upload ALL files to workspace (including images)
+      // to match the button-based folder upload behavior.
+      if (hasDirectory) {
+        const ok = await uploadFiles(targetGroupJid, allFiles);
+        if (ok && targetGroupJid === groupJidRef.current) {
+          const newPending = allFiles.map((f) => ({
+            label:
+              (f as unknown as { webkitRelativePath?: string })
+                .webkitRelativePath || f.name,
+          }));
+          setPendingFiles((prev) => [...prev, ...newPending]);
+        }
+        return;
+      }
+
+      // For individual files: split images (inline) from regular files (workspace)
+      const imageFiles: File[] = [];
+      const regularFiles: File[] = [];
+      allFiles.forEach((file) => {
+        if (file.type.startsWith('image/')) {
+          imageFiles.push(file);
+        } else {
+          regularFiles.push(file);
+        }
+      });
+
+      // Process images inline (same as handleImageSelect)
+      if (imageFiles.length > 0) {
+        const newImages: PendingImage[] = [];
+        for (const file of imageFiles) {
+          try {
+            const base64 = await readFileAsBase64(file);
+            newImages.push({
+              name: file.name,
+              data: base64,
+              mimeType: file.type,
+              preview: URL.createObjectURL(file),
+            });
+          } catch (err) {
+            console.warn('跳过图片:', err instanceof Error ? err.message : err);
+          }
+        }
+        // Verify groupJid hasn't changed during async processing (use ref for live value)
+        if (targetGroupJid === groupJidRef.current) {
+          setPendingImages((prev) => [...prev, ...newImages]);
+        } else {
+          // Conversation switched — revoke preview URLs to avoid memory leak
+          newImages.forEach((img) => URL.revokeObjectURL(img.preview));
+        }
+      }
+
+      // Upload non-image files to workspace (same as handleFileSelect)
+      if (regularFiles.length > 0) {
+        const ok = await uploadFiles(targetGroupJid, regularFiles);
+        if (ok && targetGroupJid === groupJidRef.current) {
+          const newPending = regularFiles.map((f) => ({ label: f.name }));
+          setPendingFiles((prev) => [...prev, ...newPending]);
+        }
+      }
+    },
+    [groupJid, disabled, sending, uploading, uploadFiles],
+  );
+
   const handleFolderSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!groupJid) return;
     const fileList = e.target.files;
@@ -390,29 +770,56 @@ export function MessageInput({
   };
 
   const hasContent = content.trim().length > 0;
-  const canSend = (hasContent || pendingFiles.length > 0 || pendingImages.length > 0) && !sending;
+  const hasPayload =
+    hasContent || pendingFiles.length > 0 || pendingImages.length > 0;
+  const canSend = hasPayload && !sending;
+  const showStop = isRunning && !hasPayload && !sending && !!onStop;
 
   const progressPercent =
     uploadProgress && uploadProgress.totalBytes > 0
-      ? Math.round((uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100)
+      ? Math.round(
+          (uploadProgress.uploadedBytes / uploadProgress.totalBytes) * 100,
+        )
       : 0;
 
   return (
     <div
-      className="pt-1 pb-3 bg-surface dark:bg-background max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40"
-      style={{ paddingBottom: `max(0.75rem, env(safe-area-inset-bottom, 0px), var(--keyboard-height, 0px))` }}
+      className="pt-1 pb-3 bg-surface dark:bg-background max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-t max-lg:border-border/40 relative"
+      style={{
+        paddingBottom: `max(0.75rem, env(safe-area-inset-bottom, 0px), var(--keyboard-height, 0px))`,
+      }}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
     >
+      {/* Drag overlay */}
+      {isDragOver && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-primary/5 dark:bg-primary/10 backdrop-blur-[2px] border-2 border-dashed border-primary rounded-xl pointer-events-none">
+          <div className="flex flex-col items-center gap-2 text-primary">
+            <Upload className="w-8 h-8" />
+            <span className="text-sm font-medium">松开上传文件</span>
+          </div>
+        </div>
+      )}
       {/* lg:pl-[60px] = avatar w-8 (32px) + gap-3 (12px) + visual balance (16px), aligns input left edge with message card content */}
-      <div className={isCompact ? 'mx-auto px-4' : 'max-w-4xl mx-auto px-4 lg:pl-[60px]'}>
+      <div
+        className={
+          isCompact ? 'mx-auto px-4' : 'max-w-4xl mx-auto px-4 lg:pl-[60px]'
+        }
+      >
         {/* Upload progress bar */}
         {uploading && uploadProgress && (
-          <div className={`mb-2 px-4 py-2.5 ${isCompact ? 'bg-surface border border-border' : 'bg-surface rounded-xl border border-border shadow-sm'}`}>
+          <div
+            className={`mb-2 px-4 py-2.5 ${isCompact ? 'bg-surface border border-border' : 'bg-surface rounded-xl border border-border shadow-sm'}`}
+          >
             <div className="flex items-center justify-between mb-1.5">
               <span className="text-xs text-foreground/70 truncate max-w-[65%]">
                 {uploadProgress.currentFile || '完成'}
               </span>
               <span className="text-xs text-muted-foreground">
-                {uploadProgress.completed}/{uploadProgress.total} · {progressPercent}%
+                {uploadProgress.completed}/{uploadProgress.total} ·{' '}
+                {progressPercent}%
               </span>
             </div>
             <div className="w-full h-1.5 bg-muted rounded-full overflow-hidden">
@@ -424,11 +831,171 @@ export function MessageInput({
           </div>
         )}
 
+        {queuedFollowUps.length > 0 && (
+          <div className="mb-2 overflow-hidden rounded-xl border border-border bg-muted/30">
+            <div className="flex items-center gap-2 border-b border-border/70 px-3 py-2 text-xs text-muted-foreground">
+              <Clock3 className="h-3.5 w-3.5" />
+              <span>
+                {queuedFollowUps.some((item) => item.delivery_mode === 'steer')
+                  ? '正在停止当前回复，随后发送引导消息'
+                  : `${queuedFollowUps.length} 条消息已排队`}
+              </span>
+            </div>
+            <div className="max-h-56 divide-y divide-border/70 overflow-y-auto">
+              {queuedFollowUps.map((item, index) => {
+                const busy = actingOn.has(item.id);
+                const steering = item.delivery_mode === 'steer';
+                const locked = steering || item.delivery_status === 'promoting';
+                const editing = editingFollowUpId === item.id;
+                return (
+                  <div
+                    key={item.id}
+                    className="flex min-w-0 items-start gap-2 px-3 py-2"
+                  >
+                    <span className="mt-1.5 shrink-0 text-[11px] font-medium tabular-nums text-muted-foreground">
+                      {index + 1}
+                    </span>
+                    {editing ? (
+                      <div className="min-w-0 flex-1 space-y-2">
+                        <textarea
+                          value={editingFollowUpContent}
+                          onChange={(event) => {
+                            editingFollowUpContentRef.current =
+                              event.target.value;
+                            setEditingFollowUpContent(event.target.value);
+                          }}
+                          rows={2}
+                          autoFocus
+                          className="w-full resize-none rounded-lg border border-border bg-surface px-2.5 py-2 text-xs leading-5 text-foreground outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                          aria-label="编辑排队消息"
+                        />
+                        <div className="flex justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setEditingFollowUpId(null);
+                              setEditingFollowUpContent('');
+                              editingFollowUpInitialContentRef.current = '';
+                              editingFollowUpContentRef.current = '';
+                            }}
+                            className="inline-flex min-h-8 items-center gap-1 rounded-md px-2 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                            取消
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy || !editingFollowUpContent.trim()}
+                            onClick={() => void saveFollowUpEdit(item)}
+                            className="inline-flex min-h-8 items-center gap-1 rounded-md bg-primary px-2 text-[11px] font-medium text-white hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            {busy ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <Check className="h-3.5 w-3.5" />
+                            )}
+                            保存
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="min-w-0 flex-1">
+                        <span
+                          className="block whitespace-pre-wrap break-words pt-1 text-xs leading-5 text-foreground/80"
+                          title={item.content}
+                        >
+                          {item.content}
+                        </span>
+                        <div className="mt-1 flex flex-wrap items-center justify-end gap-0.5">
+                          <button
+                            type="button"
+                            disabled={busy || locked || index === 0}
+                            onClick={() =>
+                              void handleFollowUpAction(item, 'move_up')
+                            }
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+                            aria-label={`上移：${item.content}`}
+                            title="上移"
+                          >
+                            <ChevronUp className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={
+                              busy ||
+                              locked ||
+                              index === queuedFollowUps.length - 1
+                            }
+                            onClick={() =>
+                              void handleFollowUpAction(item, 'move_down')
+                            }
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+                            aria-label={`下移：${item.content}`}
+                            title="下移"
+                          >
+                            <ChevronDown className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy || locked}
+                            onClick={() => beginEditingFollowUp(item)}
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground disabled:cursor-not-allowed disabled:opacity-35"
+                            aria-label={`编辑：${item.content}`}
+                            title="编辑"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy || locked}
+                            onClick={() =>
+                              void handleFollowUpAction(item, 'steer')
+                            }
+                            className="inline-flex min-h-8 shrink-0 items-center gap-1 rounded-md px-2 text-[11px] font-medium text-primary transition-colors hover:bg-brand-50 disabled:cursor-not-allowed disabled:opacity-50"
+                            aria-label={`立即发送：${item.content}`}
+                          >
+                            {busy || locked ? (
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            ) : (
+                              <CornerUpLeft className="h-3.5 w-3.5" />
+                            )}
+                            {locked ? '发送中' : '发送'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={busy || locked}
+                            onClick={() =>
+                              void handleFollowUpAction(item, 'cancel')
+                            }
+                            className="flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
+                            aria-label={`删除排队消息：${item.content}`}
+                            title="删除"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         {/* Main input card */}
-        <div className={isCompact ? 'bg-surface border border-border rounded-lg' : 'bg-surface rounded-2xl border border-border shadow-sm'}>
+        <div
+          className={
+            isCompact
+              ? 'bg-surface border border-border rounded-lg'
+              : 'bg-surface rounded-2xl border border-border shadow-sm'
+          }
+        >
           {/* Send error banner */}
           {sendError && (
-            <div className={`px-4 py-2 bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 text-xs font-medium border-b border-red-100 dark:border-red-800 flex items-center gap-2 ${isCompact ? 'rounded-t-lg' : 'rounded-t-2xl'}`}>
+            <div
+              className={`px-4 py-2 bg-red-50 dark:bg-red-950/40 text-red-600 dark:text-red-400 text-xs font-medium border-b border-red-100 dark:border-red-800 flex items-center gap-2 ${isCompact ? 'rounded-t-lg' : 'rounded-t-2xl'}`}
+            >
               <span>{sendError}</span>
             </div>
           )}
@@ -543,8 +1110,13 @@ export function MessageInput({
                 debouncedSaveDraft(e.target.value);
               }}
               onKeyDown={handleKeyDown}
-              onCompositionStart={() => { composingRef.current = true; }}
-              onCompositionEnd={() => { composingRef.current = false; compositionEndTimeRef.current = Date.now(); }}
+              onCompositionStart={() => {
+                composingRef.current = true;
+              }}
+              onCompositionEnd={() => {
+                composingRef.current = false;
+                compositionEndTimeRef.current = Date.now();
+              }}
               onPaste={handlePaste}
               placeholder="输入消息..."
               disabled={disabled}
@@ -580,8 +1152,9 @@ export function MessageInput({
                   onClick={onResetSession}
                   className="w-10 h-10 rounded-lg flex items-center justify-center hover:bg-amber-50 dark:hover:bg-amber-950/40 text-muted-foreground hover:text-amber-600 dark:hover:text-amber-400 transition-all cursor-pointer"
                   title="清除上下文"
+                  aria-label="清除当前会话上下文"
                 >
-                  <Brush className="w-4.5 h-4.5" />
+                  <Eraser className="w-4.5 h-4.5" />
                 </button>
               )}
               {onToggleTerminal && (
@@ -597,20 +1170,44 @@ export function MessageInput({
               )}
             </div>
 
+            {contextLabel && (
+              <span
+                className="ml-1 inline-flex min-w-0 max-w-[min(42vw,180px)] items-center rounded-md bg-brand-50 px-2 py-1 text-[10px] font-medium text-primary dark:bg-brand-700/15 dark:text-brand-300"
+                title={`发送到：${contextLabel}`}
+              >
+                <span className="truncate">{contextLabel}</span>
+              </span>
+            )}
+
             {/* Spacer */}
             <div className="flex-1" />
 
-            {/* Right: send button */}
+            {/* Right: one contextual primary action, matching Codex. */}
             <button
-              onClick={handleSend}
-              disabled={!canSend || disabled || sending}
+              type="button"
+              onClick={() => (showStop ? void handleStop() : void handleSend())}
+              disabled={
+                showStop
+                  ? disabled || stopping
+                  : !canSend || disabled || sending
+              }
+              title={showStop ? '停止当前运行' : '发送消息'}
+              aria-label={showStop ? '停止当前运行' : '发送消息'}
               className={`w-10 h-10 rounded-full flex items-center justify-center transition-all cursor-pointer active:scale-90 ${
-                canSend && !disabled && !sending
-                  ? 'bg-primary text-white hover:bg-primary/90 max-lg:shadow-[0_2px_8px_rgba(249,115,22,0.3)]'
-                  : 'bg-muted text-muted-foreground'
-              }`}
+                showStop && !disabled && !stopping
+                  ? 'bg-foreground text-background hover:bg-foreground/90'
+                  : canSend && !disabled && !sending
+                    ? 'bg-primary text-white hover:bg-primary/90 max-lg:shadow-[0_2px_8px_rgba(249,115,22,0.3)]'
+                    : 'bg-muted text-muted-foreground'
+              } focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2`}
             >
-              {sending ? <Loader2 className="w-4.5 h-4.5 animate-spin" /> : <ArrowUp className="w-4.5 h-4.5" />}
+              {sending || stopping ? (
+                <Loader2 className="w-4.5 h-4.5 animate-spin" />
+              ) : showStop ? (
+                <Square className="w-4 h-4 fill-current" />
+              ) : (
+                <ArrowUp className="w-4.5 h-4.5" />
+              )}
             </button>
           </div>
         </div>

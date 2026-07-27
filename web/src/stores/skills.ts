@@ -1,14 +1,22 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, apiFetch, computeUploadTimeoutMs } from '../api/client';
 
 export interface Skill {
   id: string;
   name: string;
   description: string;
   source: 'user' | 'project' | 'external';
+  sourceKey: string;
+  conflictSources?: Skill['source'][];
+  effectiveSource?: Skill['source'] | null;
+  effective?: boolean;
+  readonly?: boolean;
   enabled: boolean;
   packageName?: string;
   installedAt?: string;
+  installSource?: string;
+  sourceUrl?: string;
+  version?: string;
   userInvocable: boolean;
   allowedTools: string[];
   argumentHint: string | null;
@@ -52,9 +60,16 @@ interface SkillsState {
   toggleSkill: (id: string, enabled: boolean) => Promise<void>;
   deleteSkill: (id: string) => Promise<void>;
   installSkill: (pkg: string) => Promise<void>;
+  importSkillFromGit: (options: {
+    url: string;
+    ref?: string;
+    subdirectory?: string;
+    replace?: boolean;
+  }) => Promise<string[]>;
+  importSkillArchive: (file: File, replace?: boolean) => Promise<string[]>;
   reinstallSkill: (id: string) => Promise<void>;
   deleteAllUserSkills: () => Promise<number>;
-  getSkillDetail: (id: string) => Promise<SkillDetail>;
+  getSkillDetail: (sourceKey: string) => Promise<SkillDetail>;
   searchSkills: (query: string) => Promise<void>;
   fetchSearchDetail: (result: SearchResult) => Promise<void>;
 }
@@ -73,9 +88,20 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
     set({ loading: true });
     try {
       const data = await api.get<{ skills: Skill[] }>('/api/skills');
-      set({ skills: data.skills, loading: false, error: null });
+      set({
+        skills: data.skills.map((skill) => ({
+          ...skill,
+          sourceKey: skill.sourceKey ?? `${skill.source}:${skill.id}`,
+          conflictSources: skill.conflictSources ?? [],
+        })),
+        loading: false,
+        error: null,
+      });
     } catch (err) {
-      set({ loading: false, error: err instanceof Error ? err.message : String(err) });
+      set({
+        loading: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   },
 
@@ -106,7 +132,53 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
       await api.post('/api/skills/install', { package: pkg }, 60_000);
       await get().loadSkills();
     } catch (err: any) {
-      set({ error: err?.message || (err instanceof Error ? err.message : '安装失败，请稍后重试') });
+      set({
+        error:
+          err?.message ||
+          (err instanceof Error ? err.message : '安装失败，请稍后重试'),
+      });
+      throw err;
+    } finally {
+      set({ installing: false });
+    }
+  },
+
+  importSkillFromGit: async (options) => {
+    set({ installing: true, error: null });
+    try {
+      const result = await api.post<{ installed: string[] }>(
+        '/api/skills/import/git',
+        options,
+        60_000,
+      );
+      await get().loadSkills();
+      return result.installed;
+    } catch (err: any) {
+      set({ error: err?.message || 'Git 导入失败' });
+      throw err;
+    } finally {
+      set({ installing: false });
+    }
+  },
+
+  importSkillArchive: async (file, replace = false) => {
+    set({ installing: true, error: null });
+    try {
+      const formData = new FormData();
+      formData.append('archive', file);
+      formData.append('replace', String(replace));
+      const result = await apiFetch<{ installed: string[] }>(
+        '/api/skills/import/archive',
+        {
+          method: 'POST',
+          body: formData,
+          timeoutMs: computeUploadTimeoutMs(file.size),
+        },
+      );
+      await get().loadSkills();
+      return result.installed;
+    } catch (err: any) {
+      set({ error: err?.message || 'ZIP 导入失败' });
       throw err;
     } finally {
       set({ installing: false });
@@ -127,18 +199,30 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
   },
 
   deleteAllUserSkills: async () => {
-    const result = await api.delete<{ deleted: number }>('/api/skills/user-all');
+    const result = await api.delete<{ deleted: number }>(
+      '/api/skills/user-all',
+    );
     await get().loadSkills();
     return result.deleted;
   },
 
-  getSkillDetail: async (id: string) => {
-    const data = await api.get<{ skill: SkillDetail }>(`/api/skills/${id}`);
+  getSkillDetail: async (sourceKey: string) => {
+    const separator = sourceKey.indexOf(':');
+    const source = separator > 0 ? sourceKey.slice(0, separator) : 'user';
+    const id = separator > 0 ? sourceKey.slice(separator + 1) : sourceKey;
+    const data = await api.get<{ skill: SkillDetail }>(
+      `/api/skills/${encodeURIComponent(id)}?source=${encodeURIComponent(source)}`,
+    );
     return data.skill;
   },
 
   searchSkills: async (query: string) => {
-    set({ searching: true, searchResults: [], searchDetails: {}, searchDetailLoading: {} });
+    set({
+      searching: true,
+      searchResults: [],
+      searchDetails: {},
+      searchDetailLoading: {},
+    });
     try {
       const data = await api.get<{ results: SearchResult[] }>(
         `/api/skills/search?q=${encodeURIComponent(query)}`,
@@ -157,11 +241,12 @@ export const useSkillsStore = create<SkillsState>((set, get) => ({
     set({ searchDetailLoading: { ...get().searchDetailLoading, [key]: true } });
     try {
       // Use source/skillId params if available (new API), fallback to url
-      const params = result.source && result.skillId
-        ? `source=${encodeURIComponent(result.source)}&skillId=${encodeURIComponent(result.skillId)}`
-        : result.url
-          ? `url=${encodeURIComponent(result.url)}`
-          : '';
+      const params =
+        result.source && result.skillId
+          ? `source=${encodeURIComponent(result.source)}&skillId=${encodeURIComponent(result.skillId)}`
+          : result.url
+            ? `url=${encodeURIComponent(result.url)}`
+            : '';
 
       if (!params) {
         set({

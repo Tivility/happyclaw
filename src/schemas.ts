@@ -1,19 +1,92 @@
 // Zod schemas and validation types for API requests
 
-import { z } from 'zod';
-import { ALL_PERMISSIONS } from './permissions.js';
-import type { Permission } from './types.js';
-import { MAX_GROUP_NAME_LEN } from './web-context.js';
+import {
+  z,
+} from 'zod';
+import {
+  ALL_PERMISSIONS,
+} from './permissions.js';
+import type {
+  Permission,
+} from './types.js';
+import {
+  MAX_GROUP_NAME_LEN,
+} from './web-context.js';
+
+export const ChannelProviderSchema = z.enum([
+  'feishu',
+  'telegram',
+  'qq',
+  'wechat',
+  'dingtalk',
+  'discord',
+  'whatsapp',
+]);
+
+const ChannelCredentialsSchema = z
+  .record(z.string(), z.string().max(8192))
+  .refine(
+    (value) => Object.keys(value).length <= 16,
+    'Too many credential fields',
+  );
+
+export const ChannelAccountCreateSchema = z.object({
+  provider: ChannelProviderSchema,
+  name: z.string().trim().min(1).max(80),
+  enabled: z.boolean().optional().default(true),
+  is_default: z.boolean().optional().default(false),
+  default_workspace_jid: z
+    .string()
+    .trim()
+    .min(1)
+    .max(512)
+    .nullable()
+    .optional(),
+  credentials: ChannelCredentialsSchema.optional().default({}),
+});
+
+export const ChannelAccountPatchSchema = z.object({
+  name: z.string().trim().min(1).max(80).optional(),
+  enabled: z.boolean().optional(),
+  is_default: z.boolean().optional(),
+  default_workspace_jid: z
+    .string()
+    .trim()
+    .min(1)
+    .max(512)
+    .nullable()
+    .optional(),
+  credentials: ChannelCredentialsSchema.optional(),
+});
+
+/**
+ * A schedule's prompt is replayed on a timer, so it is stored content with no
+ * natural bound.
+ *
+ * Exported because the REST schemas are not the only writers: the MCP/IPC
+ * `schedule_task` and `update_task` handlers call createTask/updateTask
+ * directly. The Agent path is the one this cap exists for, so it must use the
+ * same number rather than leave the hole open.
+ */
+export const MAX_TASK_PROMPT_LENGTH = 16384;
+
+/** Same reasoning as MAX_TASK_PROMPT_LENGTH, for script tasks. */
+export const MAX_TASK_SCRIPT_COMMAND_LENGTH = 4096;
 
 export const TaskPatchSchema = z.object({
   chat_jid: z.string().min(1).optional(),
-  prompt: z.string().optional(),
+  // Same bound as TaskCreateSchema; an update must not be a way around it.
+  prompt: z.string().max(MAX_TASK_PROMPT_LENGTH).optional(),
   schedule_type: z.enum(['cron', 'interval', 'once']).optional(),
   schedule_value: z.string().optional(),
   context_mode: z.enum(['group', 'isolated']).optional(),
   execution_type: z.enum(['agent', 'script']).optional(),
   execution_mode: z.enum(['host', 'container']).optional(),
-  script_command: z.string().max(4096).nullable().optional(),
+  script_command: z
+    .string()
+    .max(MAX_TASK_SCRIPT_COMMAND_LENGTH)
+    .nullable()
+    .optional(),
   status: z.enum(['active', 'paused']).optional(),
   // next_run 必须是可解析的 ISO 日期。schedule_value 在 PATCH 路由里随
   // schedule_type 决定语义（cron/interval/once 各有要求），路由层会单独检查。
@@ -24,7 +97,17 @@ export const TaskPatchSchema = z.object({
     .refine((v) => !isNaN(Date.parse(v)), 'next_run must be ISO 8601')
     .optional(),
   notify_channels: z
-    .array(z.enum(['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord']))
+    .array(
+      z.enum([
+        'feishu',
+        'telegram',
+        'qq',
+        'wechat',
+        'dingtalk',
+        'discord',
+        'whatsapp',
+      ]),
+    )
     .nullable()
     .optional(),
 });
@@ -38,6 +121,7 @@ const CRON_REGEX =
 // `new Date(Date.now() + ms).toISOString()` 会抛 RangeError。1 年内任何场景
 // 都该用 cron 而不是 interval，所以这是合理的硬上限。
 const MAX_INTERVAL_MS = 365 * 24 * 60 * 60 * 1000;
+const MIN_INTERVAL_MS = 60 * 1000;
 
 // JS Date 安全上限（约 8.64e15ms after 1970）。once 任务给 100 年余量足够。
 const MAX_ONCE_TIMESTAMP_MS = 100 * 365 * 24 * 60 * 60 * 1000;
@@ -46,15 +130,26 @@ export const TaskCreateSchema = z
   .object({
     group_folder: z.string().min(1).optional(),
     chat_jid: z.string().min(1).optional(),
-    prompt: z.string().optional().default(''),
+    // See MAX_TASK_PROMPT_LENGTH: the same bound applies on every writer.
+    prompt: z.string().max(MAX_TASK_PROMPT_LENGTH).optional().default(''),
     schedule_type: z.enum(['cron', 'interval', 'once']),
     schedule_value: z.string().min(1),
     context_mode: z.enum(['group', 'isolated']).optional(),
     execution_type: z.enum(['agent', 'script']).optional(),
     execution_mode: z.enum(['host', 'container']).optional(),
-    script_command: z.string().max(4096).optional(),
+    script_command: z.string().max(MAX_TASK_SCRIPT_COMMAND_LENGTH).optional(),
     notify_channels: z
-      .array(z.enum(['feishu', 'telegram', 'qq', 'wechat', 'dingtalk', 'discord']))
+      .array(
+        z.enum([
+          'feishu',
+          'telegram',
+          'qq',
+          'wechat',
+          'dingtalk',
+          'discord',
+          'whatsapp',
+        ]),
+      )
       .nullable()
       .optional(),
   })
@@ -84,11 +179,11 @@ export const TaskCreateSchema = z
       }
     } else if (data.schedule_type === 'interval') {
       const num = Number(data.schedule_value);
-      if (!Number.isFinite(num) || num <= 0) {
+      if (!Number.isFinite(num) || num < MIN_INTERVAL_MS) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           path: ['schedule_value'],
-          message: 'Interval must be a positive number (milliseconds)',
+          message: 'Interval must be at least 60000 milliseconds',
         });
       } else if (num > MAX_INTERVAL_MS) {
         // 防止 `new Date(Date.now() + ms).toISOString()` 抛 RangeError 让请求 500
@@ -140,8 +235,10 @@ const MAX_MESSAGE_CONTENT_LENGTH = 64 * 1024;
 export const MessageCreateSchema = z
   .object({
     chatJid: z.string().min(1).max(512),
+    agentId: z.string().uuid().optional(),
     content: z.string().max(MAX_MESSAGE_CONTENT_LENGTH).optional().default(''),
     attachments: z.array(MessageAttachmentSchema).max(10).optional(),
+    followUpBehavior: z.enum(['queue', 'steer']).optional().default('queue'),
   })
   .superRefine((data, ctx) => {
     const hasContent = data.content.trim().length > 0;
@@ -155,9 +252,18 @@ export const MessageCreateSchema = z
     }
   });
 
+const InteractionModeSchema = z
+  .enum(['assistant', 'proactive', 'persona'])
+  .transform((mode) => (mode === 'persona' ? 'proactive' : mode));
+
 export const GroupCreateSchema = z.object({
   name: z.string().min(1).max(MAX_GROUP_NAME_LEN),
+  agent_profile_id: z
+    .string()
+    .optional()
+    .transform((val) => (val && val.trim() ? val.trim() : undefined)),
   execution_mode: z.enum(['container', 'host']).optional(),
+  interaction_mode: InteractionModeSchema.optional(),
   custom_cwd: z
     .string()
     .optional()
@@ -173,9 +279,162 @@ export const GroupCreateSchema = z.object({
   privacy_mode: z.boolean().optional(),
 });
 
-export const GroupMemberAddSchema = z.object({
-  user_id: z.string().min(1),
+export const GroupAgentProfilePatchSchema = z.object({
+  agent_profile_id: z.string().trim().min(1),
 });
+
+const AgentProfileRuntimePolicyModeSchema = z.enum([
+  'inherit',
+  'custom',
+  'disabled',
+]);
+
+export const AgentProfileRuntimePolicySchema = z
+  .object({
+    context: z
+      .object({
+        source: z.enum(['managed', 'host_claude']).optional(),
+        auto_compact_window: z
+          .number()
+          .int()
+          .refine(
+            (value) => value === 0 || (value >= 100000 && value <= 1000000),
+            'auto_compact_window must be 0 or between 100000 and 1000000',
+          )
+          .optional(),
+        auto_compact_percentage: z
+          .number()
+          .int()
+          .refine(
+            (value) => value === 0 || (value >= 50 && value <= 90),
+            'auto_compact_percentage must be 0 or between 50 and 90',
+          )
+          .optional(),
+      })
+      .optional(),
+    skills: z
+      .object({
+        mode: AgentProfileRuntimePolicyModeSchema.optional(),
+        ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
+        host: z
+          .object({
+            mode: AgentProfileRuntimePolicyModeSchema.optional(),
+            ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
+          })
+          .optional(),
+      })
+      .optional(),
+    mcp: z
+      .object({
+        mode: AgentProfileRuntimePolicyModeSchema.optional(),
+        ids: z.array(z.string().trim().min(1).max(128)).max(100).optional(),
+      })
+      .optional(),
+  })
+  .strict();
+
+const AgentPromptTextSchema = z.string().max(20000);
+const AgentPromptModeSchema = z.enum(['append', 'replace']);
+const AgentPromptSectionsSchema = z.object({
+  identity_prompt: AgentPromptTextSchema,
+  soul_prompt: AgentPromptTextSchema,
+  agents_prompt: AgentPromptTextSchema,
+  tools_prompt: AgentPromptTextSchema,
+});
+
+function validatePromptModeCompatibility(
+  value: {
+    prompt_mode?: 'append' | 'replace';
+    include_claude_preset?: boolean;
+  },
+  ctx: z.RefinementCtx,
+): void {
+  if (
+    value.prompt_mode !== undefined &&
+    value.include_claude_preset !== undefined &&
+    (value.prompt_mode === 'append') !== value.include_claude_preset
+  ) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['include_claude_preset'],
+      message: 'include_claude_preset conflicts with prompt_mode',
+    });
+  }
+}
+
+export const AgentProfileCreateSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80),
+    /** Explicitly disambiguates four-part clients from legacy identity_prompt. */
+    prompt_schema_version: z.literal(2).optional(),
+    identity_prompt: AgentPromptTextSchema.optional(),
+    soul_prompt: AgentPromptTextSchema.optional(),
+    agents_prompt: AgentPromptTextSchema.optional(),
+    tools_prompt: AgentPromptTextSchema.optional(),
+    prompt_mode: AgentPromptModeSchema.optional(),
+    include_claude_preset: z.boolean().optional(),
+    avatar_emoji: z.string().max(8).nullable().optional(),
+    avatar_color: z
+      .string()
+      .regex(/^#[0-9a-fA-F]{6}$/)
+      .nullable()
+      .optional(),
+    runtime_policy: AgentProfileRuntimePolicySchema.optional(),
+  })
+  .superRefine(validatePromptModeCompatibility);
+
+export const AgentProfilePatchSchema = z
+  .object({
+    name: z.string().trim().min(1).max(80).optional(),
+    /** Explicitly disambiguates four-part clients from legacy identity_prompt. */
+    prompt_schema_version: z.literal(2).optional(),
+    identity_prompt: AgentPromptTextSchema.optional(),
+    soul_prompt: AgentPromptTextSchema.optional(),
+    agents_prompt: AgentPromptTextSchema.optional(),
+    tools_prompt: AgentPromptTextSchema.optional(),
+    prompt_mode: AgentPromptModeSchema.optional(),
+    include_claude_preset: z.boolean().optional(),
+    avatar_emoji: z.string().max(8).nullable().optional(),
+    avatar_color: z
+      .string()
+      .regex(/^#[0-9a-fA-F]{6}$/)
+      .nullable()
+      .optional(),
+    runtime_policy: AgentProfileRuntimePolicySchema.optional(),
+  })
+  .superRefine(validatePromptModeCompatibility);
+
+export const AgentProfileGenerateSchema = z.object({
+  description: z.string().trim().min(1).max(4000),
+});
+
+export const AgentProfileRefinePromptSchema = z
+  .object({
+    message: z.string().trim().min(1).max(4000),
+    section: z.enum(['identity', 'soul', 'agents', 'tools']).optional(),
+    current_prompts: AgentPromptSectionsSchema.optional(),
+    /** @deprecated Legacy all-in-one prompt, interpreted as AGENTS. */
+    current_prompt: AgentPromptTextSchema.optional(),
+    history: z
+      .array(
+        z.object({
+          role: z.enum(['user', 'assistant']),
+          content: z.string().trim().min(1).max(4000),
+        }),
+      )
+      .max(12)
+      .optional()
+      .default([]),
+  })
+  .superRefine((value, ctx) => {
+    if (!value.current_prompts && value.current_prompt === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['current_prompts'],
+        message: 'current_prompts or current_prompt is required',
+      });
+    }
+  });
 
 // Schema 层 cap：路由 handler 还有 byteLength 校验作为底线。Schema 层 cap
 // 让 Hono 在 c.req.json() 之后立刻拒绝，攻击者无法用单条巨大 JSON 把内存
@@ -242,6 +501,7 @@ export const GroupPatchSchema = z.object({
     .optional(),
   execution_mode: z.enum(['container', 'host']).optional(),
   privacy_mode: z.literal(true).optional(), // one-way: only accepts true
+  interaction_mode: InteractionModeSchema.optional(),
 });
 
 export const LoginSchema = z.object({
@@ -261,54 +521,86 @@ export const RegistrationConfigSchema = z.object({
   requireInviteCode: z.boolean(),
 });
 
-export const SystemSettingsSchema = z.object({
-  containerTimeout: z.number().int().min(60000).max(86400000).optional(),
-  idleTimeout: z.number().int().min(60000).max(86400000).optional(),
-  containerMaxOutputSize: z
-    .number()
-    .int()
-    .min(1048576)
-    .max(104857600)
-    .optional(),
-  maxConcurrentContainers: z.number().int().min(1).max(100).optional(),
-  maxConcurrentHostProcesses: z.number().int().min(1).max(50).optional(),
-  maxLoginAttempts: z.number().int().min(1).max(100).optional(),
-  loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
-  maxConcurrentScripts: z.number().int().min(1).max(50).optional(),
-  scriptTimeout: z.number().int().min(5000).max(600000).optional(),
-  billingEnabled: z.boolean().optional(),
-  billingMode: z.literal('wallet_first').optional(),
-  billingMinStartBalanceUsd: z.number().min(0).max(1000000).optional(),
-  billingCurrency: z.string().min(1).max(10).optional(),
-  billingCurrencyRate: z.number().min(0.0001).max(1000000).optional(),
-  externalClaudeDir: z.string().max(512).optional(),
-  autoCompactWindow: z
-    .number()
-    .int()
-    .refine(
-      (v) => v === 0 || (v >= 100000 && v <= 1000000),
-      'autoCompactWindow must be 0 (disabled) or between 100000 and 1000000',
-    )
-    .optional(),
-  subagentModel: z.string().min(1).max(64).optional(),
-  disableMemoryLayerForAdminHost: z.boolean().optional(),
-  pluginAutoScan: z.boolean().optional(),
-  taskBackfillGraceMs: z
-    .number()
-    .int()
-    .refine(
-      (v) => v === 0 || (v >= 1000 && v <= 86400000),
-      'taskBackfillGraceMs must be 0 (disabled) or between 1000 (1s) and 86400000 (24h)',
-    )
-    .optional(),
-  autoRemoveDeadImGroup: z.boolean().optional(),
-});
+export const SystemSettingsSchema = z
+  .object({
+    containerTimeout: z.number().int().min(60000).max(86400000).optional(),
+    idleTimeout: z.number().int().min(60000).max(86400000).optional(),
+    containerMaxOutputSize: z
+      .number()
+      .int()
+      .min(1048576)
+      .max(104857600)
+      .optional(),
+    maxConcurrentContainers: z.number().int().min(1).max(100).optional(),
+    // Deprecated compatibility input. Host execution is serialized only by
+    // Session; the route accepts and discards this key for stale clients.
+    maxConcurrentHostProcesses: z.number().int().min(1).max(50).optional(),
+    maxLoginAttempts: z.number().int().min(1).max(100).optional(),
+    loginLockoutMinutes: z.number().int().min(1).max(1440).optional(),
+    maxConcurrentScripts: z.number().int().min(1).max(50).optional(),
+    scriptTimeout: z.number().int().min(5000).max(600000).optional(),
+    taskBackfillGraceMs: z
+      .number()
+      .int()
+      .refine(
+        (v) => v === 0 || (v >= 1000 && v <= 86400000),
+        'taskBackfillGraceMs must be 0 (disabled) or between 1000 (1s) and 86400000 (24h)',
+      )
+      .optional(),
+    maxRepliesPerTurn: z.number().int().min(0).max(500).optional(),
+    maxTasksPerUser: z.number().int().min(0).max(10000).optional(),
+    fallbackModel: z.string().max(64).optional(),
+  })
+  .strict();
+
+export const HostIntegrationSettingsSchema = z
+  .object({
+    externalClaudeDir: z.string().max(512).optional(),
+    pluginAutoScan: z.boolean().optional(),
+    mainAgentContextSource: z.enum(['managed', 'host_claude']).optional(),
+    mainAgentAutoCompactWindow: z
+      .number()
+      .int()
+      .refine(
+        (value) => value === 0 || (value >= 100000 && value <= 1000000),
+        'mainAgentAutoCompactWindow must be 0 or between 100000 and 1000000',
+      )
+      .optional(),
+    mainAgentAutoCompactPercentage: z
+      .number()
+      .int()
+      .refine(
+        (value) => value === 0 || (value >= 50 && value <= 90),
+        'mainAgentAutoCompactPercentage must be 0 or between 50 and 90',
+      )
+      .optional(),
+  })
+  .strict();
+
+export const BillingSettingsSchema = z
+  .object({
+    enabled: z.boolean().optional(),
+    minStartBalanceUsd: z.number().min(0).max(1000000).optional(),
+    currency: z.string().trim().min(1).max(10).optional(),
+    currencyRate: z.number().min(0.0001).max(1000000).optional(),
+  })
+  .strict();
 
 export const AppearanceConfigSchema = z.object({
-  appName: z.string().max(32).optional(),
-  aiName: z.string().min(1).max(32),
-  aiAvatarEmoji: z.string().min(1).max(8),
-  aiAvatarColor: z.string().regex(/^#[0-9a-fA-F]{6}$/),
+  appName: z.string().min(1).max(32).optional(),
+  // Compatibility field names; these now describe the global main Agent.
+  aiName: z.string().min(1).max(32).optional(),
+  aiAvatarEmoji: z.string().min(1).max(8).optional(),
+  aiAvatarColor: z
+    .string()
+    .regex(/^#[0-9a-fA-F]{6}$/)
+    .optional(),
+  aiAvatarUrl: z
+    .string()
+    .regex(/^\/api\/auth\/avatars\/[a-zA-Z0-9._-]+$/)
+    .nullable()
+    .optional(),
+  aiAvatarMode: z.enum(['brand', 'emoji']).optional(),
 });
 
 export const ChangePasswordSchema = z.object({
@@ -459,6 +751,16 @@ export const FeishuConfigSchema = z
         message:
           'appId must be in Feishu/Lark official format (cli_ prefix + lowercase alphanumeric)',
       })
+      .refine(
+        (v) => {
+          const trimmed = v.trim();
+          return trimmed === '' || FEISHU_APP_ID_REGEX.test(trimmed);
+        },
+        {
+          message:
+            'appId must be in Feishu/Lark official format (cli_ prefix + lowercase alphanumeric)',
+        },
+      )
       .optional(),
     appSecret: z.string().max(2000).optional(),
     clearAppSecret: z.boolean().optional(),
@@ -652,11 +954,7 @@ export const RedeemCodeSchema = z.object({
 });
 
 // Memory types
-export type MemoryType =
-  | 'global'
-  | 'session'
-  | 'date'
-  | 'conversation';
+export type MemoryType = 'global' | 'session' | 'date' | 'conversation';
 
 export interface MemorySource {
   path: string;
@@ -703,6 +1001,22 @@ export const BugReportSubmitSchema = z.object({
 
 // ─── 统一供应商 (V4) ────────────────────────────────────────
 
+const ProviderBaseUrlSchema = z
+  .string()
+  .max(2000)
+  .refine(
+    (value) => {
+      if (!value.trim()) return true;
+      try {
+        const parsed = new URL(value.trim());
+        return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+      } catch {
+        return false;
+      }
+    },
+    { message: 'Base URL must be an HTTP(S) URL' },
+  );
+
 export const UnifiedProviderCreateSchema = z
   .object({
     name: z.string().min(1).max(64),
@@ -720,7 +1034,7 @@ export const UnifiedProviderCreateSchema = z
         'grok_oauth',
       ])
       .optional(),
-    anthropicBaseUrl: z.string().max(2000).optional(),
+    anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
     anthropicAuthToken: z.string().max(2000).optional(),
     anthropicModel: z.string().max(128).optional(),
     anthropicApiKey: z.string().max(2000).optional(),
@@ -750,7 +1064,7 @@ export const UnifiedProviderCreateSchema = z
 export const UnifiedProviderPatchSchema = z
   .object({
     name: z.string().min(1).max(64).optional(),
-    anthropicBaseUrl: z.string().max(2000).optional(),
+    anthropicBaseUrl: ProviderBaseUrlSchema.optional(),
     anthropicModel: z.string().max(128).optional(),
     customEnv: z.record(z.string().max(256), z.string().max(4096)).optional(),
     weight: z.number().int().min(1).max(100).optional(),
@@ -856,7 +1170,13 @@ export const DiscordConfigSchema = z
 
 export const WhatsAppConfigSchema = z
   .object({
-    accountId: z.string().max(64).optional(),
+    accountId: z
+      .union([
+        z.string().regex(/^[A-Za-z0-9_-]{1,64}$/),
+        // Historical clients may submit an empty value to mean "default".
+        z.literal(''),
+      ])
+      .optional(),
     phoneNumber: z.string().max(32).optional(),
     enabled: z.boolean().optional(),
     // `paired` 由 Baileys 登录回调（saveUserWhatsAppConfig 内部）写入，

@@ -19,7 +19,11 @@ export function shorten(input: string, maxLen = 180): string {
 export function redactSensitive(input: unknown, depth = 0): unknown {
   if (depth > 3) return '[truncated]';
   if (input == null) return input;
-  if (typeof input === 'string' || typeof input === 'number' || typeof input === 'boolean') {
+  if (
+    typeof input === 'string' ||
+    typeof input === 'number' ||
+    typeof input === 'boolean'
+  ) {
     return input;
   }
   if (Array.isArray(input)) {
@@ -29,7 +33,9 @@ export function redactSensitive(input: unknown, depth = 0): unknown {
     const obj = input as Record<string, unknown>;
     const out: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(obj)) {
-      if (/(token|password|secret|api[_-]?key|authorization|cookie)/iu.test(k)) {
+      if (
+        /(token|password|secret|api[_-]?key|authorization|cookie)/iu.test(k)
+      ) {
         out[k] = '[REDACTED]';
       } else {
         out[k] = redactSensitive(v, depth + 1);
@@ -66,8 +72,10 @@ export function redactInlineSecrets(value: string): string {
       // to cover postgres / mongodb / redis / mysql / ftp / ssh / git etc.
       // The DSN form `<scheme>://user:pass@host/...` is universal; restrict
       // the scheme to a reasonable identifier shape to avoid colon-rich text.
-      .replace(/(\b[a-z][a-z0-9+.\-]{1,15}:\/\/[^\s\/:@]+:)[^\s@\/?#]+(@)/gi,
-        '$1[REDACTED]$2')
+      .replace(
+        /(\b[a-z][a-z0-9+.\-]{1,15}:\/\/[^\s\/:@]+:)[^\s@\/?#]+(@)/gi,
+        '$1[REDACTED]$2',
+      )
       // key=value / key:value with explicit secret-shaped key. Anchor 不再
       // 用 lazy `[A-Za-z0-9_]*?` 兜底（O(n^2) ReDoS 源头），改成显式枚举
       // 常见前缀 + 限定长度。截止字符增加 ; , 拦多 cookie 行。
@@ -108,7 +116,10 @@ export function redactInlineSecrets(value: string): string {
         '[REDACTED JWT]',
       )
       // private key / pem 头标识，整段一路擦到 END 标记
-      .replace(/-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g, '[REDACTED PRIVATE KEY]')
+      .replace(
+        /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
+        '[REDACTED PRIVATE KEY]',
+      )
   );
 }
 
@@ -125,7 +136,15 @@ export function summarizeToolInput(input: unknown): string | undefined {
 
   if (typeof input === 'object') {
     const obj = input as Record<string, unknown>;
-    const keyCandidates = ['command', 'query', 'path', 'pattern', 'prompt', 'url', 'name'];
+    const keyCandidates = [
+      'command',
+      'query',
+      'path',
+      'pattern',
+      'prompt',
+      'url',
+      'name',
+    ];
     for (const key of keyCandidates) {
       const value = obj[key];
       if (typeof value === 'string' && value.trim()) {
@@ -153,7 +172,10 @@ export function summarizeToolInput(input: unknown): string | undefined {
  * and clamp the length so the trace stays readable without dumping a 10K-line
  * bash output into the card. Returns undefined for empty / non-textual results.
  */
-export function summarizeToolResult(content: unknown, maxLen = 400): string | undefined {
+export function summarizeToolResult(
+  content: unknown,
+  maxLen = 400,
+): string | undefined {
   let text: string | undefined;
   if (typeof content === 'string') {
     text = content;
@@ -180,7 +202,10 @@ export function summarizeToolResult(content: unknown, maxLen = 400): string | un
  * Extract a skill name from Skill tool input.
  * Tries skillName, skill, name, command fields, then regex-matches leading slashes.
  */
-export function extractSkillName(toolName: unknown, input: unknown): string | undefined {
+export function extractSkillName(
+  toolName: unknown,
+  input: unknown,
+): string | undefined {
   if (toolName !== 'Skill') return undefined;
   if (!input || typeof input !== 'object') return undefined;
   const obj = input as Record<string, unknown>;
@@ -214,6 +239,136 @@ export function sanitizeFilename(summary: string): string {
 export function generateFallbackName(): string {
   const time = new Date();
   return `conversation-${time.getHours().toString().padStart(2, '0')}${time.getMinutes().toString().padStart(2, '0')}`;
+}
+
+/**
+ * 判定一个 subtype=success 的 SDK result 是否为「上游断流截断」的合成结果。
+ *
+ * 指纹来源（实测事故）：第三方网关在长文本生成中途断流时，SDK 收不到终结帧
+ * （message_delta/message_stop + usage），只能把已缓冲的 partial 文本按
+ * subtype=success 收口，此时 result.usage 的 input/output tokens 均为 0——
+ * 而健康 turn 的 result.usage 恒为正（query 级累计值，且真实 turn 必产生
+ * output tokens）。正文非空 + usage 双零 = 截断合成结果的确定性指纹。
+ *
+ * 保守起见 usage 缺失不判定为截断（避免误伤未知的 SDK 变体）；误报的代价是
+ * 多发一次"请继续"的续写 turn（有次数上限），漏报的代价是半截回复被当成
+ * 完整回复交付。
+ */
+export function isSuspectTruncatedStreamResult(
+  usage: { input_tokens?: number; output_tokens?: number } | null | undefined,
+  resultTextLength: number,
+): boolean {
+  if (resultTextLength <= 0) return false;
+  if (!usage) return false;
+  return (usage.input_tokens ?? 0) === 0 && (usage.output_tokens ?? 0) === 0;
+}
+
+const STALE_BACKGROUND_WAIT_PATTERNS = [
+  /等待其余\s*\d+\s*个\s*(?:Agent|agent|任务|后台任务)/u,
+  /\d+\s*\/\s*\d+\s*完成[\s\S]{0,80}等待/u,
+  /后台\s*(?:Agent|agent|任务)[\s\S]{0,80}(?:完成后|结束后)[\s\S]{0,80}(?:继续汇总|自动唤醒|继续)/u,
+  /(?:任务|Agent|agent)[\s\S]{0,80}(?:运行中|还在跑|尚未完成)[\s\S]{0,80}(?:继续汇总|等待)/u,
+  /(?:I'll|I will)\s+wait\s+for\s+the\s+(?:other|remaining)\s+\d+\s+(?:agents|tasks)/iu,
+  /(?:waiting|wait)\s+for\s+(?:the\s+)?(?:other|remaining)\s+\d+\s+(?:agents|tasks)/iu,
+];
+
+/**
+ * Background task completion can race with model text generation. The SDK may
+ * deliver all task notifications, but the model can still finish with a stale
+ * progress update ("1/6 done, waiting for the rest"). Only use this predicate
+ * after this query has already emitted a result with pending background tasks.
+ */
+export function isStaleBackgroundWaitReply(
+  text: string | null | undefined,
+): boolean {
+  const trimmed = text?.trim();
+  if (!trimmed) return false;
+  return STALE_BACKGROUND_WAIT_PATTERNS.some((pattern) =>
+    pattern.test(trimmed),
+  );
+}
+
+export function shouldForceBackgroundTaskSummary(params: {
+  emitOutput: boolean;
+  sawPendingBackgroundTasks: boolean;
+  pendingBgTasks: number;
+  finalText: string | null | undefined;
+  attempts: number;
+  maxAttempts: number;
+}): boolean {
+  if (!params.emitOutput) return false;
+  if (!params.sawPendingBackgroundTasks) return false;
+  if (params.pendingBgTasks !== 0) return false;
+  if (params.attempts >= params.maxAttempts) return false;
+  return isStaleBackgroundWaitReply(params.finalText);
+}
+
+export function buildBackgroundTaskSummaryPrompt(): string {
+  return [
+    '<system-reminder>',
+    'All background Task agents for the previous user request have now completed.',
+    'Your previous draft still said you were waiting for remaining agents, so it was stale.',
+    'Do not send another progress update. Use the task-notification results already present in this conversation and produce the final user-facing synthesis now.',
+    'If you wrote scratch files for any cluster, read them only if needed. Otherwise summarize directly from the completed task notifications.',
+    '</system-reminder>',
+  ].join('\n');
+}
+
+/** AssistantTextTracker 处理的 content block 最小形状（SDK assistant 消息的 content 数组元素）。 */
+export interface AssistantContentBlock {
+  type: string;
+  text?: string;
+}
+
+/**
+ * Turn 内 assistant 文本按 AssistantMessage 边界分类。
+ *
+ * 只要一整条 top-level AssistantMessage 含 tool_use，该消息里的所有 text
+ * 都是过程旁白——无论 block 顺序是 [text, tool_use]、[tool_use, text]，
+ * 或 text/tool 交错。只有整条消息完全不含 top-level tool_use 时，它的完整
+ * text 才能成为 SDK Result 缺失时的候选答案。
+ */
+export class AssistantTextTracker {
+  private answerCandidate = '';
+
+  /**
+   * 原子处理一整条 top-level AssistantMessage 的 content blocks。
+   * 返回该消息是否含文本（调用方据此更新 canonical uuid）。
+   */
+  addContentBlocks(blocks: AssistantContentBlock[]): boolean {
+    let messageText = '';
+    let hasTopLevelTool = false;
+    for (const block of blocks) {
+      if (
+        block.type === 'text' &&
+        typeof block.text === 'string' &&
+        block.text
+      ) {
+        messageText += block.text;
+      } else if (block.type === 'tool_use') {
+        hasTopLevelTool = true;
+      }
+    }
+    if (!hasTopLevelTool && messageText.trim()) {
+      this.answerCandidate = messageText;
+    }
+    return messageText.length > 0;
+  }
+
+  /**
+   * 非空 SDK Result 是唯一权威。只有 SDK Result 缺失时，才回退到最近一条
+   * 完全不含 top-level tool_use 的 AssistantMessage；过程旁白绝不兜底成
+   * 最终答复。
+   */
+  pickFinalText(sdkResult: string | null | undefined): string | null {
+    if (sdkResult && sdkResult.trim()) return sdkResult;
+    return this.answerCandidate.trim() ? this.answerCandidate : null;
+  }
+
+  /** mid-query follow-up 产生第二条 result 时与 turnId 一起重置。 */
+  reset(): void {
+    this.answerCandidate = '';
+  }
 }
 
 /**

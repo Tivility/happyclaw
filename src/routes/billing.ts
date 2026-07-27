@@ -54,14 +54,82 @@ import {
   BatchAssignPlanSchema,
   RedeemCodeCreateSchema,
   RedeemCodeSchema,
+  BillingSettingsSchema,
 } from '../schemas.js';
-import { getSystemSettings } from '../runtime-config.js';
+import { getSystemSettings, saveSystemSettings } from '../runtime-config.js';
 import type { Variables } from '../web-context.js';
 import type { AuthUser, BillingPlan, RedeemCode } from '../types.js';
 import { escapeCsvField } from '../utils.js';
 
 const billingRoutes = new Hono<{ Variables: Variables }>();
 const billingManageMiddleware = requirePermission('manage_billing');
+
+function toBillingConfig(settings: ReturnType<typeof getSystemSettings>) {
+  return {
+    enabled: settings.billingEnabled,
+    minStartBalanceUsd: settings.billingMinStartBalanceUsd,
+    currency: settings.billingCurrency,
+    currencyRate: settings.billingCurrencyRate,
+  };
+}
+
+// Billing configuration is intentionally separate from general system config:
+// manage_system_config must not grant billing control.
+billingRoutes.get(
+  '/admin/config',
+  authMiddleware,
+  billingManageMiddleware,
+  (c) => c.json(toBillingConfig(getSystemSettings())),
+);
+
+billingRoutes.put(
+  '/admin/config',
+  authMiddleware,
+  billingManageMiddleware,
+  async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    const validation = BillingSettingsSchema.safeParse(body);
+    if (!validation.success) {
+      return c.json(
+        { error: 'Invalid request body', details: validation.error.format() },
+        400,
+      );
+    }
+    const before = toBillingConfig(getSystemSettings());
+    const saved = saveSystemSettings({
+      ...(validation.data.enabled === undefined
+        ? {}
+        : { billingEnabled: validation.data.enabled }),
+      ...(validation.data.minStartBalanceUsd === undefined
+        ? {}
+        : { billingMinStartBalanceUsd: validation.data.minStartBalanceUsd }),
+      ...(validation.data.currency === undefined
+        ? {}
+        : { billingCurrency: validation.data.currency }),
+      ...(validation.data.currencyRate === undefined
+        ? {}
+        : { billingCurrencyRate: validation.data.currencyRate }),
+    });
+    invalidateAllBillingCaches();
+    const response = toBillingConfig(saved);
+    const changedFields = Object.keys(validation.data)
+      .filter(
+        (key) =>
+          !Object.is(
+            before[key as keyof typeof before],
+            response[key as keyof typeof response],
+          ),
+      )
+      .sort();
+    if (changedFields.length > 0) {
+      const actor = c.get('user') as AuthUser;
+      logBillingAudit('billing_settings_updated', actor.id, actor.id, {
+        changed_fields: changedFields,
+      });
+    }
+    return c.json(response);
+  },
+);
 
 /**
  * Parse a pagination/range query param into a clamped integer. Non-numeric
@@ -135,7 +203,12 @@ billingRoutes.get('/my/usage', authMiddleware, async (c) => {
 billingRoutes.get('/my/transactions', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   const limit = parseClampedInt(c.req.query('limit'), 50, 1, 100);
-  const offset = parseClampedInt(c.req.query('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
+  const offset = parseClampedInt(
+    c.req.query('offset'),
+    0,
+    0,
+    Number.MAX_SAFE_INTEGER,
+  );
   const result = getBalanceTransactions(user.id, limit, offset);
   return c.json(result);
 });
@@ -382,7 +455,8 @@ billingRoutes.get(
       // Plan info
       plan_id: plan?.id ?? null,
       plan_name: plan?.name ?? null,
-      subscription_status: realSubscription?.status ?? (isFallback ? 'default' : null),
+      subscription_status:
+        realSubscription?.status ?? (isFallback ? 'default' : null),
       is_fallback: isFallback,
       has_real_subscription: !!realSubscription,
       access_allowed: access.allowed,
@@ -410,7 +484,12 @@ billingRoutes.get(
   async (c) => {
     const userId = c.req.param('id');
     const limit = parseClampedInt(c.req.query('limit'), 20, 1, 100);
-    const offset = parseClampedInt(c.req.query('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
+    const offset = parseClampedInt(
+      c.req.query('offset'),
+      0,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
     const result = getBalanceTransactions(userId, limit, offset);
     return c.json(result);
   },
@@ -476,8 +555,7 @@ billingRoutes.post(
       );
       return c.json(tx);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : '调整余额失败';
+      const message = err instanceof Error ? err.message : '调整余额失败';
       return c.json({ error: message }, 400);
     }
   },
@@ -574,10 +652,20 @@ billingRoutes.get(
   billingManageMiddleware,
   async (c) => {
     const limit = parseClampedInt(c.req.query('limit'), 50, 1, 200);
-    const offset = parseClampedInt(c.req.query('offset'), 0, 0, Number.MAX_SAFE_INTEGER);
+    const offset = parseClampedInt(
+      c.req.query('offset'),
+      0,
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
     const userId = c.req.query('user_id');
     const eventType = c.req.query('event_type');
-    const result = getBillingAuditLog(limit, offset, userId || undefined, eventType || undefined);
+    const result = getBillingAuditLog(
+      limit,
+      offset,
+      userId || undefined,
+      eventType || undefined,
+    );
     return c.json(result);
   },
 );
@@ -672,7 +760,8 @@ billingRoutes.get(
   billingManageMiddleware,
   async (c) => {
     const codes = getAllRedeemCodes();
-    const header = 'code,type,value_usd,plan_id,duration_days,max_uses,used_count,expires_at,notes,batch_id,created_at\n';
+    const header =
+      'code,type,value_usd,plan_id,duration_days,max_uses,used_count,expires_at,notes,batch_id,created_at\n';
     const rows = codes.map((rc) =>
       [
         escapeCsvField(rc.code),

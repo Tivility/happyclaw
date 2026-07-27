@@ -17,16 +17,19 @@ interface UsePairedChatsOptions {
 export function usePairedChats({ endpoint }: UsePairedChatsOptions) {
   const [chats, setChats] = useState<PairedChat[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [removingJid, setRemovingJid] = useState<string | null>(null);
   const [renamingJid, setRenamingJid] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const data = await api.get<{ chats: PairedChat[] }>(endpoint);
       setChats(data.chats);
-    } catch {
+    } catch (err) {
       setChats([]);
+      setError(getErrorMessage(err, '加载已配对聊天失败'));
     } finally {
       setLoading(false);
     }
@@ -35,12 +38,14 @@ export function usePairedChats({ endpoint }: UsePairedChatsOptions) {
   const remove = useCallback(
     async (jid: string) => {
       setRemovingJid(jid);
+      setError(null);
       try {
         await api.delete(`${endpoint}/${encodeURIComponent(jid)}`);
         setChats((prev) => prev.filter((c) => c.jid !== jid));
-        toast.success('已移除配对聊天');
+        toast.success('已删除接入记录与本地历史');
       } catch (err) {
-        toast.error(getErrorMessage(err, '移除配对聊天失败'));
+        setError(getErrorMessage(err, '解除配对失败'));
+        toast.error(getErrorMessage(err, '删除接入记录失败'));
       } finally {
         setRemovingJid(null);
       }
@@ -66,5 +71,14 @@ export function usePairedChats({ endpoint }: UsePairedChatsOptions) {
     [endpoint],
   );
 
-  return { chats, loading, removingJid, renamingJid, load, remove, rename };
+  return {
+    chats,
+    loading,
+    error,
+    removingJid,
+    renamingJid,
+    load,
+    remove,
+    rename,
+  };
 }

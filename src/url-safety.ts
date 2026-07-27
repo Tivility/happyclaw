@@ -4,6 +4,7 @@
 // 或 cloud-metadata 的场景下复用，避免每个调用点各自实现一份正则。
 
 import net from 'net';
+import { lookup } from 'node:dns/promises';
 
 function isPrivateIPv4(ip: string): boolean {
   const parts = ip.split('.').map(Number);
@@ -42,7 +43,8 @@ export function isPrivateHostname(hostname: string): boolean {
     // fc00::/7 (unique local) 整段 + fe80::/10 (link-local)。fc00 / fd00 都算
     // ULA。fe80::/10 的 high 10 bits = 1111111010，所以第二字节范围 0x80-0xbf —
     // 即第二个 hex 字符是 8/9/a/b。原实现 startsWith('fe80') 漏了 fe81…febf。
-    if (/^fc[0-9a-f]{2}:/.test(lower) || /^fd[0-9a-f]{2}:/.test(lower)) return true;
+    if (/^fc[0-9a-f]{2}:/.test(lower) || /^fd[0-9a-f]{2}:/.test(lower))
+      return true;
     if (/^fe[89ab][0-9a-f]:/.test(lower)) return true;
     // ::ffff:127.0.0.1 (dotted form) — 直接复用 IPv4 判定
     if (lower.startsWith('::ffff:') && lower.includes('.')) {
@@ -119,4 +121,53 @@ export function validateSafeHttpsUrl(
     return `Hostname not allowed (private/link-local): ${parsed.hostname}`;
   }
   return null;
+}
+
+/**
+ * DNS 解析校验：拒绝那些字面量看起来是公网域名、但实际解析到内网/link-local
+ * 地址的 hostname（DNS rebinding，例如攻击者控制的域名 A 记录指向云
+ * metadata 169.254.169.254）。isPrivateHostname() 只能拦截字面量 IP/
+ * localhost，必须真正做一次 DNS lookup 并校验解析出的每一个地址。
+ *
+ * 调用方应在此之前先用 validateSafeHttpsUrl()/isPrivateHostname() 做字面量
+ * 校验（更快、且能在拼写内网字面 IP 时直接拒绝，不依赖网络）。
+ *
+ * 抛出 Error（而非返回 reason 字符串）：解析失败和解析出内网地址都需要中止
+ * 调用方后续的网络请求，用异常更不容易被漏判。
+ */
+export async function assertResolvesToPublicAddress(
+  hostname: string,
+  label = 'Hostname',
+): Promise<void> {
+  await resolvePublicAddresses(hostname, label);
+}
+
+export interface ResolvedPublicAddress {
+  address: string;
+  family: 4 | 6;
+}
+
+/** Resolve and validate every address, returning the exact IPs that a caller
+ * can connect to without performing a second DNS lookup. This is the
+ * connection-time primitive needed to close DNS-rebinding TOCTOU windows. */
+export async function resolvePublicAddresses(
+  hostname: string,
+  label = 'Hostname',
+): Promise<ResolvedPublicAddress[]> {
+  let addresses: ResolvedPublicAddress[];
+  try {
+    addresses = (await lookup(hostname, { all: true })).map((entry) => ({
+      address: entry.address,
+      family: entry.family === 6 ? 6 : 4,
+    }));
+  } catch {
+    throw new Error(`${label} could not be resolved`);
+  }
+  if (
+    addresses.length === 0 ||
+    addresses.some(({ address }) => isPrivateHostname(address))
+  ) {
+    throw new Error(`${label} resolves to a private or link-local address`);
+  }
+  return addresses;
 }
