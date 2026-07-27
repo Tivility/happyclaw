@@ -11227,8 +11227,17 @@ function channelMountFromRegisteredGroup(
     };
   }
 
-  if (group.target_main_jid) {
-    const workspaceJid = resolveWorkspaceJidForMount(group.target_main_jid);
+  // 兜底：两个绑定字段都空的历史群。它们是按 `folder` 直接路由的旧模型产物
+  // （binding_mode='single_context'），没有 target_agent_id / target_main_jid。
+  // 不补这条，v49 的 channel_mounts 回填会整个跳过它们，而新的路由解析要求
+  // 显式绑定 —— 结果这些会话在升级后**完全收不到消息**，报
+  // ChannelRouteRejectedError，且没有任何 ERROR 日志指向根因。
+  // 实际影响过 6 个真实会话（飞书主群 / QQ 私聊 / 三个微信）。
+  const effectiveTargetMainJid =
+    group.target_main_jid || (group.folder ? `web:${group.folder}` : null);
+
+  if (effectiveTargetMainJid) {
+    const workspaceJid = resolveWorkspaceJidForMount(effectiveTargetMainJid);
     if (!workspaceJid) return null;
     return {
       channel_jid: channelJid,
