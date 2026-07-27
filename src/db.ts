@@ -1776,6 +1776,20 @@ export function initDatabase(): void {
   ensureColumn('usage_records', 'cost_status', 'TEXT');
   ensureColumn('usage_records', 'cost_source', 'TEXT');
   ensureColumn('usage_records', 'usage_metadata_json', 'TEXT');
+  // 这三列只在 usage_records 的 CREATE TABLE 里声明过，**没有**对应的
+  // ensureColumn —— 新装的库有，v45 之前建的存量库没有。后果有两处：
+  //   1. v51 的回填 UPDATE 直接引用 provider_estimated_cost_usd，
+  //      存量库升级时抛 "no such column"，initDatabase 崩，服务起不来。
+  //   2. insertUsageRecord 的 INSERT 也写这三列，即使跳过迁移也会在
+  //      第一条 Agent 回复落用量时挂掉。
+  // 默认值与 CREATE TABLE 保持一致（cost 两列 0、event_id 可空）。
+  ensureColumn(
+    'usage_records',
+    'provider_estimated_cost_usd',
+    'REAL NOT NULL DEFAULT 0',
+  );
+  ensureColumn('usage_records', 'billed_cost_usd', 'REAL NOT NULL DEFAULT 0');
+  ensureColumn('usage_records', 'event_id', 'TEXT');
   ensureColumn('conversation_runtime_sessions', 'based_on_message_id', 'TEXT');
   ensureColumn(
     'conversation_runtime_sessions',
@@ -4356,58 +4370,20 @@ export function insertUsageRecord(record: {
   costSource?: 'runtime' | 'pricing_table' | 'zero_fallback' | 'legacy' | null;
   usageMetadataJson?: string | null;
 }): void {
-  const id = crypto.randomUUID();
-  const now = new Date().toISOString();
-  const localDate = toLocalDateString();
-
-  db.transaction(() => {
-    stmts().insertUsageInsert.run(
-      id,
-      // upstream v51 起 usage_records 加了 event_id / reasoning / 成本三分列 /
-      // usage_date。这条旧写入路径（insertUsageRecord）当年按 26 列写，必须补齐
-      // 到 31 列，否则实参会整体错位（token 数落进成本列）。
-      null, // event_id：旧路径不产生批次事件
-      record.userId,
-      record.groupFolder,
-      record.agentId ?? null,
-      record.messageId ?? null,
-      record.model,
-      record.inputTokens,
-      record.outputTokens,
-      record.cacheReadInputTokens,
-      record.cacheCreationInputTokens,
-      record.reasoningTokens ?? 0,
-      record.costUSD,
-      record.costUSD, // provider_estimated_cost_usd：旧路径无分列，同 cost_usd
-      record.costUSD, // billed_cost_usd：同上
-      record.durationMs ?? 0,
-      record.numTurns ?? 0,
-      record.source ?? 'agent',
-      localDate,
-      now,
-      record.runtime ?? null,
-      record.providerFamily ?? null,
-      record.providerPoolId ?? null,
-      record.providerId ?? null,
-      record.authProfileGeneration ?? null,
-      record.selectedModel ?? null,
-      record.resolvedModel ?? null,
-      record.billingScope ?? null,
-      record.costStatus ?? (record.costUSD > 0 ? 'exact' : null),
-      record.costSource ?? null,
-      record.usageMetadataJson ?? null,
-    );
-    stmts().insertUsageUpsert.run(
-      record.userId,
-      record.model,
-      localDate,
-      record.inputTokens,
-      record.outputTokens,
-      record.cacheReadInputTokens,
-      record.cacheCreationInputTokens,
-      record.costUSD,
-    );
-  })();
+  // 单一写入路径（合并修正）。
+  //
+  // upstream 把 insertUsageRecord 整个改成只转发给 recordUsageEventBatch —— 由
+  // 后者统一写 usage_events + usage_records + usage_daily_summary。本地旧实现是
+  // 自己直接 INSERT 这三张表。阶段 2 解冲突时两边都留下了，结果同一笔用量被写
+  // 两遍：usage_records 多出一行、usage_daily_summary 的 token 与成本翻倍，
+  // 前端用量页和日汇总全部显示双倍。
+  //
+  // 只保留转发。本地的归因列（决策 11：runtime / provider_* / cost_status 等）
+  // 通过 UsageEventRecordInput 一并传下去 —— 那些字段是阶段 2 给
+  // recordUsageEventBatch 补的，不需要再走独立 INSERT。
+  //
+  // trackBillingUsage:false 沿用 upstream —— 这条旧路径不进计费聚合，
+  // 计费由 billing.ts 的独立入口负责。
   recordUsageEventBatch({
     eventId: crypto.randomUUID(),
     userId: record.userId,
@@ -4436,6 +4412,17 @@ export function insertUsageRecord(record: {
         billedCostUSD: 0,
       },
     ],
+    runtime: record.runtime ?? null,
+    providerFamily: record.providerFamily ?? null,
+    providerPoolId: record.providerPoolId ?? null,
+    providerId: record.providerId ?? null,
+    authProfileGeneration: record.authProfileGeneration ?? null,
+    selectedModel: record.selectedModel ?? null,
+    resolvedModel: record.resolvedModel ?? null,
+    billingScope: record.billingScope ?? null,
+    costStatus: record.costStatus ?? (record.costUSD > 0 ? 'exact' : null),
+    costSource: record.costSource ?? null,
+    usageMetadataJson: record.usageMetadataJson ?? null,
     trackBillingUsage: false,
   });
 }
