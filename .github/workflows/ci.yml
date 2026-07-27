@@ -21,16 +21,21 @@ jobs:
         with:
           node-version: 22.22.3
           cache: npm
+          # agent-runner 刻意不保留 lock file（见 §10 的「始终最新」契约与
+          # tests/reproducible-build-contract.test.ts）—— 列在这里会让缓存
+          # key 计算找不到文件。只缓存有 lock 的两个项目。
           cache-dependency-path: |
             package-lock.json
             web/package-lock.json
-            container/agent-runner/package-lock.json
 
       - name: Install dependencies
         run: |
           npm ci
           npm --prefix web ci
-          npm --prefix container/agent-runner ci
+          # agent-runner 必须走 install 而不是 ci：它没有 lock file，
+          # @anthropic-ai/claude-agent-sdk 钉在 "*" 上以便每次装到最新。
+          # `npm ci` 在无 lock 的项目里直接报错，CI 会全红。
+          npm --prefix container/agent-runner install --no-package-lock
 
       - name: Check changed-file formatting
         run: npm run format:check

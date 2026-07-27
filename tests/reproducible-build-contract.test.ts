@@ -19,7 +19,7 @@ const streamEventFiles = [
 ];
 
 describe('reproducible build contract', () => {
-  test('all npm projects commit lockfiles and install them with npm ci', () => {
+  test('lockfile projects use npm ci; agent-runner stays on always-latest install', () => {
     const gitignore = read('.gitignore');
     for (const lockfile of lockfiles) {
       expect(fs.existsSync(path.join(root, lockfile))).toBe(true);
@@ -43,14 +43,27 @@ describe('reproducible build contract', () => {
       .split(/\n(?=\S)/)
       .find((target) => target.startsWith('install:'));
     expect(installTarget).toContain('$(PKG) ci');
-    expect(installTarget).toContain('container/agent-runner && $(PKG) ci');
     expect(installTarget).toContain('web && $(PKG) ci');
-    expect(installTarget).not.toMatch(/\$\(PKG\) install(?:\s|$)/);
+    // agent-runner 是「始终最新」的例外：它没有 lock file，`npm ci` 会直接报
+    // EUSAGE（全新克隆装不上）。这里断言它**必须**走 install --no-package-lock，
+    // 反过来锁住这个例外，防止有人为了「统一」把它改回 ci。
+    expect(installTarget).toContain(
+      'container/agent-runner && $(PKG) install --no-package-lock',
+    );
+    expect(installTarget).not.toContain('container/agent-runner && $(PKG) ci');
 
     const ci = read('.github/workflows/ci.yml');
     expect(ci).toContain('npm ci');
     expect(ci).toContain('npm --prefix web ci');
-    expect(ci).toContain('npm --prefix container/agent-runner ci');
+    // 同上：CI 也必须用 install --no-package-lock，且不得把 agent-runner 的
+    // lock 列进 setup-node 的 cache-dependency-path（文件不存在会让缓存 key
+    // 算不出来）。
+    expect(ci).toContain(
+      'npm --prefix container/agent-runner install --no-package-lock',
+    );
+    expect(ci).not.toContain('npm --prefix container/agent-runner ci');
+    expect(ci).not.toContain('container/agent-runner/package-lock.json');
+    // 裸 install（不带 --no-package-lock）会生成 lock，等于悄悄锁死版本。
     expect(ci).not.toMatch(/^\s+npm(?: --prefix \S+)? install\s*$/m);
     expect(ci).toMatch(/uses: actions\/checkout@[a-f0-9]{40}/);
     expect(ci).toMatch(/uses: actions\/setup-node@[a-f0-9]{40}/);

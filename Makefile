@@ -20,7 +20,7 @@ BACKUP_DIR ?= .
 # ─── Development ─────────────────────────────────────────────
 
 dev: ## 启动前后端（首次自动安装依赖和构建容器镜像）
-	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
 	@$(PKG) --prefix container/agent-runner run build --silent 2>/dev/null || $(PKG) --prefix container/agent-runner run build
@@ -56,7 +56,7 @@ start: ensure-latest-sdk ensure-latest-codex-sdk check-container-sdk ## 一键�
 	  lsof -ti:$(PORT) -sTCP:LISTEN | xargs ps -fp 2>/dev/null | tail -1; \
 	  exit 1; \
 	fi
-	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ] || [ container/agent-runner/package-lock.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
+	@if [ ! -d node_modules ] || [ package.json -nt node_modules ] || [ package-lock.json -nt node_modules ] || [ web/package.json -nt web/node_modules ] || [ web/package-lock.json -nt web/node_modules ] || [ container/agent-runner/package.json -nt container/agent-runner/node_modules ]; then echo "📦 依赖有更新，安装依赖..."; $(MAKE) install; fi
 	@$(MAKE) _ensure-builtin-skills
 	@$(MAKE) _ensure-docker-image
 	@$(MAKE) _check-sync
@@ -342,7 +342,9 @@ install: ## 安装全部依赖并编译 agent-runner
 	$(PKG) ci
 	@# node-pty 的 spawn-helper 预构建二进制可能缺少可执行权限，导致 PTY 模式失败
 	@chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper 2>/dev/null || true
-	cd container/agent-runner && $(PKG) ci
+	@# agent-runner 刻意不保留 lock file（§10「始终最新」+ tests/reproducible-build-contract）。
+	@# `npm ci` 在无 lock 的项目里直接报 EUSAGE，全新克隆会装不上。
+	cd container/agent-runner && $(PKG) install --no-package-lock
 	cd container/agent-runner && $(PKG) run build
 	cd web && $(PKG) ci
 	@$(MAKE) _ensure-builtin-skills
