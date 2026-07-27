@@ -11244,8 +11244,26 @@ function channelMountFromRegisteredGroup(
     };
   }
 
-  if (group.target_main_jid) {
-    const workspaceJid = resolveWorkspaceJidForMount(group.target_main_jid);
+  // 兜底：`binding_mode='single_context'` 的历史会话两个绑定字段都空，靠 `folder`
+  // 直接路由（旧模型）。多数这类会话不经过 channel_mounts —— 轮询按 folder 派发
+  // 那条路不需要 mount，所以它们一直正常工作。
+  //
+  // 但**微信/飞书的 durable inbox 路径要走 resolveEffectiveChatJid**，它要求显式
+  // 绑定或 mount。没有 mount 时 fail-closed 拒收，且命中的是静默的
+  // `'no binding found'` debug 分支 —— 现象是消息静静消失、日志里只有
+  // ChannelRouteRejectedError 而没有任何指向根因的信息。
+  //
+  // 实测：三个微信会话 target_main_jid 都为 NULL，其中两个的 folder 有对应的
+  // `web:{folder}` 工作区，能被下面的反查解析出来；只有 folder=wechat 那个没有，
+  // 于是它一直收不到消息。
+  //
+  // `resolveWorkspaceJidForMount` 只接受 registered_groups 里真实存在的工作区，
+  // 找不到就返回 null —— 不会凭空指向不存在的目标。
+  const effectiveTargetMainJid =
+    group.target_main_jid || (group.folder ? `web:${group.folder}` : null);
+
+  if (effectiveTargetMainJid) {
+    const workspaceJid = resolveWorkspaceJidForMount(effectiveTargetMainJid);
     if (!workspaceJid) return null;
     return {
       channel_jid: channelJid,

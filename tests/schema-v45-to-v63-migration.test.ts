@@ -215,3 +215,45 @@ describe('schema v45 → v63 存量库升级', () => {
     expect(rows[0].cache_read_input_tokens).toBe(9);
   });
 });
+
+describe('channel_mounts 的 folder 兜底', () => {
+  test('single_context 且无绑定时，folder 有 web 工作区就建 mount', () => {
+    db.initDatabase();
+
+    // 复刻实测形态：微信会话 folder=wechat，两个绑定字段都空。
+    // durable inbox 路径要走 resolveEffectiveChatJid，没有 mount 就 fail-closed
+    // 拒收 —— 且命中的是静默的 'no binding found' 分支，日志里只有
+    // ChannelRouteRejectedError，没有任何指向根因的信息。
+    db.setRegisteredGroup('web:wechat-ws', {
+      name: '微信',
+      folder: 'wechat-ws',
+      added_at: '2026-03-22T00:00:00.000Z',
+      created_by: 'legacy-user',
+    } as Parameters<typeof db.setRegisteredGroup>[1]);
+    db.setRegisteredGroup('wechat:legacy@im.wechat', {
+      name: 'WeChat Legacy',
+      folder: 'wechat-ws',
+      added_at: '2026-03-22T00:00:00.000Z',
+      created_by: 'legacy-user',
+      binding_mode: 'single_context',
+    } as Parameters<typeof db.setRegisteredGroup>[1]);
+
+    db.syncAllChannelMountsFromRegisteredGroups();
+
+    const mount = db.getChannelMount('wechat:legacy@im.wechat');
+    expect(mount).toBeTruthy();
+    expect(mount?.workspace_jid).toBe('web:wechat-ws');
+  });
+
+  test('folder 没有对应 web 工作区时不建 mount（不凭空指向不存在的目标）', () => {
+    db.setRegisteredGroup('wechat:orphan@im.wechat', {
+      name: 'Orphan',
+      folder: 'no-such-workspace',
+      added_at: '2026-03-22T00:00:00.000Z',
+      created_by: 'legacy-user',
+      binding_mode: 'single_context',
+    } as Parameters<typeof db.setRegisteredGroup>[1]);
+    db.syncAllChannelMountsFromRegisteredGroups();
+    expect(db.getChannelMount('wechat:orphan@im.wechat')).toBeFalsy();
+  });
+});
