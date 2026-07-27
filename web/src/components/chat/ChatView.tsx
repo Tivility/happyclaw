@@ -1164,11 +1164,24 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                       agentId={activeAgentTab}
                     />
                     <MessageInput
-                      onSend={async (content, attachments) => {
-                        const ok = await sendAgentMessage(groupJid, activeAgentTab, content, attachments);
-                        if (ok) setScrollTrigger(n => n + 1);
-                        return ok;
-                      }}
+                      // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
+                      // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
+                      // 那种「温进程/退避中」也算 running 的口径。
+                      isRunning={currentContextWaiting}
+                      contextLabel={currentContextName}
+                      // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
+                      // 删块时必须搬过来，否则整个跟进交互静默消失。
+                      queuedFollowUps={queuedFollowUps}
+                      onFollowUpAction={(item, action, content) =>
+                        actOnFollowUp(
+                          followUpChatJid,
+                          item.id,
+                          action,
+                          item.delivery_run_id,
+                          content,
+                        )
+                      }
+                      onSend={handleActiveAgentSend}
                       groupJid={groupJid}
                       onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); } : undefined}
                     />
@@ -1200,6 +1213,23 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 agentId={activeAgentTab}
               />
               <MessageInput
+                // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
+                // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
+                // 那种「温进程/退避中」也算 running 的口径。
+                isRunning={currentContextWaiting}
+                contextLabel={currentContextName}
+                // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
+                // 删块时必须搬过来，否则整个跟进交互静默消失。
+                queuedFollowUps={queuedFollowUps}
+                onFollowUpAction={(item, action, content) =>
+                  actOnFollowUp(
+                    followUpChatJid,
+                    item.id,
+                    action,
+                    item.delivery_run_id,
+                    content,
+                  )
+                }
                 onSend={async (content, attachments) => {
                   const ok = await sendAgentMessage(groupJid, activeAgentTab, content, attachments);
                   if (ok) setScrollTrigger(n => n + 1);
@@ -1224,6 +1254,23 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 onSend={(content) => handleSend(content)}
               />
               <MessageInput
+                // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
+                // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
+                // 那种「温进程/退避中」也算 running 的口径。
+                isRunning={currentContextWaiting}
+                contextLabel={currentContextName}
+                // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
+                // 删块时必须搬过来，否则整个跟进交互静默消失。
+                queuedFollowUps={queuedFollowUps}
+                onFollowUpAction={(item, action, content) =>
+                  actOnFollowUp(
+                    followUpChatJid,
+                    item.id,
+                    action,
+                    item.delivery_run_id,
+                    content,
+                  )
+                }
                 onSend={handleSend}
                 groupJid={groupJid}
                 onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(null); setShowResetConfirm(true); } : undefined}
@@ -1287,181 +1334,41 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             )}
           </div>
         </div>
-      </div>
 
-        {/* Message channel setup banner for home container without channel config */}
-        {isOwnHome &&
-          imStatus &&
-          !Object.values(imStatus).some(Boolean) &&
-          !imBannerDismissed && (
-            <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-sm">
-              <Link className="w-4 h-4 flex-shrink-0" />
-              <span className="flex-1 min-w-0">
-                未配置消息渠道（飞书 / Telegram / Discord / QQ / 微信 / 钉钉 /
-                WhatsApp），消息无法与 HappyClaw 的直接对话互通
-              </span>
-              <button
-                onClick={() => navigate('/setup/channels')}
-                className="flex-shrink-0 px-3 py-1 text-xs font-medium rounded-md bg-amber-600 text-white hover:bg-amber-700 transition-colors cursor-pointer"
-              >
-                去配置
-              </button>
-              <button
-                onClick={() => {
-                  setImBannerDismissed(true);
-                  localStorage.setItem('im-banner-dismissed', '1');
-                }}
-                className="flex-shrink-0 p-0.5 rounded hover:bg-amber-200/60 transition-colors cursor-pointer"
-                aria-label="关闭"
-              >
-                <X className="w-4 h-4" />
-              </button>
+      {/* Desktop: Bottom terminal panel with drag handle */}
+      {canUseTerminal && terminalMounted && (
+        <>
+          {/* Drag handle */}
+          {terminalVisible && (
+            <div
+              onMouseDown={handleDragStart}
+              onTouchStart={handleTouchDragStart}
+              className="hidden lg:flex h-1 bg-muted hover:bg-brand-400 cursor-row-resize items-center justify-center transition-colors group"
+            >
+              <div className="w-8 h-0.5 rounded-full bg-muted-foreground group-hover:bg-primary transition-colors" />
             </div>
           )}
-
-        {/* Main conversation canvas */}
-        <div className="flex-1 flex overflow-hidden min-h-0">
-          {/* Messages Area */}
-          <div className="flex-1 flex flex-col min-w-0 overflow-x-hidden">
-            {activeAgentTab && isConversationTab ? (
-              <>
-                <MessageList
-                  key={`conv-${activeAgentTab}`}
-                  messages={agentMessages[activeAgentTab] || []}
-                  loading={false}
-                  hasMore={!!agentHasMore[activeAgentTab]}
-                  onLoadMore={() =>
-                    loadAgentMessages(groupJid, activeAgentTab, true)
-                  }
-                  scrollTrigger={scrollTrigger}
-                  groupJid={groupJid}
-                  isWaiting={currentContextWaiting}
-                  agentId={activeAgentTab}
-                  contextLabel={currentContextName}
-                  agentName={agentProfileLabel}
-                  agentAvatarUrl={group?.agent_profile_avatar_url}
-                  agentAvatarEmoji={group?.agent_profile_avatar_emoji}
-                  agentAvatarColor={group?.agent_profile_avatar_color}
-                  interactionMode={interactionMode}
-                  onSend={(content) => {
-                    handleActiveAgentSend(content);
-                  }}
-                />
-                <MessageInput
-                  onSend={handleActiveAgentSend}
-                  groupJid={groupJid}
-                  contextLabel={currentContextName}
-                  isRunning={currentContextWaiting}
-                  onStop={
-                    agentStreaming[activeAgentTab]?.interrupted
-                      ? undefined
-                      : () =>
-                          interruptQuery(`${groupJid}#agent:${activeAgentTab}`)
-                  }
-                  queuedFollowUps={queuedFollowUps}
-                  onFollowUpAction={(item, action, content) =>
-                    actOnFollowUp(
-                      followUpChatJid,
-                      item.id,
-                      action,
-                      item.delivery_run_id,
-                      content,
-                    )
-                  }
-                  onResetSession={
-                    canModifyWorkspaceConfig
-                      ? () => {
-                          setResetAgentId(activeAgentTab);
-                          setShowResetConfirm(true);
-                        }
-                      : undefined
-                  }
-                />
-              </>
-            ) : (
-              <>
-                <MessageList
-                  key={`main-${groupJid}`}
-                  messages={groupMessages || []}
-                  loading={loading}
-                  hasMore={hasMoreMessages}
-                  onLoadMore={handleLoadMore}
-                  scrollTrigger={scrollTrigger}
-                  groupJid={groupJid}
-                  isWaiting={isWaiting}
-                  agentName={agentProfileLabel}
-                  agentAvatarUrl={group?.agent_profile_avatar_url}
-                  agentAvatarEmoji={group?.agent_profile_avatar_emoji}
-                  agentAvatarColor={group?.agent_profile_avatar_color}
-                  interactionMode={interactionMode}
-                  onSend={(content) => handleSend(content)}
-                />
-                <MessageInput
-                  onSend={handleSend}
-                  groupJid={groupJid}
-                  isRunning={currentContextWaiting}
-                  onStop={
-                    mainInterrupted ? undefined : () => interruptQuery(groupJid)
-                  }
-                  queuedFollowUps={queuedFollowUps}
-                  onFollowUpAction={(item, action, content) =>
-                    actOnFollowUp(
-                      followUpChatJid,
-                      item.id,
-                      action,
-                      item.delivery_run_id,
-                      content,
-                    )
-                  }
-                  onResetSession={
-                    canModifyWorkspaceConfig
-                      ? () => {
-                          setResetAgentId(null);
-                          setShowResetConfirm(true);
-                        }
-                      : undefined
-                  }
-                  onToggleTerminal={
-                    canUseTerminal ? handleTerminalToggle : undefined
-                  }
-                />
-              </>
-            )}
+          {/* Terminal panel */}
+          <div
+            className={`hidden lg:block flex-shrink-0 overflow-hidden transition-[height] duration-200 ${
+              terminalVisible ? 'border-t border-border' : 'border-t-0'
+            }`}
+            style={{ height: terminalVisible ? terminalHeight : 0 }}
+          >
+            <TerminalPanel
+              groupJid={groupJid}
+              visible={terminalVisible}
+              onHide={() => setTerminalVisible(false)}
+              onDelete={() => {
+                setTerminalVisible(false);
+                setTerminalMounted(false);
+              }}
+            />
           </div>
-        </div>
+        </>
+      )}
+      </div>
 
-        {/* Desktop: Bottom terminal panel with drag handle */}
-        {canUseTerminal && terminalMounted && (
-          <>
-            {/* Drag handle */}
-            {terminalVisible && (
-              <div
-                onMouseDown={handleDragStart}
-                onTouchStart={handleTouchDragStart}
-                className="hidden lg:flex h-1 bg-muted hover:bg-brand-400 cursor-row-resize items-center justify-center transition-colors group"
-              >
-                <div className="w-8 h-0.5 rounded-full bg-muted-foreground group-hover:bg-primary transition-colors" />
-              </div>
-            )}
-            {/* Terminal panel */}
-            <div
-              className={`hidden lg:block flex-shrink-0 overflow-hidden transition-[height] duration-200 ${
-                terminalVisible ? 'border-t border-border' : 'border-t-0'
-              }`}
-              style={{ height: terminalVisible ? terminalHeight : 0 }}
-            >
-              <TerminalPanel
-                groupJid={groupJid}
-                visible={terminalVisible}
-                onHide={() => setTerminalVisible(false)}
-                onDelete={() => {
-                  setTerminalVisible(false);
-                  setTerminalMounted(false);
-                }}
-              />
-            </div>
-          </>
-        )}
       </div>
 
       <aside

@@ -7447,9 +7447,22 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               streamingSession &&
               (streamingSession as { currentState?: string }).currentState ===
                 'error';
+            // idle 的卡片是**还没被驱动过**的新卡片，不是过期卡片 ——
+            // 它要靠下面 feedStreamEventToCard 的第一个事件才从 idle 进入
+            // creating。丢弃它会形成鸡生蛋：第一个 stream event 就把卡片扔掉，
+            // 本轮再也没有卡片，用户看到的现象是「飞书不发处理中卡片了」，
+            // 连带 metaRow 的用量行也没有载体。
+            //
+            // 只丢弃**真正终态**的卡片（completed / aborted）—— 那才是
+            // 「上一轮已定稿、需要为新 query 换一张」的场景。
+            const sessionIdleUnused =
+              streamingSession &&
+              (streamingSession as { currentState?: string }).currentState ===
+                'idle';
             if (
               streamingSession &&
               !streamingSession.isActive() &&
+              !sessionIdleUnused &&
               !sessionErrored &&
               !runEnded
             ) {
