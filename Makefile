@@ -1,6 +1,6 @@
 .PHONY: dev dev-backend dev-web build build-backend build-web start \
        typecheck typecheck-backend typecheck-web typecheck-agent-runner \
-		_build-ar-if-stale _build-backend-if-stale _build-web-if-stale _check-sync _ensure-builtin-skills _ensure-docker-image backup check-container-sdk clean ensure-latest-codex-sdk ensure-latest-sdk format format-check help install install-host-tools launchd-install launchd-log launchd-restart launchd-status launchd-uninstall logs reset-init restore status stop sync-types update-codex-sdk update-sdk
+		_build-ar-if-stale _build-backend-if-stale _build-web-if-stale _check-sync _ensure-builtin-skills _ensure-docker-image backup check-container-sdk clean ensure-latest-sdk format format-check help install install-host-tools launchd-install launchd-log launchd-restart launchd-status launchd-uninstall logs reset-init restore status stop sync-types update-sdk
 
 # ─── Runtime ────────────────────────────────────────────────
 # 本项目只用原生 Node 工具链运行（npm / npx / tsx / node），不使用 bun。
@@ -47,7 +47,7 @@ build-web: ## 仅编译前端
 
 # ─── Production ──────────────────────────────────────────────
 
-start: ensure-latest-sdk ensure-latest-codex-sdk check-container-sdk ## 一键启动生产环境（前台阻塞运行）
+start: ensure-latest-sdk check-container-sdk ## 一键启动生产环境（前台阻塞运行）
 	@# 生产启动不得隐式改写依赖图；SDK 升级请显式执行 make update-sdk，
 	@# 验证通过后再提交 package.json 与 lockfile。
 	@# 检查端口是否被占用
@@ -216,13 +216,6 @@ update-sdk: ## 显式更新 agent-runner + 主服务的 Claude Agent SDK 到最�
 	$(PKG) --prefix container/agent-runner run build; \
 	echo "✅ SDK/CLI 与 runner lockfile 已更新。请运行 make typecheck && make test 验证。"
 
-update-codex-sdk: ## 更新宿主服务与 agent-runner 的 Codex SDK 到最新版本
-	$(PKG) update @openai/codex-sdk
-	cd container/agent-runner && $(PKG) update @openai/codex-sdk && $(PKG) run build
-	@# npm/bun update 会将 "*" 回写为具体版本，还原它
-	@sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' package.json
-	@sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' container/agent-runner/package.json
-	@echo "Codex SDK updated. Run 'make typecheck' to verify."
 
 ensure-latest-sdk: ## 启动前自动检测并更新 SDK（agent-runner + 主服务，有新版才更新）
 ensure-latest-sdk: ## 只读检查 SDK/CLI 最新版本（兼容旧工作流）
@@ -232,14 +225,14 @@ ensure-latest-sdk: ## 只读检查 SDK/CLI 最新版本（兼容旧工作流）
 	LATEST=$$(npm view @anthropic-ai/claude-agent-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
 	if [ "$$LOCAL" != "$$LATEST" ]; then \
 		echo "🔄 [agent-runner] Claude Agent SDK 有新版本: $$LOCAL → $$LATEST，正在更新..."; \
-		if (cd container/agent-runner && $(PKG) update --include=dev @anthropic-ai/claude-agent-sdk && $(PKG) run build); then \
+		if (cd container/agent-runner && $(PKG) update --no-package-lock --include=dev @anthropic-ai/claude-agent-sdk && $(PKG) run build); then \
 			sed -i '' 's/"@anthropic-ai\/claude-agent-sdk": "[^"]*"/"@anthropic-ai\/claude-agent-sdk": "*"/' container/agent-runner/package.json; \
 			echo "✅ [agent-runner] SDK 更新完成（内置 Claude Code 版本随之更新）"; \
 		else \
 			echo "❌ [agent-runner] SDK $$LATEST 构建失败"; \
 			if [ "$$LOCAL" != "0.0.0" ]; then \
 				echo "↩️  回滚到 $$LOCAL ..."; \
-				(cd container/agent-runner && $(PKG) install --include=dev @anthropic-ai/claude-agent-sdk@$$LOCAL && $(PKG) run build) \
+				(cd container/agent-runner && $(PKG) install --no-package-lock --include=dev @anthropic-ai/claude-agent-sdk@$$LOCAL && $(PKG) run build) \
 					|| echo "⚠️  回滚构建也失败，dist 可能是陈旧产物——请手动检查 container/agent-runner"; \
 			else \
 				echo "⚠️  无可回滚的版本（此前未安装）"; \
@@ -264,14 +257,9 @@ check-container-sdk: ## 检查 Docker 镜像内的 SDK 是否落后于宿主机
 		echo "ℹ️  镜像 $(CONTAINER_IMAGE) 不存在，跳过检查（container 模式工作区将无法启动）"; \
 		exit 0; \
 	fi; \
-	HOST_CODEX=$$(node -p "require('./container/agent-runner/node_modules/@openai/codex-sdk/package.json').version" 2>/dev/null || echo ""); \
-	IMG_CODEX=$$(docker run --rm --entrypoint sh $(CONTAINER_IMAGE) -c "cat /app/node_modules/@openai/codex-sdk/package.json 2>/dev/null" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).version)}catch{console.log('')}})" || echo ""); \
 	HOST_CLAUDE=$$(node -p "require('./container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/package.json').version" 2>/dev/null || echo ""); \
 	IMG_CLAUDE=$$(docker run --rm --entrypoint sh $(CONTAINER_IMAGE) -c "cat /app/node_modules/@anthropic-ai/claude-agent-sdk/package.json 2>/dev/null" 2>/dev/null | node -e "let d='';process.stdin.on('data',c=>d+=c).on('end',()=>{try{console.log(JSON.parse(d).version)}catch{console.log('')}})" || echo ""); \
 	STALE=0; \
-	if [ -n "$$IMG_CODEX" ] && [ -n "$$HOST_CODEX" ] && [ "$$IMG_CODEX" != "$$HOST_CODEX" ]; then \
-		echo "⚠️  Codex SDK 落后：镜像 $$IMG_CODEX ≠ 宿主机 $$HOST_CODEX"; STALE=1; \
-	fi; \
 	if [ -n "$$IMG_CLAUDE" ] && [ -n "$$HOST_CLAUDE" ] && [ "$$IMG_CLAUDE" != "$$HOST_CLAUDE" ]; then \
 		echo "⚠️  Claude SDK 落后：镜像 $$IMG_CLAUDE ≠ 宿主机 $$HOST_CLAUDE"; STALE=1; \
 	fi; \
@@ -282,34 +270,6 @@ check-container-sdk: ## 检查 Docker 镜像内的 SDK 是否落后于宿主机
 		echo "✅ 镜像 SDK 与宿主机一致"; \
 	fi
 
-ensure-latest-codex-sdk: ## 启动前自动检测并更新 Codex SDK（有新版才更新）
-	@HOST_LOCAL=$$(node -p "require('./node_modules/@openai/codex-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
-	RUNNER_LOCAL=$$(node -p "require('./container/agent-runner/node_modules/@openai/codex-sdk/package.json').version" 2>/dev/null || echo "0.0.0"); \
-	LOCAL="$$HOST_LOCAL"; \
-	if [ "$$RUNNER_LOCAL" = "0.0.0" ]; then LOCAL="0.0.0"; fi; \
-	LATEST=$$(npm view @openai/codex-sdk version --fetch-timeout=5000 2>/dev/null || echo "$$LOCAL"); \
-	if [ "$$LOCAL" != "$$LATEST" ]; then \
-		echo "🔄 Codex SDK 有新版本或未安装: host=$$HOST_LOCAL, runner=$$RUNNER_LOCAL → $$LATEST，正在更新..."; \
-		$(PKG) update --include=dev @openai/codex-sdk; \
-		if (cd container/agent-runner && $(PKG) update --include=dev @openai/codex-sdk && $(PKG) run build); then \
-			sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' package.json; \
-			sed -i '' 's/"@openai\/codex-sdk": "[^"]*"/"@openai\/codex-sdk": "*"/' container/agent-runner/package.json; \
-			echo "✅ Codex SDK 更新完成"; \
-		else \
-			echo "❌ Codex SDK $$LATEST 构建失败"; \
-			if [ "$$RUNNER_LOCAL" != "0.0.0" ]; then \
-				echo "↩️  回滚到 $$RUNNER_LOCAL ..."; \
-				$(PKG) install --include=dev @openai/codex-sdk@$$RUNNER_LOCAL; \
-				(cd container/agent-runner && $(PKG) install --include=dev @openai/codex-sdk@$$RUNNER_LOCAL && $(PKG) run build) \
-					|| echo "⚠️  回滚构建也失败，dist 可能是陈旧产物——请手动检查 container/agent-runner"; \
-			else \
-				echo "⚠️  无可回滚的版本（此前未安装）"; \
-			fi; \
-			exit 1; \
-		fi; \
-	else \
-		echo "✅ Codex SDK 已是最新 ($$LOCAL)"; \
-	fi
 
 # ─── feishu-cli ──────────────────────────────────────────────
 

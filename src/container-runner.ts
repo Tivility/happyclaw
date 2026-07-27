@@ -2909,11 +2909,12 @@ export async function runHostAgent(
     const agentRunnerRoot = path.join(projectRoot, 'container', 'agent-runner');
     const agentRunnerNodeModules = path.join(agentRunnerRoot, 'node_modules');
     const agentRunnerDist = path.join(agentRunnerRoot, 'dist', 'index.js');
-    const requiredDeps = [
-      '@anthropic-ai/claude-agent-sdk',
-      '@openai/codex',
-      '@openai/codex-sdk',
-    ];
+      // 决策 38：codex 只保留 CLI 一条实现，`@openai/codex-sdk` 已从
+      // agent-runner 的依赖里删掉。留在这里会让 preflight 恒定失败 ——
+      // 所有宿主机会话报「缺少 agent-runner 依赖」，完全跑不起来。
+      // SDK 的可用性仍由 codex-runtime.ts 探测并在设置页展示（未安装则显示
+      // 「当前使用 Codex CLI 路径」），那只是信息展示，不是启动门槛。
+      const requiredDeps = ['@anthropic-ai/claude-agent-sdk', '@openai/codex'];
     const missingDeps = requiredDeps.filter((dep) => {
       const depJson = path.join(
         agentRunnerNodeModules,
