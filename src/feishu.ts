@@ -2879,7 +2879,12 @@ export function createFeishuConnection(
       );
       failClaimedInbound(claim, payload, err, true);
       // 仅实时消息提示自动重试；backfill 回填的旧消息失败不打扰用户。
-      if (source === 'ws') {
+      //
+      // 而且要节流：durable Inbox 的重试很密（同一条消息实测重试过 131 次），
+      // 每次失败都发一条会把群刷满一屏「消息处理暂时失败」。用户真正需要知道的
+      // 只有「这条卡住了、系统在重试」，说一次就够；持续失败按 1 / 5 / 10 分钟
+      // 的递增间隔再提醒，既不刷屏也不会让人以为已经彻底放弃。
+      if (source === 'ws' && shouldNotifyIntakeRetry(chatId, messageId)) {
         try {
           await sendTextToChat(chatId, '⚠️ 消息处理暂时失败，系统将自动重试');
         } catch (sendErr) {
@@ -2890,6 +2895,37 @@ export function createFeishuConnection(
         }
       }
     }
+  }
+
+  /**
+   * 入库失败提醒的节流器。
+   *
+   * durable Inbox 会持续重试同一条消息，每次失败都提醒等于刷屏。按 messageId 记住
+   * 首次失败时间与已提醒次数，只在 1 / 5 / 10 分钟这几个节点各说一次；之后不再
+   * 打扰 —— 持续失败属于需要人工介入的状况，该由日志和监控暴露，不该让用户在群里
+   * 被反复告知同一件事。
+   */
+  const INTAKE_RETRY_NOTICE_STEPS_MS = [0, 60_000, 5 * 60_000, 10 * 60_000];
+  const intakeRetryNotices = new Map<string, { firstAt: number; sent: number }>();
+
+  function shouldNotifyIntakeRetry(chatId: string, messageId: string): boolean {
+    const key = `${chatId}\u0000${messageId}`;
+    const now = Date.now();
+    const entry = intakeRetryNotices.get(key);
+    if (!entry) {
+      intakeRetryNotices.set(key, { firstAt: now, sent: 1 });
+      // 顺手回收：只保留最近一小时的条目，避免长期运行时无界增长。
+      if (intakeRetryNotices.size > 500) {
+        for (const [k, v] of intakeRetryNotices) {
+          if (now - v.firstAt > 60 * 60_000) intakeRetryNotices.delete(k);
+        }
+      }
+      return true;
+    }
+    if (entry.sent >= INTAKE_RETRY_NOTICE_STEPS_MS.length) return false;
+    if (now < entry.firstAt + INTAKE_RETRY_NOTICE_STEPS_MS[entry.sent]) return false;
+    entry.sent += 1;
+    return true;
   }
 
   async function backfillChatMessages(

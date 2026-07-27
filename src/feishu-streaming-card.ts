@@ -3208,7 +3208,22 @@ export class StreamingCardController {
    * transition without mutating canonical accumulatedText.
    */
   private liveDisplayText(): string {
-    return this.accumulatedText || STREAMING_PLACEHOLDER;
+    // 必须过一遍 optimizeMarkdownStyle —— 它内部的 stripInvalidImageKeys 会剔除
+    // 非 `img_` 开头的图片引用。
+    //
+    // Agent 经常在正文里写本地路径当图片（如
+    // `![](downloads/grok-gen/sheets-v3/card_A.jpg)`）。飞书 CardKit 只认先上传
+    // 换来的 image_key，收到本地路径会整张卡片拒绝：
+    //   code=200570 card contains invalid image keys
+    // 一旦被拒，卡片进 error 态冻结 —— 后续的内容推送和**用量行 patch 全部打不
+    // 进去**，用户看到的是「卡片有正文但没有底部用量 bar」。
+    //
+    // 定稿路径（buildStructuredFinalCard → optimizeMarkdownStyle）一直有这层
+    // 过滤，只有流式推送这条漏了。
+    return optimizeMarkdownStyle(
+      this.accumulatedText || STREAMING_PLACEHOLDER,
+      2,
+    );
   }
 
   private startHeartbeat(): void {

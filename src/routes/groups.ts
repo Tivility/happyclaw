@@ -2087,9 +2087,17 @@ groupRoutes.get('/:jid/messages', authMiddleware, async (c) => {
     return c.json({ messages, hasMore });
   }
 
-  // is_home 群组合并查询：将同一 owner、同 folder 下的 Web 与 IM 消息合并展示。
+  // 合并查询：把同一 owner、同 folder 下的 Web 与 IM 消息并到一起展示。
+  //
+  // 条件不再要求 `is_home`。主容器之外，用户也会手动建带专属 folder 的工作区
+  // 并把 IM 会话绑上去（例如 folder=wechat 的微信工作区）—— 那种工作区
+  // is_home=0，历史消息全存在 `wechat:` 这类渠道 jid 下，只查自己的 web jid
+  // 会显示成「没有历史记录」。
+  //
+  // 仍然要求 **同 folder + 同 owner**，不会串到别人或别的工作区：同 folder
+  // 意味着共享同一个工作目录与记忆，本来就是同一个上下文。
   const queryJids = [jid];
-  if (group.is_home) {
+  {
     const siblingJids = getJidsByFolder(group.folder);
     for (const siblingJid of siblingJids) {
       if (siblingJid === jid) continue;

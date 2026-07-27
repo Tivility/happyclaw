@@ -74,3 +74,43 @@ describe('合并去重护栏', () => {
     expect(index).toMatch(/!sessionIdleUnused/);
   });
 });
+
+describe('通知刷屏防护', () => {
+  test('系统通知的幂等键按会话而非 turnId', () => {
+    const index = read('src/index.ts');
+    // 用 turnId 时每张出问题的卡片都是独立 turn，重启对账会各发一条 ——
+    // 频繁重启后用户在群里看到一串同样的「异常中断」。
+    expect(index).toMatch(
+      /externalMessageId: `\$\{input\.route\.sourceJid\}:system-notice:/,
+    );
+    expect(index).not.toMatch(
+      /externalMessageId: `\$\{input\.originalInputTurnId\}:system-notice:/,
+    );
+  });
+
+  test('入库失败提醒有节流，不按每次重试发', () => {
+    const feishu = read('src/feishu.ts');
+    // durable Inbox 实测对同一条消息重试过 131 次，每次一条会刷满整屏。
+    expect(feishu).toMatch(/shouldNotifyIntakeRetry\(chatId, messageId\)/);
+    expect(feishu).toMatch(/INTAKE_RETRY_NOTICE_STEPS_MS/);
+  });
+
+  test('流式内容推送经过图片键过滤', () => {
+    const card = read('src/feishu-streaming-card.ts');
+    // Agent 常在正文写本地路径当图片，CardKit 只认 img_ 开头的 image_key，
+    // 收到本地路径会整张卡片拒绝（code=200570）→ 卡片进 error 冻结 →
+    // 后续内容推送与用量行 patch 全部打不进去。
+    const live = card.slice(
+      card.indexOf('private liveDisplayText()'),
+      card.indexOf('private liveDisplayText()') + 800,
+    );
+    expect(live).toMatch(/optimizeMarkdownStyle\(/);
+  });
+
+  test('工作区消息合并不再要求 is_home', () => {
+    const groups = read('src/routes/groups.ts');
+    // 用户手动建的带专属 folder 的工作区 is_home=0，历史消息全在渠道 jid 下，
+    // 只查自己的 web jid 会显示成「没有历史记录」。
+    expect(groups).not.toMatch(/const queryJids = \[jid\];\s*\n\s*if \(group\.is_home\)/);
+  });
+});

@@ -3061,9 +3061,16 @@ async function deliverIndependentChannelSystemNotice(input: {
     threadId?: string | null;
   };
 }): Promise<boolean> {
+  // 幂等键按 **会话 + 通知种类**，不是 turnId。
+  //
+  // 用 turnId 时每张出问题的卡片都是独立 turn，重启对账会为每张各发一条 ——
+  // 开发期频繁重启后用户在群里看到一串同样的「异常中断」。这类通知讲的是
+  //「这个会话出过状况、需要人工核对」，同一会话重复说 N 遍没有增量信息。
+  //
+  // turnId 仍保留做 correlationId，排查时能追回具体是哪一轮。
   const noticeRuntime = ChannelTurnRuntime.start({
     ...input.route,
-    externalMessageId: `${input.originalInputTurnId}:system-notice:${input.noticeKey}`,
+    externalMessageId: `${input.route.sourceJid}:system-notice:${input.noticeKey}`,
     correlationId: input.originalInputTurnId,
     agentId: input.agentId,
   });
