@@ -52,6 +52,7 @@ import {
   shellQuoteEnvLines,
   writeCodexProviderAuthMaterial,
   writeGrokProviderAuthMaterial,
+  persistRefreshedProviderAuth,
   writeCredentialsFile,
 } from './runtime-config.js';
 import {
@@ -2268,6 +2269,21 @@ export async function runContainerAgent(
       } else {
         providerPool.releaseSession(selectedProfileId);
       }
+      // CLI 自刷新的凭据回写（见 persistRefreshedProviderAuth）。
+      // 放在 finally 里：即使这次 spawn 抛了，CLI 也可能已经刷新过凭据，
+      // 那份才是唯一有效的 refresh_token，不能因为本轮失败就丢掉。
+      // best-effort —— 回写失败不该影响本轮结果。
+      const refreshedProviderId = codexAuthMaterial?.providerId ?? grokAuthMaterial?.providerId;
+      if (refreshedProviderId) {
+        try {
+          persistRefreshedProviderAuth(refreshedProviderId);
+        } catch (err) {
+          logger.warn(
+            { providerId: refreshedProviderId, err },
+            'Credential write-back failed (non-fatal)',
+          );
+        }
+      }
     }
   }
 }
@@ -3301,6 +3317,25 @@ export async function runHostAgent(
         hostSelectedProfileId,
       );
     }
+      // CLI 自刷新的凭据回写（见 persistRefreshedProviderAuth）。
+      // 放在 finally 里：即使这次 spawn 抛了，CLI 也可能已经刷新过凭据，
+      // 那份才是唯一有效的 refresh_token，不能因为本轮失败就丢掉。
+      // best-effort —— 回写失败不该影响本轮结果。
+      const refreshedProviderId = isCodexRuntime
+        ? codexProvider?.id
+        : isGrokRuntime
+          ? grokProvider?.id
+          : undefined;
+      if (refreshedProviderId) {
+        try {
+          persistRefreshedProviderAuth(refreshedProviderId);
+        } catch (err) {
+          logger.warn(
+            { providerId: refreshedProviderId, err },
+            'Credential write-back failed (non-fatal)',
+          );
+        }
+      }
   }
 }
 

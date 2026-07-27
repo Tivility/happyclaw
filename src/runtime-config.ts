@@ -2102,6 +2102,106 @@ export function writeGrokProviderAuthMaterial(
   };
 }
 
+/**
+ * 把 CLI 自刷新后的凭据回写进加密的 provider 配置。
+ *
+ * ## 为什么需要
+ *
+ * codex / grok 的凭据是**种子 + 自刷新**模式：spawn 前把 auth.json 播到
+ * `CLAUDE_CONFIG_DIR/{runtime}/{providerId}/`，CLI 在那里用 refresh_token 换
+ * 新 access_token 并**就地回写**（所以 grok-home 是 RW 挂载，§8.14）。
+ *
+ * 问题是刷新结果只活在那个物化目录里，从没回到加密的 provider 配置。
+ * refresh_token 是一次性的 —— 用掉之后原快照就作废，只有物化目录里那份有效。
+ * 于是一旦该目录被清掉（换机器、清缓存、手滑 rm），整条凭据链断裂且**不可
+ * 恢复**，必须重新登录。这个洞实际发生过一次。
+ *
+ * ## 判定方式
+ *
+ * seed metadata 里已经存了播种时的 `authHash`。磁盘上的 auth.json 内容 hash
+ * 与之不同 → 说明 CLI 刷新过 → 回写并刷新 metadata（否则下次又判成"变了"）。
+ *
+ * ## Docker / 并发
+ *
+ * host 与 docker 两条路都指向同一个宿主机目录（docker 是 RW bind-mount），
+ * 所以这里是运行时中立的：只看宿主机文件系统，不关心是谁刷新的。
+ *
+ * 同一个 provider 被多个会话并发使用时，几个 CLI 会共享同一个物化目录。
+ * 那本身是既有设计的固有风险（谁先刷新，另一个手里的 refresh_token 就废了），
+ * 回写不会让它变严重 —— 只是把最终落盘的那份持久化。为避免用旧凭据覆盖新
+ * 凭据，回写只在**内容确实与 metadata 不同**时发生，且 metadata 紧随更新，
+ * 单服务实例下不存在跨进程竞争。
+ */
+export function persistRefreshedProviderAuth(providerId: string): boolean {
+  const provider = getProviderById(providerId);
+  if (!provider) return false;
+
+  const runtime = provider.runtime;
+  if (runtime !== 'codex' && runtime !== 'grok') return false;
+
+  const homeDir = path.join(CLAUDE_CONFIG_DIR, runtime, provider.id);
+  const authPath = path.join(homeDir, 'auth.json');
+
+  let onDisk: string;
+  try {
+    onDisk = fs.readFileSync(authPath, 'utf-8');
+  } catch {
+    // 没有物化文件（未配置该 runtime，或还没 spawn 过）——不是错误。
+    return false;
+  }
+  const trimmed = onDisk.trim();
+  if (!trimmed) return false;
+
+  // 必须是可解析的 JSON。CLI 写一半崩了的话宁可不回写，也不能把损坏内容
+  // 覆盖掉配置里那份还能用的。
+  try {
+    JSON.parse(trimmed);
+  } catch {
+    logger.warn(
+      { providerId, runtime },
+      'Refreshed auth.json is not valid JSON; skipping write-back',
+    );
+    return false;
+  }
+
+  const diskHash = hashCodexAuthJson(trimmed);
+  const metadata = readCodexAuthSeedMetadata(homeDir);
+  if (metadata && metadata.authHash === diskHash) return false; // CLI 没刷新过
+
+  const stored = runtime === 'codex' ? provider.codexAuthJson : provider.grokAuthJson;
+  if (stored && hashCodexAuthJson(stored) === diskHash) {
+    // 内容与配置里一致，只是 metadata 落后了（例如手工改过目录）。
+    // 补齐 metadata 以免每次都判成"变了"。
+    writeCodexAuthSeedMetadata(homeDir, provider, diskHash);
+    return false;
+  }
+
+  try {
+    updateProviderSecrets(
+      provider.id,
+      runtime === 'codex' ? { codexAuthJson: trimmed } : { grokAuthJson: trimmed },
+    );
+  } catch (err) {
+    logger.error(
+      { providerId, runtime, err },
+      'Failed to persist refreshed provider auth',
+    );
+    return false;
+  }
+
+  // metadata 用回写后的 provider 快照重算 —— updateProviderSecrets 会改
+  // updatedAt / 可能改 authProfileGeneration，metadata 得跟上，否则下次
+  // writeGrokProviderAuthMaterial 会判成 mismatch 而用配置覆盖磁盘。
+  const refreshed = getProviderById(provider.id);
+  if (refreshed) writeCodexAuthSeedMetadata(homeDir, refreshed, diskHash);
+
+  logger.info(
+    { providerId, runtime },
+    'Persisted CLI-refreshed credentials back into provider config',
+  );
+  return true;
+}
+
 /** Convert UnifiedProvider to public (masked) representation */
 export function toPublicProvider(
   provider: UnifiedProvider,
