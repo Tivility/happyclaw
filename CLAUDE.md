@@ -299,6 +299,11 @@ Provider 和渠道账号应优先通过 Web 配置。Legacy `/api/config/user-im
 
 ## 10. 开发与验证
 
+> **追 upstream 版本前先读 [`docs/upstream-tracking-playbook.md`](docs/upstream-tracking-playbook.md)**
+> —— 合并伤的四种形态、门禁的能力边界、验证分层、生产切换流程与检查清单，
+> 全部来自 2026-07 那次 121 提交合并的实测。
+
+
 ```bash
 make install
 make dev
@@ -312,8 +317,10 @@ npm run self-test
 约束：
 
 - 只使用 Node.js/npm，不使用 Bun。
-- 三个 Node 项目分别位于根目录、`web/`、`container/agent-runner/`，均使用
-  `npm ci` 和已提交 lockfile。
+- 三个 Node 项目分别位于根目录、`web/`、`container/agent-runner/`。根目录与
+  `web/` 用 `npm ci` + 已提交 lockfile；**`container/agent-runner/` 是例外** ——
+  它不保留 lockfile（§10 的「SDK 始终最新」契约），必须用
+  `npm install --no-package-lock`，`npm ci` 会直接报 EUSAGE。
 - 修改共享类型后运行 `make sync-types`；`make typecheck` 会检查副本一致性。
 - 修改 Prompt 后确保 `scripts/check-agent-runner-prompts.sh` 通过。
 - 修改文档后运行 `npm run docs:check`。
