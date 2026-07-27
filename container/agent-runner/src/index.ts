@@ -1314,6 +1314,12 @@ async function runQuery(
   // before force-closing the stream.
   let resultReceivedAt: number | null = null;
   const POST_RESULT_TIMEOUT_MS = 5_000;
+  // 因后台任务而挂流的起点；null 表示当前不在挂流态。
+  let backgroundHoldStartedAt: number | null = null;
+  // 后台任务跑完后、等主 Agent 收尾汇总的宽限起点。
+  let completionGraceStartedAt: number | null = null;
+  // 宽限时长：够主 Agent 被通知唤醒并产出一轮汇总，又远短于 IDLE_TIMEOUT。
+  const COMPLETION_GRACE_MS = 90_000;
   // queryRef is set just before the for-await loop so pollIpcDuringQuery can call interrupt().
   // The return type stays `Promise<unknown>` on purpose: the SDK's Query.interrupt() resolves to
   // SDKControlInterruptResponse | undefined, and every caller here discards the value. Pinning it
@@ -1393,22 +1399,47 @@ async function runQuery(
       // tail -f）设计上就活过本 turn，等它只会把流挂到 IDLE_TIMEOUT。
       // 永不 settle 的任务由 IDLE_TIMEOUT / CONTAINER_TIMEOUT 兜底回收。
       const blockingTasks = processor.getBlockingPendingSdkTaskCount();
+      const now = Date.now();
       if (blockingTasks > 0) {
-        resultReceivedAt = null; // 撤销倒计时；下一个 result 会重新起算
-        log(
-          `Result emitted but ${blockingTasks} background task(s) still running, holding stream open: ${processor.describePendingSdkTasks().join(' | ')}`,
-        );
-        emit({
-          status: 'stream',
-          result: null,
-          streamEvent: {
-            eventType: 'status',
-            agentScope: 'system',
-            statusText: `${blockingTasks} 个后台任务运行中，完成后将继续汇总`,
-            displayLevel: 'primary',
-          },
-        });
+        // 注意：这里不能清零 resultReceivedAt。清零之后本分支只有等到「下一个
+        // result」才会重新进入，而后台任务恰恰可能以不唤醒主 Agent 的方式结束
+        //（housekeeping 通知不触发助手轮次），那样就永远没有下一个 result，
+        // 流一路挂到 IDLE_TIMEOUT 才被回收。保留时间戳，让每个 tick 都复查。
+        if (backgroundHoldStartedAt === null) {
+          backgroundHoldStartedAt = now;
+          log(
+            `Result emitted but ${blockingTasks} background task(s) still running, holding stream open: ${processor.describePendingSdkTasks().join(' | ')}`,
+          );
+          emit({
+            status: 'stream',
+            result: null,
+            streamEvent: {
+              eventType: 'status',
+              agentScope: 'system',
+              statusText: `${blockingTasks} 个后台任务运行中，完成后将继续汇总`,
+              displayLevel: 'primary',
+            },
+          });
+        }
+        // 任务又活跃起来，之前起算的收尾宽限作废。
+        completionGraceStartedAt = null;
         return;
+      }
+      // 后台任务都结束了。若欠着完成债，说明主 Agent 应被唤醒补一份汇总，
+      // 给它一个有界的宽限；不欠债就没有汇总会来，直接关流，别白等。
+      if (backgroundHoldStartedAt !== null) {
+        const debt = processor.getTaskCompletionDebt();
+        if (debt > 0) {
+          if (completionGraceStartedAt === null) {
+            completionGraceStartedAt = now;
+            log(`Background tasks finished with ${debt} completion debt, waiting up to ${COMPLETION_GRACE_MS / 1000}s for the follow-up summary`);
+            return;
+          }
+          if (now - completionGraceStartedAt <= COMPLETION_GRACE_MS) return;
+          log(`Follow-up summary did not arrive within ${COMPLETION_GRACE_MS / 1000}s, closing stream`);
+        } else {
+          log('Background tasks finished with no completion debt, closing stream');
+        }
       }
       log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
       interruptQueryForShutdown('Post-result timeout');
@@ -1752,6 +1783,9 @@ async function runQuery(
       if (message.type === 'result') {
         resultCount++;
         resultReceivedAt = Date.now();
+        backgroundHoldStartedAt = null;
+        completionGraceStartedAt = null;
+        processor.clearTaskCompletionDebt();
       }
       log(`[msg #${messageCount}] suppressed after early interrupt`);
       continue;
@@ -1972,6 +2006,10 @@ async function runQuery(
       // pollIpcDuringQuery 会在 POST_RESULT_TIMEOUT_MS 后关闭 stream，
       // 期间仍可检测 _drain/_close/_interrupt sentinel。
       resultReceivedAt = Date.now();
+      // 新 result 到达 = 完成债已偿还，退出挂流态，回到正常的 5 秒收尾倒计时。
+      backgroundHoldStartedAt = null;
+      completionGraceStartedAt = null;
+      processor.clearTaskCompletionDebt();
     }
   }
 

@@ -206,3 +206,131 @@ describe('describePendingSdkTasks', () => {
     expect(processor.describePendingSdkTasks()).toEqual(['summarize the week']);
   });
 });
+
+/**
+ * 电平信号（background_tasks_changed）与完成债。
+ *
+ * SDK 文档明确反对纯配对边沿：漏掉任一 bookend 就会让 pendingSdkTasks 里留下
+ * 永不结算的条目，把流挂到 IDLE_TIMEOUT。电平载荷是「整集替换」语义，用来纠正
+ * 漏掉的边沿；完成债则决定任务结束后值不值得为收尾汇总多等一会儿。
+ */
+const levelPayload = (
+  tasks: Array<{ task_id: string; task_type?: string; description?: string }>,
+) => ({
+  type: 'system',
+  subtype: 'background_tasks_changed',
+  tasks,
+});
+
+/** 让边沿条目越过对账宽限窗（LEVEL_RECONCILE_GRACE_MS = 3s）。 */
+function advancePastReconcileGrace() {
+  vi.setSystemTime(Date.now() + 5_000);
+}
+
+describe('电平信号对账', () => {
+  test('漏掉终态边沿时，电平信号把残留条目结算掉', () => {
+    vi.useFakeTimers();
+    try {
+      const { processor } = makeProcessor();
+      processor.processSystemMessage(taskStarted('t1'));
+      expect(processor.getBlockingPendingSdkTaskCount()).toBe(1);
+
+      // task_notification 丢了，只有电平信号说它不在了
+      advancePastReconcileGrace();
+      processor.processSystemMessage(levelPayload([]));
+
+      expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
+      // 任务确实结束过，欠一笔收尾汇总
+      expect(processor.getTaskCompletionDebt()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('刚登记的边沿不被电平集误判为已结束', () => {
+    vi.useFakeTimers();
+    try {
+      const { processor } = makeProcessor();
+      processor.processSystemMessage(taskStarted('t1'));
+      // 电平载荷紧跟着到达但还没包含 t1（SDK 声明两者顺序不保证）
+      processor.processSystemMessage(levelPayload([]));
+
+      expect(processor.getBlockingPendingSdkTaskCount()).toBe(1);
+      expect(processor.getTaskCompletionDebt()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('漏掉 task_started 时，电平集补上阻塞计数', () => {
+    const { processor } = makeProcessor();
+    processor.processSystemMessage(
+      levelPayload([{ task_id: 'ghost', task_type: 'agent', description: '子 Agent' }]),
+    );
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(1);
+  });
+
+  test('电平集里的 local_bash 按定义已 backgrounded，不阻塞收尾', () => {
+    const { processor } = makeProcessor();
+    processor.processSystemMessage(
+      levelPayload([{ task_id: 'devserver', task_type: 'local_bash', description: 'npm run dev' }]),
+    );
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
+  });
+
+  test('housekeeping 任务从电平侧混进来也不阻塞收尾', () => {
+    const { processor } = makeProcessor();
+    processor.processSystemMessage(taskStarted('hk', { skip_transcript: true }));
+    processor.processSystemMessage(
+      levelPayload([{ task_id: 'hk', task_type: 'agent', description: '内部整理' }]),
+    );
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
+  });
+
+  test('并集去重：同一任务同时出现在边沿集与电平集只计一次', () => {
+    const { processor } = makeProcessor();
+    processor.processSystemMessage(taskStarted('t1'));
+    processor.processSystemMessage(
+      levelPayload([{ task_id: 't1', task_type: 'agent', description: 'work for t1' }]),
+    );
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(1);
+  });
+});
+
+describe('完成债', () => {
+  test('对用户可见的任务结束会记债，housekeeping 不记', () => {
+    const { processor } = makeProcessor();
+    processor.processSystemMessage(taskStarted('t1'));
+    processor.processTaskNotification({ task_id: 't1', status: 'completed', summary: 'done' });
+    expect(processor.getTaskCompletionDebt()).toBe(1);
+
+    processor.processSystemMessage(taskStarted('hk', { skip_transcript: true }));
+    processor.processTaskNotification({ task_id: 'hk', status: 'completed', summary: 'tidy' });
+    // housekeeping 通知不触发助手轮次，记债只会让收尾白等 90 秒
+    expect(processor.getTaskCompletionDebt()).toBe(1);
+  });
+
+  test('未登记过的通知不记债（避免重复通知把债刷高）', () => {
+    const { processor } = makeProcessor();
+    processor.processTaskNotification({ task_id: 'unknown', status: 'completed', summary: 'x' });
+    expect(processor.getTaskCompletionDebt()).toBe(0);
+  });
+
+  test('clearTaskCompletionDebt 归零', () => {
+    const { processor } = makeProcessor();
+    processor.processSystemMessage(taskStarted('t1'));
+    processor.processTaskNotification({ task_id: 't1', status: 'completed', summary: 'done' });
+    processor.clearTaskCompletionDebt();
+    expect(processor.getTaskCompletionDebt()).toBe(0);
+  });
+
+  test('task_notification 同时把电平集里的条目清掉', () => {
+    const { processor } = makeProcessor();
+    processor.processSystemMessage(taskStarted('t1'));
+    processor.processSystemMessage(
+      levelPayload([{ task_id: 't1', task_type: 'agent', description: 'work' }]),
+    );
+    processor.processTaskNotification({ task_id: 't1', status: 'completed', summary: 'done' });
+    expect(processor.getBlockingPendingSdkTaskCount()).toBe(0);
+  });
+});

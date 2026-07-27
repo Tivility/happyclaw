@@ -116,8 +116,39 @@ export class StreamEventProcessor {
       description: string;
       taskType?: string;
       isBackgrounded: boolean;
+      registeredAt: number;
     }
   >();
+
+  // ── 电平信号（background_tasks_changed）──
+  //
+  // SDK 的 task_started / task_notification 是一对边沿，漏掉任何一侧都会让
+  // pendingSdkTasks 里留下永不结算的条目，把流一直挂到 IDLE_TIMEOUT。SDK 文档
+  // 明确反对纯配对边沿，要求消费方用电平信号「整集替换」。
+  //
+  // 电平集与边沿集并存而不是互相取代：边沿集带 skip_transcript / isBackgrounded
+  // 这些电平载荷没有的元信息，电平集则负责纠正漏掉的边沿。阻塞计数取两者并集。
+  private readonly liveBackgroundTasks = new Map<
+    string,
+    { description: string; taskType?: string }
+  >();
+
+  // 电平信号在启动时不发，空集不等于「没有任务」。只有收到过至少一次载荷，
+  // 才敢用它去反向结算边沿集里的残留。
+  private levelSignalSeen = false;
+
+  // 边沿刚登记就被电平集反向结算的竞态窗口：SDK 说两者相对顺序不保证
+  //（实践中电平在前）。给新登记的任务一点宽限再参与对账。
+  private readonly LEVEL_RECONCILE_GRACE_MS = 3_000;
+
+  // skip_transcript 的 housekeeping 任务：边沿路径故意不登记，电平载荷却会带上，
+  // 记下来免得它们从电平侧混进阻塞计数、把收尾卡住。
+  private readonly housekeepingTaskIds = new Set<string>();
+
+  // 「完成债」：有任务以对用户可见的方式结束，主 Agent 理应被唤醒补一份汇总。
+  // 欠债时才值得为收尾汇总多等一会儿；不欠债就说明没有汇总会来（例如
+  // housekeeping 通知不触发助手轮次），此时继续等就是白挂 30 分钟。
+  private taskCompletionDebt = 0;
 
   // Sub-agent active tools per parent task ID
   private readonly activeSubAgentToolsByTask = new Map<string, Set<string>>();
@@ -795,6 +826,13 @@ export class StreamEventProcessor {
       });
       return true;
     }
+    // 电平信号：整集替换，并用它纠正漏掉的边沿。
+    if (message.subtype === 'background_tasks_changed') {
+      this.processBackgroundTasksChanged(
+        Array.isArray(message.tasks) ? message.tasks : [],
+      );
+      return true;
+    }
     // task_started / task_progress — preserve the structured SDK task state.
     if (message.subtype === 'task_started') {
       if (message.task_id && message.tool_use_id) {
@@ -802,11 +840,16 @@ export class StreamEventProcessor {
       }
       const effectiveToolUseId = message.tool_use_id || this.sdkTaskIdToToolUseId.get(message.task_id) || message.task_id;
       const desc = message.description || message.prompt || '';
+      if (message.task_id && message.skip_transcript) {
+        // 电平载荷不带 skip_transcript，只能靠边沿这一侧把 housekeeping 记下来。
+        this.housekeepingTaskIds.add(message.task_id);
+      }
       if (message.task_id && !message.skip_transcript) {
         this.pendingSdkTasks.set(message.task_id, {
           description: desc,
           taskType: typeof message.task_type === 'string' ? message.task_type : undefined,
           isBackgrounded: false,
+          registeredAt: Date.now(),
         });
         this.log(
           `[pending-tasks] +${message.task_id.slice(0, 12)} (${shorten(desc, 60)}) → ${this.pendingSdkTasks.size} pending`,
@@ -1423,11 +1466,72 @@ export class StreamEventProcessor {
    * 有限的 Agent / workflow 任务仍需等它的最终汇总，必须计入。
    */
   getBlockingPendingSdkTaskCount(): number {
-    let count = 0;
-    for (const pending of this.pendingSdkTasks.values()) {
-      if (!(pending.taskType === 'local_bash' && pending.isBackgrounded)) count++;
+    const blocking = new Set<string>();
+    for (const [taskId, pending] of this.pendingSdkTasks) {
+      if (pending.taskType === 'local_bash' && pending.isBackgrounded) continue;
+      blocking.add(taskId);
     }
-    return count;
+    // 电平集里可能有边沿漏掉的任务。载荷本身就是「后台任务」清单，所以其中的
+    // local_bash 按定义已经 backgrounded（dev server / tail -f），不该阻塞收尾。
+    for (const [taskId, live] of this.liveBackgroundTasks) {
+      if (this.pendingSdkTasks.has(taskId)) continue;
+      if (this.housekeepingTaskIds.has(taskId)) continue;
+      if (live.taskType === 'local_bash') continue;
+      blocking.add(taskId);
+    }
+    return blocking.size;
+  }
+
+  /**
+   * 电平信号处理：整集替换 + 反向结算漏掉的边沿。
+   *
+   * SDK 明确说电平与边沿的相对顺序不保证（实践中电平在前），所以刚登记不久的
+   * 边沿不参与对账——否则「task_started 先到、电平后到」的顺序会把刚起的任务
+   * 误判成已结束，反而提前关流杀掉它。
+   */
+  private processBackgroundTasksChanged(
+    tasks: Array<{ task_id?: string; task_type?: string; description?: string }>,
+  ): void {
+    const previouslySeen = this.levelSignalSeen;
+    this.levelSignalSeen = true;
+
+    this.liveBackgroundTasks.clear();
+    for (const task of tasks) {
+      if (!task?.task_id) continue;
+      this.liveBackgroundTasks.set(task.task_id, {
+        description: task.description || '',
+        taskType: typeof task.task_type === 'string' ? task.task_type : undefined,
+      });
+    }
+
+    const now = Date.now();
+    const repaired: string[] = [];
+    for (const [taskId, pending] of [...this.pendingSdkTasks]) {
+      if (this.liveBackgroundTasks.has(taskId)) continue;
+      if (now - pending.registeredAt < this.LEVEL_RECONCILE_GRACE_MS) continue;
+      this.settlePendingSdkTask(taskId, 'background_tasks_changed');
+      repaired.push(taskId.slice(0, 12));
+      // 边沿丢了但任务确实结束了：仍然记一笔完成债，让收尾汇总有机会到达。
+      if (!(pending.taskType === 'local_bash' && pending.isBackgrounded)) {
+        this.taskCompletionDebt++;
+      }
+    }
+
+    this.log(
+      `[pending-tasks] level=${this.liveBackgroundTasks.size} edge=${this.pendingSdkTasks.size}`
+        + (repaired.length ? ` repaired=[${repaired.join(',')}]` : '')
+        + (previouslySeen ? '' : ' (first level payload)'),
+    );
+  }
+
+  /** 有多少笔「任务已完成、主 Agent 的收尾汇总还没到」的债。 */
+  getTaskCompletionDebt(): number {
+    return this.taskCompletionDebt;
+  }
+
+  /** 收到 result 即视为债已偿还。 */
+  clearTaskCompletionDebt(): void {
+    this.taskCompletionDebt = 0;
   }
 
   /** pending 任务的简述列表，用于日志与「N 个后台任务运行中」提示。 */
@@ -1438,7 +1542,14 @@ export class StreamEventProcessor {
   processTaskNotification(message: { task_id: string; tool_use_id?: string; status: string; summary: string; output_file?: string; usage?: any }): void {
     // 第二条 settle 路径，无条件执行：task_notification 到达即代表该任务有了终局，
     // 不依赖 task_updated 是否报过终态状态（漏 settle 会永久推迟关流）。
+    const wasBlocking = this.pendingSdkTasks.has(message.task_id);
     this.settlePendingSdkTask(message.task_id, `task_notification:${message.status}`);
+    this.liveBackgroundTasks.delete(message.task_id);
+    // 记完成债：这类通知会进 transcript，主 Agent 应当被唤醒补一份汇总。
+    // housekeeping 任务不触发助手轮次，记债只会让收尾白等。
+    if (wasBlocking && !this.housekeepingTaskIds.has(message.task_id)) {
+      this.taskCompletionDebt++;
+    }
     const effectiveToolUseId = message.tool_use_id
       || this.sdkTaskIdToToolUseId.get(message.task_id)
       || message.task_id;
