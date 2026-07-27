@@ -4063,6 +4063,20 @@ export function rebuildMessageTokenUsageFromLedger(
       },
     ]),
   );
+  // 口径标记要跟着重建出来的快照走。这条路径是从账本列聚合，不像流式路径那样
+  // 原样 JSON.stringify(usage 事件)，所以标记得从 usage_records.runtime 反推：
+  // codex / grok 的 inputTokens 是全量（已含 cacheRead），claude 不是。
+  // 丢掉它，前端的「新增输入」会把缓存读重复算进 new，和 cached 显示两遍。
+  const runtimeRow = db
+    .prepare(
+      `SELECT runtime FROM usage_records
+       WHERE group_folder = ? AND message_id = ? AND runtime IS NOT NULL
+       LIMIT 1`,
+    )
+    .get(groupFolder, messageId) as { runtime?: string } | undefined;
+  const inputTokensIncludeCacheRead =
+    runtimeRow?.runtime === 'codex' || runtimeRow?.runtime === 'grok';
+
   const tokenUsage = {
     inputTokens: Number(total.inputTokens) || 0,
     outputTokens: Number(total.outputTokens) || 0,
@@ -4072,6 +4086,9 @@ export function rebuildMessageTokenUsageFromLedger(
     costUSD: Number(total.costUSD) || 0,
     durationMs: Number(total.durationMs) || 0,
     numTurns: Number(total.numTurns) || 0,
+    ...(inputTokensIncludeCacheRead
+      ? { inputTokensIncludeCacheRead: true }
+      : {}),
     modelUsage,
   };
   updateLatestMessageTokenUsage(

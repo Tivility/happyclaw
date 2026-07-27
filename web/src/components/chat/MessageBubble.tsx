@@ -1,3 +1,4 @@
+import { formatTokens } from '@/components/billing/utils';
 import { useState, memo, lazy, Suspense } from 'react';
 import {
   Copy,
@@ -34,6 +35,7 @@ import {
   getAuthoritativeTokenBreakdown,
   getDisplayedTokenTotal,
   getPrimaryModelUsage,
+  getUncachedInputTokens,
   parseTokenUsage,
 } from '../../lib/token-usage-presentation';
 import { WorkflowRunCard } from './WorkflowRunCard';
@@ -115,7 +117,32 @@ function ReasoningBlock({
   );
 }
 
-// "claude-opus-4-8[1m]" -> "opus-4.8-1m"; keeps short names untouched.
+/** "claude-opus-4-8[1m]" -> "opus-4.8-1m"；短名原样返回。 */
+function shortModel(model: string): string {
+  const suffix = model.match(/\[(\d+)m\]$/i)?.[1];
+  const base = model.replace(/\[\d+m\]$/i, '');
+  const alias = base.match(/^(fable|opus|sonnet|haiku)$/i);
+  const m = base.match(/(fable|opus|sonnet|haiku)-(\d+)(?:-(\d+))?/i);
+  let short = '';
+  if (alias) {
+    short = alias[1].toLowerCase();
+  } else if (m && !m[3]) {
+    short = `${m[1].toLowerCase()}-${m[2]}`;
+  } else if (m) {
+    short = `${m[1].toLowerCase()}-${m[2]}.${m[3]}`;
+  }
+  if (short) return suffix ? `${short}-${suffix.toLowerCase()}m` : short;
+  return model.length > 20 ? model.slice(0, 17) + '...' : model;
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  const sec = ms / 1000;
+  if (sec < 60) return `${sec.toFixed(1)}s`;
+  const min = Math.floor(sec / 60);
+  const restSec = Math.floor(sec % 60);
+  return restSec === 0 ? `${min}m` : `${min}m ${restSec}s`;
+}
 
 
 /**
@@ -159,19 +186,43 @@ function TokenUsageDisplay({
     return String(n);
   };
 
+  // 摘要行按「模型 · 耗时 · 🆕 new · 🗂 cached · 💡 out · 💰 cost」展开。
+  //
+  // 分成 new / cached / out 三类而不是 input / output：Anthropic 的
+  // inputTokens **不含** 走 cache_read / cache_creation 的部分，只显示
+  // input+output 会把大上下文请求的绝大多数 token 藏掉，让费用看起来不合理。
+  //
+  // Codex/Grok 的 inputTokens 是全量（已含 cacheRead），所以 new 要扣掉
+  // cacheRead 再算，否则同一批缓存 token 会在 new 和 cached 各显示一遍。
+  // 口径由 usage.inputTokensIncludeCacheRead 自描述（见 shared/stream-event.ts）。
+  const cachedInput = breakdown.cacheReadInputTokens;
+  const newInput =
+    getUncachedInputTokens(usage, breakdown) +
+    breakdown.cacheCreationInputTokens;
+  const cost = usage.costUSD ?? 0;
+
+  const parts: string[] = [];
+  if (primary) parts.push(shortModel(primary[0]));
+  if (usage.durationMs !== undefined)
+    parts.push(formatDuration(usage.durationMs));
+  if (newInput > 0) parts.push(`🆕 ${formatTokens(newInput)} new`);
+  if (cachedInput > 0) parts.push(`🗂 ${formatTokens(cachedInput)} cached`);
+  if (breakdown.outputTokens > 0)
+    parts.push(`💡 ${formatTokens(breakdown.outputTokens)} out`);
+  // 订阅制运行时（codex/grok）没有 per-token 价，cost 恒为 0 —— 不显示 $0
+  // 免得误导成「这轮不花钱」。
+  if (cost > 0) parts.push(`💰 $${cost.toFixed(4)}`);
+  // Workflow subagent 的用量在主消息 payload 之外计费，单独列出而不是并进总数。
+  if (workflowTokens > 0)
+    parts.push(`🧩 ${formatTokens(workflowTokens)} workflow`);
+
   const summaryContent = (
     <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors cursor-default">
-      {displayTotal > 0 && <span>{formatNum(displayTotal)} tokens</span>}
-      {usage.durationMs ? (
-        <>
-          {displayTotal > 0 && <span className="opacity-40">·</span>}
-          <span>{(usage.durationMs / 1000).toFixed(1)}s</span>
-        </>
-      ) : null}
+      {parts.join(' · ')}
     </span>
   );
 
-  if (displayTotal === 0 && !usage.durationMs) return null;
+  if (parts.length === 0) return null;
 
   const hasDetails = displayTotal > 0 || primary !== null;
 
