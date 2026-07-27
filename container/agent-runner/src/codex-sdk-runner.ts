@@ -19,6 +19,7 @@ import {
 import {
   buildCodexConfigObject,
   buildPrompt,
+  ensureWorkspaceRootMarker,
   CodexEventNormalizer,
   resolveWorkspaceIpc,
   writeMcpContext,
@@ -91,6 +92,8 @@ export function createCodexSdkAdapter(
       for (const [key, value] of Object.entries(process.env)) {
         if (typeof value === 'string') env[key] = value;
       }
+
+      ensureWorkspaceRootMarker(input.cwd);
 
       const codexPathOverride = configuredCodexPathOverride();
       const permissionOptions = resolveCodexPermissionOptions({

@@ -17,15 +17,39 @@ import {
 } from './runtime-adapter.js';
 import { resolveCodexPermissionOptions } from './runtime-permissions.js';
 
-const CODEX_APP_CLI = '/Applications/Codex.app/Contents/Resources/codex';
+// codex 随桌面端分发，两个 bundle 名都出现过：新版装在 ChatGPT.app 里，
+// 旧版是独立的 Codex.app。只认后者会让 host 模式 spawn 直接 ENOENT
+// （PATH 上通常没有 codex —— 它不是 npm 全局包）。
+const CODEX_APP_CLI_CANDIDATES = [
+  '/Applications/ChatGPT.app/Contents/Resources/codex',
+  '/Applications/Codex.app/Contents/Resources/codex',
+];
 const DIST_DIR = path.dirname(fileURLToPath(import.meta.url));
+import { WORKSPACE_ROOT_MARKER, ensureWorkspaceRootMarker } from './workspace-root.js';
+export { WORKSPACE_ROOT_MARKER, ensureWorkspaceRootMarker };
+
 const CONTAINER_WORKSPACE_IPC = '/workspace/ipc';
+
+/**
+ * 把 codex 的项目根钉在工作区目录。
+ *
+ * codex 默认按 `.git` 向上找项目根，而 host 模式的工作区是
+ * `data/groups/<folder>`，嵌套在 HappyClaw 仓库内部。一旦某个工作区没有自己的
+ * `.git`（实测 38 个工作区里有 12 个没有），codex 就会一路走到仓库根，把
+ * `project_doc_fallback_filenames` 里的 `CLAUDE.md` 匹配到仓库那份 7 万字的
+ * 架构文档上，当成项目指令读进去 —— 业务 Agent 被重新定义成「代码库助手」。
+ *
+ * 放一个空标记文件让 codex 在工作区就停下。工作区自己的 CLAUDE.md（Agent 的
+ * 记忆）仍然会被读到，那是想要的。
+ */
 
 export function findCodexCli(): string {
   const configured =
     process.env.HAPPYCLAW_CODEX_CLI_PATH || process.env.CODEX_CLI_PATH;
   if (configured) return configured;
-  if (fs.existsSync(CODEX_APP_CLI)) return CODEX_APP_CLI;
+  for (const candidate of CODEX_APP_CLI_CANDIDATES) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
   return 'codex';
 }
 
@@ -269,6 +293,11 @@ export function buildCodexConfigObject(
     },
     model_reasoning_effort: 'xhigh',
     project_doc_fallback_filenames: ['CLAUDE.md'],
+    // 让工作区自己成为项目根。codex 默认按 .git 向上找根，而 host 模式的工作区
+    // 嵌套在 HappyClaw 仓库内部 —— 一旦某个工作区没有自己的 .git，codex 就会
+    // 一路走到仓库根，把 7 万字的架构文档当项目指令读进去，业务 Agent 被重新
+    // 定义成「代码库助手」。标记文件由 ensureWorkspaceRootMarker() 保证存在。
+    project_root_markers: [WORKSPACE_ROOT_MARKER, '.git'],
     mcp_servers: mcpServers,
   };
 }
@@ -595,6 +624,7 @@ export const codexCliAdapter: AgentRuntimeAdapter = {
     );
     const imageFiles = writeTempImages(input.images, workspaceIpc);
     const mcpContextPath = writeMcpContext(input);
+    ensureWorkspaceRootMarker(input.cwd);
     const model = input.model || input.input.selectedModel || undefined;
     const permissionOptions = resolveCodexPermissionOptions({
       privacyMode: !!input.input.privacyMode,
@@ -619,6 +649,11 @@ export const codexCliAdapter: AgentRuntimeAdapter = {
       'model_reasoning_effort="xhigh"',
     );
     args.push('-c', 'project_doc_fallback_filenames=["CLAUDE.md"]');
+    // 见 buildCodexConfig 的同名设置：把项目根钉在工作区，别向上走到仓库根
+    args.push(
+      '-c',
+      `project_root_markers=["${WORKSPACE_ROOT_MARKER}",".git"]`,
+    );
     pushMcpConfigArgs(args, mcpContextPath, input.cwd);
     args.push('--output-last-message', outputFile);
     if (model) args.push('--model', model);

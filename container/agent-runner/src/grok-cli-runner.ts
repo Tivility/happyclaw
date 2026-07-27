@@ -40,6 +40,11 @@ import type {
   RuntimeRunResult,
 } from './runtime-adapter.js';
 import {
+  buildGrokCompatEnv,
+  ensureWorkspaceGitRoot,
+  ensureWorkspaceRootMarker,
+} from './workspace-root.js';
+import {
   classifyRuntimeError,
   runtimeErrorMessage,
 } from './runtime-adapter.js';
@@ -167,6 +172,10 @@ export const grokCliAdapter: AgentRuntimeAdapter = {
   ): Promise<RuntimeRunResult> {
     const cli = findGrokCli();
     const contextPath = writeMcpContext(input);
+    // 工作区根隔离：grok 只认 git，仓库内的 host 工作区必须自成 git 根，
+    // 否则本仓库 CLAUDE.md（约 1.7 万 token）会被当项目指令灌进人格。
+    ensureWorkspaceRootMarker(input.cwd);
+    ensureWorkspaceGitRoot(input.cwd, input.input.contextAudit?.executionMode);
     const mcpServers = buildAcpMcpServers(contextPath, input.cwd);
     const model = input.model || input.input.selectedModel || 'grok-4.5';
     const startedAt = Date.now();
@@ -194,7 +203,11 @@ export const grokCliAdapter: AgentRuntimeAdapter = {
           // 关闭 grok 启动期 auto-update：`--no-auto-update` 仅 headless(`grok -p`)
           // 子命令识别，`grok agent stdio` 不认（会以 "unexpected argument" 退出）。
           // grok 二进制原生支持 env 开关 GROK_DISABLE_AUTOUPDATER=1。
-          env: { ...process.env, GROK_DISABLE_AUTOUPDATER: '1' },
+          env: {
+            ...process.env,
+            GROK_DISABLE_AUTOUPDATER: '1',
+            ...buildGrokCompatEnv(),
+          },
           stdio: ['pipe', 'pipe', 'pipe'],
           signal: input.signal,
         },

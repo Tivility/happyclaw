@@ -67,7 +67,15 @@ export interface ClaudeContextAudit {
   executionMode: 'host' | 'container';
   cwd?: string;
   claudeConfigDir?: string;
+  /**
+   * HappyClaw 仓库根。host 模式的 agent 跑在 data/groups/<folder>，嵌套在仓库
+   * 内部，Claude Code 会把仓库自己的 CLAUDE.md 当 Project memory 发现 —— 一个
+   * 业务 Agent 会被开发文档重新定义成「代码库助手」。用它算排除模式。
+   */
+  projectRoot?: string;
   externalClaudeDir?: string;
+  /** 实际下发给 SDK 的 claudeMdExcludes，便于审计与泄漏检测。 */
+  claudeMdExcludes?: string[];
   claudeMd: ClaudeContextFileAudit;
   rules: ClaudeContextRulesAudit;
   skills: ClaudeContextSkillsAudit;

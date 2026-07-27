@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { PROJECT_ROOT } from './config.js';
 import type { ClaudeContextAudit } from './stream-event.types.js';
 import type { RegisteredGroup } from './types.js';
 
@@ -132,6 +133,10 @@ export function buildClaudeContextPlan(args: ClaudeContextPlanArgs): ClaudeConte
 
   const audit: ClaudeContextAudit = {
     executionMode: args.executionMode,
+    // host 模式的 agent 跑在 data/groups/<folder>，嵌套在本仓库内部，Claude Code
+    // 会一路向上把仓库根的 CLAUDE.md 当 Project memory 发现。下发仓库根，让
+    // runner 算出排除模式。container 模式不受影响（容器里看不到仓库）。
+    projectRoot: args.executionMode === 'host' ? PROJECT_ROOT : undefined,
     externalClaudeDir: isAdminOwned ? args.externalClaudeDir : undefined,
     claudeMd: {
       sourcePath: claudeMdSource,

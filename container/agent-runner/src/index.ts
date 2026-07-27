@@ -42,6 +42,10 @@ import {
 import { StreamEventProcessor } from './stream-processor.js';
 import { buildPersonaBlock, describePersona, personaPromptMode } from './agent-persona.js';
 import { PREDEFINED_AGENTS } from './agent-definitions.js';
+import {
+  findClaudeMdExcludeLeaks,
+  resolveManagedHostClaudeMdExcludes,
+} from './claude-memory-policy.js';
 import { createMcpTools } from './mcp-tools.js';
 import { codexCliAdapter } from './codex-cli-runner.js';
 import { codexSdkAdapter } from './codex-sdk-runner.js';
@@ -238,6 +242,20 @@ function enrichContextAudit(
   }
 
   const memoryFiles = ctxUsage.memoryFiles ?? [];
+
+  // 下发了排除模式不代表 SDK 真的照做。拿它实际上报的 memoryFiles 反查，
+  // 漏进来的记进 warnings —— 否则「业务 Agent 被开发文档污染」这件事
+  // 在审计里依然不可见。
+  const excludedMemoryLeaks = findClaudeMdExcludeLeaks(
+    memoryFiles,
+    audit.claudeMdExcludes ?? [],
+  );
+  if (excludedMemoryLeaks.length > 0) {
+    audit.warnings.push(
+      `managed context isolation failed; SDK loaded excluded memory: ${excludedMemoryLeaks.join(', ')}`,
+    );
+  }
+
   const claudeMemory = memoryFiles.find((file) =>
     pathMatches(file.path, audit.claudeMd.runtimePath)
     || pathMatches(file.path, audit.claudeMd.sourcePath)
@@ -1530,6 +1548,23 @@ async function runQuery(
   const flagSettings: Record<string, unknown> = {};
   if (Number.isFinite(autoCompactWindow) && autoCompactWindow > 0) {
     flagSettings.autoCompactWindow = autoCompactWindow;
+  }
+
+  // host 模式的 agent 跑在 data/groups/<folder>，嵌套在 HappyClaw 仓库内部，
+  // Claude Code 会一路向上把仓库根那份 CLAUDE.md（7 万字架构文档）当 Project
+  // memory 加载 —— 业务 Agent 被重新定义成「代码库助手」，而且这个污染在
+  // contextAudit 里原本不可见。排除仓库根与宿主机用户记忆，工作区自己的
+  // CLAUDE.md（Agent 的记忆，不是开发文档）保留。
+  const claudeMdExcludes = resolveManagedHostClaudeMdExcludes({
+    executionMode: containerInput.contextAudit?.executionMode ?? 'container',
+    externalClaudeDir: containerInput.contextAudit?.externalClaudeDir,
+    homeDir: process.env.HOME,
+    projectRoot: containerInput.contextAudit?.projectRoot,
+  });
+  if (claudeMdExcludes.length > 0) {
+    flagSettings.claudeMdExcludes = claudeMdExcludes;
+    // 记进审计，供 enrichContextAudit 时做泄漏反查
+    contextAuditBase.claudeMdExcludes = claudeMdExcludes;
   }
 
   // Resolve the actual claude CLI path using `which`.

@@ -90,6 +90,10 @@ const previousGlobal = process.env.HAPPYCLAW_WORKSPACE_GLOBAL;
 const previousMemory = process.env.HAPPYCLAW_WORKSPACE_MEMORY;
 const previousUserMcp = process.env.HAPPYCLAW_USER_MCP_SERVERS_JSON;
 
+// 用临时目录当工作区：适配器会在 cwd 落一个 .happyclaw-workspace 标记
+// （钉住 codex 的项目根），直接传 process.cwd() 会把标记写进仓库根。
+const sdkRunnerCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'hc-codex-sdk-'));
+
 function runtimeInput(overrides: Record<string, unknown> = {}) {
   return {
     input: {
@@ -100,7 +104,7 @@ function runtimeInput(overrides: Record<string, unknown> = {}) {
       selectedModel: 'gpt-5.5',
     },
     prompt: 'hello',
-    cwd: process.cwd(),
+    cwd: sdkRunnerCwd,
     systemPromptAppend: '<system>test</system>',
     model: 'gpt-5.5',
     ...overrides,
@@ -178,7 +182,7 @@ describe('Codex SDK runner', () => {
     });
     expect(sdkMock.constructed).toHaveLength(1);
     expect(sdkMock.started[0]).toMatchObject({
-      workingDirectory: process.cwd(),
+      workingDirectory: sdkRunnerCwd,
       additionalDirectories,
       skipGitRepoCheck: true,
       sandboxMode: 'danger-full-access',

@@ -8,8 +8,10 @@ export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'HappyClaw';
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
-// Absolute paths needed for container mounts
-const PROJECT_ROOT = process.cwd();
+// Absolute paths needed for container mounts.
+// 也用于 host 模式的记忆隔离：agent 的 cwd 嵌套在本仓库内部，要把仓库根
+// 下发给 runner 才能算出 CLAUDE.md 的排除模式（见 claude-memory-policy.ts）。
+export const PROJECT_ROOT = process.cwd();
 
 // Mount security: allowlist in project config/ directory
 export const MOUNT_ALLOWLIST_PATH = path.resolve(
