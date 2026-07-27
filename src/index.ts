@@ -7807,12 +7807,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                     lastReplyMsgId,
                   );
                 } else {
-                  updateLatestMessageTokenUsage(
-                    chatJid,
-                    JSON.stringify(se.usage),
-                    undefined,
-                    se.usage.costUSD,
-                  );
+                  // usage 事件比回复消息先到（SDK 先报用量、再给最终文本）。
+                  // 此时那条回复还没落库，updateLatestMessageTokenUsage 的
+                  // 「最近一条无 token_usage 的 agent 消息」fallback 也匹配不到
+                  // —— 用量就此丢失，token_usage 列永远是 NULL，飞书卡片的
+                  // metaRow 与 Web 的摘要行都拿不到数据（用户看到的现象是
+                  // 「那条 bar 没了」）。
+                  //
+                  // 缓存起来，等回复落库后由 flushPendingUsageForReply 补记。
+                  // 那个函数一直在，**只是赋值这一侧在合并时丢了** ——
+                  // pendingUsage 只被读和清空、从没被写过，flush 恒为 no-op。
+                  pendingUsage = se.usage;
                 }
 
                 logger.debug(
@@ -15376,11 +15381,17 @@ async function processAgentConversation(
               lastAgentReplyMsgId,
             );
           } else {
-            updateLatestMessageTokenUsage(
-              virtualChatJid,
-              JSON.stringify(output.streamEvent.usage),
-              undefined,
-              output.streamEvent.usage.costUSD,
+            // 同主消息路径：usage 先于回复到达时缓存，等回复落库后由
+            // flushPendingAgentUsageForReply 补记。赋值这一侧在合并时丢了，
+            // pendingAgentUsage 只被读和清空 → SubAgent 会话的用量全部丢失。
+            pendingAgentUsage = output.streamEvent.usage;
+            logger.debug(
+              {
+                chatJid,
+                agentId,
+                inputTokens: output.streamEvent.usage.inputTokens,
+              },
+              'Agent token usage deferred until reply message exists',
             );
           }
         } catch (err) {
