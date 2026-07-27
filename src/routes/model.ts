@@ -24,7 +24,7 @@ import {
   setWorkspaceModelDefault,
   upsertProviderPoolModelOption,
 } from '../db.js';
-import { canAccessGroup, canModifyGroup } from '../web-context.js';
+import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
 import { logger } from '../logger.js';
 import type { Variables } from '../web-context.js';
 import { createModelSwitchHandoffSummary } from '../model-switch-handoff.js';
@@ -389,7 +389,34 @@ async function setScopeBindingForWorkspace(
     user.id,
     { markPending: true, handoffSummaryId: summary?.id ?? null },
   );
-  return c.json({ scope, handoffSummary: summary });
+
+  // 让切换在**下一条消息**就生效，而不是等进程自己退。
+  //
+  // pending 绑定只在 spawn 前被 promotePendingConversationRuntimeBinding()
+  // 提升。Codex/Grok 是单 turn re-spawn，每轮都过 spawn 路径，切换自然下一条
+  // 生效；Claude 是常驻进程 + IPC 注入，后续轮根本走不到那里 —— 切换要等空闲
+  // 超时（默认 30 分钟）或手动 /clear 才生效。
+  //
+  // 这个差异对用户是隐性的：UI 显示切换成功、pending 也写进库了、上面的交接
+  // 摘要（存在的唯一目的就是跨运行时延续上下文）也生成了，但下一条消息还是老
+  // 运行时回的，且没有任何提示。
+  //
+  // requestGracefulRestart 走 _drain 而非 _close：当前正在生成的回答会跑完，
+  // 只是不再接新消息。下一条消息触发重开进程 → promote pending → 消费交接摘要。
+  // 三条运行时行为由此对齐。
+  let restarted = false;
+  try {
+    restarted =
+      getWebDeps()?.queue?.requestGracefulRestart(workspace.jid) ?? false;
+  } catch (err) {
+    // 队列不可用不该让切换本身失败 —— 绑定已经落库，最坏退回旧行为
+    // （等进程自然退出后生效）。
+    logger.warn(
+      { workspaceJid: workspace.jid, err },
+      'Model binding saved but graceful restart failed',
+    );
+  }
+  return c.json({ scope, handoffSummary: summary, restarted });
 }
 
 modelRoutes.put('/workspaces/:workspaceJid/scopes/main', authMiddleware, (c) =>

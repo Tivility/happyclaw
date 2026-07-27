@@ -24,9 +24,11 @@ vi.mock('../src/middleware/auth.js', () => ({
   requirePermission: () => async (_c: any, next: any) => next(),
 }));
 
+const requestGracefulRestart = vi.fn(() => true);
 vi.mock('../src/web-context.js', () => ({
   canAccessGroup: vi.fn(() => true),
   canModifyGroup: vi.fn(() => true),
+  getWebDeps: () => ({ queue: { requestGracefulRestart } }),
 }));
 
 vi.mock('../src/logger.js', () => ({
@@ -289,6 +291,42 @@ describe('model routes', () => {
       'owner-user',
       { markPending: true, handoffSummaryId: 'handoff-summary-1' },
     );
+  });
+
+  it('切绑定后发优雅重启信号，让切换在下一条消息就生效', async () => {
+    requestGracefulRestart.mockClear();
+    const res = await modelRoutes.request(
+      jsonRequest('/workspaces/web:flow/scopes/main', 'PUT', {
+        providerPoolId: 'gpt',
+        model: 'gpt-5.5',
+      }),
+    );
+
+    expect(res.status).toBe(200);
+    // pending 绑定只在 spawn 前提升。Claude 是常驻进程 + IPC 注入，不发这个
+    // 信号的话切换要等空闲超时（默认 30 分钟）才生效 —— 而 UI 已显示切换成功、
+    // 交接摘要也生成了，用户看到的是「切了但没换」。
+    expect(requestGracefulRestart).toHaveBeenCalledWith('web:flow');
+    expect(await res.json()).toMatchObject({ restarted: true });
+  });
+
+  it('优雅重启失败不影响绑定本身落库', async () => {
+    requestGracefulRestart.mockClear();
+    requestGracefulRestart.mockImplementationOnce(() => {
+      throw new Error('queue unavailable');
+    });
+    const res = await modelRoutes.request(
+      jsonRequest('/workspaces/web:flow/scopes/main', 'PUT', {
+        providerPoolId: 'gpt',
+        model: 'gpt-5.5',
+      }),
+    );
+
+    // 绑定已经写库了，重启只是加速生效 —— 失败就退回旧行为（等进程自然退出），
+    // 不该让整个切换请求失败。
+    expect(res.status).toBe(200);
+    expect(mocks.setConversationRuntimeBinding).toHaveBeenCalled();
+    expect(await res.json()).toMatchObject({ restarted: false });
   });
 
   it('rejects the legacy folder scope route when multiple web JIDs exist', async () => {

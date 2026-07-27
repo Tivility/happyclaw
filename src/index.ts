@@ -8221,20 +8221,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               // 纯文本 IM 渠道无法编辑已发消息，经 imTextOverride 只发本 turn 增量。
               let dbText = text;
               let turnIdForDb: string | undefined;
-              lastReplyMsgId = await sendMessage(chatJid, text, {
-                sendToIM: directImReply && !skipImSend,
-                deliveryDeferred,
-                localImagePaths,
-                messageMeta: {
-                  turnId: turnIdForDb,
-                  sessionId: result.sessionId || activeSessionId,
-                  sdkMessageUuid: result.sdkMessageUuid,
-                  sourceKind: result.sourceKind || 'sdk_final',
-                  finalizationReason: result.finalizationReason || 'completed',
-                },
-              });
-              await flushPendingUsageForReply(lastReplyMsgId);
-              lastSavedTurnId = effectiveTurnId;
+              // 这里**不发送** —— 真正的发送在下方 sendMessageWithOutcome。
+              //
+              // 合并时本地的 sendMessage 和 upstream 的 sendMessageWithOutcome
+              // 都被保留了，同一条回复因此发两次、落两行：Web 聊天记录每句显示
+              // 两遍，agent_reply 也广播两次。两侧父提交各只有一个 sdk_final
+              // 落库点。
+              //
+              // 而且这次调用早于 turnIdForDb 赋值（在下面的 held-sequence 分支
+              // 里才算出来），拿到的是 undefined —— 注释里那套「按
+              // (chat_jid, turn_id) UPSERT 覆盖同一行」的去重根本没生效，
+              // 于是两行并存而不是互相覆盖。
 
               // Archive the completed turn straight from what we just persisted.
               // Replaces the Claude-only PreCompact hook as the archive of
@@ -8321,6 +8318,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 },
               );
               lastReplyMsgId = replySendOutcome.messageId;
+              // 用量补记与 turnId 记账挪到真正发送之后 —— 它们要绑定权威回复行
+              // 的 messageId。
+              await flushPendingUsageForReply(lastReplyMsgId);
+              lastSavedTurnId = effectiveTurnId;
               // A final provider-card ACK is the irreversible user-visible
               // side effect for this turn.  Do it only after the Web/DB row is
               // durable, and only after every local attachment has reached
