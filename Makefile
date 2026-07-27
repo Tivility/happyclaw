@@ -349,13 +349,10 @@ backup: ## 备份运行时数据到 happyclaw-backup-{date}.tar.gz
 	  echo "❌ 运行时数据包含不安全的链接或特殊文件，拒绝创建不可安全恢复的备份：$$UNSAFE_ENTRY"; \
 	  exit 1; \
 	fi; \
-	: "检查源目录而非 TMP_ROOT：macOS 的 cp -a 不保留硬链接（GNU cp -a 才保留），"; \
-	: "拷贝后 nlink already 降为 1，对副本检查在 macOS 上恒不触发。"; \
-	HARDLINK_ENTRY=$$(find "$(RUNTIME_DATA_DIR)" -type f -links +1 -print -quit); \
-	if [ -n "$$HARDLINK_ENTRY" ]; then \
-	  echo "❌ 运行时数据包含硬链接文件，tar 会将其存为不完整的链接条目导致备份无法恢复，拒绝创建：$$HARDLINK_ENTRY"; \
-	  exit 1; \
-	fi; \
+	: "扫源目录而非 TMP_ROOT：macOS 的 cp -a 不保留硬链接（GNU cp -a 才保留），"; \
+	: "副本里 nlink 已降为 1，对副本检查在 macOS 上恒不触发。判据是「树内重复"; \
+	: "inode」而非「nlink>1」，理由见脚本头注释。"; \
+	node scripts/check-source-hardlinks.mjs "$(RUNTIME_DATA_DIR)"; \
 	if [ -d "$$TMP_ROOT/data/groups" ]; then \
 	  find "$$TMP_ROOT/data/groups" -mindepth 2 -maxdepth 2 -type d -name logs \
 	    -prune -exec rm -rf {} +; \
