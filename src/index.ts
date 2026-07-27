@@ -8391,6 +8391,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 if (pendingStreamingCardCompleted) {
                   heldUsagePatchTarget = pendingStreamingCardCompletion;
                   heldCardParts = [];
+                  // 普通回合（无挂起序列）也要留下 patch 目标：usage 事件常在
+                  // 卡片定稿之后才到，此时往当前 session 喂事件是 no-op
+                  //（卡已 completed，且下一条消息的空白卡已轮换上来）。
+                  // heldUsagePatchTarget 只服务「挂起序列刚定稿」那条分支，普通
+                  // 回合会在下个 result 到达时把它清成 null —— 所以另存一份，由
+                  // flushPendingUsageForReply → patchCompletedStreamingSessionUsage
+                  // 补到已定稿的那张卡上。
+                  //
+                  // 这个变量本地一直有，但**赋值一侧在合并时丢了**：它只被读和
+                  // 清空，patch 恒为 no-op —— 飞书卡片的用量行因此永远不显示。
+                  completedStreamingSessionForUsage =
+                    pendingStreamingCardCompletion;
                 } else if (cardFinalization.error) {
                   logger.warn(
                     { cardError: cardFinalization.error, chatJid },
