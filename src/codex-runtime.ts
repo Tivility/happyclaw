@@ -6,12 +6,10 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
+// 决策 38：codex 运行时只保留 CLI 一条实现，`@openai/codex-sdk` 不再是本仓库的
+// 依赖，也没有任何执行路径会 import 它。因此这里不再探测 SDK —— 探测一个我们
+// 已经确定不用的包，返回的永远是常量，设置页把它当诊断信息展示反而误导。
 export interface CodexDependencyStatus {
-  sdk: {
-    available: boolean;
-    packageName: '@openai/codex-sdk';
-    error?: string;
-  };
   cli: {
     available: boolean;
     path: string | null;
@@ -36,23 +34,6 @@ export async function findCodexCli(): Promise<string | null> {
     return found || null;
   } catch {
     return null;
-  }
-}
-
-async function probeSdk(): Promise<CodexDependencyStatus['sdk']> {
-  try {
-    const dynamicImport = new Function(
-      'specifier',
-      'return import(specifier)',
-    ) as (specifier: string) => Promise<unknown>;
-    await dynamicImport('@openai/codex-sdk');
-    return { available: true, packageName: '@openai/codex-sdk' };
-  } catch (err) {
-    return {
-      available: false,
-      packageName: '@openai/codex-sdk',
-      error: err instanceof Error ? err.message : String(err),
-    };
   }
 }
 
@@ -83,7 +64,9 @@ async function probeCli(): Promise<CodexDependencyStatus['cli']> {
       '--output-last-message',
       '--image',
     ];
-    const missingFlags = requiredFlags.filter((flag) => !helpText.includes(flag));
+    const missingFlags = requiredFlags.filter(
+      (flag) => !helpText.includes(flag),
+    );
     if (missingFlags.length > 0) {
       return {
         available: false,
@@ -111,8 +94,7 @@ async function probeCli(): Promise<CodexDependencyStatus['cli']> {
 }
 
 export async function probeCodexDependencies(): Promise<CodexDependencyStatus> {
-  const [sdk, cli] = await Promise.all([probeSdk(), probeCli()]);
-  return { sdk, cli };
+  return { cli: await probeCli() };
 }
 
 export function defaultCodexHome(providerId: string): string {

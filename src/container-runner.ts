@@ -12,26 +12,15 @@ import {
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import {
-  randomUUID,
-} from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
-import {
-  CONTAINER_IMAGE,
-  DATA_DIR,
-  GROUPS_DIR,
-  TIMEZONE,
-} from './config.js';
-import {
-  logger,
-} from './logger.js';
+import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, TIMEZONE } from './config.js';
+import { logger } from './logger.js';
 import {
   buildEffectiveMcpManifest,
   loadPluginMcpDefinitions,
 } from './effective-mcp-manifest.js';
-import {
-  resolveHostNodeBinary,
-} from './node-resolver.js';
+import { resolveHostNodeBinary } from './node-resolver.js';
 import {
   AdditionalMountValidationError,
   loadMountAllowlist,
@@ -58,13 +47,8 @@ import {
   persistRefreshedProviderAuth,
   writeCredentialsFile,
 } from './runtime-config.js';
-import {
-  providerPool,
-  providerPoolManager,
-} from './provider-pool.js';
-import {
-  resolveProviderFailureDisposition,
-} from './provider-failure.js';
+import { providerPool, providerPoolManager } from './provider-pool.js';
+import { resolveProviderFailureDisposition } from './provider-failure.js';
 import {
   deleteSession,
   getUserById,
@@ -108,12 +92,8 @@ import {
   CONTAINER_PLUGINS_PATH,
   type SdkPluginConfig,
 } from './plugin-utils.js';
-import {
-  materializeUserRuntime,
-} from './plugin-materializer.js';
-import {
-  invalidateUserCommandIndex,
-} from './plugin-command-index.js';
+import { materializeUserRuntime } from './plugin-materializer.js';
+import { invalidateUserCommandIndex } from './plugin-command-index.js';
 import {
   checkHostCapabilities,
   logCapabilityPreflight,
@@ -123,14 +103,8 @@ import {
   loadHostClaudeSettings,
   syncHostClaudeContext,
 } from './claude-context-resolver.js';
-import {
-  pluginSkillLayers,
-} from './effective-skill-resolver.js';
-import {
-  MessageSourceKind,
-  RegisteredGroup,
-  StreamEvent,
-} from './types.js';
+import { pluginSkillLayers } from './effective-skill-resolver.js';
+import { MessageSourceKind, RegisteredGroup, StreamEvent } from './types.js';
 import type {
   AgentRuntime,
   ModelSelectionKind,
@@ -138,13 +112,8 @@ import type {
   ChannelTurnContext,
   InteractionMode,
 } from './types.js';
-import {
-  validateSkillId,
-  validateSkillPath,
-} from './skill-utils.js';
-import type {
-  ClaudeContextAudit,
-} from './stream-event.types.js';
+import { validateSkillId, validateSkillPath } from './skill-utils.js';
+import type { ClaudeContextAudit } from './stream-event.types.js';
 import {
   resolveHostSkillPolicy,
   type HostSkillPolicy,
@@ -1021,7 +990,9 @@ export function trySelectPoolProvider(
   }
 }
 
-function selectCodexProviderForInput(input: ContainerInput): UnifiedProvider | null {
+function selectCodexProviderForInput(
+  input: ContainerInput,
+): UnifiedProvider | null {
   const providerPoolId = input.providerPoolId || 'gpt';
 
   if (input.providerId) {
@@ -1154,7 +1125,11 @@ function resolveAgentProfileForInput(
       })
     ) {
       logger.info(
-        { folder: group.folder, agentProfileId: profile.id, version: profile.version },
+        {
+          folder: group.folder,
+          agentProfileId: profile.id,
+          version: profile.version,
+        },
         'Agent persona changed since this session started; keeping context (prompt prefix cache will miss once)',
       );
     }
@@ -1628,7 +1603,9 @@ export function buildVolumeMounts(
   const containerOverride = getContainerEnvConfig(group.folder);
   const nativeCliMaterial = codexAuthMaterial ?? grokAuthMaterial ?? null;
   const envLines = nativeCliMaterial
-    ? Object.entries(nativeCliMaterial.env).map(([key, value]) => `${key}=${value}`)
+    ? Object.entries(nativeCliMaterial.env).map(
+        ([key, value]) => `${key}=${value}`,
+      )
     : buildContainerEnvLines(
         globalConfig,
         containerOverride,
@@ -1678,7 +1655,9 @@ export function buildVolumeMounts(
   // SystemSettings.mainAgentAutoCompactWindow > 0 时注入到容器，让 agent-runner 通过 query() settings 传给 SDK
   const sysSettings = getSystemSettings();
   if (sysSettings.mainAgentAutoCompactWindow > 0) {
-    envLines.push(`AUTO_COMPACT_WINDOW=${sysSettings.mainAgentAutoCompactWindow}`);
+    envLines.push(
+      `AUTO_COMPACT_WINDOW=${sysSettings.mainAgentAutoCompactWindow}`,
+    );
   }
   const autoCompactPercentage = getAgentAutoCompactPercentage(agentProfile);
   const mainAgentAutoCompactWindow = getAgentAutoCompactWindow(agentProfile);
@@ -1742,7 +1721,6 @@ export function buildVolumeMounts(
       }
     }
   }
-
 
   // Mount agent-runner source from host — recompiled on container startup.
   // Bypasses Docker 镜像构建缓存，确保代码变更生效。
@@ -1866,7 +1844,9 @@ export async function runContainerAgent(
   const selectedProviderPoolId =
     input.providerPoolId ||
     (isCodexRuntime ? 'gpt' : isGrokRuntime ? 'grok' : 'claude');
-  const codexProvider = isCodexRuntime ? selectCodexProviderForInput(input) : null;
+  const codexProvider = isCodexRuntime
+    ? selectCodexProviderForInput(input)
+    : null;
   if (isCodexRuntime && !codexProvider) {
     return {
       status: 'error',
@@ -1886,10 +1866,10 @@ export async function runContainerAgent(
     ? null
     : trySelectPoolProvider(group.folder, input.providerId, input.agentId);
   const selectedProfileId = isCodexRuntime
-    ? codexProvider?.id ?? null
+    ? (codexProvider?.id ?? null)
     : isGrokRuntime
-      ? grokProvider?.id ?? null
-      : poolResult?.profileId ?? null;
+      ? (grokProvider?.id ?? null)
+      : (poolResult?.profileId ?? null);
   const resolvedProvider = poolResult?.resolved;
   let codexAuthMaterial: CodexProviderAuthMaterial | null = null;
   let grokAuthMaterial: GrokProviderAuthMaterial | null = null;
@@ -1905,7 +1885,11 @@ export async function runContainerAgent(
     { providerId: poolResult?.previousProviderId ?? null },
     { providerId: selectedProfileId ?? null },
   );
-  if (poolResult?.resetSession && providerValidity.shouldDiscard && input.sessionId) {
+  if (
+    poolResult?.resetSession &&
+    providerValidity.shouldDiscard &&
+    input.sessionId
+  ) {
     logger.info(
       {
         groupFolder: group.folder,
@@ -2355,16 +2339,16 @@ export async function runContainerAgent(
             );
           } else {
             providerPool.reportFailure(selectedProfileId, true);
-            }
-            providerFailureReported = true;
+          }
+          providerFailureReported = true;
         }
-        } else if (
-          // 隐藏的模型重试（providerFailureRetrying）会让本轮以 success 收尾，
-          // 但该 provider 这一轮其实已被判失败。少了这个守卫，上报的 success
-          // 会把刚熔断的 provider 重新标成健康，下一轮又路由回去。
-          !providerFailureReported &&
-          (result.status === 'success' || result.status === 'closed')
-        ) {
+      } else if (
+        // 隐藏的模型重试（providerFailureRetrying）会让本轮以 success 收尾，
+        // 但该 provider 这一轮其实已被判失败。少了这个守卫，上报的 success
+        // 会把刚熔断的 provider 重新标成健康，下一轮又路由回去。
+        !providerFailureReported &&
+        (result.status === 'success' || result.status === 'closed')
+      ) {
         if (isCodexRuntime) {
           providerPoolManager.reportSuccess(
             selectedProviderPoolId,
@@ -2422,7 +2406,8 @@ export async function runContainerAgent(
       // 放在 finally 里：即使这次 spawn 抛了，CLI 也可能已经刷新过凭据，
       // 那份才是唯一有效的 refresh_token，不能因为本轮失败就丢掉。
       // best-effort —— 回写失败不该影响本轮结果。
-      const refreshedProviderId = codexAuthMaterial?.providerId ?? grokAuthMaterial?.providerId;
+      const refreshedProviderId =
+        codexAuthMaterial?.providerId ?? grokAuthMaterial?.providerId;
       if (refreshedProviderId) {
         try {
           persistRefreshedProviderAuth(refreshedProviderId);
@@ -2804,14 +2789,15 @@ export async function runHostAgent(
     ? null
     : trySelectPoolProvider(group.folder, input.providerId, input.agentId);
   const hostSelectedProfileId = isCodexRuntime
-    ? codexProvider?.id ?? null
+    ? (codexProvider?.id ?? null)
     : isGrokRuntime
-      ? grokProvider?.id ?? null
-      : hostPoolResult?.profileId ?? null;
+      ? (grokProvider?.id ?? null)
+      : (hostPoolResult?.profileId ?? null);
   const hostProviderPoolId =
     input.providerPoolId ||
     (isCodexRuntime ? 'gpt' : isGrokRuntime ? 'grok' : 'claude');
-  const globalConfig = hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
+  const globalConfig =
+    hostPoolResult?.resolved.config ?? getClaudeProviderConfig();
   let hostProviderFailureReported = false;
   let hostProviderFailureTerminal: boolean | undefined;
   let hostProviderFailureMaintenance = false;
@@ -2947,7 +2933,10 @@ export async function runHostAgent(
 
     // Write .credentials.json for OAuth credentials
     if (!isNativeCliRuntime) {
-      const mergedConfig = mergeClaudeEnvConfig(globalConfig, containerOverride);
+      const mergedConfig = mergeClaudeEnvConfig(
+        globalConfig,
+        containerOverride,
+      );
       if (input.runtime === 'claude' && input.modelOverride) {
         mergedConfig.anthropicModel = input.modelOverride;
       }
@@ -2969,7 +2958,9 @@ export async function runHostAgent(
     const autoCompactPercentage = getAgentAutoCompactPercentage(
       input.agentProfile,
     );
-    const mainAgentAutoCompactWindow = getAgentAutoCompactWindow(input.agentProfile);
+    const mainAgentAutoCompactWindow = getAgentAutoCompactWindow(
+      input.agentProfile,
+    );
     if (autoCompactPercentage > 0) {
       hostEnv['AUTO_COMPACT_PERCENTAGE'] = String(autoCompactPercentage);
     } else if (mainAgentAutoCompactWindow > 0) {
@@ -3058,12 +3049,11 @@ export async function runHostAgent(
     const agentRunnerRoot = path.join(projectRoot, 'container', 'agent-runner');
     const agentRunnerNodeModules = path.join(agentRunnerRoot, 'node_modules');
     const agentRunnerDist = path.join(agentRunnerRoot, 'dist', 'index.js');
-      // 决策 38：codex 只保留 CLI 一条实现，`@openai/codex-sdk` 已从
-      // agent-runner 的依赖里删掉。留在这里会让 preflight 恒定失败 ——
-      // 所有宿主机会话报「缺少 agent-runner 依赖」，完全跑不起来。
-      // SDK 的可用性仍由 codex-runtime.ts 探测并在设置页展示（未安装则显示
-      // 「当前使用 Codex CLI 路径」），那只是信息展示，不是启动门槛。
-      const requiredDeps = ['@anthropic-ai/claude-agent-sdk', '@openai/codex'];
+    // 决策 38：codex 只保留 CLI 一条实现，`@openai/codex-sdk` 已从依赖里删掉
+    // （agent-runner 与主进程两侧）。留在这里会让 preflight 恒定失败 ——
+    // 所有宿主机会话报「缺少 agent-runner 依赖」，完全跑不起来。
+    // codex 的可执行文件来自 `@openai/codex`，与 SDK 无关。
+    const requiredDeps = ['@anthropic-ai/claude-agent-sdk', '@openai/codex'];
     const missingDeps = requiredDeps.filter((dep) => {
       const depJson = path.join(
         agentRunnerNodeModules,
@@ -3338,7 +3328,11 @@ export async function runHostAgent(
           (browserErr) => {
             if (browserErr) {
               logger.debug(
-                { group: group.name, browserSessionName, err: browserErr.message },
+                {
+                  group: group.name,
+                  browserSessionName,
+                  err: browserErr.message,
+                },
                 'agent-browser session cleanup skipped (no session or CLI unavailable)',
               );
             } else {
@@ -3467,25 +3461,25 @@ export async function runHostAgent(
         hostSelectedProfileId,
       );
     }
-      // CLI 自刷新的凭据回写（见 persistRefreshedProviderAuth）。
-      // 放在 finally 里：即使这次 spawn 抛了，CLI 也可能已经刷新过凭据，
-      // 那份才是唯一有效的 refresh_token，不能因为本轮失败就丢掉。
-      // best-effort —— 回写失败不该影响本轮结果。
-      const refreshedProviderId = isCodexRuntime
-        ? codexProvider?.id
-        : isGrokRuntime
-          ? grokProvider?.id
-          : undefined;
-      if (refreshedProviderId) {
-        try {
-          persistRefreshedProviderAuth(refreshedProviderId);
-        } catch (err) {
-          logger.warn(
-            { providerId: refreshedProviderId, err },
-            'Credential write-back failed (non-fatal)',
-          );
-        }
+    // CLI 自刷新的凭据回写（见 persistRefreshedProviderAuth）。
+    // 放在 finally 里：即使这次 spawn 抛了，CLI 也可能已经刷新过凭据，
+    // 那份才是唯一有效的 refresh_token，不能因为本轮失败就丢掉。
+    // best-effort —— 回写失败不该影响本轮结果。
+    const refreshedProviderId = isCodexRuntime
+      ? codexProvider?.id
+      : isGrokRuntime
+        ? grokProvider?.id
+        : undefined;
+    if (refreshedProviderId) {
+      try {
+        persistRefreshedProviderAuth(refreshedProviderId);
+      } catch (err) {
+        logger.warn(
+          { providerId: refreshedProviderId, err },
+          'Credential write-back failed (non-fatal)',
+        );
       }
+    }
   }
 }
 

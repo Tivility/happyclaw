@@ -100,7 +100,9 @@ describe('reproducible build contract', () => {
     // CLAUDE.md §10：Agent SDK 用 "*" + 无 lock file + CACHEBUST，保证每次构建
     // 都解析到最新版。这三者缺一不可 —— 少了 CACHEBUST，Docker 层缓存会让
     // `npm install` 直接命中旧层，"*" 就形同虚设。
-    expect(JSON.parse(agentRunnerPkg).dependencies['@anthropic-ai/claude-agent-sdk']).toBe('*');
+    expect(
+      JSON.parse(agentRunnerPkg).dependencies['@anthropic-ai/claude-agent-sdk'],
+    ).toBe('*');
     expect(dockerfile).toMatch(/ARG CACHEBUST=/);
 
     // feishu-cli 走 releases/latest 的 302 redirect 取 tag（不打 api.github.com
@@ -117,9 +119,9 @@ describe('reproducible build contract', () => {
     const agentRunnerPkg = JSON.parse(
       read('container/agent-runner/package.json'),
     ) as { dependencies?: Record<string, string> };
-    expect(
-      Object.keys(agentRunnerPkg.dependencies ?? {}),
-    ).not.toContain('@openai/codex-sdk');
+    expect(Object.keys(agentRunnerPkg.dependencies ?? {})).not.toContain(
+      '@openai/codex-sdk',
+    );
 
     // preflight 的必需依赖列表不得引用它，否则恒定失败。
     const runner = read('src/container-runner.ts');
@@ -135,6 +137,31 @@ describe('reproducible build contract', () => {
         path.join(root, 'container/agent-runner/src/codex-sdk-runner.ts'),
       ),
     ).toBe(false);
+
+    // 主进程侧：根 package.json 不得再声明这个包。第一轮只清了 agent-runner，
+    // 根依赖留着 —— 于是主进程的 SDK 探测恒返回「已安装」，设置页把这个常量
+    // 当诊断信息展示，决策 38 在主进程侧等于没落地。
+    const rootPkg = JSON.parse(read('package.json')) as {
+      dependencies?: Record<string, string>;
+      devDependencies?: Record<string, string>;
+    };
+    expect(Object.keys(rootPkg.dependencies ?? {})).not.toContain(
+      '@openai/codex-sdk',
+    );
+    expect(Object.keys(rootPkg.devDependencies ?? {})).not.toContain(
+      '@openai/codex-sdk',
+    );
+
+    // lockfile 也不该把它锁回来（`npm ci` 会照装不误）。
+    expect(read('package-lock.json')).not.toContain('@openai/codex-sdk');
+
+    // 主进程的运行时探测不得再 import 或声明这个包。这里比对**字符串字面量**
+    // 而非裸包名：解释「为什么删掉」的注释里会用反引号提到它，那是有用的
+    // 上下文，不该被当成残留。真正的残留一定以 import / 类型字面量形式出现。
+    // 反引号形式（注释里的写法）刻意不查。
+    const codexRuntime = read('src/codex-runtime.ts');
+    expect(codexRuntime).not.toContain("'@openai/codex-sdk'");
+    expect(codexRuntime).not.toContain('"@openai/codex-sdk"');
   });
 
   test('web 声明了源码实际 import 的所有 @dnd-kit 包', () => {
@@ -164,5 +191,4 @@ describe('reproducible build contract', () => {
       expect(declared, `web/package.json 缺少 ${pkg}`).toContain(pkg);
     }
   });
-
 });

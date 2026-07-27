@@ -13,7 +13,12 @@ import {
 
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { Button } from '@/components/ui/button';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
@@ -24,8 +29,12 @@ import { getErrorMessage } from './types';
 type CodexAuthMode = 'chatgpt_oauth' | 'api_key';
 
 interface CodexDependencyStatus {
-  sdk: { available: boolean; packageName: string; error?: string };
-  cli: { available: boolean; path: string | null; version: string | null; error?: string };
+  cli: {
+    available: boolean;
+    path: string | null;
+    version: string | null;
+    error?: string;
+  };
 }
 
 interface GptProviderSectionProps {
@@ -88,9 +97,7 @@ function GptProviderEditor({
     if (!open) return;
     setName(provider?.name || '官方 GPT');
     setWeight(provider?.weight || 1);
-    setAuthMode(
-      provider?.authMode === 'api_key' ? 'api_key' : 'chatgpt_oauth',
-    );
+    setAuthMode(provider?.authMode === 'api_key' ? 'api_key' : 'chatgpt_oauth');
     setOpenaiApiKey('');
     setCodexAuthJson('');
     setOauthLoading(false);
@@ -151,7 +158,11 @@ function GptProviderEditor({
         30000,
       );
       setOauthFlow(null);
-      setNotice(isCreate ? 'ChatGPT OAuth 登录成功，GPT 提供商已创建。' : 'ChatGPT OAuth 登录成功，凭据已更新。');
+      setNotice(
+        isCreate
+          ? 'ChatGPT OAuth 登录成功，GPT 提供商已创建。'
+          : 'ChatGPT OAuth 登录成功，凭据已更新。',
+      );
       onSave();
     } catch (err) {
       setError(getErrorMessage(err, 'ChatGPT OAuth 登录尚未完成'));
@@ -230,7 +241,12 @@ function GptProviderEditor({
       }
       onSave();
     } catch (err) {
-      setError(getErrorMessage(err, isCreate ? '创建 GPT 提供商失败' : '保存 GPT 提供商失败'));
+      setError(
+        getErrorMessage(
+          err,
+          isCreate ? '创建 GPT 提供商失败' : '保存 GPT 提供商失败',
+        ),
+      );
     } finally {
       setSaving(false);
     }
@@ -248,12 +264,18 @@ function GptProviderEditor({
     >
       <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>{isCreate ? '添加官方 GPT 提供商' : `编辑官方 GPT 提供商：${provider?.name}`}</DialogTitle>
+          <DialogTitle>
+            {isCreate
+              ? '添加官方 GPT 提供商'
+              : `编辑官方 GPT 提供商：${provider?.name}`}
+          </DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4">
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">名称</label>
+            <label className="block text-xs text-muted-foreground mb-1">
+              名称
+            </label>
             <Input
               value={name}
               onChange={(event) => setName(event.target.value)}
@@ -263,7 +285,9 @@ function GptProviderEditor({
           </div>
 
           <div>
-            <label className="block text-xs text-muted-foreground mb-2">提供商类型</label>
+            <label className="block text-xs text-muted-foreground mb-2">
+              提供商类型
+            </label>
             <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
               <button
                 type="button"
@@ -281,24 +305,33 @@ function GptProviderEditor({
               </button>
             </div>
             <p className="mt-1.5 text-xs text-muted-foreground">
-              当前 GPT 账号池仅接入 OpenAI 官方 Codex / ChatGPT OAuth / OpenAI API Key。
+              当前 GPT 账号池仅接入 OpenAI 官方 Codex / ChatGPT OAuth / OpenAI
+              API Key。
             </p>
           </div>
 
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">权重</label>
+            <label className="block text-xs text-muted-foreground mb-1">
+              权重
+            </label>
             <Input
               type="number"
               min={1}
               max={100}
               value={weight}
-              onChange={(event) => setWeight(Math.max(1, Math.min(100, Number(event.target.value) || 1)))}
+              onChange={(event) =>
+                setWeight(
+                  Math.max(1, Math.min(100, Number(event.target.value) || 1)),
+                )
+              }
               disabled={saving}
             />
           </div>
 
           <div>
-            <label className="block text-xs text-muted-foreground mb-2">认证方式</label>
+            <label className="block text-xs text-muted-foreground mb-2">
+              认证方式
+            </label>
             <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
               <button
                 type="button"
@@ -341,9 +374,12 @@ function GptProviderEditor({
           ) : (
             <div className="space-y-3">
               <div className="rounded-lg border border-teal-200 bg-teal-50/50 p-4 space-y-3 dark:border-teal-900 dark:bg-teal-950/20">
-                <div className="text-sm font-medium text-foreground">一键登录 ChatGPT（推荐）</div>
+                <div className="text-sm font-medium text-foreground">
+                  一键登录 ChatGPT（推荐）
+                </div>
                 <div className="text-xs text-muted-foreground">
-                  点击按钮后会打开 OpenAI 授权页面，把这里显示的一次性 code 填进去；完成后回到这里确认。
+                  点击按钮后会打开 OpenAI 授权页面，把这里显示的一次性 code
+                  填进去；完成后回到这里确认。
                 </div>
 
                 {!isCreate && provider?.hasCodexAuthJson && (
@@ -353,37 +389,69 @@ function GptProviderEditor({
                 )}
 
                 {!oauthFlow ? (
-                  <Button onClick={handleOAuthStart} disabled={saving || oauthLoading}>
-                    {oauthLoading ? <Loader2 className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}
-                    {!isCreate && provider?.hasCodexAuthJson ? '重新登录 ChatGPT' : '一键登录 ChatGPT'}
+                  <Button
+                    onClick={handleOAuthStart}
+                    disabled={saving || oauthLoading}
+                  >
+                    {oauthLoading ? (
+                      <Loader2 className="size-4 animate-spin" />
+                    ) : (
+                      <ExternalLink className="size-4" />
+                    )}
+                    {!isCreate && provider?.hasCodexAuthJson
+                      ? '重新登录 ChatGPT'
+                      : '一键登录 ChatGPT'}
                   </Button>
                 ) : (
                   <div className="space-y-3">
                     <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
-                      授权页面已打开。一次性 code 会在 {new Date(oauthFlow.expiresAt).toLocaleTimeString('zh-CN')} 过期。
+                      授权页面已打开。一次性 code 会在{' '}
+                      {new Date(oauthFlow.expiresAt).toLocaleTimeString(
+                        'zh-CN',
+                      )}{' '}
+                      过期。
                     </div>
                     <div className="flex flex-col sm:flex-row gap-2">
                       <div className="flex-1 rounded-md border border-border bg-background px-3 py-2 font-mono text-lg text-foreground">
                         {oauthFlow.deviceCode}
                       </div>
-                      <Button variant="outline" onClick={handleCopyDeviceCode} disabled={oauthCompleting}>
+                      <Button
+                        variant="outline"
+                        onClick={handleCopyDeviceCode}
+                        disabled={oauthCompleting}
+                      >
                         复制 code
                       </Button>
                     </div>
                     <div className="flex flex-wrap gap-2">
-                      <Button onClick={handleOAuthComplete} disabled={oauthCompleting}>
-                        {oauthCompleting && <Loader2 className="size-4 animate-spin" />}
+                      <Button
+                        onClick={handleOAuthComplete}
+                        disabled={oauthCompleting}
+                      >
+                        {oauthCompleting && (
+                          <Loader2 className="size-4 animate-spin" />
+                        )}
                         我已完成授权
                       </Button>
                       <Button
                         variant="outline"
-                        onClick={() => window.open(oauthFlow.authorizeUrl, '_blank', 'noopener,noreferrer')}
+                        onClick={() =>
+                          window.open(
+                            oauthFlow.authorizeUrl,
+                            '_blank',
+                            'noopener,noreferrer',
+                          )
+                        }
                         disabled={oauthCompleting}
                       >
                         <ExternalLink className="size-4" />
                         重新打开
                       </Button>
-                      <Button variant="ghost" onClick={() => void cancelOAuthFlow()} disabled={oauthCompleting}>
+                      <Button
+                        variant="ghost"
+                        onClick={() => void cancelOAuthFlow()}
+                        disabled={oauthCompleting}
+                      >
                         取消
                       </Button>
                     </div>
@@ -393,7 +461,8 @@ function GptProviderEditor({
 
               <div>
                 <label className="block text-xs text-muted-foreground mb-1">
-                  Codex auth.json{isCreate ? '（手动兜底）' : '（留空则不修改）'}
+                  Codex auth.json
+                  {isCreate ? '（手动兜底）' : '（留空则不修改）'}
                 </label>
                 <Textarea
                   value={codexAuthJson}
@@ -434,33 +503,47 @@ function GptProviderEditor({
   );
 }
 
-export function GptProviderSection({ setNotice, setError }: GptProviderSectionProps) {
+export function GptProviderSection({
+  setNotice,
+  setError,
+}: GptProviderSectionProps) {
   const [providers, setProviders] = useState<UnifiedProviderPublic[]>([]);
-  const [dependencies, setDependencies] = useState<CodexDependencyStatus | null>(null);
+  const [dependencies, setDependencies] =
+    useState<CodexDependencyStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [localNotice, setLocalNotice] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
-  const [editingProvider, setEditingProvider] = useState<UnifiedProviderPublic | null>(null);
-  const [pendingDeleteProvider, setPendingDeleteProvider] = useState<UnifiedProviderPublic | null>(null);
+  const [editingProvider, setEditingProvider] =
+    useState<UnifiedProviderPublic | null>(null);
+  const [pendingDeleteProvider, setPendingDeleteProvider] =
+    useState<UnifiedProviderPublic | null>(null);
 
-  const notifyNotice = useCallback((message: string | null) => {
-    setLocalNotice(message);
-    if (message) setLocalError(null);
-    setNotice(message);
-  }, [setNotice]);
+  const notifyNotice = useCallback(
+    (message: string | null) => {
+      setLocalNotice(message);
+      if (message) setLocalError(null);
+      setNotice(message);
+    },
+    [setNotice],
+  );
 
-  const notifyError = useCallback((message: string | null) => {
-    setLocalError(message);
-    if (message) setLocalNotice(null);
-    setError(message);
-  }, [setError]);
+  const notifyError = useCallback(
+    (message: string | null) => {
+      setLocalError(message);
+      if (message) setLocalNotice(null);
+      setError(message);
+    },
+    [setError],
+  );
 
   const load = useCallback(async () => {
     try {
       const [providersData, dependenciesData] = await Promise.all([
-        api.get<{ providers: UnifiedProviderPublic[] }>('/api/config/codex/providers'),
+        api.get<{ providers: UnifiedProviderPublic[] }>(
+          '/api/config/codex/providers',
+        ),
         api.get<CodexDependencyStatus>('/api/config/codex/dependencies'),
       ]);
       setProviders(providersData.providers);
@@ -483,7 +566,11 @@ export function GptProviderSection({ setNotice, setError }: GptProviderSectionPr
       await api.patch(`/api/config/codex/providers/${provider.id}`, {
         enabled: !provider.enabled,
       });
-      notifyNotice(provider.enabled ? `已禁用「${provider.name}」` : `已启用「${provider.name}」`);
+      notifyNotice(
+        provider.enabled
+          ? `已禁用「${provider.name}」`
+          : `已启用「${provider.name}」`,
+      );
       await load();
     } catch (err) {
       notifyError(getErrorMessage(err, '切换 GPT 提供商状态失败'));
@@ -526,7 +613,9 @@ export function GptProviderSection({ setNotice, setError }: GptProviderSectionPr
   return (
     <div className="space-y-4">
       {(localError || localNotice) && (
-        <div className={`rounded-md border px-3 py-2 text-sm ${localError ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300'}`}>
+        <div
+          className={`rounded-md border px-3 py-2 text-sm ${localError ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300'}`}
+        >
           {localError || localNotice}
         </div>
       )}
@@ -536,9 +625,13 @@ export function GptProviderSection({ setNotice, setError }: GptProviderSectionPr
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <KeyRound className="w-4 h-4 text-muted-foreground" />
-              <div className="text-sm font-medium text-foreground">官方 GPT 账号池</div>
+              <div className="text-sm font-medium text-foreground">
+                官方 GPT 账号池
+              </div>
             </div>
-            <span className="text-xs text-muted-foreground">{providers.length} 个提供商</span>
+            <span className="text-xs text-muted-foreground">
+              {providers.length} 个提供商
+            </span>
           </div>
         </div>
 
@@ -579,7 +672,11 @@ export function GptProviderSection({ setNotice, setError }: GptProviderSectionPr
                         checked={provider.enabled}
                         disabled={busyId !== null}
                         onCheckedChange={() => handleToggle(provider)}
-                        aria-label={provider.enabled ? '禁用 GPT 提供商' : '启用 GPT 提供商'}
+                        aria-label={
+                          provider.enabled
+                            ? '禁用 GPT 提供商'
+                            : '启用 GPT 提供商'
+                        }
                       />
                       <Button
                         size="sm"
@@ -601,7 +698,11 @@ export function GptProviderSection({ setNotice, setError }: GptProviderSectionPr
                         disabled={busyId !== null}
                         className="h-7 px-2 text-xs text-muted-foreground hover:text-red-600"
                       >
-                        {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+                        {busy ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="size-3.5" />
+                        )}
                       </Button>
                     </div>
                   </div>
@@ -621,9 +722,6 @@ export function GptProviderSection({ setNotice, setError }: GptProviderSectionPr
             </div>
             <div className="mt-1 text-xs text-muted-foreground break-all">
               CLI：{statusText(dependencies)}
-            </div>
-            <div className="mt-1 text-xs text-muted-foreground">
-              SDK：{dependencies?.sdk.available ? '已安装' : '未安装，当前使用 Codex CLI 路径'}
             </div>
           </div>
           <Button variant="ghost" size="sm" onClick={load} className="h-7 px-2">
@@ -670,7 +768,11 @@ export function GptProviderSection({ setNotice, setError }: GptProviderSectionPr
         onClose={() => setPendingDeleteProvider(null)}
         onConfirm={handleDeleteConfirm}
         title="删除官方 GPT 提供商"
-        message={pendingDeleteProvider ? `确认删除官方 GPT 提供商「${pendingDeleteProvider.name}」？` : '确认删除该官方 GPT 提供商？'}
+        message={
+          pendingDeleteProvider
+            ? `确认删除官方 GPT 提供商「${pendingDeleteProvider.name}」？`
+            : '确认删除该官方 GPT 提供商？'
+        }
         confirmText="确认删除"
         confirmVariant="danger"
         loading={busyId !== null}

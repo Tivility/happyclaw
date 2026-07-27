@@ -77,8 +77,12 @@ vi.mock('../src/logger.js', () => ({
 vi.mock('../src/codex-runtime.js', () => ({
   findCodexCli: vi.fn(async () => '/usr/local/bin/codex'),
   probeCodexDependencies: vi.fn(async () => ({
-    cliPath: '/usr/local/bin/codex',
-    sdkAvailable: true,
+    cli: {
+      available: true,
+      path: '/usr/local/bin/codex',
+      version: 'codex-cli 0.145.0',
+      supportsExecRequiredFlags: true,
+    },
   })),
 }));
 
@@ -112,10 +116,15 @@ function cleanup(): void {
   fs.rmSync(mocks.dataDir, { recursive: true, force: true });
 }
 
-function jsonRequest(pathname: string, method: string, body?: unknown): Request {
+function jsonRequest(
+  pathname: string,
+  method: string,
+  body?: unknown,
+): Request {
   return new Request(`http://localhost${pathname}`, {
     method,
-    headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+    headers:
+      body === undefined ? undefined : { 'content-type': 'application/json' },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 }

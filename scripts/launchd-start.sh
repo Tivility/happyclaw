@@ -18,8 +18,4 @@ make ensure-latest-sdk 2>&1 || {
   echo "[launchd-start] ensure-latest-sdk failed — continuing with installed SDK" >&2
 }
 
-make ensure-latest-codex-sdk 2>&1 || {
-  echo "[launchd-start] ensure-latest-codex-sdk failed — continuing with installed Codex SDK state" >&2
-}
-
 exec node dist/index.js

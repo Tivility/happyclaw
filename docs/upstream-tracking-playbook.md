@@ -4,10 +4,10 @@ fork 跟 upstream 合并的原则、流程与检查清单。**下次追版本前
 
 内容全部来自实测，不是通用建议，是这个仓库踩过的坑：
 
-| 轮次 | 规模 | 抓到 |
-|---|---|---|
-| 2026-07-25 | 121 提交 · 341 冲突块 · 147 本地提交 | **19 个真 bug**，其中 8 个上线后用户反馈才发现 |
-| 2026-07-27 | 7 提交 · 17 冲突块 | **1 个生产阻断**（2 个用户的主容器起不来）+ 1 个既存的备份失效 |
+| 轮次       | 规模                                 | 抓到                                                           |
+| ---------- | ------------------------------------ | -------------------------------------------------------------- |
+| 2026-07-25 | 121 提交 · 341 冲突块 · 147 本地提交 | **19 个真 bug**，其中 8 个上线后用户反馈才发现                 |
+| 2026-07-27 | 7 提交 · 17 冲突块                   | **1 个生产阻断**（2 个用户的主容器起不来）+ 1 个既存的备份失效 |
 
 第二轮规模只有第一轮的 1/20，但仍然出了一个能让用户直接停摆的问题 ——
 **提交数少不等于风险低**。那个 bug 的形态是第一轮没见过的（同名字段语义漂移），
@@ -50,11 +50,11 @@ tsc 和 2927 个测试全绿，只有拿生产真实数据跑关键函数才暴�
 
 本地和 upstream 各有一套实现，解冲突时两边都保留 → 同一件事做了两遍。
 
-| 症状 | 重复的两侧 |
-|---|---|
-| 每条回复发两次、DB 落两行 | 本地 `sendMessage` + upstream `sendMessageWithOutcome` |
-| 用量入库双计、日汇总翻倍 | 本地 INSERT + upstream 的事件转发 |
-| Web 聊天区渲染两遍（两个输入框） | 本地的话题侧栏块 + upstream 的主对话画布块 |
+| 症状                             | 重复的两侧                                             |
+| -------------------------------- | ------------------------------------------------------ |
+| 每条回复发两次、DB 落两行        | 本地 `sendMessage` + upstream `sendMessageWithOutcome` |
+| 用量入库双计、日汇总翻倍         | 本地 INSERT + upstream 的事件转发                      |
+| Web 聊天区渲染两遍（两个输入框） | 本地的话题侧栏块 + upstream 的主对话画布块             |
 
 **怎么找**：对每个大改动的文件，数一数「关键锚点」在两侧父提交里各有几个、合并后
 有几个。数量变多就是信号。
@@ -75,6 +75,7 @@ done
 变量有声明、有读取、有清空，**唯独赋值那一行没了**。逻辑上永远走不到那条路。
 
 这次实际发生 6 次：
+
 - `pendingUsage` —— 主消息用量丢失
 - `pendingAgentUsage` —— SubAgent 用量丢失
 - `completedStreamingSessionForUsage` —— 卡片用量 patch 恒为 no-op
@@ -117,12 +118,33 @@ grep -c "pendingUsage = " src/index.ts
 做了「删掉 X」的决策，但 X 在别处还被引用。
 
 决策 38（codex 只留 CLI）删了 `@openai/codex-sdk`，三处没跟上：
+
 - `container-runner.ts` 的 preflight `requiredDeps` —— **所有宿主机会话报缺依赖，完全跑不起来**
 - `Makefile` 的 `ensure-latest-codex-sdk` / `update-codex-sdk` —— 每次 `make start` 都去更新不存在的包
 - `check-container-sdk` 的版本比对 —— 死代码
 
 **怎么找**：每条「删除类」决策落地后，全仓 grep 被删的符号名，包括
 Makefile / CI / 字符串数组 / 注释。
+
+**第二轮（2026-07-27）又扫出四处**，全在主进程侧——第一轮只清了 agent-runner：
+
+- 根 `package.json` + `package-lock.json` 仍声明 `@openai/codex-sdk`
+- `src/codex-runtime.ts` 的 `probeSdk()` —— 动态 import 探测该包是否可用
+- `web/.../GptProviderSection.tsx` 把探测结果渲染成「SDK：已安装」
+- `scripts/launchd-start.sh` 还在调 `make ensure-latest-codex-sdk`（target 已删，
+  每次 launchd 启动都报 `No rule to make target`，被 `||` 兜住所以没人注意）
+
+这轮的教训是**「有消费方」不等于「该保留」**。表面上探测有完整调用链
+（probe → HTTP 路由 → 前端展示），看着像真实用途；但被探测的包是我们自己
+根 `package.json` 里的硬依赖，所以探测结果恒为 `true`，那行 UI 只能渲染出
+「已安装」一种状态。**一个由自己的依赖声明决定的常量，被包装成诊断信息展示**
+——它不是消费方，是同一条残留往上多爬了两层。
+
+判据：顺着调用链找到消费方之后，再问一句「这个值有没有可能取到另一个分支？」
+取不到，就是常量，就还是残留。
+
+**同一条决策要在所有 workspace 里各清一遍**：monorepo 的每个 `package.json`、
+每个 `node_modules` 解析根都是独立的现场，清了一个不等于清了其余。
 
 ### 形态 D · 前提被另一侧取消
 
@@ -172,17 +194,17 @@ git diff $LOCAL_PARENT -- src/ | grep -E '^\+.*throw new' | sed 's/^+ *//' | sor
 
 **按检出难度排序，越往下越需要真跑。**
 
-| 手段 | 能抓 | 抓不到 |
-|---|---|---|
-| `tsc` | 语法破坏、重复声明、类型不符 | 形态 A/B/C 全部 |
-| `make test` | 参数错位、逻辑分支、契约 | 未连接的组件、镜像/环境状态 |
-| 全量 test（非单跑） | 共享路径的连带影响 | — |
-| `build:all` | 构建期的类型与依赖 | node_modules 残留掩盖的缺失 |
-| `npm ci` 后构建 | 依赖声明缺失 | — |
-| 空库启动 | 全新安装路径 | **存量库迁移路径** |
-| **存量库副本迁移** | schema 演进、回填、幂等 | 运行时行为 |
-| **真实 spawn 一轮** | 归因、事件链、渲染 | 渠道实际收发 |
-| **生产切换** | 镜像、launchd、渠道 | — |
+| 手段                | 能抓                         | 抓不到                      |
+| ------------------- | ---------------------------- | --------------------------- |
+| `tsc`               | 语法破坏、重复声明、类型不符 | 形态 A/B/C 全部             |
+| `make test`         | 参数错位、逻辑分支、契约     | 未连接的组件、镜像/环境状态 |
+| 全量 test（非单跑） | 共享路径的连带影响           | —                           |
+| `build:all`         | 构建期的类型与依赖           | node_modules 残留掩盖的缺失 |
+| `npm ci` 后构建     | 依赖声明缺失                 | —                           |
+| 空库启动            | 全新安装路径                 | **存量库迁移路径**          |
+| **存量库副本迁移**  | schema 演进、回填、幂等      | 运行时行为                  |
+| **真实 spawn 一轮** | 归因、事件链、渲染           | 渠道实际收发                |
+| **生产切换**        | 镜像、launchd、渠道          | —                           |
 
 ### 三条硬教训
 
@@ -286,7 +308,13 @@ cp data/db/messages.db /tmp/migtest/data/db/
 
 ```js
 import ts from 'typescript';
-const sf = ts.createSourceFile(f, src, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const sf = ts.createSourceFile(
+  f,
+  src,
+  ts.ScriptTarget.Latest,
+  true,
+  ts.ScriptKind.TSX,
+);
 // 遍历找目标 JSX 元素，getStart(sf) / getEnd() → 精确行号
 ```
 
@@ -335,12 +363,12 @@ curl -s localhost:3000/api/health
 
 ### 切换时踩到的坑
 
-| 坑 | 后果 |
-|---|---|
-| 只跑 `npm run build` | 前端还是旧构建，用户看到的还是旧界面 |
-| 忘了 `./container/build.sh` | container 模式会话报 `/tmp/prompts/xxx.md` ENOENT |
-| `kill` 进程 | launchd 会自动拉起，等于没停 |
-| worktree 的 `node_modules` 符号链接被 git 跟踪 | merge 时把真实目录替换成链接文件，**依赖被毁** |
+| 坑                                             | 后果                                              |
+| ---------------------------------------------- | ------------------------------------------------- |
+| 只跑 `npm run build`                           | 前端还是旧构建，用户看到的还是旧界面              |
+| 忘了 `./container/build.sh`                    | container 模式会话报 `/tmp/prompts/xxx.md` ENOENT |
+| `kill` 进程                                    | launchd 会自动拉起，等于没停                      |
+| worktree 的 `node_modules` 符号链接被 git 跟踪 | merge 时把真实目录替换成链接文件，**依赖被毁**    |
 
 最后一条已经用 `.gitignore` 加了不带斜杠的 `node_modules` 规则堵住（带斜杠只匹配
 目录，匹配不到符号链接文件）。
@@ -365,14 +393,14 @@ curl -s localhost:3000/api/health
 
 ### 这次新增的护栏
 
-| 文件 | 盯什么 |
-|---|---|
+| 文件                                   | 盯什么                                                                                                                     |
+| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
 | `merge-duplicate-render-guard.test.ts` | 形态 A：聊天主体容器只有一个、MessageInput 与 MessageList 数量一致、关键 prop 各出现 3 次、主回复只有一个 sdk_final 落库点 |
-| `schema-v45-to-v63-migration.test.ts` | 存量库升级路径（起点 DDL 从真实生产库导出，不是人造场景） |
-| `usage-insert-legacy-path.test.ts` | 逐列断言值不错位、一次调用只落一行、幂等键有效 |
-| `usage-deferred-until-reply.test.ts` | usage 早于回复到达时必须缓存 |
-| `runtime-parity-phase3.test.ts` | 三条运行时的口径与权限对齐 |
-| `provider-auth-writeback.test.ts` | CLI 自刷新凭据的回写 |
+| `schema-v45-to-v63-migration.test.ts`  | 存量库升级路径（起点 DDL 从真实生产库导出，不是人造场景）                                                                  |
+| `usage-insert-legacy-path.test.ts`     | 逐列断言值不错位、一次调用只落一行、幂等键有效                                                                             |
+| `usage-deferred-until-reply.test.ts`   | usage 早于回复到达时必须缓存                                                                                               |
+| `runtime-parity-phase3.test.ts`        | 三条运行时的口径与权限对齐                                                                                                 |
+| `provider-auth-writeback.test.ts`      | CLI 自刷新凭据的回写                                                                                                       |
 
 ---
 
@@ -469,11 +497,11 @@ codex / grok 用**可轮换的 refresh_token**，与 API key 完全不同。
 
 ## 十、相关文档
 
-| 文档 | 内容 |
-|---|---|
-| `upstream-decision-ledger.md` | 决策台账，代码注释里的「决策 N」指向这里 |
-| `upstream-decision-tree.md` | 冲突分类与判定树 |
-| `upstream-silent-changes.md` | upstream 的静默行为变更 |
-| `merge-conflict-guide.md` | 逐文件的冲突处理记录 |
-| `merge-acceptance-test-matrix.md` | 验收测试表，67 个用例 |
-| `design-provider-credential-lifecycle.md` | codex/grok 凭据的种子 + 自刷新 + 回写 |
+| 文档                                      | 内容                                     |
+| ----------------------------------------- | ---------------------------------------- |
+| `upstream-decision-ledger.md`             | 决策台账，代码注释里的「决策 N」指向这里 |
+| `upstream-decision-tree.md`               | 冲突分类与判定树                         |
+| `upstream-silent-changes.md`              | upstream 的静默行为变更                  |
+| `merge-conflict-guide.md`                 | 逐文件的冲突处理记录                     |
+| `merge-acceptance-test-matrix.md`         | 验收测试表，67 个用例                    |
+| `design-provider-credential-lifecycle.md` | codex/grok 凭据的种子 + 自刷新 + 回写    |
