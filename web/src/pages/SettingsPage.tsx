@@ -48,7 +48,6 @@ const VALID_TABS: SettingsTab[] = [
   'bindings',
   'usage',
   'monitor',
-  'automation',
   'main-agent',
   'host-integration',
   'billing',
@@ -63,7 +62,6 @@ const SYSTEM_TABS: SettingsTab[] = [
   'registration',
   'appearance',
   'system',
-  'automation',
   'main-agent',
   'host-integration',
 ];
@@ -81,10 +79,6 @@ const FULLPAGE_TABS: SettingsTab[] = [
   'billing',
 ];
 const BillingPage = lazy(() => import('./BillingPage'));
-
-
-
-
 
 const LEGACY_TAB_ROUTES: Partial<Record<SettingsTab, string>> = {
   groups: '/chat',
@@ -118,8 +112,13 @@ export function SettingsPage() {
     !!currentUser?.permissions.includes('manage_invites') ||
     !!currentUser?.permissions.includes('view_audit_log');
 
+  // 默认 tab 保持本地的 'models'（upstream 的 'claude' 在本 fork 已被 models 页取代）。
   const defaultTab: SettingsTab = canManageSystemConfig ? 'models' : 'profile';
-  const rawTab = searchParams.get('tab') as SettingsTab | null;
+  const rawTabValue = searchParams.get('tab');
+  // 「任务与自动化」页随五项设置一起退役，旧书签落到最接近的 system 页而不是回退默认。
+  const rawTab = (
+    rawTabValue === 'automation' ? 'system' : rawTabValue
+  ) as SettingsTab | null;
 
   const activeTab = useMemo((): SettingsTab => {
     if (mustChangePassword) return 'security';
@@ -158,15 +157,14 @@ export function SettingsPage() {
   );
 
   const sectionTitle: Record<SettingsTab, string> = {
-  // 本地多运行时新增的三个入口（模型 / GPT / Grok 提供商）
-  models: '模型',
-  claude: 'Claude 提供商',
-  gpt: 'GPT 提供商',
-  grok: 'Grok 提供商',
+    // 本地多运行时新增的三个入口（模型 / GPT / Grok 提供商）
+    models: '模型',
+    claude: 'Claude 提供商',
+    gpt: 'GPT 提供商',
+    grok: 'Grok 提供商',
     registration: '注册策略',
     appearance: '常规与品牌',
     system: '运行与容量',
-    automation: '任务与自动化',
     'main-agent': '主 HappyClaw',
     'host-integration': '宿主机集成',
     billing: '计费管理',
@@ -175,7 +173,7 @@ export function SettingsPage() {
     'my-channels': '消息渠道',
     security: '安全与设备',
     groups: '会话管理',
-    'agent-profiles': 'Agent',
+    'agent-profiles': '智能体',
     memory: '记忆管理',
     skills: '技能(Skill)管理',
     'mcp-servers': 'MCP 服务器',
@@ -190,7 +188,7 @@ export function SettingsPage() {
 
   const sectionDescription: Partial<Record<SettingsTab, string>> = {
     'main-agent':
-      '管理主 Agent 的头像、系统附加能力、宿主机配置继承和上下文压缩策略。',
+      '管理主智能体的头像、系统附加能力、宿主机配置继承和上下文压缩策略。',
     'host-integration':
       '管理宿主机 Claude 目录以及共享 Plugin Catalog 的来源。',
   };
@@ -261,10 +259,8 @@ export function SettingsPage() {
                 </div>
               )}
 
-              {activeTab === 'system' || activeTab === 'automation' ? (
-                <SystemSettingsSection
-                  scope={activeTab === 'automation' ? 'automation' : 'runtime'}
-                />
+              {activeTab === 'system' ? (
+                <SystemSettingsSection scope="runtime" />
               ) : activeTab === 'main-agent' ||
                 activeTab === 'host-integration' ? (
                 <div>

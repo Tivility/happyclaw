@@ -1,5 +1,7 @@
 import crypto from 'node:crypto';
 
+import { isRedundantProactiveSdkClosure } from './proactive-final-classifier.js';
+
 /**
  * User-visible delivery semantics are deliberately owned by the HappyClaw
  * host, not inferred from the fact that an MCP tool happened to run.
@@ -27,6 +29,22 @@ export interface TurnOutputProjection {
 export interface ResolvedPrimaryAnswer {
   text: string | null;
   source: 'sdk_final' | 'mcp_final' | 'candidate' | 'empty';
+}
+
+export interface ProactiveFinalRecoveryDecision {
+  deliver: boolean;
+  text: string | null;
+  reason:
+    | 'missing_final_delivery'
+    | 'empty_candidate'
+    | 'duplicate_delivery'
+    | 'explicit_final_delivered'
+    | 'redundant_sdk_closure'
+    | 'untracked_turn';
+}
+
+function normalizeDeliveredText(text: string): string {
+  return text.trim().replace(/\r\n?/g, '\n');
 }
 
 interface PreparedTurnMessage {
@@ -59,6 +77,9 @@ export class TurnOutputCoordinator {
   private stagedFinal: string | null = null;
   private finalized = false;
   private deliveredUtteranceCount = 0;
+  private deliveredFinalUtterance = false;
+  private readonly deliveredProgressTexts: string[] = [];
+  private readonly deliveredTextFingerprints = new Set<string>();
   private readonly stagedFingerprints = new Set<string>();
 
   /**
@@ -235,10 +256,63 @@ export class TurnOutputCoordinator {
     this.finalized = true;
   }
 
-  recordDeliveredUtterance(): boolean {
+  recordDeliveredUtterance(input?: {
+    role?: TurnMessageDeliveryRole;
+    text?: string;
+  }): boolean {
     if (this.finalized) return false;
     this.deliveredUtteranceCount += 1;
+    if (input?.role === 'final') {
+      this.deliveredFinalUtterance = true;
+    }
+    const normalizedText = input?.text
+      ? normalizeDeliveredText(input.text)
+      : '';
+    if (normalizedText) {
+      this.deliveredTextFingerprints.add(
+        crypto.createHash('sha256').update(normalizedText).digest('hex'),
+      );
+      if (input?.role === 'progress') {
+        this.deliveredProgressTexts.push(normalizedText);
+        if (this.deliveredProgressTexts.length > 8) {
+          this.deliveredProgressTexts.shift();
+        }
+      }
+    }
     return true;
+  }
+
+  /**
+   * Reconcile hidden SDK final text produced in Proactive mode.
+   *
+   * A physically acknowledged, explicitly-final utterance is authoritative.
+   * Exact text matches are also suppressed so older models that repeat the
+   * delivered answer in SDK final text do not create duplicates. A narrow
+   * courtesy-closure check also suppresses low-value SDK tails after a complete
+   * progress answer; everything else is recovered by the host.
+   */
+  resolveProactiveFinalRecovery(
+    candidate: string | null | undefined,
+  ): ProactiveFinalRecoveryDecision {
+    const text = candidate?.trim() ? candidate : null;
+    if (!text) {
+      return { deliver: false, text: null, reason: 'empty_candidate' };
+    }
+    const normalizedText = normalizeDeliveredText(text);
+    const fingerprint = crypto
+      .createHash('sha256')
+      .update(normalizedText)
+      .digest('hex');
+    if (this.deliveredTextFingerprints.has(fingerprint)) {
+      return { deliver: false, text, reason: 'duplicate_delivery' };
+    }
+    if (this.deliveredFinalUtterance) {
+      return { deliver: false, text, reason: 'explicit_final_delivered' };
+    }
+    if (isRedundantProactiveSdkClosure(text, this.deliveredProgressTexts)) {
+      return { deliver: false, text, reason: 'redundant_sdk_closure' };
+    }
+    return { deliver: true, text, reason: 'missing_final_delivery' };
   }
 
   get deliveredUtterances(): number {
@@ -277,6 +351,14 @@ export interface StageTurnMessageResult {
 export interface RecordDeliveredUtteranceInput {
   scopeKey: string;
   inputTurnId: string;
+  role?: TurnMessageDeliveryRole;
+  text?: string;
+}
+
+export interface ResolveProactiveFinalRecoveryInput {
+  scopeKey: string;
+  inputTurnId: string;
+  text: string | null | undefined;
 }
 
 /**
@@ -288,12 +370,7 @@ export interface RecordDeliveredUtteranceInput {
 export class ActiveTurnOutputRegistry {
   private readonly bindings = new Map<string, ActiveTurnOutputBinding>();
 
-  /**
-   * Read lazily per turn so a settings change applies to newly started turns
-   * without a restart, while a turn already in flight keeps the bound it began
-   * with.
-   */
-  constructor(private readonly maxUtterancesProvider: () => number = () => 0) {}
+  constructor(private readonly maxUtterances = 0) {}
 
   private key(scopeKey: string, inputTurnId: string): string {
     return `${scopeKey}\0${inputTurnId}`;
@@ -303,7 +380,7 @@ export class ActiveTurnOutputRegistry {
     scopeKey: string,
     inputTurnId: string,
     callbacks: ActiveTurnOutputCallbacks,
-    coordinator = new TurnOutputCoordinator(this.maxUtterancesProvider()),
+    coordinator = new TurnOutputCoordinator(this.maxUtterances),
   ): TurnOutputCoordinator {
     this.bindings.set(this.key(scopeKey, inputTurnId), {
       coordinator,
@@ -360,9 +437,41 @@ export class ActiveTurnOutputRegistry {
       this.key(input.scopeKey, input.inputTurnId),
     );
     if (!binding) return false;
-    if (!binding.coordinator.recordDeliveredUtterance()) return false;
+    if (!this.recordProjectedUtterance(input)) return false;
     binding.callbacks.onUtteranceDelivered?.();
     return true;
+  }
+
+  /**
+   * Record a durable user-visible projection without claiming that the native
+   * provider acknowledged it. Used when recovery persists the final answer to
+   * the canonical Web session after a native delivery failure.
+   */
+  recordProjectedUtterance(input: RecordDeliveredUtteranceInput): boolean {
+    const binding = this.bindings.get(
+      this.key(input.scopeKey, input.inputTurnId),
+    );
+    return (
+      binding?.coordinator.recordDeliveredUtterance({
+        role: input.role,
+        text: input.text,
+      }) ?? false
+    );
+  }
+
+  resolveProactiveFinalRecovery(
+    input: ResolveProactiveFinalRecoveryInput,
+  ): ProactiveFinalRecoveryDecision {
+    const binding = this.bindings.get(
+      this.key(input.scopeKey, input.inputTurnId),
+    );
+    if (binding) {
+      return binding.coordinator.resolveProactiveFinalRecovery(input.text);
+    }
+    const text = input.text?.trim() ? input.text : null;
+    return text
+      ? { deliver: true, text, reason: 'untracked_turn' }
+      : { deliver: false, text: null, reason: 'empty_candidate' };
   }
 
   /**

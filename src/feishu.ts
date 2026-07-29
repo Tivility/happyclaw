@@ -1,7 +1,5 @@
 import fs from 'fs';
-import {
-  randomUUID,
-} from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
@@ -11,32 +9,21 @@ import {
   updateChatName,
   updateRegisteredGroupAvatar,
 } from './db.js';
-import {
-  logger,
-} from './logger.js';
+import { logger } from './logger.js';
 import {
   saveDownloadedFile,
   sanitizeImFilename,
   MAX_FILE_SIZE,
   FileTooLargeError,
 } from './im-downloader.js';
-import {
-  notifyNewImMessage,
-} from './message-notifier.js';
-import {
-  broadcastFollowUpUpdate,
-  broadcastNewMessage,
-} from './web.js';
-import {
-  detectImageMimeType,
-} from './image-detector.js';
+import { notifyNewImMessage } from './message-notifier.js';
+import { broadcastFollowUpUpdate, broadcastNewMessage } from './web.js';
+import { detectImageMimeType } from './image-detector.js';
 import {
   resolveJidByMessageId,
   getStreamingSession,
 } from './feishu-streaming-card.js';
-import {
-  optimizeMarkdownStyle,
-} from './feishu-markdown-style.js';
+import { optimizeMarkdownStyle } from './feishu-markdown-style.js';
 import {
   buildAgentReplyCard,
   buildFollowUpActionResultCard,
@@ -48,12 +35,10 @@ import {
   stripLeadingBotMention,
   type MentionGateMention,
 } from './feishu-mention-gate.js';
-import {
-  ProcessingLock,
-  isStale,
-} from './im-safety/index.js';
+import { ProcessingLock, isStale } from './im-safety/index.js';
 import type {
   ChatProbe,
+  ChannelReferencedMessage,
   FeishuMessageMeta,
   ChannelTurnContext,
   FollowUpAction,
@@ -61,25 +46,19 @@ import type {
   FollowUpDisposition,
   FollowUpMode,
 } from './types.js';
-import {
-  resolveAdmittedChannelRoute,
-} from './channel-admission.js';
+import { resolveAdmittedChannelRoute } from './channel-admission.js';
 import {
   extractProviderTarget,
   parseChannelAddress,
   scopeChannelJid,
 } from './channel-address.js';
-import type {
-  FeishuConversationPlan,
-} from './feishu-conversation-policy.js';
+import type { FeishuConversationPlan } from './feishu-conversation-policy.js';
 import {
   runFeishuCapability,
   type FeishuCapabilityRequest,
   type FeishuCapabilityResult,
 } from './feishu-capability.js';
-import {
-  enrichFeishuInboundContent,
-} from './feishu-rich-content.js';
+import { enrichFeishuInboundContent } from './feishu-rich-content.js';
 import {
   advanceChannelCursor,
   claimChannelInboxById,
@@ -367,10 +346,16 @@ export function classifyFeishuError(err: unknown): ChatProbe {
       : undefined;
   if (feishuCode !== undefined) {
     if (FEISHU_CHAT_NOT_FOUND_CODES.has(feishuCode)) {
-      return { status: 'gone', reason: `feishu code ${feishuCode}: chat not found` };
+      return {
+        status: 'gone',
+        reason: `feishu code ${feishuCode}: chat not found`,
+      };
     }
     if (FEISHU_BOT_NOT_IN_CHAT_CODES.has(feishuCode)) {
-      return { status: 'gone', reason: `feishu code ${feishuCode}: bot not in chat` };
+      return {
+        status: 'gone',
+        reason: `feishu code ${feishuCode}: bot not in chat`,
+      };
     }
     // 无法确定含义的业务码 → unknown（宁可漏判不删）
     return { status: 'unknown', reason: `feishu code ${feishuCode}` };
@@ -607,6 +592,7 @@ export function buildFeishuChannelTurnContext(input: {
     parentId?: string;
     threadId?: string;
     type?: string;
+    referencedMessages?: ChannelReferencedMessage[];
   };
   sender?: {
     openId?: string;
@@ -664,6 +650,9 @@ export function buildFeishuChannelTurnContext(input: {
       ...(input.message.parentId ? { parentId: input.message.parentId } : {}),
       ...(input.message.threadId ? { threadId: input.message.threadId } : {}),
       ...(input.message.type ? { type: input.message.type } : {}),
+      ...(input.message.referencedMessages?.length
+        ? { referencedMessages: input.message.referencedMessages }
+        : {}),
     },
     sender: input.sender
       ? {
@@ -2458,9 +2447,9 @@ export function createFeishuConnection(
         parentId,
         nativeRootId: rootId,
         threadId,
-        // A native thread already has durable SDK session history; only its
-        // explicitly-replied parent needs reinjection. Ordinary reply chains
-        // need bounded reconstruction when a fresh @ starts a new topic.
+        // A native thread already has durable SDK history, so one explicit
+        // parent is enough to preserve reply semantics. Ordinary reply chains
+        // may start a new logical session and need bounded ancestor metadata.
         limits: threadId ? { maxReferenceDepth: 1 } : undefined,
         parseContent: (type, content) => extractMessageContent(type, content),
       });
@@ -2500,6 +2489,32 @@ export function createFeishuConnection(
         enriched.currentImageRefs ??
         currentImageKeys.map((imageKey) => ({ messageId, imageKey }));
       const referencedImageRefs = enriched.referencedImageRefs ?? [];
+      const referencedMessages: ChannelReferencedMessage[] = (
+        enriched.references ?? []
+      ).map((reference) => ({ ...reference }));
+      const replaceReferenceMarker = (
+        referenceMessageId: string,
+        marker: string,
+        replacement: string,
+        attachmentIndex?: number,
+      ): void => {
+        const reference = referencedMessages.find(
+          (item) =>
+            item.id === referenceMessageId && item.text.includes(marker),
+        );
+        if (!reference) return;
+        reference.text = reference.text.replace(marker, replacement);
+        reference.attachmentHints = [
+          ...(reference.attachmentHints ?? []),
+          replacement,
+        ];
+        if (attachmentIndex !== undefined) {
+          reference.attachmentIndexes = [
+            ...(reference.attachmentIndexes ?? []),
+            attachmentIndex,
+          ];
+        }
+      };
       if (currentImageRefs.length > 0 || referencedImageRefs.length > 0) {
         // 图片消息：下载后双轨处理
         // 1. Vision 通道：base64 附件供模型看图
@@ -2564,9 +2579,14 @@ export function createFeishuConnection(
             ref.imageKey,
           );
           if (!imageData) {
-            text = text.replace(ref.marker, '[引用图片下载失败]');
+            replaceReferenceMarker(
+              ref.referenceMessageId,
+              ref.marker,
+              '[引用图片下载失败]',
+            );
             continue;
           }
+          const attachmentIndex = attachments.length;
           attachments.push({
             type: 'image',
             data: imageData.base64,
@@ -2599,7 +2619,12 @@ export function createFeishuConnection(
               );
             }
           }
-          text = text.replace(ref.marker, replacement);
+          replaceReferenceMarker(
+            ref.referenceMessageId,
+            ref.marker,
+            replacement,
+            attachmentIndex,
+          );
         }
 
         // 拼接图片标记：成功下载的用路径，失败的用占位符，确保 text 不为空。
@@ -2608,6 +2633,8 @@ export function createFeishuConnection(
         const markers: string[] = [];
         if (attachments.length > 0) {
           attachmentsJson = JSON.stringify(attachments);
+        }
+        if (downloadedCurrentImages > 0) {
           if (savedPaths.length > 0) {
             markers.push(...savedPaths.map((p) => `[图片: ${p}]`));
           } else {
@@ -2723,6 +2750,7 @@ export function createFeishuConnection(
           parentId,
           threadId,
           type: messageType,
+          referencedMessages,
         },
         sender: {
           openId: senderOpenId,
@@ -2906,7 +2934,10 @@ export function createFeishuConnection(
    * 被反复告知同一件事。
    */
   const INTAKE_RETRY_NOTICE_STEPS_MS = [0, 60_000, 5 * 60_000, 10 * 60_000];
-  const intakeRetryNotices = new Map<string, { firstAt: number; sent: number }>();
+  const intakeRetryNotices = new Map<
+    string,
+    { firstAt: number; sent: number }
+  >();
 
   function shouldNotifyIntakeRetry(chatId: string, messageId: string): boolean {
     const key = `${chatId}\u0000${messageId}`;
@@ -2923,7 +2954,8 @@ export function createFeishuConnection(
       return true;
     }
     if (entry.sent >= INTAKE_RETRY_NOTICE_STEPS_MS.length) return false;
-    if (now < entry.firstAt + INTAKE_RETRY_NOTICE_STEPS_MS[entry.sent]) return false;
+    if (now < entry.firstAt + INTAKE_RETRY_NOTICE_STEPS_MS[entry.sent])
+      return false;
     entry.sent += 1;
     return true;
   }

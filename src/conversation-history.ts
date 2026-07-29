@@ -1,4 +1,5 @@
 import { getMessagesPage } from './db.js';
+import { escapeXml } from './message-prompt.js';
 
 /**
  * Build a `<system_context>` block of recent persisted HappyClaw chat history
@@ -55,7 +56,16 @@ export function buildRecentConversationHistoryContext(
     /** 单条消息最大长度（本地历史注入用）。 */
     maxMessageLength?: number;
   },
-): { context: string; count: number; droppedCount: number } | null {
+): {
+  context: string;
+  count: number;
+  // droppedCount 供 runtime-input-builder 提示「这份记录是部分的」；
+  // messageIds 供 feishu-streaming-card 去重。两侧都有真实消费方，取并集。
+  droppedCount: number;
+  messageIds: string[];
+} | null {
+  // 默认候选池取 1000 而不是 upstream 的 30：本地按 token 预算从最新往回整条填充，
+  // 池子太小会让预算根本用不满，droppedCount 也失去意义。调用点仍可显式传 limit。
   const recentHistory = getMessagesPage(chatJid, undefined, opts.limit ?? 1000);
   const candidates = recentHistory
     .reverse()
@@ -95,7 +105,13 @@ export function buildRecentConversationHistoryContext(
   const droppedCount = candidates.length - historyMsgs.length;
 
   const historyLines = historyMsgs.map((m) => {
-    const role = m.is_from_me ? 'assistant' : m.sender_name;
+    // role/sender 取 upstream：共享的输出模板同时引用这两个字段。
+    const role = m.is_from_me ? 'assistant' : 'user';
+    const sender = m.is_from_me ? 'HappyClaw' : m.sender_name;
+    // 但**不做单条截断** —— 本地刻意去掉了 upstream 在 maxMessageLength 处加「…」
+    // 的行为。两条交接路径（provider 轮换 / runtime 切换）必须交出同样多的内容，
+    // 靠上面按 token 预算从最新往回整条填充来保证；再叠一层按字符截断会让同一段
+    // 对话因为触发的是哪种切换而降级得不一样。见 conversation-history-budget.test.ts。
     const truncated = m.content;
     // Strip lone (unpaired) surrogates while preserving valid surrogate pairs
     // such as emoji. Must stay byte-for-byte aligned with the matching regex in
@@ -108,7 +124,10 @@ export function buildRecentConversationHistoryContext(
     // Defense in depth: strip the closing tag we use to fence this block so a
     // user message containing "</system_context>" can't escape early.
     cleaned = cleaned.replace(/<\/system_context>/gi, '</system_context_>');
-    return `[${role}] ${cleaned}`;
+    return (
+      `<history_message id="${escapeXml(m.id)}" role="${role}"` +
+      ` sender="${escapeXml(sender)}">${escapeXml(cleaned)}</history_message>`
+    );
   });
 
   const droppedNote =
@@ -119,6 +138,7 @@ export function buildRecentConversationHistoryContext(
   return {
     count: historyMsgs.length,
     droppedCount,
+    messageIds: historyMsgs.map((message) => message.id),
     context:
       '<system_context>\n' +
       opts.intro +

@@ -11,7 +11,6 @@ import {
   Bot,
   ServerCog,
   Settings2,
-  ListTodo,
   SlidersHorizontal,
   User,
   UserCog,
@@ -84,11 +83,6 @@ const systemItems: NavItem[] = [
     key: 'system',
     label: '执行与容量',
     icon: <SlidersHorizontal className="size-4" />,
-  },
-  {
-    key: 'automation',
-    label: '任务与自动化',
-    icon: <ListTodo className="size-4" />,
   },
   {
     key: 'host-integration',

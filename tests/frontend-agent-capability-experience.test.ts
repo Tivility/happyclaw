@@ -7,6 +7,7 @@ import {
   estimatePromptTokens,
   totalPromptStats,
 } from '../web/src/utils/agent-prompts';
+import { hostSkillPolicyForMode } from '../web/src/utils/agent-runtime-policy';
 
 const root = process.cwd();
 const read = (relativePath: string) =>
@@ -108,6 +109,50 @@ describe('Agent prompt and capability frontend contract', () => {
     expect(main).toContain("skill.source === 'user' && skill.enabled");
     expect(main).toContain("skill.source === 'external' && skill.enabled");
     expect(system).toContain('宿主机');
+  });
+
+  test('treats all host Skills as symbolic inherit and auto-applies existing-profile changes', () => {
+    expect(
+      hostSkillPolicyForMode('inherit', [
+        'old-custom-selection',
+        'another-selection',
+      ]),
+    ).toEqual({ mode: 'inherit', ids: [] });
+    expect(
+      hostSkillPolicyForMode('custom', ['research', 'research', 'docs']),
+    ).toEqual({ mode: 'custom', ids: ['research', 'docs'] });
+
+    const profiles = read('web/src/pages/AgentProfilesPage.tsx');
+    expect(profiles).toContain('onHostModeChange={handleHostSkillsModeChange}');
+    expect(profiles).toContain('void persistHostSkillPolicy(');
+    expect(profiles).toMatch(
+      /runtime_policy:\s*\{\s*skills:\s*\{\s*host: nextPolicy/,
+    );
+  });
+
+  test('isolates capability preview failures instead of blanking the page', () => {
+    const app = read('web/src/App.tsx');
+    const appLayout = read('web/src/components/layout/AppLayout.tsx');
+    const profiles = read('web/src/pages/AgentProfilesPage.tsx');
+    const main = read(
+      'web/src/components/settings/MainAgentCapabilitiesSection.tsx',
+    );
+    const boundary = read('web/src/components/common/ErrorBoundary.tsx');
+
+    expect(appLayout).toMatch(
+      /<ErrorBoundary resetKeys=\{\[location\.pathname\]\}>[\s\S]*<Outlet \/>/,
+    );
+    expect(profiles).toMatch(
+      /<ErrorBoundary resetKeys=\{\[selected\.id\]\}>[\s\S]*<EffectiveCapabilitiesPreview/,
+    );
+    expect(main).toMatch(
+      /<ErrorBoundary resetKeys=\{\[profile\.id\]\}>[\s\S]*<EffectiveCapabilitiesPreview/,
+    );
+    expect(boundary).toMatch(/role="alert"[\s\S]*重试渲染[\s\S]*刷新页面/);
+    expect(app).toContain(
+      '<Suspense fallback={<AgentProfilesRouteFallback />}>',
+    );
+    expect(app).toContain('正在加载智能体设置…');
   });
 
   test('never refills or reveals stored MCP secrets', () => {

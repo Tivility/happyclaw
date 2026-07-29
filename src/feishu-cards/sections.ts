@@ -6,20 +6,10 @@
  * strict); colors are always v2 enum tokens (never hex).
  */
 
-import type {
-  AgentCardInput,
-  CardMeta,
-  ToolCallStat,
-} from './types.js';
-import {
-  resolveStatusTheme,
-} from './status-theme.js';
-import {
-  splitIntoBodySections,
-} from './length.js';
-import {
-  formatFeishuTokenSummary,
-} from '../feishu-usage-display.js';
+import type { AgentCardInput, CardMeta, ToolCallStat } from './types.js';
+import { resolveStatusTheme } from './status-theme.js';
+import { splitIntoBodySections } from './length.js';
+import { formatFeishuTokenSummary } from '../feishu-usage-display.js';
 
 /** Element ids for both the structured streaming layout and the static terminal card.
  *
@@ -228,7 +218,7 @@ export function buildHeader(input: AgentCardInput): El {
 /** 2×2 metadata row via div.fields. Returns [] when no meta is useful. */
 export function buildMetaRow(
   meta: CardMeta | undefined,
-  _completedAtMs?: number,  // accepted for compat; no longer rendered
+  _completedAtMs?: number, // accepted for compat; no longer rendered
 ): El[] {
   if (!meta) return [];
   // Single compact line: model · duration · new · cached · out · cost.
@@ -241,7 +231,8 @@ export function buildMetaRow(
   // `cached` is shown only when > 0 (first turn / new sessions have none).
   const parts: string[] = [];
   if (meta.model) parts.push(`🤖 ${shortModel(meta.model)}`);
-  if (meta.durationMs !== undefined) parts.push(`⏱ ${formatDuration(meta.durationMs)}`);
+  if (meta.durationMs !== undefined)
+    parts.push(`⏱ ${formatDuration(meta.durationMs)}`);
   // Token 明细走 formatFeishuTokenSummary（单一真相源）：卡片与纯文本回复必须
   // 给出同一份 breakdown，且它额外覆盖推理 token 与「全零 = 未上报」判定。
   if (
@@ -321,17 +312,16 @@ export function buildThinkingPanel(thinking: string | undefined): El[] {
  * single query (e.g. "analyze → call tool → report"). Only the last segment
  * is the Body text; earlier segments are preserved here as collapsed panels.
  */
-export function buildPriorSegmentsPanels(
-  segments: string[] | undefined,
-): El[] {
+export function buildPriorSegmentsPanels(segments: string[] | undefined): El[] {
   if (!segments || segments.length === 0) return [];
   const total = segments.length;
   const MAX_SEGMENT_CHARS = 4000;
   return segments.map((text, i) => {
     const trimmed = text.trim();
-    const display = trimmed.length > MAX_SEGMENT_CHARS
-      ? trimmed.slice(0, MAX_SEGMENT_CHARS) + '\n\n_…（已截断）_'
-      : trimmed;
+    const display =
+      trimmed.length > MAX_SEGMENT_CHARS
+        ? trimmed.slice(0, MAX_SEGMENT_CHARS) + '\n\n_…（已截断）_'
+        : trimmed;
     return collapsiblePanel({
       title: `**📝 前置输出 · 第 ${i + 1}/${total} 段**`,
       expanded: false,
@@ -373,9 +363,7 @@ export function buildSubAgentPanels(
   });
 }
 
-export function buildCodexTodoPanel(
-  todos: AgentCardInput['codexTodos'],
-): El[] {
+export function buildCodexTodoPanel(todos: AgentCardInput['codexTodos']): El[] {
   if (!todos || todos.length === 0) return [];
   return [
     collapsiblePanel({
@@ -694,7 +682,7 @@ export function buildAskQuestionText(questions: AskQuestionView[]): string {
           return `<text_tag color='blue'>${label}</text_tag>`;
         })
         .join(' ');
-      return `${head}\n${tags}\n<font color='grey'>请在 Agent 终端回复</font>`;
+      return `${head}\n${tags}\n<font color='grey'>请在智能体终端回复</font>`;
     })
     .join('\n\n');
 }
@@ -780,25 +768,45 @@ export interface StreamingPanelsInit {
  */
 export function buildStreamingPanels(init: StreamingPanelsInit): El[] {
   const profile = init.runtimeProfile ?? 'claude';
-  const askTitle = runtimeLabel(profile, '**❓ 等待你的回复**', '**❓ 需要你的输入**');
-  const progressTitle = runtimeLabel(profile, '**📋 任务进度**', '**📋 计划 / Todo**');
-  const toolsTitle = runtimeLabel(profile, '**🛠 工具时间轴**', '**🛠 操作时间轴**');
-  const thinkingTitle = runtimeLabel(profile, '**💭 思考过程**', '**💭 推理过程**');
-  const timelineTitle = runtimeLabel(profile, '**📝 调用轨迹**', '**📝 运行日志**');
+  const askTitle = runtimeLabel(
+    profile,
+    '**❓ 等待你的回复**',
+    '**❓ 需要你的输入**',
+  );
+  const progressTitle = runtimeLabel(
+    profile,
+    '**📋 任务进度**',
+    '**📋 计划 / Todo**',
+  );
+  const toolsTitle = runtimeLabel(
+    profile,
+    '**🛠 工具时间轴**',
+    '**🛠 操作时间轴**',
+  );
+  const thinkingTitle = runtimeLabel(
+    profile,
+    '**💭 思考过程**',
+    '**💭 推理过程**',
+  );
+  const timelineTitle = runtimeLabel(
+    profile,
+    '**📝 调用轨迹**',
+    '**📝 运行日志**',
+  );
   const progressPlaceholder = runtimeLabel(
     profile,
-    '<font color=\'grey\'>等待任务规划…</font>',
-    '<font color=\'grey\'>暂无计划</font>',
+    "<font color='grey'>等待任务规划…</font>",
+    "<font color='grey'>暂无计划</font>",
   );
   const toolsPlaceholder = runtimeLabel(
     profile,
-    '<font color=\'grey\'>尚未调用工具…</font>',
-    '<font color=\'grey\'>尚未执行操作</font>',
+    "<font color='grey'>尚未调用工具…</font>",
+    "<font color='grey'>尚未执行操作</font>",
   );
   const thinkingPlaceholder = runtimeLabel(
     profile,
-    '<font color=\'grey\'>尚未开始思考…</font>',
-    '<font color=\'grey\'>等待推理事件</font>',
+    "<font color='grey'>尚未开始思考…</font>",
+    "<font color='grey'>等待推理事件</font>",
   );
   const timelinePlaceholder = runtimeLabel(
     profile,

@@ -25,6 +25,7 @@ import {
   AVATAR_MAX_FILE_BYTES,
 } from '../http-upload-policy.js';
 import {
+  getWorkspaceRuntimeJids,
   listWorkspaceGroupsForAgentProfile,
   quiesceWorkspaceRunnersAroundCommit,
   resolveEffectiveAgentProfile,
@@ -214,7 +215,7 @@ agentProfileRoutes.post(
     const user = c.get('user') as AuthUser;
     const id = c.req.param('id');
     const existing = getAgentProfileForUser(id, user.id);
-    if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+    if (!existing) return c.json({ error: '智能体配置不存在' }, 404);
     const body = (await c.req.json().catch(() => ({}))) as Record<
       string,
       unknown
@@ -281,10 +282,7 @@ agentProfileRoutes.post(
         group.created_by !== user.id ||
         mappedProfileId !== id
       ) {
-        return c.json(
-          { error: 'Workspace does not belong to this Agent' },
-          400,
-        );
+        return c.json({ error: '该工作区不属于此智能体' }, 400);
       }
       workspace = { jid: workspaceJid, group };
     }
@@ -320,7 +318,7 @@ agentProfileRoutes.post(
     const user = c.get('user') as AuthUser;
     const id = c.req.param('id');
     const profile = getAgentProfileForUser(id, user.id);
-    if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+    if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
     if (profile.is_default) {
       return c.json(
         { error: 'Configure the main HappyClaw avatar in system settings' },
@@ -363,7 +361,7 @@ agentProfileRoutes.delete('/:id/avatar', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
   const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
   if (profile.is_default) {
     return c.json(
       { error: 'Configure the main HappyClaw avatar in system settings' },
@@ -379,7 +377,7 @@ agentProfileRoutes.post('/:id/refine-prompt', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
   const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
 
   const body = await c.req.json().catch(() => ({}));
   const parsed = AgentProfileRefinePromptSchema.safeParse(body);
@@ -459,7 +457,7 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
         // profile and workspace snapshot here prevents a new A-owned workspace
         // from being published between snapshot and post-commit cleanup.
         const existing = getAgentProfileForUser(id, user.id);
-        if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+        if (!existing) return c.json({ error: '智能体配置不存在' }, 404);
 
         const effectiveRuntimePolicy =
           parsed.data.runtime_policy === undefined
@@ -609,8 +607,8 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
             return c.json(
               {
                 error: err.persisted
-                  ? 'Agent profile was updated, but runtime cleanup failed; retry the same request'
-                  : 'Failed to quiesce active workspaces; profile was not updated',
+                  ? '智能体配置已更新，但运行时清理失败；请重试相同请求'
+                  : '无法停止活动工作区；智能体配置未更新',
                 persisted: err.persisted,
                 retryable: true,
                 profile: persistedProfile,
@@ -621,7 +619,7 @@ agentProfileRoutes.patch('/:id', authMiddleware, async (c) => {
         } else {
           profile = commit();
         }
-        if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+        if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
 
         return c.json({
           profile,
@@ -635,7 +633,7 @@ agentProfileRoutes.get('/:id/prompt-versions', authMiddleware, (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
   const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
   return c.json({ versions: listAgentProfilePromptVersions(id, user.id) });
 });
 
@@ -652,7 +650,7 @@ agentProfileRoutes.post(
 
     return withAgentProfileLocks([id], async () => {
       const existing = getAgentProfileForUser(id, user.id);
-      if (!existing) return c.json({ error: 'Agent profile not found' }, 404);
+      if (!existing) return c.json({ error: '智能体配置不存在' }, 404);
       const target = getAgentProfilePromptVersion(id, user.id, version);
       if (!target) return c.json({ error: 'Prompt version not found' }, 404);
 
@@ -743,19 +741,15 @@ agentProfileRoutes.delete('/:id', authMiddleware, async (c) => {
     // wins and archive observes the mapping and returns 409.
     const result = archiveAgentProfile(id, user.id);
     if (result === 'not_found') {
-      return c.json({ error: 'Agent profile not found' }, 404);
+      return c.json({ error: '智能体配置不存在' }, 404);
     }
     if (result === 'is_default') {
-      return c.json(
-        { error: 'The built-in HappyClaw Agent cannot be deleted' },
-        400,
-      );
+      return c.json({ error: '不能删除内置的 HappyClaw 智能体' }, 400);
     }
     if (result === 'has_workspaces') {
       return c.json(
         {
-          error:
-            'Agent profile still owns workspaces; move or delete them first',
+          error: '该智能体仍拥有工作区；请先迁移或删除这些工作区',
         },
         409,
       );
@@ -763,8 +757,7 @@ agentProfileRoutes.delete('/:id', authMiddleware, async (c) => {
     if (result === 'has_mounts') {
       return c.json(
         {
-          error:
-            'Agent profile still owns IM channel mounts; unbind them first',
+          error: '该智能体仍有消息渠道挂载；请先解绑',
         },
         409,
       );
@@ -773,59 +766,154 @@ agentProfileRoutes.delete('/:id', authMiddleware, async (c) => {
   });
 });
 
-agentProfileRoutes.get('/:id/workspaces', authMiddleware, (c) => {
+agentProfileRoutes.post('/:id/runtime-cleanup', authMiddleware, async (c) => {
   const user = c.get('user') as AuthUser;
   const id = c.req.param('id');
-  const profile = getAgentProfileForUser(id, user.id);
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  return withCapabilityScopeLocks(
+    [SYSTEM_CAPABILITY_LOCK_KEY, userCapabilityLockKey(user.id)],
+    () =>
+      withAgentProfileLocks([id], async () => {
+        const profile = getAgentProfileForUser(id, user.id);
+        if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
 
-  const defaultProfile = getOrCreateDefaultAgentProfile(user.id);
-  const groups = getAllRegisteredGroups();
-  const workspaces = Object.entries(groups)
-    .filter(([jid, group]) => {
-      if (!jid.startsWith('web:')) return false;
-      if (group.created_by !== user.id) return false;
-      const mapped =
-        getWorkspaceAgentProfileId(group.folder) ?? defaultProfile.id;
-      return mapped === id;
-    })
-    .map(([jid, group]) => ({
-      jid,
-      name: group.name,
-      folder: group.folder,
-      is_home: !!group.is_home,
-      execution_mode: group.executionMode ?? 'container',
-      added_at: group.added_at,
-      runtime_sessions: listWorkspaceRuntimeSessionsByWorkspace(jid).map(
-        (session) => ({
-          runtime_agent_id: session.runtime_agent_id,
-          sdk_session_id: session.sdk_session_id,
-          provider_id: session.provider_id,
-          agent_profile_id: session.agent_profile_id,
-          agent_profile_version: session.agent_profile_version,
-          identity_hash: session.identity_hash,
-          updated_at: session.updated_at,
-        }),
-      ),
-    }));
-  const workspaceJids = new Set(workspaces.map((workspace) => workspace.jid));
-  const channelMounts = listAgentChannelMountsForProfile(id)
-    .filter((mount) => workspaceJids.has(mount.workspace_jid))
-    .map((mount) => ({
-      channel_jid: mount.channel_jid,
-      channel_type: mount.channel_type,
-      workspace_jid: mount.workspace_jid,
-      workspace_folder: mount.workspace_folder,
-      session_id: mount.session_id ?? null,
-      routing_mode: mount.routing_mode,
-      reply_policy: mount.reply_policy,
-      activation_mode: mount.activation_mode,
-      audience_mode: mount.audience_mode,
-      owner_im_id: mount.owner_im_id ?? null,
-      updated_at: mount.updated_at,
-    }));
+        const deps = getWebDeps();
+        const profileWorkspaces = deps
+          ? listWorkspaceGroupsForAgentProfile(user.id, id)
+          : [];
+        if (!deps || profileWorkspaces.length === 0) {
+          return c.json({
+            success: true,
+            cleaned_runtime_jids: 0,
+            runtime_cleanup_pending: false,
+          });
+        }
+        const targets = profileWorkspaces.map((workspace) => ({
+          folder: workspace.group.folder,
+          primaryJid: workspace.jid,
+        }));
+        const runtimeJids = Array.from(
+          new Set(
+            targets.flatMap((target) =>
+              getWorkspaceRuntimeJids(deps, target.folder, target.primaryJid),
+            ),
+          ),
+        );
+        try {
+          const result = await quiesceWorkspaceRunnersAroundCommit(
+            deps,
+            targets,
+            {
+              reason: `Retry pending runtime cleanup for Agent profile ${id}`,
+              onPostCommitFailure: (failedRuntimeJids) =>
+                deps.queue.blockGroupsForRuntimeSafety?.(
+                  failedRuntimeJids,
+                  `Agent profile ${id} runtime cleanup retry failed`,
+                ),
+            },
+            () => undefined,
+          );
+          deps.queue.unblockGroupsForRuntimeSafety?.(result.runtimeJids);
+          return c.json({
+            success: true,
+            cleaned_runtime_jids: result.runtimeJids.length,
+            runtime_cleanup_pending: false,
+          });
+        } catch (err) {
+          if (!(err instanceof WorkspaceRuntimeQuiesceError)) throw err;
+          // Keep the profile fail-closed even if a cleanup-only retry fails
+          // before its no-op commit. The original configuration is already
+          // durable, so every user can safely retry this owner-scoped endpoint.
+          deps.queue.blockGroupsForRuntimeSafety?.(
+            runtimeJids,
+            `Agent profile ${id} runtime cleanup retry failed`,
+          );
+          logger.error(
+            { err, agentProfileId: id },
+            'Agent profile runtime cleanup retry failed',
+          );
+          return c.json(
+            {
+              error: '工作区运行时清理失败，请重试',
+              retryable: true,
+              runtime_cleanup_pending: true,
+            },
+            503,
+          );
+        }
+      }),
+  );
+});
 
-  return c.json({ profile, workspaces, channel_mounts: channelMounts });
+agentProfileRoutes.get('/:id/workspaces', authMiddleware, async (c) => {
+  const user = c.get('user') as AuthUser;
+  const id = c.req.param('id');
+  return withAgentProfileLocks([id], () => {
+    const profile = getAgentProfileForUser(id, user.id);
+    if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
+
+    const defaultProfile = getOrCreateDefaultAgentProfile(user.id);
+    const groups = getAllRegisteredGroups();
+    const workspaces = Object.entries(groups)
+      .filter(([jid, group]) => {
+        if (!jid.startsWith('web:')) return false;
+        if (group.created_by !== user.id) return false;
+        const mapped =
+          getWorkspaceAgentProfileId(group.folder) ?? defaultProfile.id;
+        return mapped === id;
+      })
+      .map(([jid, group]) => ({
+        jid,
+        name: group.name,
+        folder: group.folder,
+        is_home: !!group.is_home,
+        execution_mode: group.executionMode ?? 'container',
+        added_at: group.added_at,
+        runtime_sessions: listWorkspaceRuntimeSessionsByWorkspace(jid).map(
+          (session) => ({
+            runtime_agent_id: session.runtime_agent_id,
+            sdk_session_id: session.sdk_session_id,
+            provider_id: session.provider_id,
+            agent_profile_id: session.agent_profile_id,
+            agent_profile_version: session.agent_profile_version,
+            identity_hash: session.identity_hash,
+            updated_at: session.updated_at,
+          }),
+        ),
+      }));
+    const workspaceJids = new Set(workspaces.map((workspace) => workspace.jid));
+    const channelMounts = listAgentChannelMountsForProfile(id)
+      .filter((mount) => workspaceJids.has(mount.workspace_jid))
+      .map((mount) => ({
+        channel_jid: mount.channel_jid,
+        channel_type: mount.channel_type,
+        workspace_jid: mount.workspace_jid,
+        workspace_folder: mount.workspace_folder,
+        session_id: mount.session_id ?? null,
+        routing_mode: mount.routing_mode,
+        reply_policy: mount.reply_policy,
+        activation_mode: mount.activation_mode,
+        audience_mode: mount.audience_mode,
+        owner_im_id: mount.owner_im_id ?? null,
+        updated_at: mount.updated_at,
+      }));
+    const deps = getWebDeps();
+    const runtimeCleanupPending =
+      deps != null &&
+      listWorkspaceGroupsForAgentProfile(user.id, id).some((workspace) =>
+        getWorkspaceRuntimeJids(
+          deps,
+          workspace.group.folder,
+          workspace.jid,
+        ).some((jid) => deps.queue.isGroupRuntimeSafetyBlocked?.(jid) ?? false),
+      );
+
+    return c.json({
+      profile,
+      workspaces,
+      channel_mounts: channelMounts,
+      runtime_cleanup_pending: runtimeCleanupPending,
+    });
+  });
 });
 
 export default agentProfileRoutes;

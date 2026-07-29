@@ -122,7 +122,8 @@ Radix UI。路由以 `web/src/App.tsx` 为准：
 - 不同飞书话题、不同 Runtime Session 使用不同序列化键，可以并发。
 - 普通消息与定时任务使用明确的队列状态；失败采用有界指数退避。
 - `CONTAINER_TIMEOUT` 控制单次运行上限，`IDLE_TIMEOUT` 控制暖 Runner 的空闲保留时间。
-- Script 任务使用独立的 `maxConcurrentScripts` 和 `scriptTimeout`。
+- Script 任务与其他任务共用 `CONTAINER_TIMEOUT`，不设置独立并发池或超时配置。
+- 服务重启时，错过的周期任务记为 `missed` 并推进计划；一次性任务仍会补跑。
 
 Host 模式没有 `maxConcurrentHostProcesses`。旧客户端提交该字段时后端仅为兼容而忽略，
 不得重新把它实现为全局 Host 并发池。
@@ -287,8 +288,6 @@ Web 持久设置 > 环境变量 > 代码默认值
 | `CONTAINER_TIMEOUT`         | `1800000`                | 默认运行超时            |
 | `IDLE_TIMEOUT`              | `1800000`                | 暖 Runner 空闲时间      |
 | `MAX_CONCURRENT_CONTAINERS` | `20`                     | Docker 并发             |
-| `MAX_CONCURRENT_SCRIPTS`    | `10`                     | Script 并发             |
-| `SCRIPT_TIMEOUT`            | `60000`                  | Script 超时             |
 | `MAX_FILE_SIZE_MB`          | `50`                     | Web/IM 入站文件上限     |
 | `CORS_ALLOWED_ORIGINS`      | 仅 localhost             | WebSocket Origin 白名单 |
 | `TRUST_PROXY`               | `false`                  | 是否信任反向代理来源头  |
@@ -302,7 +301,6 @@ Provider 和渠道账号应优先通过 Web 配置。Legacy `/api/config/user-im
 > **追 upstream 版本前先读 [`docs/upstream-tracking-playbook.md`](docs/upstream-tracking-playbook.md)**
 > —— 合并伤的四种形态、门禁的能力边界、验证分层、生产切换流程与检查清单，
 > 全部来自 2026-07 那次 121 提交合并的实测。
-
 
 ```bash
 make install

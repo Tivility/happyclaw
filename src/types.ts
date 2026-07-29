@@ -1,7 +1,4 @@
-import type {
-  StreamEvent,
-  WorkflowRunSnapshot,
-} from './stream-event.types.js';
+import type { StreamEvent, WorkflowRunSnapshot } from './stream-event.types.js';
 
 export interface AdditionalMount {
   hostPath: string; // Absolute canonical path on host
@@ -226,6 +223,25 @@ export interface FeishuMessageMeta extends ChannelMessageMeta {
 }
 
 /**
+ * Provider-fetched context for a message referenced by the current inbound
+ * turn. The text is prompt-only metadata: `NewMessage.content` remains scoped
+ * to the current turn and its own attachment markers.
+ */
+export interface ChannelReferencedMessage {
+  id: string;
+  sender?: string;
+  text: string;
+  /** Prompt hints for referenced files/images that were materialized locally. */
+  attachmentHints?: string[];
+  /**
+   * Raw `messages.attachments` indexes owned by this reference. The host uses
+   * them to avoid resending quoted image bytes when the referenced turn is
+   * already present in the active session.
+   */
+  attachmentIndexes?: number[];
+}
+
+/**
  * Sanitized provider context for one inbound turn.
  *
  * This object is safe to persist and expose to the Agent. It intentionally
@@ -260,6 +276,7 @@ export interface ChannelTurnContext {
     parentId?: string;
     threadId?: string;
     type?: string;
+    referencedMessages?: ChannelReferencedMessage[];
   };
   sender?: {
     openId?: string;
@@ -622,6 +639,7 @@ export interface FollowUpActionResult {
 export type MessageSourceKind =
   | 'sdk_final'
   | 'sdk_send_message'
+  | 'proactive_sdk_fallback'
   | 'interrupt_partial'
   | 'overflow_partial'
   | 'compact_partial'

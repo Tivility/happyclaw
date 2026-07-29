@@ -7,7 +7,13 @@ export interface UnifiedProviderPublic {
   runtime: 'claude' | 'codex' | 'grok';
   providerFamily: 'claude' | 'gpt' | 'grok';
   providerPoolId: string;
-  authMode: 'api_key' | 'oauth' | 'setup_token' | 'third_party' | 'chatgpt_oauth' | 'grok_oauth';
+  authMode:
+    | 'api_key'
+    | 'oauth'
+    | 'setup_token'
+    | 'third_party'
+    | 'chatgpt_oauth'
+    | 'grok_oauth';
   authProfileGeneration: number;
   enabled: boolean;
   weight: number;
@@ -104,12 +110,7 @@ export interface SystemSettings {
   maxConcurrentContainers: number;
   maxLoginAttempts: number;
   loginLockoutMinutes: number;
-  maxConcurrentScripts: number;
-  scriptTimeout: number;
-  taskBackfillGraceMs: number;
   deletedTaskRetentionDays: number;
-  maxRepliesPerTurn: number;
-  maxTasksPerUser: number;
   fallbackModel: string;
 }
 
@@ -146,7 +147,12 @@ export interface ProviderPoolModelOption {
   provider_family: 'claude' | 'gpt' | 'grok';
   provider_pool_id: string;
   model_id: string;
-  model_kind: 'provider_default' | 'runtime_default' | 'alias' | 'explicit_version' | 'custom';
+  model_kind:
+    | 'provider_default'
+    | 'runtime_default'
+    | 'alias'
+    | 'explicit_version'
+    | 'custom';
   display_name: string | null;
   source: string;
   status: 'available' | 'unverified' | 'unsupported' | 'stale' | 'hidden';
@@ -167,7 +173,11 @@ export interface ConversationRuntimeState {
   selected_model: string | null;
   model_kind: ProviderPoolModelOption['model_kind'];
   resolved_model: string | null;
-  binding_source: 'system_default' | 'workspace_default' | 'copied_workspace_default' | 'user_pinned';
+  binding_source:
+    | 'system_default'
+    | 'workspace_default'
+    | 'copied_workspace_default'
+    | 'user_pinned';
 }
 
 export type SettingsTab =
@@ -175,7 +185,6 @@ export type SettingsTab =
   | 'agent-definitions'
   | 'agent-profiles'
   | 'appearance'
-  | 'automation'
   | 'billing'
   | 'bindings'
   | 'claude'

@@ -523,7 +523,7 @@ export function createMcpToolCatalog(
     defineTool(
       'send_message',
       usesProactiveInteractiveContract
-        ? 'Send one user-visible message now. The Workspace uses Proactive reply mode: every call creates an independent native chat message immediately, and your normal SDK final text is not published. You may call this tool zero, one, or many times and continue working after each successful send. A delivery error is authoritative: do not sleep and retry, switch to a card, or call a raw channel API as a fallback.'
+        ? 'Send one user-visible message now. The Workspace uses Proactive reply mode: every call creates an independent native chat message immediately, and your normal SDK final text is not published. Set delivery_role=progress for acknowledgements or updates and delivery_role=final for the last substantive answer. You may call this tool zero, one, or many times and continue working after each successful progress send. A delivery error is authoritative: do not sleep and retry, switch to a card, or call a raw channel API as a fallback.'
         : "Publish text through HappyClaw's turn-owned delivery coordinator. In an interactive user turn, delivery_role=progress updates the existing reply status and delivery_role=final stages the primary answer on the existing card; neither creates a second text reply. Use delivery_role=separate only when the user explicitly requested another message. Scheduled/background tasks always deliver separately because their normal SDK final is not published.",
       {
         // Trim/min-length at the schema layer: the host guard is `!data.text`,
@@ -535,7 +535,7 @@ export function createMcpToolCatalog(
           .optional()
           .describe(
             usesProactiveInteractiveContract
-              ? 'Ignored in Proactive reply mode: every call is delivered as an independent native message.'
+              ? 'Semantic completion hint used for delivery recovery. Both roles still create independent native messages. Use progress for interim updates and final for the last substantive answer; omitted defaults to progress.'
               : 'progress updates the active reply, final stages its answer, separate creates an additional message. Defaults to final for interactive turns and separate for scheduled tasks.',
           ),
       },
@@ -543,7 +543,7 @@ export function createMcpToolCatalog(
         const deliveryRole = ctx.isScheduledTask
           ? 'separate'
           : ctx.interactionMode === 'proactive'
-            ? 'separate'
+            ? (args.delivery_role ?? 'progress')
             : (args.delivery_role ?? 'final');
         const data = buildSendMessageData(ctx, {
           type: 'message',
@@ -578,7 +578,11 @@ export function createMcpToolCatalog(
             : disposition === 'staged_final'
               ? 'Final answer staged on the active reply; return the same answer normally so the SDK Result can finalize it.'
               : usesProactiveInteractiveContract
-                ? 'Message delivered. If this completes the thought, end the turn now. Send again only for new, non-redundant content; never repeat this message in SDK final text.'
+                ? deliveryRole === 'progress'
+                  ? 'Progress message delivered. This does not complete the user-visible answer. Continue the work, then call send_message(delivery_role=final) with the last substantive result before ending. Do not put a conclusion, completion phrase, or closing message only in SDK final text.'
+                  : deliveryRole === 'final'
+                    ? 'Final message delivered. End the turn now without any user-facing SDK final text. Do not repeat, summarize, acknowledge, or append a closing phrase.'
+                    : 'Separate message delivered. Continue the work; if this turn needs a final answer, call send_message(delivery_role=final) before ending.'
                 : 'Message sent separately.';
         return {
           content: [{ type: 'text' as const, text: acknowledgement }],
@@ -2481,216 +2485,215 @@ Use the skills panel in the UI to find the skill ID (directory name, e.g. "memor
   // --- memory_search + memory_get ---
   {
     tools.push(
-    defineTool(
-      'memory_search',
-      `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
+      defineTool(
+        'memory_search',
+        `\u5728\u5de5\u4f5c\u533a\u7684\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u641c\u7d22\uff08CLAUDE.md\u3001memory/\u3001conversations/ \u53ca\u5176\u4ed6 .md/.txt \u6587\u4ef6\uff09\u3002
 \u8fd4\u56de\u6587\u4ef6\u8def\u5f84\u3001\u884c\u53f7\u548c\u4e0a\u4e0b\u6587\u7247\u6bb5\u3002\u8d85\u8fc7 512KB \u7684\u6587\u4ef6\u4f1a\u88ab\u8df3\u8fc7\u3002
 \u7528\u4e8e\u56de\u5fc6\u8fc7\u53bb\u7684\u51b3\u7b56\u3001\u504f\u597d\u3001\u9879\u76ee\u4e0a\u4e0b\u6587\u6216\u5bf9\u8bdd\u5386\u53f2\u3002`,
-      {
-        query: z
-          .string()
-          .describe(
-            '\u641c\u7d22\u5173\u952e\u8bcd\u6216\u77ed\u8bed\uff08\u4e0d\u533a\u5206\u5927\u5c0f\u5199\uff09',
-          ),
-        max_results: z
-          .number()
-          .optional()
-          .default(20)
-          .describe(
-            '\u6700\u5927\u7ed3\u679c\u6570\uff08\u9ed8\u8ba4 20\uff0c\u4e0a\u9650 50\uff09',
-          ),
-      },
-      async (args) => {
-        if (!args.query.trim()) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u641c\u7d22\u5173\u952e\u8bcd\u4e0d\u80fd\u4e3a\u7a7a\u3002',
-              },
-            ],
-            isError: true,
-          };
-        }
-        const maxResults = Math.min(Math.max(args.max_results ?? 20, 1), 50);
-        const queryLower = args.query.toLowerCase();
-        const files: string[] = [];
-        collectMemoryFiles(ctx.workspaceMemory, files, 4);
-        collectMemoryFiles(ctx.workspaceGroup, files, 4);
-        collectMemoryFiles(ctx.workspaceGlobal, files, 4);
-        const uniqueFiles = Array.from(new Set(files)).filter(
-          (f) => !f.endsWith('/PRIVATE.md'),
-        );
-        if (uniqueFiles.length === 0) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u672a\u627e\u5230\u8bb0\u5fc6\u6587\u4ef6\u3002',
-              },
-            ],
-          };
-        }
-        const results: string[] = [];
-        let skippedLarge = 0;
-        for (const filePath of uniqueFiles) {
-          if (results.length >= maxResults) break;
-          try {
-            const stat = fs.statSync(filePath);
-            if (stat.size > MAX_MEMORY_FILE_SIZE) {
-              skippedLarge++;
-              continue;
-            }
-            const content = fs.readFileSync(filePath, 'utf-8');
-            const lines = content.split('\n');
-            let lastEnd = -1;
-            for (let i = 0; i < lines.length; i++) {
-              if (results.length >= maxResults) break;
-              if (lines[i].toLowerCase().includes(queryLower)) {
-                const start = Math.max(0, i - 1);
-                if (start <= lastEnd) continue;
-                const end = Math.min(lines.length, i + 2);
-                lastEnd = end;
-                const snippet = lines.slice(start, end).join('\n');
-                results.push(
-                  `${toRelativePath(filePath)}:${i + 1}\n${snippet}`,
-                );
-              }
-            }
-          } catch {
-            /* skip unreadable */
+        {
+          query: z
+            .string()
+            .describe(
+              '\u641c\u7d22\u5173\u952e\u8bcd\u6216\u77ed\u8bed\uff08\u4e0d\u533a\u5206\u5927\u5c0f\u5199\uff09',
+            ),
+          max_results: z
+            .number()
+            .optional()
+            .default(20)
+            .describe(
+              '\u6700\u5927\u7ed3\u679c\u6570\uff08\u9ed8\u8ba4 20\uff0c\u4e0a\u9650 50\uff09',
+            ),
+        },
+        async (args) => {
+          if (!args.query.trim()) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u641c\u7d22\u5173\u952e\u8bcd\u4e0d\u80fd\u4e3a\u7a7a\u3002',
+                },
+              ],
+              isError: true,
+            };
           }
-        }
-        const skippedNote =
-          skippedLarge > 0
-            ? `\uff08\u8df3\u8fc7 ${skippedLarge} \u4e2a\u5927\u6587\u4ef6\uff09`
-            : '';
-        if (results.length === 0) {
+          const maxResults = Math.min(Math.max(args.max_results ?? 20, 1), 50);
+          const queryLower = args.query.toLowerCase();
+          const files: string[] = [];
+          collectMemoryFiles(ctx.workspaceMemory, files, 4);
+          collectMemoryFiles(ctx.workspaceGroup, files, 4);
+          collectMemoryFiles(ctx.workspaceGlobal, files, 4);
+          const uniqueFiles = Array.from(new Set(files)).filter(
+            (f) => !f.endsWith('/PRIVATE.md'),
+          );
+          if (uniqueFiles.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u672a\u627e\u5230\u8bb0\u5fc6\u6587\u4ef6\u3002',
+                },
+              ],
+            };
+          }
+          const results: string[] = [];
+          let skippedLarge = 0;
+          for (const filePath of uniqueFiles) {
+            if (results.length >= maxResults) break;
+            try {
+              const stat = fs.statSync(filePath);
+              if (stat.size > MAX_MEMORY_FILE_SIZE) {
+                skippedLarge++;
+                continue;
+              }
+              const content = fs.readFileSync(filePath, 'utf-8');
+              const lines = content.split('\n');
+              let lastEnd = -1;
+              for (let i = 0; i < lines.length; i++) {
+                if (results.length >= maxResults) break;
+                if (lines[i].toLowerCase().includes(queryLower)) {
+                  const start = Math.max(0, i - 1);
+                  if (start <= lastEnd) continue;
+                  const end = Math.min(lines.length, i + 2);
+                  lastEnd = end;
+                  const snippet = lines.slice(start, end).join('\n');
+                  results.push(
+                    `${toRelativePath(filePath)}:${i + 1}\n${snippet}`,
+                  );
+                }
+              }
+            } catch {
+              /* skip unreadable */
+            }
+          }
+          const skippedNote =
+            skippedLarge > 0
+              ? `\uff08\u8df3\u8fc7 ${skippedLarge} \u4e2a\u5927\u6587\u4ef6\uff09`
+              : '';
+          if (results.length === 0) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u5728 ${uniqueFiles.length} \u4e2a\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u672a\u627e\u5230\u201c${args.query}\u201d\u7684\u5339\u914d\u3002${skippedNote}`,
+                },
+              ],
+            };
+          }
           return {
             content: [
               {
                 type: 'text' as const,
-                text: `\u5728 ${uniqueFiles.length} \u4e2a\u8bb0\u5fc6\u6587\u4ef6\u4e2d\u672a\u627e\u5230\u201c${args.query}\u201d\u7684\u5339\u914d\u3002${skippedNote}`,
+                text: `\u627e\u5230 ${results.length} \u6761\u5339\u914d${skippedNote}\uff1a\n\n${results.join('\n---\n')}`,
               },
             ],
           };
-        }
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: `\u627e\u5230 ${results.length} \u6761\u5339\u914d${skippedNote}\uff1a\n\n${results.join('\n---\n')}`,
-            },
-          ],
-        };
         },
       ),
 
-    // --- memory_get ---
-    defineTool(
-      'memory_get',
-      `\u8bfb\u53d6\u8bb0\u5fc6\u6587\u4ef6\u6216\u6307\u5b9a\u884c\u8303\u56f4\u3002\u5728 memory_search \u4e4b\u540e\u4f7f\u7528\u4ee5\u83b7\u53d6\u5b8c\u6574\u4e0a\u4e0b\u6587\u3002`,
-      {
-        file: z
-          .string()
-          .describe(
-            '\u76f8\u5bf9\u8def\u5f84\uff0c\u53ef\u5e26 :\u884c\u53f7\uff08\u5982 "CLAUDE.md:12"\u3001"[global] CLAUDE.md:8" \u6216 "[memory] 2026-01-15.md"\uff09',
-          ),
-        from_line: z
-          .number()
-          .optional()
-          .describe(
-            '\u8d77\u59cb\u884c\u53f7\uff08\u4ece 1 \u5f00\u59cb\uff0c\u9ed8\u8ba4\uff1a1\uff09',
-          ),
-        lines: z
-          .number()
-          .optional()
-          .describe(
-            '\u8bfb\u53d6\u884c\u6570\uff08\u9ed8\u8ba4\uff1a\u5168\u90e8\uff0c\u4e0a\u9650\uff1a200\uff09',
-          ),
-      },
-      async (args) => {
-        const { pathRef, lineFromRef } = parseMemoryFileReference(args.file);
-        let resolvedPath: string;
-        if (pathRef.startsWith('[global] ')) {
-          resolvedPath = path.join(
-            ctx.workspaceGlobal,
-            pathRef.slice('[global] '.length),
-          );
-        } else if (pathRef.startsWith('[memory] ')) {
-          resolvedPath = path.join(
-            ctx.workspaceMemory,
-            pathRef.slice('[memory] '.length),
-          );
-        } else {
-          resolvedPath = path.join(ctx.workspaceGroup, pathRef);
-        }
-        resolvedPath = path.normalize(resolvedPath);
-        const inGroup =
-          resolvedPath === ctx.workspaceGroup ||
-          resolvedPath.startsWith(ctx.workspaceGroup + path.sep);
-        const inGlobal =
-          resolvedPath === ctx.workspaceGlobal ||
-          resolvedPath.startsWith(ctx.workspaceGlobal + path.sep);
-        const inMemory =
-          resolvedPath === ctx.workspaceMemory ||
-          resolvedPath.startsWith(ctx.workspaceMemory + path.sep);
-        if (!inGroup && !inGlobal && !inMemory) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: '\u8bbf\u95ee\u88ab\u62d2\u7edd\uff1a\u8def\u5f84\u8d85\u51fa\u5de5\u4f5c\u533a\u8303\u56f4\u3002',
-              },
-            ],
-            isError: true,
-          };
-        }
-        if (!fs.existsSync(resolvedPath)) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `\u6587\u4ef6\u672a\u627e\u5230\uff1a${pathRef}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-        try {
-          const content = fs.readFileSync(resolvedPath, 'utf-8');
-          const allLines = content.split('\n');
-          const fromLine = Math.max(
-            (args.from_line ?? lineFromRef ?? 1) - 1,
-            0,
-          );
-          const maxLines = Math.min(args.lines ?? allLines.length, 200);
-          const slice = allLines.slice(fromLine, fromLine + maxLines);
-          const header = `${pathRef}\uff08\u7b2c ${fromLine + 1}-${fromLine + slice.length} \u884c\uff0c\u5171 ${allLines.length} \u884c\uff09`;
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `${header}\n\n${slice.join('\n')}`,
-              },
-            ],
-          };
-        } catch (err) {
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: `\u8bfb\u53d6\u6587\u4ef6\u65f6\u51fa\u9519\uff1a${err instanceof Error ? err.message : String(err)}`,
-              },
-            ],
-            isError: true,
-          };
-        }
-      },
-    ),
-  );
+      // --- memory_get ---
+      defineTool(
+        'memory_get',
+        `\u8bfb\u53d6\u8bb0\u5fc6\u6587\u4ef6\u6216\u6307\u5b9a\u884c\u8303\u56f4\u3002\u5728 memory_search \u4e4b\u540e\u4f7f\u7528\u4ee5\u83b7\u53d6\u5b8c\u6574\u4e0a\u4e0b\u6587\u3002`,
+        {
+          file: z
+            .string()
+            .describe(
+              '\u76f8\u5bf9\u8def\u5f84\uff0c\u53ef\u5e26 :\u884c\u53f7\uff08\u5982 "CLAUDE.md:12"\u3001"[global] CLAUDE.md:8" \u6216 "[memory] 2026-01-15.md"\uff09',
+            ),
+          from_line: z
+            .number()
+            .optional()
+            .describe(
+              '\u8d77\u59cb\u884c\u53f7\uff08\u4ece 1 \u5f00\u59cb\uff0c\u9ed8\u8ba4\uff1a1\uff09',
+            ),
+          lines: z
+            .number()
+            .optional()
+            .describe(
+              '\u8bfb\u53d6\u884c\u6570\uff08\u9ed8\u8ba4\uff1a\u5168\u90e8\uff0c\u4e0a\u9650\uff1a200\uff09',
+            ),
+        },
+        async (args) => {
+          const { pathRef, lineFromRef } = parseMemoryFileReference(args.file);
+          let resolvedPath: string;
+          if (pathRef.startsWith('[global] ')) {
+            resolvedPath = path.join(
+              ctx.workspaceGlobal,
+              pathRef.slice('[global] '.length),
+            );
+          } else if (pathRef.startsWith('[memory] ')) {
+            resolvedPath = path.join(
+              ctx.workspaceMemory,
+              pathRef.slice('[memory] '.length),
+            );
+          } else {
+            resolvedPath = path.join(ctx.workspaceGroup, pathRef);
+          }
+          resolvedPath = path.normalize(resolvedPath);
+          const inGroup =
+            resolvedPath === ctx.workspaceGroup ||
+            resolvedPath.startsWith(ctx.workspaceGroup + path.sep);
+          const inGlobal =
+            resolvedPath === ctx.workspaceGlobal ||
+            resolvedPath.startsWith(ctx.workspaceGlobal + path.sep);
+          const inMemory =
+            resolvedPath === ctx.workspaceMemory ||
+            resolvedPath.startsWith(ctx.workspaceMemory + path.sep);
+          if (!inGroup && !inGlobal && !inMemory) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: '\u8bbf\u95ee\u88ab\u62d2\u7edd\uff1a\u8def\u5f84\u8d85\u51fa\u5de5\u4f5c\u533a\u8303\u56f4\u3002',
+                },
+              ],
+              isError: true,
+            };
+          }
+          if (!fs.existsSync(resolvedPath)) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u6587\u4ef6\u672a\u627e\u5230\uff1a${pathRef}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+          try {
+            const content = fs.readFileSync(resolvedPath, 'utf-8');
+            const allLines = content.split('\n');
+            const fromLine = Math.max(
+              (args.from_line ?? lineFromRef ?? 1) - 1,
+              0,
+            );
+            const maxLines = Math.min(args.lines ?? allLines.length, 200);
+            const slice = allLines.slice(fromLine, fromLine + maxLines);
+            const header = `${pathRef}\uff08\u7b2c ${fromLine + 1}-${fromLine + slice.length} \u884c\uff0c\u5171 ${allLines.length} \u884c\uff09`;
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `${header}\n\n${slice.join('\n')}`,
+                },
+              ],
+            };
+          } catch (err) {
+            return {
+              content: [
+                {
+                  type: 'text' as const,
+                  text: `\u8bfb\u53d6\u6587\u4ef6\u65f6\u51fa\u9519\uff1a${err instanceof Error ? err.message : String(err)}`,
+                },
+              ],
+              isError: true,
+            };
+          }
+        },
+      ),
+    );
   }
-
 
   return tools;
 }

@@ -374,10 +374,7 @@ describe('buildAgentReplyCard', () => {
   });
 
   test('header.template reflects CardStatus and omits icon', () => {
-    const cases: Array<[
-      'running' | 'done' | 'warning' | 'error',
-      string,
-    ]> = [
+    const cases: Array<['running' | 'done' | 'warning' | 'error', string]> = [
       ['running', 'blue'],
       ['done', 'violet'],
       ['warning', 'orange'],
@@ -755,7 +752,9 @@ describe('buildAgentReplyCard', () => {
     expect(json).toContain('操作记录');
     expect(json).toContain('检查状态');
     expect(json).toContain('Codex SDK 正在处理');
-    expect(collectElementIds(card)).toContain(CARD_ELEMENT_IDS.CODEX_TODOS_FINAL);
+    expect(collectElementIds(card)).toContain(
+      CARD_ELEMENT_IDS.CODEX_TODOS_FINAL,
+    );
     expect(collectElementIds(card)).toContain(CARD_ELEMENT_IDS.CODEX_OPS_FINAL);
     expect(validateV2Shape(card)).toEqual([]);
   });
@@ -1167,7 +1166,7 @@ describe('buildAskQuestionText', () => {
     expect(text).toContain('<text_tag');
     expect(text).toContain('Alpha');
     expect(text).toContain('beta');
-    expect(text).toContain('请在 Agent 终端回复');
+    expect(text).toContain('请在智能体终端回复');
   });
 
   test('empty options → just the bold question', () => {

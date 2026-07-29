@@ -3,13 +3,8 @@ import Database from './sqlite-compat.js';
 import fs from 'fs';
 import path from 'path';
 
-import {
-  STORE_DIR,
-  GROUPS_DIR,
-} from './config.js';
-import {
-  logger,
-} from './logger.js';
+import { STORE_DIR, GROUPS_DIR } from './config.js';
+import { logger } from './logger.js';
 import {
   AgentProfile,
   AgentBuilderDefinition,
@@ -99,6 +94,7 @@ import {
   bindChannelReliabilityDatabase,
   createChannelReliabilitySchema,
 } from './channel-reliability-store.js';
+import { splitLegacyEmbeddedReferenceContent } from './message-prompt.js';
 
 let db: InstanceType<typeof Database>;
 const DB_BACKUP_ENV_OVERRIDE = 'HAPPYCLAW_ALLOW_DB_MIGRATION_WITHOUT_BACKUP';
@@ -107,7 +103,7 @@ const DB_BACKUP_ENV_OVERRIDE = 'HAPPYCLAW_ALLOW_DB_MIGRATION_WITHOUT_BACKUP';
  * restating the number. Hardcoding it meant every schema bump edited a dozen
  * unrelated test files, which is churn that hides real assertion changes.
  */
-export const CURRENT_SCHEMA_VERSION = 63;
+export const CURRENT_SCHEMA_VERSION = 64;
 
 export function isDatabaseInitialized(): boolean {
   return Boolean(db?.open);
@@ -139,7 +135,6 @@ function copyIfExists(src: string, dest: string): boolean {
   fs.copyFileSync(src, dest);
   return true;
 }
-
 
 function stmts() {
   if (!_stmts) {
@@ -1796,7 +1791,11 @@ export function initDatabase(): void {
     'TEXT',
   );
   ensureColumn('conversation_runtime_sessions', 'summary_id', 'TEXT');
-  ensureColumn('conversation_runtime_state', 'pending_handoff_summary_id', 'TEXT');
+  ensureColumn(
+    'conversation_runtime_state',
+    'pending_handoff_summary_id',
+    'TEXT',
+  );
   migrateLegacySessionsToRuntimeSessions();
   ensureColumn('messages', 'delivery_mode', 'TEXT');
   ensureColumn('messages', 'delivery_status', 'TEXT');
@@ -2746,6 +2745,89 @@ export function initDatabase(): void {
 
   // 合并后 schema 已包含 upstream 全部迁移，统一用 CURRENT_SCHEMA_VERSION 记账；
   // 本地旧编号 '45' 已废弃（两者写的是同一个 router_state key）。
+  // v63 -> v64: early Feishu reply enrichment embedded quoted ancestors in
+  // messages.content, leaking prompt scaffolding into Web history and then
+  // duplicating it again during fresh-session recovery. Clean only rows whose
+  // direct parent is safely present in the same logical conversation; rows
+  // whose quoted context is the sole surviving copy remain untouched.
+  const embeddedReferenceSchemaVersion = Number(
+    getRouterStateInternal('schema_version') ?? '0',
+  );
+  if (embeddedReferenceSchemaVersion < 64) {
+    const candidates = db
+      .prepare(
+        `SELECT id, chat_jid, content, channel_context
+         FROM messages
+         WHERE content LIKE ?`,
+      )
+      .all('[引用消息链（最早到最近）]\n%') as Array<{
+      id: string;
+      chat_jid: string;
+      content: string;
+      channel_context: unknown;
+    }>;
+    const findParent = db.prepare(
+      `SELECT sender_name, content
+       FROM messages
+       WHERE id = ? AND chat_jid = ?
+       LIMIT 1`,
+    );
+    const updateMessage = db.prepare(
+      `UPDATE messages
+       SET content = ?, channel_context = ?
+       WHERE id = ? AND chat_jid = ? AND content = ?`,
+    );
+    let migratedRows = 0;
+    db.transaction(() => {
+      for (const candidate of candidates) {
+        const split = splitLegacyEmbeddedReferenceContent(candidate.content);
+        const context = parseChannelTurnContext(candidate.channel_context);
+        const parentId = context?.message?.parentId;
+        if (!split || !context?.message || !parentId) continue;
+        const parent = findParent.get(parentId, candidate.chat_jid) as
+          | { sender_name: string | null; content: string }
+          | undefined;
+        if (!parent) continue;
+
+        const parentText =
+          splitLegacyEmbeddedReferenceContent(String(parent.content))
+            ?.currentContent ?? String(parent.content);
+        const referencedMessages = context.message.referencedMessages?.length
+          ? context.message.referencedMessages
+          : [
+              {
+                id: parentId,
+                ...(parent.sender_name
+                  ? { sender: String(parent.sender_name) }
+                  : {}),
+                text: parentText,
+              },
+            ];
+        const migratedContext: ChannelTurnContext = {
+          ...context,
+          message: {
+            ...context.message,
+            referencedMessages,
+          },
+        };
+        const result = updateMessage.run(
+          split.currentContent,
+          JSON.stringify(migratedContext),
+          candidate.id,
+          candidate.chat_jid,
+          candidate.content,
+        );
+        migratedRows += Number(result.changes ?? 0);
+      }
+    })();
+    if (migratedRows > 0) {
+      logger.info(
+        { migratedRows },
+        'Separated legacy Feishu quoted context from canonical message content',
+      );
+    }
+  }
+
   db.prepare(
     'INSERT OR REPLACE INTO router_state (key, value) VALUES (?, ?)',
   ).run('schema_version', String(CURRENT_SCHEMA_VERSION));
@@ -3243,7 +3325,11 @@ function initializeModelSwitchingDefaults(): void {
       status: 'unverified',
       metadata: {
         resolved_model: 'grok-build-0.1',
-        aliases: ['grok-code-fast-1', 'grok-code-fast', 'grok-code-fast-1-0825'],
+        aliases: [
+          'grok-code-fast-1',
+          'grok-code-fast',
+          'grok-code-fast-1-0825',
+        ],
         capabilities: {
           context_window: 256_000,
           input_modalities: ['text', 'image'],
@@ -3353,7 +3439,6 @@ export function cleanupAllPrivacyMessages(): number {
   }
   return total;
 }
-
 
 /**
  * Store chat metadata only (no message content).
@@ -5282,39 +5367,6 @@ export function createTask(task: CreateTaskInput): void {
   );
 }
 
-export type TaskCapacityCreateResult =
-  | { status: 'created' }
-  | { status: 'limit_reached'; limit: number; count: number };
-
-/**
- * Atomically enforce the per-owner live-task fuse and insert a definition.
- *
- * Every production writer must use this boundary. Keeping the COUNT and INSERT
- * in one IMMEDIATE transaction prevents concurrent REST/IPC processes from
- * observing the same remaining slot.
- */
-export function createTaskWithinOwnerLimit(
-  task: CreateTaskInput,
-  maxTasksPerUser: number,
-): TaskCapacityCreateResult {
-  return db
-    .transaction((): TaskCapacityCreateResult => {
-      if (maxTasksPerUser > 0 && task.created_by) {
-        const count = countTasksByOwner(task.created_by);
-        if (count >= maxTasksPerUser) {
-          return {
-            status: 'limit_reached',
-            limit: maxTasksPerUser,
-            count,
-          };
-        }
-      }
-      createTask(task);
-      return { status: 'created' };
-    })
-    .immediate();
-}
-
 /** Parse notify_channels from JSON string stored in DB and normalize new fields */
 function mapTaskRow(row: unknown): ScheduledTask {
   const r = row as any;
@@ -5358,23 +5410,6 @@ export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
     )
     .all(groupFolder)
     .map(mapTaskRow);
-}
-
-/**
- * Live (non-deleted) schedule count for one owner, used as a capacity fuse.
- *
- * Per-task frequency floors and the one-nonterminal-run index bound a single
- * task, but nothing bounded the number of tasks: N schedules firing every
- * minute can keep the queue saturated and crowd out interactive sessions.
- */
-export function countTasksByOwner(ownerId: string): number {
-  const row = db
-    .prepare(
-      `SELECT COUNT(*) AS count FROM scheduled_tasks
-       WHERE deleted_at IS NULL AND created_by = ?`,
-    )
-    .get(ownerId) as { count: number } | undefined;
-  return row?.count ?? 0;
 }
 
 export function getAllTasks(): ScheduledTask[] {
@@ -5504,15 +5539,6 @@ export type TaskSoftDeleteMutationResult =
   | TaskRevisionMutationResult
   | { status: 'active_run'; task: ScheduledTask; run: TaskRun };
 
-export type TaskRestoreMutationResult =
-  | TaskRevisionMutationResult
-  | {
-      status: 'limit_reached';
-      task: ScheduledTask;
-      limit: number;
-      count: number;
-    };
-
 /**
  * Optimistic mutation used by V2 REST/MCP callers. Legacy updateTask remains
  * available while all in-process clients migrate to this contract.
@@ -5636,27 +5662,15 @@ export function softDeleteTaskWithRevision(
 export function restoreTaskWithRevision(
   id: string,
   expectedRevision: number,
-  maxTasksPerUser = 0,
-): TaskRestoreMutationResult {
+): TaskRevisionMutationResult {
   return db
-    .transaction((): TaskRestoreMutationResult => {
+    .transaction((): TaskRevisionMutationResult => {
       const current = getTaskById(id);
       if (!current) return { status: 'not_found' };
       if (current.revision !== expectedRevision) {
         return { status: 'conflict', task: current };
       }
       if (!current.deleted_at) return { status: 'updated', task: current };
-      if (maxTasksPerUser > 0 && current.created_by) {
-        const count = countTasksByOwner(current.created_by);
-        if (count >= maxTasksPerUser) {
-          return {
-            status: 'limit_reached',
-            task: current,
-            limit: maxTasksPerUser,
-            count,
-          };
-        }
-      }
       const now = new Date().toISOString();
       const result = db
         .prepare(
@@ -6132,7 +6146,7 @@ export interface MaterializeTaskOccurrenceInput {
   scheduledFor: string;
   nextRun: string | null;
   triggerType: 'scheduled' | 'backfill';
-  /** Recurring occurrences beyond grace are persisted as terminal missed rows. */
+  /** Intentionally skipped occurrences are persisted as terminal missed rows. */
   missedReason?: string;
 }
 
@@ -6288,8 +6302,6 @@ export function getActiveTaskRunForTask(taskId: string): TaskRun | undefined {
     .get(taskId) as TaskRunRow | undefined;
   return row ? mapTaskRunRow(row) : undefined;
 }
-
-
 
 export function claimNextTaskRun(
   owner: string,
@@ -7283,7 +7295,7 @@ export function setConversationRuntimeBinding(
     markPending ? normalized.selected_model : null,
     markPending ? normalized.model_kind : null,
     markPending ? normalized.resolved_model : null,
-    markPending ? options?.handoffSummaryId ?? null : null,
+    markPending ? (options?.handoffSummaryId ?? null) : null,
     updatedBy ?? null,
     now,
   );
@@ -8574,7 +8586,6 @@ export function getRouterStateByPrefix(
 
 // --- Session accessors ---
 
-
 function sessionChannelOwnerKey(
   groupFolder: string,
   agentId?: string | null,
@@ -8668,7 +8679,9 @@ export function clearSessionChannelOwner(
 
 /** Invalidate every SDK resume token associated with a workspace. */
 /** 该工作区还剩多少条 per-runtime native session（测试与诊断用）。 */
-export function getConversationRuntimeSessionCount(groupFolder: string): number {
+export function getConversationRuntimeSessionCount(
+  groupFolder: string,
+): number {
   const row = db
     .prepare(
       'SELECT COUNT(*) AS n FROM conversation_runtime_sessions WHERE group_folder = ?',
@@ -8752,7 +8765,6 @@ export interface SessionAgentIdentity {
   agent_profile_version: number | null;
   identity_hash: string | null;
 }
-
 
 const DEFAULT_AGENT_PROFILE_RUNTIME_POLICY: AgentProfileRuntimePolicy = {
   context: {
@@ -9578,7 +9590,6 @@ export function listAgentProfilesForUser(userId: string): AgentProfile[] {
   return rows.map(mapAgentProfileRow);
 }
 
-
 export function updateAgentProfile(
   profileId: string,
   ownerUserId: string,
@@ -9973,7 +9984,6 @@ export function getAllSessions(): Record<string, string> {
 }
 
 // --- Registered group accessors ---
-
 
 /** Raw row shape from registered_groups table — single source of truth for column mapping. */
 type RegisteredGroupRow = {
@@ -10991,7 +11001,6 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
   })();
 }
 
-
 /**
  * Enable privacy mode for all JIDs sharing the given folder.
  * Privacy mode is one-way (public → private) and cannot be reversed.
@@ -11378,7 +11387,6 @@ export function getChannelMount(channelJid: string): ChannelMount | undefined {
     .get(channelJid) as ChannelMountRow | undefined;
   return row ? parseChannelMountRow(row) : undefined;
 }
-
 
 export function listChannelMountsByWorkspace(
   workspaceJid: string,
@@ -11907,7 +11915,9 @@ function parseTokenUsageNumber(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
-function summarizeTokenUsage(raw: string | null): Omit<
+function summarizeTokenUsage(
+  raw: string | null,
+): Omit<
   SessionTokenUsageSnapshot,
   'message_id' | 'chat_jid' | 'timestamp'
 > | null {
@@ -13245,9 +13255,9 @@ export function listActiveConversationAgents(): SubAgent[] {
 export function deleteAgent(id: string): void {
   // Delete associated session
   db.prepare('DELETE FROM sessions WHERE agent_id = ?').run(id);
-  db.prepare('DELETE FROM conversation_runtime_sessions WHERE agent_id = ?').run(
-    id,
-  );
+  db.prepare(
+    'DELETE FROM conversation_runtime_sessions WHERE agent_id = ?',
+  ).run(id);
   deleteImContextBindingsByAgent(id);
   db.prepare('DELETE FROM agents WHERE id = ?').run(id);
   db.transaction(() => {
@@ -14951,7 +14961,7 @@ function mapAgentProfile(r: Record<string, unknown>): AgentProfile {
     soul_prompt: (r.soul_prompt as string) ?? '',
     agents_prompt: (r.agents_prompt as string) ?? '',
     tools_prompt: (r.tools_prompt as string) ?? '',
-    prompt_mode: ((r.prompt_mode as AgentProfilePromptMode) ?? 'append'),
+    prompt_mode: (r.prompt_mode as AgentProfilePromptMode) ?? 'append',
     include_claude_preset: !!(r.include_claude_preset as number),
     avatar_emoji: (r.avatar_emoji as string) ?? null,
     avatar_color: (r.avatar_color as string) ?? null,
@@ -14960,7 +14970,7 @@ function mapAgentProfile(r: Record<string, unknown>): AgentProfile {
     identity_hash: (r.identity_hash as string) ?? '',
     version: (r.version as number) ?? 1,
     is_default: !!(r.is_default as number),
-    status: ((r.status as 'active' | 'archived') ?? 'active'),
+    status: (r.status as 'active' | 'archived') ?? 'active',
     created_at: r.created_at as string,
     updated_at: r.updated_at as string,
   };
@@ -14976,7 +14986,11 @@ function mapAgentProfile(r: Record<string, unknown>): AgentProfile {
 export function computeAgentIdentityHash(
   parts: Pick<
     AgentProfile,
-    'identity_prompt' | 'soul_prompt' | 'agents_prompt' | 'tools_prompt' | 'prompt_mode'
+    | 'identity_prompt'
+    | 'soul_prompt'
+    | 'agents_prompt'
+    | 'tools_prompt'
+    | 'prompt_mode'
   >,
 ): string {
   return crypto
@@ -14993,7 +15007,6 @@ export function computeAgentIdentityHash(
     .digest('hex')
     .slice(0, 32);
 }
-
 
 export function listAgentProfiles(ownerUserId: string): AgentProfile[] {
   const rows = db
@@ -15203,7 +15216,6 @@ export function updateAgentProfilePrompts(
   return getAgentProfile(id) ?? null;
 }
 
-
 /** Record which persona a session was started under. */
 export function setSessionAgentIdentity(
   groupFolder: string,
@@ -15359,13 +15371,17 @@ export function verifyWorkspaceProjection(): {
   const problems: string[] = [];
 
   const groupCount = (
-    db.prepare('SELECT COUNT(*) AS c FROM registered_groups').get() as { c: number }
+    db.prepare('SELECT COUNT(*) AS c FROM registered_groups').get() as {
+      c: number;
+    }
   ).c;
   const wsCount = (
     db.prepare('SELECT COUNT(*) AS c FROM workspaces').get() as { c: number }
   ).c;
   if (groupCount !== wsCount) {
-    problems.push(`workspaces count ${wsCount} != registered_groups ${groupCount}`);
+    problems.push(
+      `workspaces count ${wsCount} != registered_groups ${groupCount}`,
+    );
   }
 
   const missing = db
@@ -15405,7 +15421,6 @@ export function verifyWorkspaceProjection(): {
 
 // --- Channel mounts (batch 7) ---
 
-
 /**
  * 本地 agent_channel_mounts 表的行视图（camelCase）。
  *
@@ -15442,7 +15457,6 @@ function mapMount(r: Record<string, unknown>): AgentChannelMount {
     ownerImId: (r.owner_im_id as string) ?? null,
   };
 }
-
 
 /**
  * 读单条 agent_channel_mounts（camelCase 视图）。
@@ -15525,7 +15539,6 @@ export function setChannelMount(mount: {
   );
 }
 
-
 /**
  * Copy every registered_groups.target_main_jid binding into agent_channel_mounts.
  *
@@ -15566,7 +15579,10 @@ export function migrateTargetMainJidToChannelMounts(): {
         .prepare('SELECT jid, folder FROM registered_groups WHERE jid = ?')
         .get(targetJid) as { jid: string; folder: string } | undefined;
       if (!target) {
-        skipped.push({ jid: channelJid, reason: `target ${targetJid} not registered` });
+        skipped.push({
+          jid: channelJid,
+          reason: `target ${targetJid} not registered`,
+        });
         continue;
       }
 
@@ -15632,7 +15648,11 @@ export function reconcileChannelMounts(): {
          LEFT JOIN registered_groups t ON t.jid = g.target_main_jid
         WHERE g.target_main_jid IS NOT NULL AND g.target_main_jid != ''`,
     )
-    .all() as Array<{ jid: string; target_main_jid: string; target_folder: string | null }>;
+    .all() as Array<{
+    jid: string;
+    target_main_jid: string;
+    target_folder: string | null;
+  }>;
 
   for (const binding of bindings) {
     const mount = db
@@ -15679,7 +15699,9 @@ export function reconcileChannelMounts(): {
     )
     .all() as Array<{ channel_jid: string }>;
   for (const extra of extras) {
-    problems.push(`unexpected mount not backed by a binding: ${extra.channel_jid}`);
+    problems.push(
+      `unexpected mount not backed by a binding: ${extra.channel_jid}`,
+    );
   }
 
   // A mount pointing at an unregistered workspace routes into nothing.
@@ -15691,7 +15713,9 @@ export function reconcileChannelMounts(): {
     )
     .all() as Array<{ channel_jid: string }>;
   for (const row of dangling) {
-    problems.push(`mount ${row.channel_jid} points at an unregistered workspace`);
+    problems.push(
+      `mount ${row.channel_jid} points at an unregistered workspace`,
+    );
   }
 
   return { ok: problems.length === 0, checked: bindings.length, problems };
@@ -15901,7 +15925,8 @@ export function evaluateSessionValidity(
   ) {
     reasons.push('persona_changed');
   }
-  if (drifted(recorded.runtime, current.runtime)) reasons.push('runtime_changed');
+  if (drifted(recorded.runtime, current.runtime))
+    reasons.push('runtime_changed');
   if (drifted(recorded.providerId, current.providerId)) {
     reasons.push('provider_changed');
   }
@@ -16053,7 +16078,6 @@ export function getTaskRunsForTask(taskId: string, limit = 20): TaskRun[] {
       .all(taskId, limit) as TaskRunRow[]
   ).map(mapTaskRunRow);
 }
-
 
 export function getTaskRunsByStatus(
   statuses: TaskRunStatus[],

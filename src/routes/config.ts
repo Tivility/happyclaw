@@ -1,52 +1,23 @@
 // Configuration management routes
 
-import {
-  randomBytes,
-  createHash,
-} from 'node:crypto';
-import {
-  spawn,
-  execFile,
-  type ChildProcess,
-} from 'node:child_process';
-import {
-  promisify,
-} from 'node:util';
+import { randomBytes, createHash } from 'node:crypto';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
-import {
-  Agent as HttpsAgent,
-} from 'node:https';
-import {
-  ProxyAgent,
-} from 'proxy-agent';
+import { Agent as HttpsAgent } from 'node:https';
+import { ProxyAgent } from 'proxy-agent';
 import QRCode from 'qrcode';
-import {
-  Hono,
-} from 'hono';
-import {
-  z,
-} from 'zod';
-import {
-  DATA_DIR,
-  updateWeChatNoProxy,
-} from '../config.js';
+import { Hono } from 'hono';
+import { z } from 'zod';
+import { DATA_DIR, updateWeChatNoProxy } from '../config.js';
 import {
   avatarUploadBodyLimit,
   AVATAR_MAX_FILE_BYTES,
 } from '../http-upload-policy.js';
-import type {
-  Variables,
-} from '../web-context.js';
-import {
-  canAccessGroup,
-  canModifyGroup,
-  getWebDeps,
-} from '../web-context.js';
-import {
-  extractChatId,
-  getChannelType,
-} from '../im-channel.js';
+import type { Variables } from '../web-context.js';
+import { canAccessGroup, canModifyGroup, getWebDeps } from '../web-context.js';
+import { extractChatId, getChannelType } from '../im-channel.js';
 import {
   deleteRegisteredGroup,
   deleteChatHistory,
@@ -78,12 +49,8 @@ import {
   channelConversationJid,
   parseChannelAddress,
 } from '../channel-address.js';
-import {
-  isMentionActivationMode,
-} from '../feishu-conversation-policy.js';
-import {
-  normalizeLegacyOwnerMention,
-} from '../im-audience-policy.js';
+import { isMentionActivationMode } from '../feishu-conversation-policy.js';
+import { normalizeLegacyOwnerMention } from '../im-audience-policy.js';
 import {
   conversationBindingPolicyError,
   resolveChannelConversationKind,
@@ -163,10 +130,7 @@ import {
   appendImConfigAudit,
   parseOAuthUsageBucket,
 } from '../runtime-config.js';
-import {
-  findCodexCli,
-  probeCodexDependencies,
-} from '../codex-runtime.js';
+import { findCodexCli, probeCodexDependencies } from '../codex-runtime.js';
 import type {
   ClaudeOAuthCredentials,
   CachedOAuthUsage,
@@ -179,15 +143,9 @@ import type {
   AuthUser,
   RegisteredGroup,
 } from '../types.js';
-import {
-  hasPermission,
-} from '../permissions.js';
-import {
-  logger,
-} from '../logger.js';
-import {
-  testFeishuCredentials,
-} from '../feishu-connectivity.js';
+import { hasPermission } from '../permissions.js';
+import { logger } from '../logger.js';
+import { testFeishuCredentials } from '../feishu-connectivity.js';
 import {
   buildSessionMountUpdate,
   buildDetachedWorkspaceUpdate,
@@ -200,19 +158,12 @@ import {
   restoreDefaultChannelMount,
   type NativeContextMetadata,
 } from '../channel-mount-service.js';
-import {
-  checkImChannelLimit,
-  isBillingEnabled,
-} from '../billing.js';
-import {
-  providerPool,
-} from '../provider-pool.js';
+import { checkImChannelLimit, isBillingEnabled } from '../billing.js';
+import { providerPool } from '../provider-pool.js';
 
 const execFileAsync = promisify(execFile);
 
-import {
-  getClientIp,
-} from '../utils.js';
+import { getClientIp } from '../utils.js';
 import {
   getWorkspaceRuntimeJids,
   quiesceWorkspaceRunnersAroundCommit,
@@ -420,10 +371,7 @@ const GrokProviderSecretsSchema = z
     clearGrokAuthJson: z.boolean().optional(),
   })
   .superRefine((data, ctx) => {
-    if (
-      data.grokAuthJson === undefined &&
-      data.clearGrokAuthJson !== true
-    ) {
+    if (data.grokAuthJson === undefined && data.clearGrokAuthJson !== true) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: 'At least one secret field must be provided',
@@ -1173,7 +1121,9 @@ configRoutes.get(
   systemConfigMiddleware,
   (c) => {
     try {
-      const providers = getProviders().filter((p) => p.providerPoolId === 'claude');
+      const providers = getProviders().filter(
+        (p) => p.providerPoolId === 'claude',
+      );
       const balancing = getBalancingConfig();
       const enabledProviders = getEnabledProvidersForPool('claude');
 
@@ -1742,8 +1692,7 @@ configRoutes.post(
       return c.json(
         {
           error:
-            detail ||
-            'Codex login did not produce a device authorization URL',
+            detail || 'Codex login did not produce a device authorization URL',
         },
         400,
       );
@@ -1773,19 +1722,26 @@ configRoutes.post(
     }
 
     const flow = codexOAuthFlows.get(validation.data.state);
-    if (!flow) return c.json({ error: 'Codex OAuth flow not found or expired' }, 404);
+    if (!flow)
+      return c.json({ error: 'Codex OAuth flow not found or expired' }, 404);
 
     await waitForCodexDeviceCode(flow, 1500);
     const authPath = findCodexAuthJson(flow.codexHome);
     if (!authPath && flow.exitCode === null && flow.exitSignal === null) {
-      return c.json({ error: '授权尚未完成，请在浏览器中完成登录后再确认。' }, 409);
+      return c.json(
+        { error: '授权尚未完成，请在浏览器中完成登录后再确认。' },
+        409,
+      );
     }
 
     if (!authPath) {
       const detail = stripAnsi(flow.stderr || flow.stdout).trim();
       cleanupCodexOAuthFlow(validation.data.state, flow);
       return c.json(
-        { error: detail || 'Codex OAuth login failed before auth.json was created' },
+        {
+          error:
+            detail || 'Codex OAuth login failed before auth.json was created',
+        },
         400,
       );
     }
@@ -1828,7 +1784,9 @@ configRoutes.post(
       return c.json({ provider: toPublicProvider(provider) });
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : 'Failed to save Codex OAuth credentials';
+        err instanceof Error
+          ? err.message
+          : 'Failed to save Codex OAuth credentials';
       logger.warn({ err }, 'Failed to save Codex OAuth credentials');
       return c.json({ error: message }, 400);
     }
@@ -1940,7 +1898,10 @@ configRoutes.patch(
         name: validation.data.name,
         weight: validation.data.weight,
       });
-      if (validation.data.enabled !== undefined && provider.enabled !== validation.data.enabled) {
+      if (
+        validation.data.enabled !== undefined &&
+        provider.enabled !== validation.data.enabled
+      ) {
         provider = setProviderEnabled(id, validation.data.enabled);
       }
       return c.json({ provider: toPublicProvider(provider) });
@@ -2246,19 +2207,26 @@ configRoutes.post(
     }
 
     const flow = grokOAuthFlows.get(validation.data.state);
-    if (!flow) return c.json({ error: 'Grok OAuth flow not found or expired' }, 404);
+    if (!flow)
+      return c.json({ error: 'Grok OAuth flow not found or expired' }, 404);
 
     await waitForGrokDeviceCode(flow, 1500);
     const authPath = findGrokAuthJson(flow.grokHome);
     if (!authPath && flow.exitCode === null && flow.exitSignal === null) {
-      return c.json({ error: '授权尚未完成，请在浏览器中完成登录后再确认。' }, 409);
+      return c.json(
+        { error: '授权尚未完成，请在浏览器中完成登录后再确认。' },
+        409,
+      );
     }
 
     if (!authPath) {
       const detail = stripAnsi(flow.stderr || flow.stdout).trim();
       cleanupGrokOAuthFlow(validation.data.state, flow);
       return c.json(
-        { error: detail || 'Grok OAuth login failed before auth.json was created' },
+        {
+          error:
+            detail || 'Grok OAuth login failed before auth.json was created',
+        },
         400,
       );
     }
@@ -2299,7 +2267,9 @@ configRoutes.post(
       return c.json({ provider: toPublicProvider(provider) });
     } catch (err) {
       const message =
-        err instanceof Error ? err.message : 'Failed to save Grok OAuth credentials';
+        err instanceof Error
+          ? err.message
+          : 'Failed to save Grok OAuth credentials';
       logger.warn({ err }, 'Failed to save Grok OAuth credentials');
       return c.json({ error: message }, 400);
     }
@@ -3324,12 +3294,7 @@ function toSystemSettingsResponse(
     maxConcurrentContainers: settings.maxConcurrentContainers,
     maxLoginAttempts: settings.maxLoginAttempts,
     loginLockoutMinutes: settings.loginLockoutMinutes,
-    maxConcurrentScripts: settings.maxConcurrentScripts,
-    scriptTimeout: settings.scriptTimeout,
-    taskBackfillGraceMs: settings.taskBackfillGraceMs,
     deletedTaskRetentionDays: settings.deletedTaskRetentionDays,
-    maxRepliesPerTurn: settings.maxRepliesPerTurn,
-    maxTasksPerUser: settings.maxTasksPerUser,
     fallbackModel: settings.fallbackModel,
   };
 }
@@ -3369,11 +3334,19 @@ configRoutes.put(
 
     try {
       const before = toSystemSettingsResponse(getSystemSettings());
-      // Deprecated compatibility input. Host mode no longer has an
-      // application-level concurrency pool; accept the old key so stale Web
-      // clients do not fail the whole request, but never persist/apply it.
+      // Deprecated compatibility inputs. Accept them so stale Web clients do
+      // not fail the whole request, but never persist or apply them.
       const effectiveSettings = { ...validation.data };
-      delete effectiveSettings.maxConcurrentHostProcesses;
+      for (const key of [
+        'maxConcurrentHostProcesses',
+        'maxConcurrentScripts',
+        'scriptTimeout',
+        'taskBackfillGraceMs',
+        'maxRepliesPerTurn',
+        'maxTasksPerUser',
+      ] as const) {
+        delete effectiveSettings[key];
+      }
       const saved = saveSystemSettings(effectiveSettings);
       const response = toSystemSettingsResponse(saved);
       const changedFields = changedSettingFields(

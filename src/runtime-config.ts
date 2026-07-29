@@ -3,13 +3,8 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-import {
-  ASSISTANT_NAME,
-  DATA_DIR,
-} from './config.js';
-import {
-  logger,
-} from './logger.js';
+import { ASSISTANT_NAME, DATA_DIR } from './config.js';
+import { logger } from './logger.js';
 
 const MAX_FIELD_LENGTH = 2000;
 const CURRENT_CONFIG_VERSION = 3;
@@ -1407,7 +1402,10 @@ function readStoredStateV5(): {
 
     // 版本比本地新 —— 拒绝而不是当成旧格式迁移，否则会用 V3 路径读出空配置
     // 并把一份残缺的 v5 写回去，抹掉未知字段。
-    if (typeof parsed.version === 'number' && parsed.version > PROVIDER_FILE_VERSION) {
+    if (
+      typeof parsed.version === 'number' &&
+      parsed.version > PROVIDER_FILE_VERSION
+    ) {
       throw new Error(
         `Claude provider config version ${parsed.version} is newer than supported ${PROVIDER_FILE_VERSION}; refusing to downgrade`,
       );
@@ -1464,7 +1462,8 @@ export function getEnabledProviders(): UnifiedProvider[] {
 
 export function getProvidersForPool(providerPoolId: string): UnifiedProvider[] {
   return getProviders().filter(
-    (p) => (p.providerPoolId || p.providerFamily || 'claude') === providerPoolId,
+    (p) =>
+      (p.providerPoolId || p.providerFamily || 'claude') === providerPoolId,
   );
 }
 
@@ -1563,7 +1562,9 @@ export function createProvider(input: {
     enabled:
       input.enabled ??
       !state.providers.some(
-        (p) => (p.providerPoolId || p.providerFamily || 'claude') === (input.providerPoolId || providerFamily),
+        (p) =>
+          (p.providerPoolId || p.providerFamily || 'claude') ===
+          (input.providerPoolId || providerFamily),
       ),
     weight: Math.max(1, Math.min(100, input.weight ?? 1)),
     anthropicBaseUrl: input.anthropicBaseUrl
@@ -1723,7 +1724,10 @@ export function updateProviderSecrets(
   }
 
   if (typeof secrets.openaiApiKey === 'string') {
-    updated.openaiApiKey = normalizeSecret(secrets.openaiApiKey, 'openaiApiKey');
+    updated.openaiApiKey = normalizeSecret(
+      secrets.openaiApiKey,
+      'openaiApiKey',
+    );
     updated.authMode = 'api_key';
     credentialsChanged = true;
   } else if (secrets.clearOpenaiApiKey) {
@@ -1826,7 +1830,8 @@ export function deleteProvider(id: string): void {
     wasEnabled &&
     !state.providers.some(
       (p) =>
-        p.enabled && (p.providerPoolId || p.providerFamily || 'claude') === poolId,
+        p.enabled &&
+        (p.providerPoolId || p.providerFamily || 'claude') === poolId,
     )
   ) {
     const fallback = state.providers.find(
@@ -1877,10 +1882,7 @@ interface CodexAuthSeedMetadata {
 }
 
 function hashCodexAuthJson(authJson: string): string {
-  return crypto
-    .createHash('sha256')
-    .update(authJson.trim())
-    .digest('hex');
+  return crypto.createHash('sha256').update(authJson.trim()).digest('hex');
 }
 
 function readCodexAuthSeedMetadata(
@@ -1957,9 +1959,7 @@ export function writeCodexProviderAuthMaterial(
         metadata.authProfileGeneration !== provider.authProfileGeneration ||
         metadata.authHash !== authHash);
     const shouldSeedAuthJson =
-      !authStat ||
-      providerUpdatedAfterAuth ||
-      metadataMismatch;
+      !authStat || providerUpdatedAfterAuth || metadataMismatch;
 
     if (shouldSeedAuthJson) {
       fs.writeFileSync(authPath, provider.codexAuthJson.trim() + '\n', {
@@ -2168,7 +2168,8 @@ export function persistRefreshedProviderAuth(providerId: string): boolean {
   const metadata = readCodexAuthSeedMetadata(homeDir);
   if (metadata && metadata.authHash === diskHash) return false; // CLI 没刷新过
 
-  const stored = runtime === 'codex' ? provider.codexAuthJson : provider.grokAuthJson;
+  const stored =
+    runtime === 'codex' ? provider.codexAuthJson : provider.grokAuthJson;
   if (stored && hashCodexAuthJson(stored) === diskHash) {
     // 内容与配置里一致，只是 metadata 落后了（例如手工改过目录）。
     // 补齐 metadata 以免每次都判成"变了"。
@@ -2179,7 +2180,9 @@ export function persistRefreshedProviderAuth(providerId: string): boolean {
   try {
     updateProviderSecrets(
       provider.id,
-      runtime === 'codex' ? { codexAuthJson: trimmed } : { grokAuthJson: trimmed },
+      runtime === 'codex'
+        ? { codexAuthJson: trimmed }
+        : { grokAuthJson: trimmed },
     );
   } catch (err) {
     logger.error(
@@ -4451,8 +4454,6 @@ export interface SystemSettings {
   maxConcurrentContainers: number;
   maxLoginAttempts: number;
   loginLockoutMinutes: number;
-  maxConcurrentScripts: number;
-  scriptTimeout: number;
   // Billing
   billingEnabled: boolean;
   billingMode: 'wallet_first';
@@ -4476,37 +4477,24 @@ export interface SystemSettings {
   // false = 关闭定时扫描，admin 仍可手点 POST /api/plugins/catalog/scan。
   // 适用于不希望本机私有 plugin 自动入共享 catalog 的环境。
   pluginAutoScan: boolean;
-  // 定时任务逾期容忍窗口（毫秒）。任何 next_run 落在过去且距今超过该窗口的任务
-  // 在 scheduler 轮询时直接跳过本次（next_run 推到下一次），避免停机/重启后多个
-  // 跨天积压任务集体在重启那一秒并发 fire 刷屏。
-  // 0 = 关闭（保留旧行为：无视逾期时长全部 backfill）。默认 300000 (5 分钟)。
-  taskBackfillGraceMs: number;
+  // upstream 105195d6 退役了 taskBackfillGraceMs / maxRepliesPerTurn /
+  // maxTasksPerUser / maxConcurrentScripts / scriptTimeout 五项，本 fork 跟随。
+  // 下面保留的都是 upstream 从来没有的本地独有项 —— 它的 normalizeSystemSettings
+  // 不认识这些字段，漏掉会让它们「页面能改、存得进去、运行时永不生效」。
   // 软删除任务的保留天数。upstream 把任务删除改成了可恢复的软删除
   // （deleted_at + /restore），但全仓没有任何回收路径 —— flow-* 专属工作区
   // 会永久留在磁盘上。这里给保留期：过期后连同专属工作区一并物理回收。
   // 0 = 永不自动回收（只能显式 purge），保守默认。
   deletedTaskRetentionDays: number;
-  // 健康检查确认某 IM 群"针对该群的确定性否定"达阈值后，是否自动解绑该群。
-  // 默认 false：只打 warn 旗标、等待人工复核，绝不自动毁数据（避免误判错删）。
-  // true：用可恢复的 unbindImGroup（清空 target_* 指针）自动解绑。
-  autoRemoveDeadImGroup: boolean;
-  // 单个 Agent turn 内允许送达的用户可见消息条数上限（send_message / send_image /
-  // send_file / feishu_send_card 共用）。这是防止模型进入重复发送循环的保险丝，
-  // 不是 UX 限制：正常轮次（确认 → 执行 → 进展 → 结果）远达不到。达到上限后
-  // 后续投递被拒绝并向模型返回 reply_limit_reached，已送达内容不受影响。
-  // 该数字刻意不写进 Prompt，避免模型把它当成可以用满的配额。
-  // 0 = 关闭。默认 20。
-  maxRepliesPerTurn: number;
-  // 每个用户可持有的定时任务数上限（不含已软删）。频率下限和「每 task 至多一条
-  // 非终态 run」只约束单个任务，挡不住「N 个任务 × 每分钟」持续占满执行容量。
-  // 0 = 关闭。默认 200。
-  maxTasksPerUser: number;
   /** 本地独有：宿主机模式并发上限 */
   maxConcurrentHostProcesses: number;
   /** 本地独有：SubAgent 使用的模型 */
   subagentModel: string;
   /** 本地独有：admin host 禁用记忆层 */
   disableMemoryLayerForAdminHost: boolean;
+  /** 本地独有：健康检查确认某 IM 群持续否定后是否自动解绑。默认 false —— 只打
+   *  warn 旗标等人工复核，绝不自动毁数据。 */
+  autoRemoveDeadImGroup: boolean;
 }
 
 // Upper bound for the login lockout window. auth.ts reclaims login-attempt
@@ -4524,8 +4512,6 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   maxConcurrentContainers: 20,
   maxLoginAttempts: 5,
   loginLockoutMinutes: 15,
-  maxConcurrentScripts: 10,
-  scriptTimeout: 60000,
   billingEnabled: false,
   billingMode: 'wallet_first',
   billingMinStartBalanceUsd: 0.01,
@@ -4537,11 +4523,8 @@ const DEFAULT_SYSTEM_SETTINGS: SystemSettings = {
   mainAgentAutoCompactPercentage: 0,
   fallbackModel: '',
   pluginAutoScan: true,
-  taskBackfillGraceMs: 300000,
   deletedTaskRetentionDays: 0,
   autoRemoveDeadImGroup: false,
-  maxRepliesPerTurn: 20,
-  maxTasksPerUser: 200,
   maxConcurrentHostProcesses: 5,
   subagentModel: '',
   disableMemoryLayerForAdminHost: false,
@@ -4594,38 +4577,12 @@ function normalizeSystemSettings(
     return fallback;
   };
 
-  const taskBackfillRaw = numberField(
-    'taskBackfillGraceMs',
-    DEFAULT_SYSTEM_SETTINGS.taskBackfillGraceMs,
-    0,
-    86_400_000,
-  );
-  const taskBackfillGraceMs =
-    taskBackfillRaw === 0 ? 0 : Math.max(1_000, taskBackfillRaw);
-  if (taskBackfillGraceMs !== taskBackfillRaw) {
-    invalidFields.add('taskBackfillGraceMs');
-  }
-
   // 上限 365 天：更长的保留期实际等于「永不回收」，直接用 0 表达更清楚。
   const deletedTaskRetentionDays = numberField(
     'deletedTaskRetentionDays',
     DEFAULT_SYSTEM_SETTINGS.deletedTaskRetentionDays,
     0,
     365,
-  );
-
-  const maxRepliesPerTurn = numberField(
-    'maxRepliesPerTurn',
-    DEFAULT_SYSTEM_SETTINGS.maxRepliesPerTurn,
-    0,
-    500,
-  );
-
-  const maxTasksPerUser = numberField(
-    'maxTasksPerUser',
-    DEFAULT_SYSTEM_SETTINGS.maxTasksPerUser,
-    0,
-    10_000,
   );
 
   // Accept the former system-wide key as the main Agent default during upgrade.
@@ -4758,18 +4715,6 @@ function normalizeSystemSettings(
       1,
       MAX_LOGIN_LOCKOUT_MINUTES,
     ),
-    maxConcurrentScripts: numberField(
-      'maxConcurrentScripts',
-      DEFAULT_SYSTEM_SETTINGS.maxConcurrentScripts,
-      1,
-      50,
-    ),
-    scriptTimeout: numberField(
-      'scriptTimeout',
-      DEFAULT_SYSTEM_SETTINGS.scriptTimeout,
-      5_000,
-      600_000,
-    ),
     billingEnabled: booleanField(
       'billingEnabled',
       DEFAULT_SYSTEM_SETTINGS.billingEnabled,
@@ -4800,9 +4745,8 @@ function normalizeSystemSettings(
       'pluginAutoScan',
       DEFAULT_SYSTEM_SETTINGS.pluginAutoScan,
     ),
-    taskBackfillGraceMs,
     deletedTaskRetentionDays,
-    // 本地独有设置项。upstream 的规范化函数没有这四项；缺了它们会被静默
+    // 本地独有设置项。upstream 的规范化函数没有这些字段；缺了它们会被静默
     // 丢弃——设置页照常显示与保存，运行时永远读到默认值。
     maxConcurrentHostProcesses: numberField(
       'maxConcurrentHostProcesses',
@@ -4822,8 +4766,6 @@ function normalizeSystemSettings(
       'disableMemoryLayerForAdminHost',
       DEFAULT_SYSTEM_SETTINGS.disableMemoryLayerForAdminHost,
     ),
-    maxRepliesPerTurn,
-    maxTasksPerUser,
   };
 
   if (invalidFields.size > 0) {
@@ -4856,8 +4798,6 @@ function buildEnvFallbackSettings(): SystemSettings {
       maxConcurrentContainers: process.env.MAX_CONCURRENT_CONTAINERS,
       maxLoginAttempts: process.env.MAX_LOGIN_ATTEMPTS,
       loginLockoutMinutes: process.env.LOGIN_LOCKOUT_MINUTES,
-      maxConcurrentScripts: process.env.MAX_CONCURRENT_SCRIPTS,
-      scriptTimeout: process.env.SCRIPT_TIMEOUT,
       billingEnabled: process.env.BILLING_ENABLED,
       billingMinStartBalanceUsd: process.env.BILLING_MIN_START_BALANCE_USD,
       billingCurrency: process.env.BILLING_CURRENCY,
@@ -4872,9 +4812,8 @@ function buildEnvFallbackSettings(): SystemSettings {
         process.env.AUTO_COMPACT_PERCENTAGE,
       fallbackModel: process.env.FALLBACK_MODEL,
       pluginAutoScan: process.env.PLUGIN_AUTO_SCAN,
-      taskBackfillGraceMs: process.env.TASK_BACKFILL_GRACE_MS,
       deletedTaskRetentionDays: process.env.DELETED_TASK_RETENTION_DAYS,
-      // 本地独有设置项：upstream 的 normalizeSystemSettings 不认识这四个，
+      // 本地独有设置项：upstream 的 normalizeSystemSettings 不认识这些，
       // 只取它的骨架会让这些设置「页面能改、schema 里有、永不生效」。
       maxConcurrentHostProcesses: process.env.MAX_CONCURRENT_HOST_PROCESSES,
       subagentModel: process.env.SUBAGENT_MODEL,

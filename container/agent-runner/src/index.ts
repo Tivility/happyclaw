@@ -132,7 +132,11 @@ import {
 } from './background-task-drain.js';
 
 // ── 本地多运行时（Codex / Grok）模块 ──
-import { buildPersonaBlock, describePersona, personaPromptMode } from './agent-persona.js';
+import {
+  buildPersonaBlock,
+  describePersona,
+  personaPromptMode,
+} from './agent-persona.js';
 import { codexCliAdapter } from './codex-cli-runner.js';
 import { grokCliAdapter } from './grok-cli-runner.js';
 import type { AgentRuntimeAdapter } from './runtime-adapter.js';
@@ -148,7 +152,6 @@ import {
   resolveClaudePermissionOptions,
 } from './runtime-permissions.js';
 import { buildCodexMemoryLifecyclePrompt } from './runtime-memory.js';
-
 
 // 路径解析：优先读取环境变量，降级到容器内默认路径（保持向后兼容）
 const WORKSPACE_GROUP =
@@ -188,7 +191,6 @@ let activeOutputInputTurnId: string | undefined;
 // MCP 工具部分不在这里硬编码，而是在 main() 里按 createMcpTools() 的注册全集动态派生
 // （见 memoryFlushDisallowedTools），只保留 memory_append/get/search，避免后续新增 MCP
 // 工具后再次遗漏屏蔽（如曾漏掉的 send_image/send_file/discord_*/*_skill）。
-
 
 // Memory flush 期间禁用的工具（disallowedTools 会从模型上下文中完全移除这些工具）
 // 注意：allowedTools 仅控制自动审批，不限制工具可见性；
@@ -1158,7 +1160,9 @@ function createPreCompactHook(
           log('No messages to archive');
         } else {
           const summary = getSessionSummary(sessionId, transcriptPath);
-          const name = summary ? sanitizeFilename(summary) : generateFallbackName();
+          const name = summary
+            ? sanitizeFilename(summary)
+            : generateFallbackName();
 
           const conversationsDir = path.join(WORKSPACE_GROUP, 'conversations');
           fs.mkdirSync(conversationsDir, { recursive: true });
@@ -1173,7 +1177,9 @@ function createPreCompactHook(
           log(`Archived conversation to ${filePath}`);
         }
       } catch (err) {
-        log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
+        log(
+          `Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
 
@@ -1687,7 +1693,9 @@ function uniqueExistingDirectories(directories: string[]): string[] {
   return result;
 }
 
-function buildRuntimeAdditionalDirectories(disableMemoryLayer: boolean): string[] {
+function buildRuntimeAdditionalDirectories(
+  disableMemoryLayer: boolean,
+): string[] {
   if (disableMemoryLayer) return [];
   return uniqueExistingDirectories([WORKSPACE_GLOBAL, WORKSPACE_MEMORY]);
 }
@@ -1699,9 +1707,10 @@ function buildGlobalMemoryContext(disableMemoryLayer: boolean): string {
     if (!fs.existsSync(claudeMdPath)) return '';
     const raw = fs.readFileSync(claudeMdPath, 'utf-8').trim();
     if (!raw) return '';
-    const content = raw.length > GLOBAL_MEMORY_CONTEXT_MAX_CHARS
-      ? `${raw.slice(0, GLOBAL_MEMORY_CONTEXT_MAX_CHARS)}\n\n[...全局记忆已截断]`
-      : raw;
+    const content =
+      raw.length > GLOBAL_MEMORY_CONTEXT_MAX_CHARS
+        ? `${raw.slice(0, GLOBAL_MEMORY_CONTEXT_MAX_CHARS)}\n\n[...全局记忆已截断]`
+        : raw;
     return [
       `<global-memory source="${claudeMdPath.replace(/"/g, '&quot;')}">`,
       '以下内容来自 HappyClaw 用户级全局 CLAUDE.md，适用于当前工作区。',
@@ -1711,12 +1720,17 @@ function buildGlobalMemoryContext(disableMemoryLayer: boolean): string {
       '</global-memory>',
     ].join('\n');
   } catch (err) {
-    log(`Failed to read global CLAUDE.md context: ${err instanceof Error ? err.message : String(err)}`);
+    log(
+      `Failed to read global CLAUDE.md context: ${err instanceof Error ? err.message : String(err)}`,
+    );
     return '';
   }
 }
 
-function buildMemoryRecallPrompt(isHome: boolean, disableMemoryLayer: boolean): string {
+function buildMemoryRecallPrompt(
+  isHome: boolean,
+  disableMemoryLayer: boolean,
+): string {
   // 禁用记忆层：完全跳过 HappyClaw 的记忆系统提示，让用户本机 ~/.claude/ Playbook 接管
   // 记忆系统提示词已外置到 prompts/memory-system.{home,guest}.md。
   // 全局记忆内容（用户级 CLAUDE.md 实文本）的注入由 buildGlobalMemoryContext() 作为
@@ -2264,10 +2278,10 @@ async function runQueryAttempt(
     // 主循环会继续进入 waitForIpcMessage()，等待 _close/_drain 才退出。
     // 这保证了终端预热等场景下容器不会在查询完成后立即退出。
     if (
-        resultReceivedAt &&
-        !ipcDeliveryTracker.hasPendingTurns &&
-        Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS
-      ) {
+      resultReceivedAt &&
+      !ipcDeliveryTracker.hasPendingTurns &&
+      Date.now() - resultReceivedAt > POST_RESULT_TIMEOUT_MS
+    ) {
       // 后台任务未 settle 时推迟关流。没有这道判断，主 Agent 一输出最终文本，
       // 5 秒后就会把仍在跑的后台子 Agent 连坐 interrupt 掉——实测认知管线两轮
       // 六个提取子 Agent 全灭，且失败静默（agents 表不记录 SDK Task，StreamEvent
@@ -2310,16 +2324,24 @@ async function runQueryAttempt(
         if (debt > 0) {
           if (completionGraceStartedAt === null) {
             completionGraceStartedAt = now;
-            log(`Background tasks finished with ${debt} completion debt, waiting up to ${COMPLETION_GRACE_MS / 1000}s for the follow-up summary`);
+            log(
+              `Background tasks finished with ${debt} completion debt, waiting up to ${COMPLETION_GRACE_MS / 1000}s for the follow-up summary`,
+            );
             return;
           }
           if (now - completionGraceStartedAt <= COMPLETION_GRACE_MS) return;
-          log(`Follow-up summary did not arrive within ${COMPLETION_GRACE_MS / 1000}s, closing stream`);
+          log(
+            `Follow-up summary did not arrive within ${COMPLETION_GRACE_MS / 1000}s, closing stream`,
+          );
         } else {
-          log('Background tasks finished with no completion debt, closing stream');
+          log(
+            'Background tasks finished with no completion debt, closing stream',
+          );
         }
       }
-      log(`Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`);
+      log(
+        `Post-result timeout (${POST_RESULT_TIMEOUT_MS / 1000}s), closing stream`,
+      );
       interruptQueryForShutdown('Post-result timeout');
       stream.end();
       ipcPolling = false;
@@ -2455,20 +2477,35 @@ async function runQueryAttempt(
   const personaBlock = buildPersonaBlock(containerInput);
   const personaMode = personaPromptMode(containerInput);
   const personaDescription = describePersona(containerInput);
-  if (personaDescription) log(`Agent profile: ${personaDescription} mode=${personaMode}`);
+  if (personaDescription)
+    log(`Agent profile: ${personaDescription} mode=${personaMode}`);
 
   const globalMemoryContext = buildGlobalMemoryContext(disableMemoryLayer);
 
   const promptPieces: PromptPiece[] = [
     ...(personaBlock ? [{ name: 'agent-persona', text: personaBlock }] : []),
-    { name: 'interaction.md', text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>` },
-    { name: 'skill-routing.md', text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>` },
-    { name: 'security-rules.md', text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>` },
+    {
+      name: 'interaction.md',
+      text: `<behavior>\n${INTERACTION_GUIDELINES}\n</behavior>`,
+    },
+    {
+      name: 'skill-routing.md',
+      text: `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n</skill-routing>`,
+    },
+    {
+      name: 'security-rules.md',
+      text: `<security>\n${buildSecurityRulesPrompt(disableMemoryLayer)}\n</security>`,
+    },
     ...(globalMemoryContext
       ? [{ name: 'global-memory', text: globalMemoryContext }]
       : []),
     ...(memoryRecall && memoryPromptName
-      ? [{ name: memoryPromptName, text: `<memory-system>\n${memoryRecall}\n</memory-system>` }]
+      ? [
+          {
+            name: memoryPromptName,
+            text: `<memory-system>\n${memoryRecall}\n</memory-system>`,
+          },
+        ]
       : []),
     // 'replace' mode means the persona deliberately takes over the system
     // prompt, so the built-in guidelines stand down. Everything else here
@@ -2494,8 +2531,16 @@ async function runQueryAttempt(
     emit({
       status: 'success',
       // Proactive SDK text is control-plane only; user-visible speech must
-      // already have crossed the send_message delivery boundary.
+      // normally have crossed the send_message delivery boundary. Preserve a
+      // completed non-empty candidate for host-side, ACK-aware recovery rather
+      // than silently discarding it when the model violates that contract.
       result: proactiveInteractiveContract ? null : candidate.finalText,
+      ...(proactiveInteractiveContract &&
+      inputTurnCompleted &&
+      !candidate.suspectTruncated &&
+      candidate.finalText?.trim()
+        ? { proactiveFinalCandidate: candidate.finalText }
+        : {}),
       newSessionId,
       sdkMessageUuid: candidate.sdkMessageUuid,
       sourceKind: sourceKindOverride ?? 'sdk_final',
@@ -4047,13 +4092,17 @@ async function runOneTurnRuntime(
     if (closed || interrupted) return;
     if (shouldClose()) {
       closed = true;
-      log(`Close sentinel detected during ${adapter.runtime} run, aborting turn`);
+      log(
+        `Close sentinel detected during ${adapter.runtime} run, aborting turn`,
+      );
       abortController.abort();
       return;
     }
     if (shouldInterrupt()) {
       interrupted = true;
-      log(`Interrupt sentinel detected during ${adapter.runtime} run, aborting turn`);
+      log(
+        `Interrupt sentinel detected during ${adapter.runtime} run, aborting turn`,
+      );
       emit({
         status: 'stream',
         result: null,
@@ -4064,7 +4113,9 @@ async function runOneTurnRuntime(
       return;
     }
     if (shouldDrain()) {
-      log(`Drain sentinel detected during ${adapter.runtime} run; one-turn runtime will exit after current turn`);
+      log(
+        `Drain sentinel detected during ${adapter.runtime} run; one-turn runtime will exit after current turn`,
+      );
     }
   };
 
@@ -4282,7 +4333,10 @@ async function main(): Promise<void> {
       .filter((n) => !MEMORY_FLUSH_KEEP_MCP.has(n)),
   ];
 
-  const memoryRecallPrompt = buildMemoryRecallPrompt(isHome, disableMemoryLayer);
+  const memoryRecallPrompt = buildMemoryRecallPrompt(
+    isHome,
+    disableMemoryLayer,
+  );
   fs.mkdirSync(IPC_INPUT_DIR, { recursive: true });
 
   // Clean up stale sentinels from previous container runs.
@@ -4378,7 +4432,8 @@ async function main(): Promise<void> {
     const channelGuidelines = CHANNEL_GUIDELINES[channel] ?? '';
     const skillContext = buildCodexSkillContext();
     const globalMemoryContext = buildGlobalMemoryContext(disableMemoryLayer);
-    const additionalDirectories = buildRuntimeAdditionalDirectories(disableMemoryLayer);
+    const additionalDirectories =
+      buildRuntimeAdditionalDirectories(disableMemoryLayer);
     const runtimeNote =
       runtime === 'grok'
         ? '当前运行时是 Grok。HappyClaw 会把你的最终文本作为本轮回复发送给用户；请直接完成用户当前请求。'
@@ -4416,7 +4471,8 @@ async function main(): Promise<void> {
       `<skill-routing>\n${SKILL_ROUTING_GUIDELINES}\n${CODEX_SKILL_FILE_GUIDELINES}\n\n${skillContext}\n</skill-routing>`,
       `<security>\n${SECURITY_RULES}\n</security>`,
       globalMemoryContext,
-      memoryRecallPrompt && `<memory-system>\n${memoryRecallPrompt}\n</memory-system>`,
+      memoryRecallPrompt &&
+        `<memory-system>\n${memoryRecallPrompt}\n</memory-system>`,
       buildCodexMemoryLifecyclePrompt({
         isHome,
         privacyMode: !!containerInput.privacyMode,
@@ -4429,13 +4485,16 @@ async function main(): Promise<void> {
       // 否则模型不知道工具存在 → scheduled-task 的 send_message 回复契约失效。
       buildHappyClawToolsHint(runtime) &&
         `<happyclaw-tools>${buildHappyClawToolsHint(runtime)}\n</happyclaw-tools>`,
-      channelGuidelines && `<channel-format>\n${channelGuidelines}\n</channel-format>`,
+      channelGuidelines &&
+        `<channel-format>\n${channelGuidelines}\n</channel-format>`,
       containerInput.agentId && CONVERSATION_AGENT_BLOCK,
       '',
       '<runtime-note>',
       runtimeNote,
       '</runtime-note>',
-    ].filter(Boolean).join('\n');
+    ]
+      .filter(Boolean)
+      .join('\n');
 
     // 决策 38：Codex 只保留 CLI 一条实现（OAuth 走 codex CLI 自带链路），
     // SDK 适配器不再参与运行时选择。
@@ -4737,12 +4796,14 @@ async function main(): Promise<void> {
           '用户明确要求记住的内容，以及下次对话仍可能用到的信息，也写入全局记忆。',
           `然后使用 memory_append 将时效性记忆保存到 memory/${today}.md（今日进展、临时决策、待办等）。`,
           '如需确认上下文，可先用 memory_search/memory_get 查阅。',
-          ...(hasClaudeMd ? [
-            `**工作区 CLAUDE.md 维护**：Read ${claudeMdPath}，检查「当前状态」节是否需要更新。`,
-            '如果本次对话有实质性进展（新系统上线、关键决策、工作重心变化），用 Edit 整体替换「当前状态」节，保持 3-5 行。',
-            '如果目录结构有变化（新增了重要文件或目录），顺带更新「目录结构」节。其他节不动。',
-            '没有实质变化则不改。',
-          ] : []),
+          ...(hasClaudeMd
+            ? [
+                `**工作区 CLAUDE.md 维护**：Read ${claudeMdPath}，检查「当前状态」节是否需要更新。`,
+                '如果本次对话有实质性进展（新系统上线、关键决策、工作重心变化），用 Edit 整体替换「当前状态」节，保持 3-5 行。',
+                '如果目录结构有变化（新增了重要文件或目录），顺带更新「目录结构」节。其他节不动。',
+                '没有实质变化则不改。',
+              ]
+            : []),
           '如果没有值得保存的内容（记忆和 CLAUDE.md 都无需更新），回复一个字：OK。',
         ].join(' ');
 
@@ -4804,7 +4865,8 @@ async function main(): Promise<void> {
             CLAUDEMD_UPDATE_DISALLOWED_TOOLS,
           );
           if (updateResult.newSessionId) sessionId = updateResult.newSessionId;
-          if (updateResult.lastAssistantUuid) resumeAt = updateResult.lastAssistantUuid;
+          if (updateResult.lastAssistantUuid)
+            resumeAt = updateResult.lastAssistantUuid;
           log('CLAUDE.md update completed');
 
           if (updateResult.closedDuringQuery) {

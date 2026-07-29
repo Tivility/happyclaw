@@ -1,12 +1,6 @@
-import {
-  ChildProcess,
-} from 'child_process';
-import {
-  randomUUID,
-} from 'node:crypto';
-import {
-  CronExpressionParser,
-} from 'cron-parser';
+import { ChildProcess } from 'child_process';
+import { randomUUID } from 'node:crypto';
+import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 import path from 'path';
 
@@ -16,19 +10,13 @@ import {
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
-import {
-  getSystemSettings,
-} from './runtime-config.js';
-import {
-  channelConversationJid,
-} from './channel-address.js';
+import { getSystemSettings } from './runtime-config.js';
+import { channelConversationJid } from './channel-address.js';
 import {
   persistRuntimeNativeSession,
   resolveRuntimeForSourceScope,
 } from './model-runtime.js';
-import {
-  buildRuntimePrompt,
-} from './runtime-input-builder.js';
+import { buildRuntimePrompt } from './runtime-input-builder.js';
 import {
   ContainerOutput,
   cleanupContainerTaskRuntimeEnvDirs,
@@ -37,9 +25,7 @@ import {
   runAgentWithModelFallback,
   writeTasksSnapshot,
 } from './container-runner.js';
-import {
-  PROVIDER_FAILURE_USER_NOTICE,
-} from './provider-failure.js';
+import { PROVIDER_FAILURE_USER_NOTICE } from './provider-failure.js';
 import {
   advanceSkippedTask,
   cancelTaskRun,
@@ -96,28 +82,15 @@ import {
   updateTaskAfterRun,
   updateTask,
 } from './db.js';
-import {
-  GroupQueue,
-} from './group-queue.js';
-import {
-  logger,
-} from './logger.js';
-import {
-  resolveTaskOwner,
-} from './task-utils.js';
-import {
-  resolveTaskSourceImJid,
-} from './task-routing.js';
-import {
-  removeFlowArtifacts,
-} from './file-manager.js';
-import {
-  hasScriptCapacity,
-  runScript,
-} from './script-runner.js';
-import type {
-  StreamEvent,
-} from './stream-event.types.js';
+import { GroupQueue } from './group-queue.js';
+import { logger } from './logger.js';
+import { resolveTaskOwner } from './task-utils.js';
+import { resolveTaskSourceImJid } from './task-routing.js';
+import { removeFlowArtifacts } from './file-manager.js';
+// 决策：跟随 upstream 105195d6 退役脚本并发闸门（hasScriptCapacity 已随
+// maxConcurrentScripts 一并移除），脚本任务到点即跑，只保留计数用于展示。
+import { runScript } from './script-runner.js';
+import type { StreamEvent } from './stream-event.types.js';
 import {
   ExecutionMode,
   RegisteredGroup,
@@ -129,34 +102,23 @@ import {
   TaskRunLog,
   TaskRunNotificationSummary,
 } from './types.js';
-import {
-  checkBillingAccessFresh,
-  isBillingEnabled,
-} from './billing.js';
-import {
-  checkOwnerActive,
-} from './owner-gate.js';
+import { checkBillingAccessFresh, isBillingEnabled } from './billing.js';
+import { checkOwnerActive } from './owner-gate.js';
 import {
   canExecuteOnHost,
   HOST_EXECUTION_FORBIDDEN_ERROR,
 } from './host-execution-policy.js';
-import {
-  resolveEffectiveAgentProfile,
-} from './agent-profile-runtime.js';
+import { resolveEffectiveAgentProfile } from './agent-profile-runtime.js';
 import {
   buildAgentProfilePrompt,
   hasAgentProfilePrompts,
 } from './agent-profile-prompts.js';
-import {
-  stripAgentInternalTags,
-} from './utils.js';
+import { stripAgentInternalTags } from './utils.js';
 import {
   markIsolatedTaskRunIpcComplete,
   tryCleanupCompletedIsolatedTaskRunIpc,
 } from './isolated-task-ipc.js';
-import {
-  getScriptTaskHostExecutionError,
-} from './script-task-policy.js';
+import { getScriptTaskHostExecutionError } from './script-task-policy.js';
 
 export function shouldFinalizeScheduledRunOutput(
   output: Pick<
@@ -517,7 +479,14 @@ export interface SchedulerDependencies {
     userId?: string,
   ) => void;
   /** Store task prompt as a user-visible message in the workspace chat */
-  storePromptMessage?: (chatJid: string, senderId: string, senderName: string, text: string, taskId?: string, sourceJid?: string) => void;
+  storePromptMessage?: (
+    chatJid: string,
+    senderId: string,
+    senderName: string,
+    text: string,
+    taskId?: string,
+    sourceJid?: string,
+  ) => void;
   /** Store task result in workspace chat and push to owner's IM channels */
   storeResultAndNotify?: (
     chatJid: string,
@@ -591,19 +560,17 @@ export function getRunningTaskIds(): string[] {
 }
 
 /**
- * Decide whether a due task is so overdue that we should skip this missed run
- * and advance to the next scheduled trigger instead. Prevents the
- * "restart-storm" failure mode where many tasks fire concurrently after a
- * long downtime. Exported for direct test coverage of the policy.
+ * Recurring work that became due before this scheduler process started is
+ * recorded as missed instead of replayed. One-time work is handled separately
+ * and still runs after a restart. Exported for direct policy coverage.
  */
 export function shouldSkipBackfill(
   nextRunIso: string | null | undefined,
-  nowMs: number,
-  graceMs: number,
+  schedulerStartedAtMs: number,
 ): boolean {
-  if (graceMs <= 0 || !nextRunIso) return false;
-  const overdueMs = nowMs - new Date(nextRunIso).getTime();
-  return overdueMs > graceMs;
+  if (schedulerStartedAtMs <= 0 || !nextRunIso) return false;
+  const scheduledAtMs = new Date(nextRunIso).getTime();
+  return Number.isFinite(scheduledAtMs) && scheduledAtMs < schedulerStartedAtMs;
 }
 
 /**
@@ -1213,8 +1180,9 @@ async function runTaskInner(
   };
 
   // Use persistent session for task workspace
-  const hadPendingModelBinding = !!getConversationRuntimeState(task.group_folder)
-    ?.pending_runtime;
+  const hadPendingModelBinding = !!getConversationRuntimeState(
+    task.group_folder,
+  )?.pending_runtime;
   if (hadPendingModelBinding) {
     promotePendingConversationRuntimeBinding(task.group_folder);
   }
@@ -1983,7 +1951,7 @@ async function runGroupModeTask(
   )
     return;
   runningTaskIds.add(task.id);
-  let resultSummary = '已排队到源工作区，等待 Agent 执行';
+  let resultSummary = '已排队到源工作区，等待智能体执行';
 
   try {
     // Resolve task owner for sender attribution
@@ -2066,6 +2034,7 @@ async function runGroupModeTask(
 }
 
 let schedulerRunning = false;
+let schedulerStartedAtMs = 0;
 const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 let lastCleanupTime = 0;
 const TASK_RUN_LEASE_MS = 60_000;
@@ -2575,10 +2544,6 @@ function executeClaimedTaskRun(
       });
       return;
     }
-    if (!hasScriptCapacity()) {
-      scheduleSafePrestartRetry(claim, 'Script capacity is currently full');
-      return;
-    }
     let leaseLost = false;
     const abortController = new AbortController();
     const heartbeat = startTaskRunHeartbeat(claim, () => {
@@ -2781,7 +2746,6 @@ function executeClaimedTaskRun(
 }
 
 function materializeDueOccurrences(): void {
-  const graceMs = getSystemSettings().taskBackfillGraceMs;
   for (const task of getDueTaskDefinitionsV2(100)) {
     if (!task.next_run) continue;
     const scheduledFor = task.next_run;
@@ -2802,17 +2766,18 @@ function materializeDueOccurrences(): void {
       continue;
     }
     const recurringMisfire =
-      task.schedule_type !== 'once' && graceMs > 0 && overdueMs > graceMs;
+      task.schedule_type !== 'once' &&
+      shouldSkipBackfill(scheduledFor, schedulerStartedAtMs);
     materializeTaskOccurrence({
       taskId: task.id,
       scheduledFor,
       nextRun,
       triggerType:
-        task.schedule_type === 'once' && overdueMs > 0
+        recurringMisfire || (task.schedule_type === 'once' && overdueMs > 0)
           ? 'backfill'
           : 'scheduled',
       missedReason: recurringMisfire
-        ? `Missed by ${Math.round(overdueMs / 1000)}s; grace is ${Math.round(graceMs / 1000)}s`
+        ? `Missed while scheduler was offline by ${Math.round(overdueMs / 1000)}s`
         : undefined,
     });
   }
@@ -3107,6 +3072,7 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
     return;
   }
   schedulerRunning = true;
+  schedulerStartedAtMs = Date.now();
   schedulerDepsRef = deps;
 
   // Process-local reservations are never authoritative after restart. Durable

@@ -1,12 +1,6 @@
-import {
-  Hono,
-} from 'hono';
-import type {
-  Variables,
-} from '../web-context.js';
-import {
-  authMiddleware,
-} from '../middleware/auth.js';
+import { Hono } from 'hono';
+import type { Variables } from '../web-context.js';
+import { authMiddleware } from '../middleware/auth.js';
 import {
   GroupAgentProfilePatchSchema,
   GroupCreateSchema,
@@ -20,14 +14,8 @@ import type {
   ExecutionMode,
   InteractionMode,
 } from '../types.js';
-import {
-  checkGroupLimit,
-} from '../billing.js';
-import {
-  DATA_DIR,
-  GROUPS_DIR,
-  isDockerAvailable,
-} from '../config.js';
+import { checkGroupLimit } from '../billing.js';
+import { DATA_DIR, GROUPS_DIR, isDockerAvailable } from '../config.js';
 import {
   isHostExecutionGroup,
   hasHostExecutionPermission,
@@ -83,13 +71,8 @@ import {
   getWorkspaceInteractionMode,
   setWorkspaceInteractionMode,
 } from '../db.js';
-import {
-  releaseOwner,
-  persistGroupUpdate,
-} from '../group-owner.js';
-import {
-  logger,
-} from '../logger.js';
+import { releaseOwner, persistGroupUpdate } from '../group-owner.js';
+import { logger } from '../logger.js';
 import {
   getWorkspaceRuntimeJids,
   quiesceWorkspaceRunnersAroundCommit,
@@ -101,12 +84,8 @@ import {
   saveContainerEnvConfig,
   toPublicContainerEnvConfig,
 } from '../runtime-config.js';
-import {
-  clearTargetAgentBindingsForDeletedAgents,
-} from '../im-context-isolation.js';
-import {
-  getChannelType,
-} from '../im-channel.js';
+import { clearTargetAgentBindingsForDeletedAgents } from '../im-context-isolation.js';
+import { getChannelType } from '../im-channel.js';
 import {
   buildNativeThreadWorkspaceUpdate,
   buildUnmountUpdate,
@@ -120,28 +99,16 @@ import {
   validateAdditionalMountsStrict,
 } from '../mount-security.js';
 import crypto from 'node:crypto';
-import {
-  execFile,
-} from 'node:child_process';
-import {
-  promisify,
-} from 'node:util';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 // SSRF helpers 抽到 ../url-safety.ts；本文件 re-export isPrivateHostname 以保留旧导入路径。
-import {
-  z,
-} from 'zod';
-import {
-  broadcastNewMessage,
-} from '../web.js';
-import {
-  getStreamingSession,
-} from '../feishu-streaming-card.js';
-import {
-  attachSessionWorkflowRuns,
-} from '../session-workflows.js';
+import { z } from 'zod';
+import { broadcastNewMessage } from '../web.js';
+import { getStreamingSession } from '../feishu-streaming-card.js';
+import { attachSessionWorkflowRuns } from '../session-workflows.js';
 import {
   buildPinnedGitEnvironment,
   startPinnedHttpsProxy,
@@ -446,12 +413,8 @@ function buildGroupsPayload(user: AuthUser): Record<string, GroupPayloadItem> {
   return result;
 }
 
-import {
-  removeFlowArtifacts,
-} from '../file-manager.js';
-import {
-  clearSessionFiles,
-} from '../session-files.js';
+import { removeFlowArtifacts } from '../file-manager.js';
+import { clearSessionFiles } from '../session-files.js';
 export { removeFlowArtifacts };
 
 class WorkspaceMissingDuringMigrationError extends Error {
@@ -560,7 +523,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
     ? getAgentProfileForUser(validation.data.agent_profile_id, authUser.id)
     : getOrCreateDefaultAgentProfile(authUser.id);
   if (!agentProfile) {
-    return c.json({ error: 'Agent profile not found' }, 404);
+    return c.json({ error: '智能体配置不存在' }, 404);
   }
 
   // Billing: check group limit
@@ -984,10 +947,7 @@ groupRoutes.post('/', authMiddleware, async (c) => {
   }
   if (!publishedAgentProfile) {
     fs.rmSync(groupDir, { recursive: true, force: true });
-    return c.json(
-      { error: 'Agent profile is no longer active; choose another Agent' },
-      409,
-    );
+    return c.json({ error: '该智能体配置已失效；请选择其他智能体' }, 409);
   }
 
   // 容器模式工作区创建后立即启动容器预热，避免用户打开终端时还需等待
@@ -1092,7 +1052,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
     activation_mode === undefined &&
     execution_mode === undefined &&
     privacy_mode === undefined;
-    interaction_mode === undefined;
+  interaction_mode === undefined;
   if (isPinOnly) {
     if (
       !canAccessGroup(
@@ -1151,8 +1111,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
   ) {
     return c.json(
       {
-        error:
-          'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+        error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
         code: 'WORKSPACE_AGENT_PROFILE_MISSING',
       },
       409,
@@ -1255,8 +1214,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
           deps.queue?.unblockGroupsForRuntimeSafety?.(runtimeJids);
           return c.json(
             {
-              error:
-                'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+              error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
               code: 'WORKSPACE_AGENT_PROFILE_MISSING',
             },
             409,
@@ -1287,8 +1245,7 @@ groupRoutes.patch('/:jid', authMiddleware, async (c) => {
         if (!(err instanceof WorkspaceAgentProfileMissingError)) throw err;
         return c.json(
           {
-            error:
-              'This workspace has no Agent Profile binding, so its interaction mode cannot be changed.',
+            error: '该工作区未绑定智能体配置，因此无法修改回复模式。',
             code: 'WORKSPACE_AGENT_PROFILE_MISSING',
           },
           409,
@@ -1339,7 +1296,7 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
     validation.data.agent_profile_id,
     authUser.id,
   );
-  if (!profile) return c.json({ error: 'Agent profile not found' }, 404);
+  if (!profile) return c.json({ error: '智能体配置不存在' }, 404);
 
   let invalidatedRuntimeJids = 0;
   let committedProfile = profile;
@@ -1415,7 +1372,7 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
       );
       if (outcome.kind === 'retry') continue;
       if (outcome.kind === 'target_missing') {
-        return c.json({ error: 'Agent profile is no longer active' }, 409);
+        return c.json({ error: '该智能体配置已失效' }, 409);
       }
       if (outcome.kind === 'workspace_missing') {
         return c.json(
@@ -1452,8 +1409,8 @@ groupRoutes.patch('/:jid/agent-profile', authMiddleware, async (c) => {
       return c.json(
         {
           error: err.persisted
-            ? 'Workspace Agent profile was updated, but runtime cleanup failed; retry the same request'
-            : 'Failed to quiesce active runtime; Workspace Agent profile was not updated',
+            ? '工作区智能体配置已更新，但运行时清理失败；请重试相同请求'
+            : '无法停止活动运行时；工作区智能体配置未更新',
           persisted: err.persisted,
           retryable: true,
           agent_profile_id: err.persisted ? profile.id : undefined,
@@ -1653,8 +1610,8 @@ groupRoutes.delete('/:jid', authMiddleware, async (c) => {
       );
     }
 
-  delete deps.getRegisteredGroups()[jid];
-  deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
+    delete deps.getRegisteredGroups()[jid];
+    deps.setLastAgentTimestamp(jid, { timestamp: '', id: '' });
     const excludedWorkspaceJids = new Set([jid, `web:${freshExisting.folder}`]);
     const channelUpdates: Array<{
       jid: string;
@@ -2495,7 +2452,9 @@ groupRoutes.post('/:jid/bind-im', authMiddleware, async (c) => {
 
   const group = getRegisteredGroup(jid);
   if (!group) return c.json({ error: 'Group not found' }, 404);
-  if (!canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })) {
+  if (
+    !canAccessGroup({ id: authUser.id, role: authUser.role }, { ...group, jid })
+  ) {
     return c.json({ error: 'Forbidden' }, 403);
   }
 
@@ -2506,13 +2465,19 @@ groupRoutes.post('/:jid/bind-im', authMiddleware, async (c) => {
 
   if (!imJid) return c.json({ error: 'im_jid is required' }, 400);
   if (!/^(feishu|telegram|qq):/.test(imJid)) {
-    return c.json({ error: 'im_jid must start with feishu:, telegram:, or qq:' }, 400);
+    return c.json(
+      { error: 'im_jid must start with feishu:, telegram:, or qq:' },
+      400,
+    );
   }
 
   // 检查是否已注册且指向不同 folder
   const existing = getRegisteredGroup(imJid);
   if (existing && existing.folder !== group.folder && !force) {
-    return c.json({ error: 'IM group is already bound to another workspace' }, 409);
+    return c.json(
+      { error: 'IM group is already bound to another workspace' },
+      409,
+    );
   }
 
   const now = new Date().toISOString();
@@ -2580,7 +2545,10 @@ groupRoutes.get('/:jid/turn-events', authMiddleware, async (c) => {
   }
 
   const limitRaw = parseInt(c.req.query('limit') || '200', 10);
-  const limit = Math.min(Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 200, 1000);
+  const limit = Math.min(
+    Number.isFinite(limitRaw) ? Math.max(1, limitRaw) : 200,
+    1000,
+  );
   const beforeIdRaw = parseInt(c.req.query('beforeId') || '', 10);
   const beforeId = Number.isFinite(beforeIdRaw) ? beforeIdRaw : undefined;
 

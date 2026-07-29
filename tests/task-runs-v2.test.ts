@@ -46,40 +46,6 @@ function createDefinition(id: string, overrides: Record<string, unknown> = {}) {
 }
 
 describe('scheduled task definition revisions', () => {
-  test('atomically enforces the per-owner live definition cap', () => {
-    const createdAt = new Date().toISOString();
-    const definition = {
-      group_folder: 'workspace',
-      chat_jid: 'web:workspace',
-      prompt: 'capacity test',
-      schedule_type: 'cron' as const,
-      schedule_value: '0 * * * *',
-      context_mode: 'isolated' as const,
-      execution_type: 'agent' as const,
-      execution_mode: 'container' as const,
-      script_command: null,
-      next_run: new Date(Date.now() + 60_000).toISOString(),
-      status: 'active' as const,
-      created_at: createdAt,
-      created_by: 'capacity-owner',
-      notify_channels: null,
-    };
-    expect(
-      db.createTaskWithinOwnerLimit({ ...definition, id: 'capacity-first' }, 1),
-    ).toEqual({ status: 'created' });
-    expect(
-      db.createTaskWithinOwnerLimit(
-        { ...definition, id: 'capacity-second' },
-        1,
-      ),
-    ).toMatchObject({
-      status: 'limit_reached',
-      limit: 1,
-      count: 1,
-    });
-    expect(db.getTaskById('capacity-second')).toBeUndefined();
-  });
-
   test('uses CAS and preserves soft-deleted definitions for restore/history', () => {
     const onceAt = new Date(Date.now() + 60 * 60_000).toISOString();
     const task = createDefinition('revision-task', {
@@ -968,9 +934,7 @@ describe('软删除任务的保留期回收', () => {
     raw.close();
 
     // 保留期 7 天 → cutoff 是 7 天前：只有 old 过期。
-    const cutoff = new Date(
-      Date.now() - 7 * 24 * 60 * 60 * 1000,
-    ).toISOString();
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     const purgeable = db.getPurgeableTasks(cutoff).map((t) => t.id);
     expect(purgeable).toContain(old.id);
     // 关键不变量：仍在保留期内的任务不能被回收，否则 /restore 会恢复出一个
@@ -981,6 +945,8 @@ describe('软删除任务的保留期回收', () => {
   test('未删除的任务永不出现在可回收集合里', () => {
     const live = createDefinition('purge-live');
     const cutoff = new Date(Date.now() + 60_000).toISOString();
-    expect(db.getPurgeableTasks(cutoff).map((t) => t.id)).not.toContain(live.id);
+    expect(db.getPurgeableTasks(cutoff).map((t) => t.id)).not.toContain(
+      live.id,
+    );
   });
 });

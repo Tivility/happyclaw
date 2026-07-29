@@ -251,7 +251,12 @@ export interface ContainerInput {
   authProfileGeneration?: number;
   authProfileFingerprint?: string | null;
   selectedModel?: string | null;
-  modelKind?: 'provider_default' | 'runtime_default' | 'alias' | 'explicit_version' | 'custom';
+  modelKind?:
+    | 'provider_default'
+    | 'runtime_default'
+    | 'alias'
+    | 'explicit_version'
+    | 'custom';
   resolvedModel?: string | null;
   modelKey?: string;
   modelOverride?: string | null;
@@ -293,6 +298,15 @@ export interface ContainerInput {
 export interface ContainerOutput {
   status: 'success' | 'error' | 'stream' | 'closed';
   result: string | null;
+  /**
+   * Non-empty SDK final text produced under the interactive Proactive contract.
+   *
+   * Proactive mode still keeps `result` null so ordinary SDK text is never
+   * published blindly. The host reconciles this candidate against physically
+   * acknowledged `send_message` deliveries and only publishes it when the
+   * model failed to send a final utterance.
+   */
+  proactiveFinalCandidate?: string;
   newSessionId?: string;
   error?: string;
   providerFailure?: boolean;
@@ -324,6 +338,7 @@ export interface ContainerOutput {
   sourceKind?:
     | 'sdk_final'
     | 'sdk_send_message'
+    | 'proactive_sdk_fallback'
     | 'interrupt_partial'
     | 'overflow_partial'
     | 'compact_partial'

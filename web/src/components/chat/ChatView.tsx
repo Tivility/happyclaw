@@ -96,7 +96,6 @@ const SIDEBAR_TABS = [
 
 type SidebarTab = 'files' | 'env' | 'skills' | 'mcp';
 
-
 export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
   const { mode: displayMode, toggle: toggleDisplayMode } = useDisplayMode();
   const { theme, toggle: toggleTheme } = useTheme();
@@ -110,8 +109,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
       ? window.matchMedia('(min-width: 1024px)').matches
       : true,
   );
-  const [imStatus, setImStatus] = useState<Record<string, boolean> | null>(null);
-  const reorderConversations = useChatStore(s => s.reorderConversations);
+  const [imStatus, setImStatus] = useState<Record<string, boolean> | null>(
+    null,
+  );
+  const reorderConversations = useChatStore((s) => s.reorderConversations);
   const [mobileContextOpen, setMobileContextOpen] = useState(false);
   const [contextPanelView, setContextPanelView] = useState<'files' | 'env'>(
     'files',
@@ -370,29 +371,34 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
 
   // ── 本地：侧栏页签可见性 / 话题列表派生 ──
   const visibleTabs = SIDEBAR_TABS;
-  const topicAgents = useMemo(() =>
-    agents
-      .filter((a) => a.kind === 'conversation')
-      .slice()
-      .sort((a, b) => {
-        const aTs = a.last_active_at || a.latest_message?.timestamp || a.created_at;
-        const bTs = b.last_active_at || b.latest_message?.timestamp || b.created_at;
-        return new Date(bTs).getTime() - new Date(aTs).getTime();
-      }),
+  const topicAgents = useMemo(
+    () =>
+      agents
+        .filter((a) => a.kind === 'conversation')
+        .slice()
+        .sort((a, b) => {
+          const aTs =
+            a.last_active_at || a.latest_message?.timestamp || a.created_at;
+          const bTs =
+            b.last_active_at || b.latest_message?.timestamp || b.created_at;
+          return new Date(bTs).getTime() - new Date(aTs).getTime();
+        }),
     [agents],
   );
-  const filteredTopicAgents = useMemo(() =>
-    topicAgents.filter((agent) => {
-      const q = topicFilter.trim().toLowerCase();
-      if (!q) return true;
-      return (
-        agent.name.toLowerCase().includes(q) ||
-        (agent.latest_message?.content || '').toLowerCase().includes(q)
-      );
-    }),
+  const filteredTopicAgents = useMemo(
+    () =>
+      topicAgents.filter((agent) => {
+        const q = topicFilter.trim().toLowerCase();
+        if (!q) return true;
+        return (
+          agent.name.toLowerCase().includes(q) ||
+          (agent.latest_message?.content || '').toLowerCase().includes(q)
+        );
+      }),
     [topicAgents, topicFilter],
   );
-  const showTopicListOnlyMobile = isTopicWorkspace && !isDesktop && !activeAgentTab;
+  const showTopicListOnlyMobile =
+    isTopicWorkspace && !isDesktop && !activeAgentTab;
   const conversationAgents = useMemo(
     () =>
       agents
@@ -427,7 +433,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
     ? getAgentProfileDisplayName(group.agent_profile_name)
     : group?.is_home
       ? 'HappyClaw'
-      : 'Agent';
+      : '智能体';
   const workspaceDisplayName = group?.is_my_home
     ? agentProfileLabel
     : group?.name;
@@ -918,7 +924,6 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
           mobileSessionsVisible ? 'hidden lg:flex' : 'flex',
         )}
       >
-
         {/* Header */}
         <div className="flex items-center gap-3 px-6 py-4 max-lg:px-4 max-lg:py-2.5 max-lg:bg-background/60 max-lg:backdrop-blur-xl max-lg:saturate-[1.8] max-lg:border-border/40">
           {onBack && (
@@ -957,7 +962,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
                 )}
                 title={
                   interactionMode === 'proactive'
-                    ? '主动模式：由 Agent 决定何时发送 0～多条独立消息'
+                    ? '主动模式：由智能体决定何时发送 0～多条独立消息'
                     : 'Assistant 模式：框架在任务完成后交付一条主回复'
                 }
                 aria-label={
@@ -1019,7 +1024,10 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             </button>
           )}
           {/* 会话级模型 / 运行时切换（本地多运行时能力） */}
-          <WorkspaceModelSelector groupJid={groupJid} agentId={activeAgentTab} />
+          <WorkspaceModelSelector
+            groupJid={groupJid}
+            agentId={activeAgentTab}
+          />
           <button
             onClick={toggleTheme}
             className="hidden min-h-9 min-w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:flex cursor-pointer"
@@ -1059,316 +1067,399 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
             )}
           </button>
         </div>
-      {/* IM channel setup banner for home container without IM */}
-      {isOwnHome && imStatus && !Object.values(imStatus).some(Boolean) && !imBannerDismissed && (
-        <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-sm">
-          <Link className="w-4 h-4 flex-shrink-0" />
-          <span className="flex-1 min-w-0">未配置 IM 渠道（飞书 / Telegram / Discord / QQ / 微信 / 钉钉），消息无法与主工作区互通</span>
-          <button
-            onClick={() => navigate('/setup/channels')}
-            className="flex-shrink-0 px-3 py-1 text-xs font-medium rounded-md bg-amber-600 text-white hover:bg-amber-700 transition-colors cursor-pointer"
-          >
-            去配置
-          </button>
-          <button
-            onClick={() => {
-              setImBannerDismissed(true);
-              localStorage.setItem('im-banner-dismissed', '1');
+        {/* IM channel setup banner for home container without IM */}
+        {isOwnHome &&
+          imStatus &&
+          !Object.values(imStatus).some(Boolean) &&
+          !imBannerDismissed && (
+            <div className="flex items-center gap-2 px-4 py-2 bg-amber-50 dark:bg-amber-950/40 border-b border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300 text-sm">
+              <Link className="w-4 h-4 flex-shrink-0" />
+              <span className="flex-1 min-w-0">
+                未配置 IM 渠道（飞书 / Telegram / Discord / QQ / 微信 /
+                钉钉），消息无法与主工作区互通
+              </span>
+              <button
+                onClick={() => navigate('/setup/channels')}
+                className="flex-shrink-0 px-3 py-1 text-xs font-medium rounded-md bg-amber-600 text-white hover:bg-amber-700 transition-colors cursor-pointer"
+              >
+                去配置
+              </button>
+              <button
+                onClick={() => {
+                  setImBannerDismissed(true);
+                  localStorage.setItem('im-banner-dismissed', '1');
+                }}
+                className="flex-shrink-0 p-0.5 rounded hover:bg-amber-200/60 transition-colors cursor-pointer"
+                aria-label="关闭"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+        {!isTopicWorkspace && (
+          <AgentTabBar
+            agents={agents}
+            activeTab={activeAgentTab}
+            canModify={canModifyWorkspaceConfig}
+            onSelectTab={(id) => selectTab(id)}
+            onDeleteAgent={(id) => {
+              const agent = agents.find((a) => a.id === id);
+              if (
+                agent?.linked_im_groups &&
+                agent.linked_im_groups.length > 0
+              ) {
+                const names = agent.linked_im_groups
+                  .map((g) => g.name)
+                  .join('、');
+                alert(`该对话已绑定 IM 渠道（${names}），请先解绑后再删除。`);
+                setBindingAgentId(id);
+                return;
+              }
+              deleteAgentAction(groupJid, id);
             }}
-            className="flex-shrink-0 p-0.5 rounded hover:bg-amber-200/60 transition-colors cursor-pointer"
-            aria-label="关闭"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-
-      {!isTopicWorkspace && (
-        <AgentTabBar
-          agents={agents}
-          activeTab={activeAgentTab}
-          canModify={canModifyWorkspaceConfig}
-          onSelectTab={(id) => selectTab(id)}
-          onDeleteAgent={(id) => {
-            const agent = agents.find((a) => a.id === id);
-            if (agent?.linked_im_groups && agent.linked_im_groups.length > 0) {
-              const names = agent.linked_im_groups.map((g) => g.name).join('、');
-              alert(`该对话已绑定 IM 渠道（${names}），请先解绑后再删除。`);
-              setBindingAgentId(id);
-              return;
+            onRenameAgent={(id, currentName) =>
+              setRenameTarget({ agentId: id, name: currentName })
             }
-            deleteAgentAction(groupJid, id);
-          }}
-          onRenameAgent={(id, currentName) => setRenameTarget({ agentId: id, name: currentName })}
-          onCreateConversation={() => {
-            createConversation(groupJid, '').then((agent) => {
-              if (agent) selectTab(agent.id);
-            });
-          }}
-          onBindIm={setBindingAgentId}
-          onBindMainIm={!isHome ? () => setBindingAgentId(MAIN_BINDING) : undefined}
-          onReorder={(orderedIds) => reorderConversations(groupJid, orderedIds)}
-        />
-      )}
+            onCreateConversation={() => {
+              createConversation(groupJid, '').then((agent) => {
+                if (agent) selectTab(agent.id);
+              });
+            }}
+            onBindIm={setBindingAgentId}
+            onBindMainIm={
+              !isHome ? () => setBindingAgentId(MAIN_BINDING) : undefined
+            }
+            onReorder={(orderedIds) =>
+              reorderConversations(groupJid, orderedIds)
+            }
+          />
+        )}
 
-      {/* Main Content: Messages + Sidebar */}
-      <div className="flex-1 flex overflow-hidden min-h-0">
-        {/* Messages Area */}
-        <div className="flex-1 flex flex-col min-w-0 overflow-x-hidden">
-          {isTopicWorkspace ? (
-            <div className="flex flex-1 min-h-0">
-              <div className={cn(
-                'border-r border-border bg-muted/20 lg:w-80 lg:flex lg:flex-col',
-                showTopicListOnlyMobile ? 'flex flex-1 flex-col' : 'hidden',
-              )}>
-                <TopicSidebar
-                  topicAgents={filteredTopicAgents}
-                  activeAgentTab={activeAgentTab}
-                  canModify={canModifyWorkspaceConfig}
-                  onSelectAgent={(id) => selectTab(id)}
-                  onDeleteAgent={(id) => deleteAgentAction(groupJid, id)}
-                  topicFilter={topicFilter}
-                  onFilterChange={setTopicFilter}
-                  emptyCount={topicAgents.length}
-                />
-              </div>
+        {/* Main Content: Messages + Sidebar */}
+        <div className="flex-1 flex overflow-hidden min-h-0">
+          {/* Messages Area */}
+          <div className="flex-1 flex flex-col min-w-0 overflow-x-hidden">
+            {isTopicWorkspace ? (
+              <div className="flex flex-1 min-h-0">
+                <div
+                  className={cn(
+                    'border-r border-border bg-muted/20 lg:w-80 lg:flex lg:flex-col',
+                    showTopicListOnlyMobile ? 'flex flex-1 flex-col' : 'hidden',
+                  )}
+                >
+                  <TopicSidebar
+                    topicAgents={filteredTopicAgents}
+                    activeAgentTab={activeAgentTab}
+                    canModify={canModifyWorkspaceConfig}
+                    onSelectAgent={(id) => selectTab(id)}
+                    onDeleteAgent={(id) => deleteAgentAction(groupJid, id)}
+                    topicFilter={topicFilter}
+                    onFilterChange={setTopicFilter}
+                    emptyCount={topicAgents.length}
+                  />
+                </div>
 
-              <div className={cn('flex-1 min-w-0 flex-col', showTopicListOnlyMobile ? 'hidden' : 'flex')}>
-                {activeAgentTab && isConversationTab ? (
-                  <>
-                    {!isDesktop && (
-                      <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
-                        <button
-                          onClick={() => selectTab(null)}
-                          className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-muted cursor-pointer"
-                          aria-label="返回话题列表"
-                        >
-                          <ArrowLeft className="h-4 w-4" />
-                        </button>
-                        <div className="min-w-0">
-                          <div className="truncate text-sm font-medium text-foreground">{activeAgent?.name}</div>
-                          <div className="text-xs text-muted-foreground">飞书话题上下文</div>
+                <div
+                  className={cn(
+                    'flex-1 min-w-0 flex-col',
+                    showTopicListOnlyMobile ? 'hidden' : 'flex',
+                  )}
+                >
+                  {activeAgentTab && isConversationTab ? (
+                    <>
+                      {!isDesktop && (
+                        <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
+                          <button
+                            onClick={() => selectTab(null)}
+                            className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-muted cursor-pointer"
+                            aria-label="返回话题列表"
+                          >
+                            <ArrowLeft className="h-4 w-4" />
+                          </button>
+                          <div className="min-w-0">
+                            <div className="truncate text-sm font-medium text-foreground">
+                              {activeAgent?.name}
+                            </div>
+                            <div className="text-xs text-muted-foreground">
+                              飞书话题上下文
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                      <MessageList
+                        key={`conv-${activeAgentTab}`}
+                        messages={agentMessages[activeAgentTab] || []}
+                        loading={false}
+                        hasMore={!!agentHasMore[activeAgentTab]}
+                        onLoadMore={() =>
+                          loadAgentMessages(groupJid, activeAgentTab, true)
+                        }
+                        scrollTrigger={scrollTrigger}
+                        groupJid={groupJid}
+                        isWaiting={
+                          !!agentWaiting[activeAgentTab] ||
+                          !!agentStreaming[activeAgentTab]
+                        }
+                        onInterrupt={
+                          agentStreaming[activeAgentTab]?.interrupted
+                            ? undefined
+                            : () =>
+                                interruptQuery(
+                                  `${groupJid}#agent:${activeAgentTab}`,
+                                )
+                        }
+                        agentId={activeAgentTab}
+                      />
+                      <MessageInput
+                        // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
+                        // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
+                        // 那种「温进程/退避中」也算 running 的口径。
+                        isRunning={currentContextWaiting}
+                        contextLabel={currentContextName}
+                        // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
+                        // 删块时必须搬过来，否则整个跟进交互静默消失。
+                        queuedFollowUps={queuedFollowUps}
+                        onFollowUpAction={(item, action, content) =>
+                          actOnFollowUp(
+                            followUpChatJid,
+                            item.id,
+                            action,
+                            item.delivery_run_id,
+                            content,
+                          )
+                        }
+                        onSend={handleActiveAgentSend}
+                        groupJid={groupJid}
+                        onResetSession={
+                          canModifyWorkspaceConfig
+                            ? () => {
+                                setResetAgentId(activeAgentTab);
+                                setShowResetConfirm(true);
+                              }
+                            : undefined
+                        }
+                      />
+                    </>
+                  ) : (
+                    <div className="flex flex-1 items-center justify-center bg-background px-6 text-center">
+                      <div>
+                        <div className="text-sm font-medium text-foreground">
+                          选择一个飞书话题
+                        </div>
+                        <div className="mt-2 text-sm text-muted-foreground">
+                          左侧列表按最近活跃排序，进入后可继续在对应飞书话题里同步对话。
                         </div>
                       </div>
-                    )}
-                    <MessageList
-                      key={`conv-${activeAgentTab}`}
-                      messages={agentMessages[activeAgentTab] || []}
-                      loading={false}
-                      hasMore={!!agentHasMore[activeAgentTab]}
-                      onLoadMore={() => loadAgentMessages(groupJid, activeAgentTab, true)}
-                      scrollTrigger={scrollTrigger}
-                      groupJid={groupJid}
-                      isWaiting={!!agentWaiting[activeAgentTab] || !!agentStreaming[activeAgentTab]}
-                      onInterrupt={agentStreaming[activeAgentTab]?.interrupted ? undefined : () => interruptQuery(`${groupJid}#agent:${activeAgentTab}`)}
-                      agentId={activeAgentTab}
-                    />
-                    <MessageInput
-                      // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
-                      // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
-                      // 那种「温进程/退避中」也算 running 的口径。
-                      isRunning={currentContextWaiting}
-                      contextLabel={currentContextName}
-                      // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
-                      // 删块时必须搬过来，否则整个跟进交互静默消失。
-                      queuedFollowUps={queuedFollowUps}
-                      onFollowUpAction={(item, action, content) =>
-                        actOnFollowUp(
-                          followUpChatJid,
-                          item.id,
-                          action,
-                          item.delivery_run_id,
-                          content,
-                        )
-                      }
-                      onSend={handleActiveAgentSend}
-                      groupJid={groupJid}
-                      onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); } : undefined}
-                    />
-                  </>
-                ) : (
-                  <div className="flex flex-1 items-center justify-center bg-background px-6 text-center">
-                    <div>
-                      <div className="text-sm font-medium text-foreground">选择一个飞书话题</div>
-                      <div className="mt-2 text-sm text-muted-foreground">
-                        左侧列表按最近活跃排序，进入后可继续在对应飞书话题里同步对话。
-                      </div>
                     </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
-            </div>
-          ) : activeAgentTab && isConversationTab ? (
-            <>
-              <MessageList
-                key={`conv-${activeAgentTab}`}
-                messages={agentMessages[activeAgentTab] || []}
-                loading={false}
-                hasMore={!!agentHasMore[activeAgentTab]}
-                onLoadMore={() => loadAgentMessages(groupJid, activeAgentTab, true)}
-                scrollTrigger={scrollTrigger}
-                groupJid={groupJid}
-                isWaiting={!!agentWaiting[activeAgentTab] || !!agentStreaming[activeAgentTab]}
-                onInterrupt={agentStreaming[activeAgentTab]?.interrupted ? undefined : () => interruptQuery(`${groupJid}#agent:${activeAgentTab}`)}
-                agentId={activeAgentTab}
-              />
-              <MessageInput
-                // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
-                // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
-                // 那种「温进程/退避中」也算 running 的口径。
-                isRunning={currentContextWaiting}
-                contextLabel={currentContextName}
-                // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
-                // 删块时必须搬过来，否则整个跟进交互静默消失。
-                queuedFollowUps={queuedFollowUps}
-                onFollowUpAction={(item, action, content) =>
-                  actOnFollowUp(
-                    followUpChatJid,
-                    item.id,
-                    action,
-                    item.delivery_run_id,
-                    content,
-                  )
-                }
-                onSend={async (content, attachments) => {
-                  const ok = await sendAgentMessage(groupJid, activeAgentTab, content, attachments);
-                  if (ok) setScrollTrigger(n => n + 1);
-                  return ok;
-                }}
-                groupJid={groupJid}
-                onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(activeAgentTab); setShowResetConfirm(true); } : undefined}
-              />
-            </>
-          ) : (
-            <>
-              <MessageList
-                key={`main-${groupJid}`}
-                messages={groupMessages || []}
-                loading={loading}
-                hasMore={hasMoreMessages}
-                onLoadMore={handleLoadMore}
-                scrollTrigger={scrollTrigger}
-                groupJid={groupJid}
-                isWaiting={isWaiting}
-                onInterrupt={mainInterrupted ? undefined : () => interruptQuery(groupJid)}
-                onSend={(content) => handleSend(content)}
-              />
-              <MessageInput
-                // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
-                // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
-                // 那种「温进程/退避中」也算 running 的口径。
-                isRunning={currentContextWaiting}
-                contextLabel={currentContextName}
-                // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
-                // 删块时必须搬过来，否则整个跟进交互静默消失。
-                queuedFollowUps={queuedFollowUps}
-                onFollowUpAction={(item, action, content) =>
-                  actOnFollowUp(
-                    followUpChatJid,
-                    item.id,
-                    action,
-                    item.delivery_run_id,
-                    content,
-                  )
-                }
-                onSend={handleSend}
-                groupJid={groupJid}
-                onResetSession={canModifyWorkspaceConfig ? () => { setResetAgentId(null); setShowResetConfirm(true); } : undefined}
-                onToggleTerminal={canUseTerminal ? handleTerminalToggle : undefined}
-              />
-            </>
-          )}
-        </div>
-
-        {/* Desktop: sidebar with icon tabs (collapsible) */}
-        <div className={cn(
-          "hidden lg:flex lg:flex-col flex-shrink-0 border-l border-border bg-surface dark:bg-background transition-[width] duration-200",
-          panelOpen ? "w-80" : "w-0 overflow-hidden border-l-0"
-        )}>
-          {/* Icon tab bar */}
-          <TooltipProvider delayDuration={300}>
-            <div className="flex border-b border-border">
-              {visibleTabs.map(tab => {
-                const Icon = tab.icon;
-                const active = sidebarTab === tab.id;
-                return (
-                  <Tooltip key={tab.id}>
-                    <TooltipTrigger asChild>
-                      <button
-                        onClick={() => setSidebarTab(tab.id)}
-                        className={cn(
-                          "flex-1 flex items-center justify-center py-2.5 transition-colors cursor-pointer",
-                          active
-                            ? "text-primary border-b-2 border-primary"
-                            : "text-muted-foreground hover:text-foreground"
-                        )}
-                      >
-                        <Icon className="w-4 h-4" />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent side="bottom" className="text-xs">
-                      {tab.label}
-                    </TooltipContent>
-                  </Tooltip>
-                );
-              })}
-            </div>
-          </TooltipProvider>
-
-          {/* Tab content */}
-          <div className="flex-1 overflow-hidden min-h-0">
-            {sidebarTab === 'files' ? (
-              <FilePanel groupJid={groupJid} />
-            ) : sidebarTab === 'env' ? (
-              <ContainerEnvPanel groupJid={groupJid} />
-            ) : sidebarTab === 'skills' ? (
-              <WorkspaceSkillsPanel
-                groupJid={groupJid}
-                canModify={canModifyWorkspaceConfig}
-              />
+            ) : activeAgentTab && isConversationTab ? (
+              <>
+                <MessageList
+                  key={`conv-${activeAgentTab}`}
+                  messages={agentMessages[activeAgentTab] || []}
+                  loading={false}
+                  hasMore={!!agentHasMore[activeAgentTab]}
+                  onLoadMore={() =>
+                    loadAgentMessages(groupJid, activeAgentTab, true)
+                  }
+                  scrollTrigger={scrollTrigger}
+                  groupJid={groupJid}
+                  isWaiting={
+                    !!agentWaiting[activeAgentTab] ||
+                    !!agentStreaming[activeAgentTab]
+                  }
+                  onInterrupt={
+                    agentStreaming[activeAgentTab]?.interrupted
+                      ? undefined
+                      : () =>
+                          interruptQuery(`${groupJid}#agent:${activeAgentTab}`)
+                  }
+                  agentId={activeAgentTab}
+                />
+                <MessageInput
+                  // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
+                  // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
+                  // 那种「温进程/退避中」也算 running 的口径。
+                  isRunning={currentContextWaiting}
+                  contextLabel={currentContextName}
+                  // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
+                  // 删块时必须搬过来，否则整个跟进交互静默消失。
+                  queuedFollowUps={queuedFollowUps}
+                  onFollowUpAction={(item, action, content) =>
+                    actOnFollowUp(
+                      followUpChatJid,
+                      item.id,
+                      action,
+                      item.delivery_run_id,
+                      content,
+                    )
+                  }
+                  onSend={async (content, attachments) => {
+                    const ok = await sendAgentMessage(
+                      groupJid,
+                      activeAgentTab,
+                      content,
+                      attachments,
+                    );
+                    if (ok) setScrollTrigger((n) => n + 1);
+                    return ok;
+                  }}
+                  groupJid={groupJid}
+                  onResetSession={
+                    canModifyWorkspaceConfig
+                      ? () => {
+                          setResetAgentId(activeAgentTab);
+                          setShowResetConfirm(true);
+                        }
+                      : undefined
+                  }
+                />
+              </>
             ) : (
-              <WorkspaceMcpPanel
-                groupJid={groupJid}
-                canModify={canModifyWorkspaceConfig}
-              />
+              <>
+                <MessageList
+                  key={`main-${groupJid}`}
+                  messages={groupMessages || []}
+                  loading={loading}
+                  hasMore={hasMoreMessages}
+                  onLoadMore={handleLoadMore}
+                  scrollTrigger={scrollTrigger}
+                  groupJid={groupJid}
+                  isWaiting={isWaiting}
+                  onInterrupt={
+                    mainInterrupted ? undefined : () => interruptQuery(groupJid)
+                  }
+                  onSend={(content) => handleSend(content)}
+                />
+                <MessageInput
+                  // 停止按钮的状态源（契约测试 follow-up-web-product-contract 锁定）：
+                  // 必须用精确的 query attempt，不能用 activeAgent.status === 'running'
+                  // 那种「温进程/退避中」也算 running 的口径。
+                  isRunning={currentContextWaiting}
+                  contextLabel={currentContextName}
+                  // 跟进卡（upstream 能力）：原本只挂在重复渲染的那一块上，
+                  // 删块时必须搬过来，否则整个跟进交互静默消失。
+                  queuedFollowUps={queuedFollowUps}
+                  onFollowUpAction={(item, action, content) =>
+                    actOnFollowUp(
+                      followUpChatJid,
+                      item.id,
+                      action,
+                      item.delivery_run_id,
+                      content,
+                    )
+                  }
+                  onSend={handleSend}
+                  groupJid={groupJid}
+                  onResetSession={
+                    canModifyWorkspaceConfig
+                      ? () => {
+                          setResetAgentId(null);
+                          setShowResetConfirm(true);
+                        }
+                      : undefined
+                  }
+                  onToggleTerminal={
+                    canUseTerminal ? handleTerminalToggle : undefined
+                  }
+                />
+              </>
             )}
           </div>
-        </div>
 
-      {/* Desktop: Bottom terminal panel with drag handle */}
-      {canUseTerminal && terminalMounted && (
-        <>
-          {/* Drag handle */}
-          {terminalVisible && (
-            <div
-              onMouseDown={handleDragStart}
-              onTouchStart={handleTouchDragStart}
-              className="hidden lg:flex h-1 bg-muted hover:bg-brand-400 cursor-row-resize items-center justify-center transition-colors group"
-            >
-              <div className="w-8 h-0.5 rounded-full bg-muted-foreground group-hover:bg-primary transition-colors" />
-            </div>
-          )}
-          {/* Terminal panel */}
+          {/* Desktop: sidebar with icon tabs (collapsible) */}
           <div
-            className={`hidden lg:block flex-shrink-0 overflow-hidden transition-[height] duration-200 ${
-              terminalVisible ? 'border-t border-border' : 'border-t-0'
-            }`}
-            style={{ height: terminalVisible ? terminalHeight : 0 }}
+            className={cn(
+              'hidden lg:flex lg:flex-col flex-shrink-0 border-l border-border bg-surface dark:bg-background transition-[width] duration-200',
+              panelOpen ? 'w-80' : 'w-0 overflow-hidden border-l-0',
+            )}
           >
-            <TerminalPanel
-              groupJid={groupJid}
-              visible={terminalVisible}
-              onHide={() => setTerminalVisible(false)}
-              onDelete={() => {
-                setTerminalVisible(false);
-                setTerminalMounted(false);
-              }}
-            />
-          </div>
-        </>
-      )}
-      </div>
+            {/* Icon tab bar */}
+            <TooltipProvider delayDuration={300}>
+              <div className="flex border-b border-border">
+                {visibleTabs.map((tab) => {
+                  const Icon = tab.icon;
+                  const active = sidebarTab === tab.id;
+                  return (
+                    <Tooltip key={tab.id}>
+                      <TooltipTrigger asChild>
+                        <button
+                          onClick={() => setSidebarTab(tab.id)}
+                          className={cn(
+                            'flex-1 flex items-center justify-center py-2.5 transition-colors cursor-pointer',
+                            active
+                              ? 'text-primary border-b-2 border-primary'
+                              : 'text-muted-foreground hover:text-foreground',
+                          )}
+                        >
+                          <Icon className="w-4 h-4" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent side="bottom" className="text-xs">
+                        {tab.label}
+                      </TooltipContent>
+                    </Tooltip>
+                  );
+                })}
+              </div>
+            </TooltipProvider>
 
+            {/* Tab content */}
+            <div className="flex-1 overflow-hidden min-h-0">
+              {sidebarTab === 'files' ? (
+                <FilePanel groupJid={groupJid} />
+              ) : sidebarTab === 'env' ? (
+                <ContainerEnvPanel groupJid={groupJid} />
+              ) : sidebarTab === 'skills' ? (
+                <WorkspaceSkillsPanel
+                  groupJid={groupJid}
+                  canModify={canModifyWorkspaceConfig}
+                />
+              ) : (
+                <WorkspaceMcpPanel
+                  groupJid={groupJid}
+                  canModify={canModifyWorkspaceConfig}
+                />
+              )}
+            </div>
+          </div>
+
+          {/* Desktop: Bottom terminal panel with drag handle */}
+          {canUseTerminal && terminalMounted && (
+            <>
+              {/* Drag handle */}
+              {terminalVisible && (
+                <div
+                  onMouseDown={handleDragStart}
+                  onTouchStart={handleTouchDragStart}
+                  className="hidden lg:flex h-1 bg-muted hover:bg-brand-400 cursor-row-resize items-center justify-center transition-colors group"
+                >
+                  <div className="w-8 h-0.5 rounded-full bg-muted-foreground group-hover:bg-primary transition-colors" />
+                </div>
+              )}
+              {/* Terminal panel */}
+              <div
+                className={`hidden lg:block flex-shrink-0 overflow-hidden transition-[height] duration-200 ${
+                  terminalVisible ? 'border-t border-border' : 'border-t-0'
+                }`}
+                style={{ height: terminalVisible ? terminalHeight : 0 }}
+              >
+                <TerminalPanel
+                  groupJid={groupJid}
+                  visible={terminalVisible}
+                  onHide={() => setTerminalVisible(false)}
+                  onDelete={() => {
+                    setTerminalVisible(false);
+                    setTerminalMounted(false);
+                  }}
+                />
+              </div>
+            </>
+          )}
+        </div>
       </div>
 
       <aside
@@ -1440,7 +1531,7 @@ export function ChatView({ groupJid, onBack, headerLeft }: ChatViewProps) {
         message={
           resetAgentId
             ? '将清除该子对话的 Claude 会话上下文，下次发送消息时将开始全新会话。聊天记录不受影响。'
-            : '将清除当前对话的 Claude 上下文并停止运行中的 Agent 进程，下次发送消息时将开始全新会话。聊天记录和其他对话不受影响。'
+            : '将清除当前对话的 Claude 上下文并停止运行中的智能体进程，下次发送消息时将开始全新会话。聊天记录和其他对话不受影响。'
         }
         confirmText="清除"
         confirmVariant="danger"
