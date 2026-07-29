@@ -1,16 +1,14 @@
 import { useCallback, useEffect, useState } from 'react';
-import {
-  Bot,
-  Edit3,
-  ExternalLink,
-  Loader2,
-  Plus,
-  Trash2,
-} from 'lucide-react';
+import { Bot, Edit3, ExternalLink, Loader2, Plus, Trash2 } from 'lucide-react';
 
 import { ConfirmDialog } from '@/components/common/ConfirmDialog';
 import { Button } from '@/components/ui/button';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
@@ -113,25 +111,76 @@ function GrokProviderEditor({
     }
   }, [cancelOAuthFlow, isCreate, name, oauthFlow, provider, setError, weight]);
 
-  const handleOAuthComplete = useCallback(async () => {
+  /**
+   * `silent` 供轮询使用：后端在浏览器授权还没完成时返回 409，那是**预期状态**
+   * 而不是错误，不能弹给用户看。手动点「我已完成授权」时仍按错误提示。
+   */
+  const completeOAuthFlow = useCallback(
+    async (silent: boolean): Promise<'done' | 'pending' | 'failed'> => {
+      if (!oauthFlow) return 'failed';
+      if (!silent) setOauthCompleting(true);
+      if (!silent) setError(null);
+      try {
+        await api.post<{ provider: UnifiedProviderPublic }>(
+          '/api/config/grok/oauth/complete',
+          { state: oauthFlow.state },
+          30000,
+        );
+        setOauthFlow(null);
+        setNotice(
+          isCreate
+            ? 'Grok OAuth 登录成功，Grok 提供商已创建。'
+            : 'Grok OAuth 登录成功，凭据已更新。',
+        );
+        onSave();
+        return 'done';
+      } catch (err) {
+        // 409 = 后端说「授权尚未完成」，轮询里这是预期状态。
+        const status = (err as { status?: number } | null)?.status;
+        if (silent && status === 409) return 'pending';
+        setError(getErrorMessage(err, 'Grok OAuth 登录尚未完成'));
+        return 'failed';
+      } finally {
+        if (!silent) setOauthCompleting(false);
+      }
+    },
+    [isCreate, oauthFlow, onSave, setError, setNotice],
+  );
+
+  const handleOAuthComplete = useCallback(
+    () => void completeOAuthFlow(false),
+    [completeOAuthFlow],
+  );
+
+  /**
+   * 浏览器授权完成后自动落库。
+   *
+   * 没有这段轮询时，整条链路是「点登录 → 浏览器授权 → **回来再点一次确认**」。
+   * 但浏览器里授权成功后页面就提示完成了，没人会想到还要回到 HappyClaw 再点一下；
+   * 于是 CLI 已经把 auth.json 写进了 flow 目录，却没人调 /oauth/complete 把它存进
+   * provider 配置，15 分钟后被 TTL 清理**连同凭据一起删掉** —— 用户看到的现象是
+   * 「我明明登录成功了，但设置里还是旧凭据」，且没有任何报错。
+   *
+   * 实测踩过一次：flow 目录里 auth.json 确实生成了，provider 配置纹丝不动。
+   */
+  useEffect(() => {
     if (!oauthFlow) return;
-    setOauthCompleting(true);
-    setError(null);
-    try {
-      await api.post<{ provider: UnifiedProviderPublic }>(
-        '/api/config/grok/oauth/complete',
-        { state: oauthFlow.state },
-        30000,
-      );
-      setOauthFlow(null);
-      setNotice(isCreate ? 'Grok OAuth 登录成功，Grok 提供商已创建。' : 'Grok OAuth 登录成功，凭据已更新。');
-      onSave();
-    } catch (err) {
-      setError(getErrorMessage(err, 'Grok OAuth 登录尚未完成'));
-    } finally {
-      setOauthCompleting(false);
-    }
-  }, [isCreate, oauthFlow, onSave, setError, setNotice]);
+    let cancelled = false;
+    const timer = setInterval(() => {
+      if (cancelled) return;
+      if (Date.now() >= oauthFlow.expiresAt) {
+        clearInterval(timer);
+        return;
+      }
+      void completeOAuthFlow(true).then((result) => {
+        if (result !== 'pending') clearInterval(timer);
+      });
+    }, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [completeOAuthFlow, oauthFlow]);
 
   const handleCopyDeviceCode = useCallback(async () => {
     if (!oauthFlow?.deviceCode) return;
@@ -177,16 +226,20 @@ function GrokProviderEditor({
         });
 
         if (grokAuthJson.trim()) {
-          await api.put(
-            `/api/config/grok/providers/${provider.id}/secrets`,
-            { grokAuthJson: grokAuthJson.trim() },
-          );
+          await api.put(`/api/config/grok/providers/${provider.id}/secrets`, {
+            grokAuthJson: grokAuthJson.trim(),
+          });
         }
         setNotice('Grok 提供商配置已保存。');
       }
       onSave();
     } catch (err) {
-      setError(getErrorMessage(err, isCreate ? '创建 Grok 提供商失败' : '保存 Grok 提供商失败'));
+      setError(
+        getErrorMessage(
+          err,
+          isCreate ? '创建 Grok 提供商失败' : '保存 Grok 提供商失败',
+        ),
+      );
     } finally {
       setSaving(false);
     }
@@ -204,12 +257,18 @@ function GrokProviderEditor({
     >
       <DialogContent className="sm:max-w-xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>{isCreate ? '添加官方 Grok 提供商' : `编辑官方 Grok 提供商：${provider?.name}`}</DialogTitle>
+          <DialogTitle>
+            {isCreate
+              ? '添加官方 Grok 提供商'
+              : `编辑官方 Grok 提供商：${provider?.name}`}
+          </DialogTitle>
         </DialogHeader>
 
         <div className="space-y-4">
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">名称</label>
+            <label className="block text-xs text-muted-foreground mb-1">
+              名称
+            </label>
             <Input
               value={name}
               onChange={(event) => setName(event.target.value)}
@@ -219,7 +278,9 @@ function GrokProviderEditor({
           </div>
 
           <div>
-            <label className="block text-xs text-muted-foreground mb-2">提供商类型</label>
+            <label className="block text-xs text-muted-foreground mb-2">
+              提供商类型
+            </label>
             <div className="inline-flex rounded-lg border border-border p-1 bg-muted">
               <button
                 type="button"
@@ -234,22 +295,31 @@ function GrokProviderEditor({
           </div>
 
           <div>
-            <label className="block text-xs text-muted-foreground mb-1">权重</label>
+            <label className="block text-xs text-muted-foreground mb-1">
+              权重
+            </label>
             <Input
               type="number"
               min={1}
               max={100}
               value={weight}
-              onChange={(event) => setWeight(Math.max(1, Math.min(100, Number(event.target.value) || 1)))}
+              onChange={(event) =>
+                setWeight(
+                  Math.max(1, Math.min(100, Number(event.target.value) || 1)),
+                )
+              }
               disabled={saving}
             />
           </div>
 
           <div className="space-y-3">
             <div className="rounded-lg border border-teal-200 bg-teal-50/50 p-4 space-y-3 dark:border-teal-900 dark:bg-teal-950/20">
-              <div className="text-sm font-medium text-foreground">一键登录 Grok（推荐）</div>
+              <div className="text-sm font-medium text-foreground">
+                一键登录 Grok（推荐）
+              </div>
               <div className="text-xs text-muted-foreground">
-                点击按钮后会打开 xAI 授权页面，把这里显示的一次性 code 填进去；完成后回到这里确认。
+                点击按钮后会打开 xAI 授权页面，把这里显示的一次性 code
+                填进去；完成后回到这里确认。
               </div>
 
               {!isCreate && provider?.hasGrokAuthJson && (
@@ -259,39 +329,69 @@ function GrokProviderEditor({
               )}
 
               {!oauthFlow ? (
-                <Button onClick={handleOAuthStart} disabled={saving || oauthLoading}>
-                  {oauthLoading ? <Loader2 className="size-4 animate-spin" /> : <ExternalLink className="size-4" />}
-                  {!isCreate && provider?.hasGrokAuthJson ? '重新登录 Grok' : '一键登录 Grok'}
+                <Button
+                  onClick={handleOAuthStart}
+                  disabled={saving || oauthLoading}
+                >
+                  {oauthLoading ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <ExternalLink className="size-4" />
+                  )}
+                  {!isCreate && provider?.hasGrokAuthJson
+                    ? '重新登录 Grok'
+                    : '一键登录 Grok'}
                 </Button>
               ) : (
                 <div className="space-y-3">
                   <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
-                    授权页面已打开。一次性 code 会在 {new Date(oauthFlow.expiresAt).toLocaleTimeString('zh-CN')} 过期。
+                    授权页面已打开。一次性 code 会在{' '}
+                    {new Date(oauthFlow.expiresAt).toLocaleTimeString('zh-CN')}{' '}
+                    过期。
                   </div>
                   {oauthFlow.deviceCode && (
                     <div className="flex flex-col sm:flex-row gap-2">
                       <div className="flex-1 rounded-md border border-border bg-background px-3 py-2 font-mono text-lg text-foreground">
                         {oauthFlow.deviceCode}
                       </div>
-                      <Button variant="outline" onClick={handleCopyDeviceCode} disabled={oauthCompleting}>
+                      <Button
+                        variant="outline"
+                        onClick={handleCopyDeviceCode}
+                        disabled={oauthCompleting}
+                      >
                         复制 code
                       </Button>
                     </div>
                   )}
                   <div className="flex flex-wrap gap-2">
-                    <Button onClick={handleOAuthComplete} disabled={oauthCompleting}>
-                      {oauthCompleting && <Loader2 className="size-4 animate-spin" />}
+                    <Button
+                      onClick={handleOAuthComplete}
+                      disabled={oauthCompleting}
+                    >
+                      {oauthCompleting && (
+                        <Loader2 className="size-4 animate-spin" />
+                      )}
                       我已完成授权
                     </Button>
                     <Button
                       variant="outline"
-                      onClick={() => window.open(oauthFlow.authorizeUrl, '_blank', 'noopener,noreferrer')}
+                      onClick={() =>
+                        window.open(
+                          oauthFlow.authorizeUrl,
+                          '_blank',
+                          'noopener,noreferrer',
+                        )
+                      }
                       disabled={oauthCompleting}
                     >
                       <ExternalLink className="size-4" />
                       重新打开
                     </Button>
-                    <Button variant="ghost" onClick={() => void cancelOAuthFlow()} disabled={oauthCompleting}>
+                    <Button
+                      variant="ghost"
+                      onClick={() => void cancelOAuthFlow()}
+                      disabled={oauthCompleting}
+                    >
                       取消
                     </Button>
                   </div>
@@ -341,33 +441,44 @@ function GrokProviderEditor({
   );
 }
 
-export function GrokProviderSection({ setNotice, setError }: GrokProviderSectionProps) {
+export function GrokProviderSection({
+  setNotice,
+  setError,
+}: GrokProviderSectionProps) {
   const [providers, setProviders] = useState<UnifiedProviderPublic[]>([]);
   const [loading, setLoading] = useState(true);
   const [localNotice, setLocalNotice] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [editorOpen, setEditorOpen] = useState(false);
-  const [editingProvider, setEditingProvider] = useState<UnifiedProviderPublic | null>(null);
-  const [pendingDeleteProvider, setPendingDeleteProvider] = useState<UnifiedProviderPublic | null>(null);
+  const [editingProvider, setEditingProvider] =
+    useState<UnifiedProviderPublic | null>(null);
+  const [pendingDeleteProvider, setPendingDeleteProvider] =
+    useState<UnifiedProviderPublic | null>(null);
 
-  const notifyNotice = useCallback((message: string | null) => {
-    setLocalNotice(message);
-    if (message) setLocalError(null);
-    setNotice(message);
-  }, [setNotice]);
+  const notifyNotice = useCallback(
+    (message: string | null) => {
+      setLocalNotice(message);
+      if (message) setLocalError(null);
+      setNotice(message);
+    },
+    [setNotice],
+  );
 
-  const notifyError = useCallback((message: string | null) => {
-    setLocalError(message);
-    if (message) setLocalNotice(null);
-    setError(message);
-  }, [setError]);
+  const notifyError = useCallback(
+    (message: string | null) => {
+      setLocalError(message);
+      if (message) setLocalNotice(null);
+      setError(message);
+    },
+    [setError],
+  );
 
   const load = useCallback(async () => {
     try {
-      const providersData = await api.get<{ providers: UnifiedProviderPublic[] }>(
-        '/api/config/grok/providers',
-      );
+      const providersData = await api.get<{
+        providers: UnifiedProviderPublic[];
+      }>('/api/config/grok/providers');
       setProviders(providersData.providers);
     } catch (err) {
       notifyError(getErrorMessage(err, '加载 Grok 提供商失败'));
@@ -387,7 +498,11 @@ export function GrokProviderSection({ setNotice, setError }: GrokProviderSection
       await api.patch(`/api/config/grok/providers/${provider.id}`, {
         enabled: !provider.enabled,
       });
-      notifyNotice(provider.enabled ? `已禁用「${provider.name}」` : `已启用「${provider.name}」`);
+      notifyNotice(
+        provider.enabled
+          ? `已禁用「${provider.name}」`
+          : `已启用「${provider.name}」`,
+      );
       await load();
     } catch (err) {
       notifyError(getErrorMessage(err, '切换 Grok 提供商状态失败'));
@@ -430,7 +545,9 @@ export function GrokProviderSection({ setNotice, setError }: GrokProviderSection
   return (
     <div className="space-y-4">
       {(localError || localNotice) && (
-        <div className={`rounded-md border px-3 py-2 text-sm ${localError ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300'}`}>
+        <div
+          className={`rounded-md border px-3 py-2 text-sm ${localError ? 'border-destructive/30 bg-destructive/5 text-destructive' : 'border-emerald-200 bg-emerald-50 text-emerald-700 dark:border-emerald-900 dark:bg-emerald-950/30 dark:text-emerald-300'}`}
+        >
           {localError || localNotice}
         </div>
       )}
@@ -440,9 +557,13 @@ export function GrokProviderSection({ setNotice, setError }: GrokProviderSection
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <Bot className="w-4 h-4 text-muted-foreground" />
-              <div className="text-sm font-medium text-foreground">官方 Grok 账号池</div>
+              <div className="text-sm font-medium text-foreground">
+                官方 Grok 账号池
+              </div>
             </div>
-            <span className="text-xs text-muted-foreground">{providers.length} 个提供商</span>
+            <span className="text-xs text-muted-foreground">
+              {providers.length} 个提供商
+            </span>
           </div>
         </div>
 
@@ -483,7 +604,11 @@ export function GrokProviderSection({ setNotice, setError }: GrokProviderSection
                         checked={provider.enabled}
                         disabled={busyId !== null}
                         onCheckedChange={() => handleToggle(provider)}
-                        aria-label={provider.enabled ? '禁用 Grok 提供商' : '启用 Grok 提供商'}
+                        aria-label={
+                          provider.enabled
+                            ? '禁用 Grok 提供商'
+                            : '启用 Grok 提供商'
+                        }
                       />
                       <Button
                         size="sm"
@@ -505,7 +630,11 @@ export function GrokProviderSection({ setNotice, setError }: GrokProviderSection
                         disabled={busyId !== null}
                         className="h-7 px-2 text-xs text-muted-foreground hover:text-red-600"
                       >
-                        {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+                        {busy ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="size-3.5" />
+                        )}
                       </Button>
                     </div>
                   </div>
@@ -548,7 +677,11 @@ export function GrokProviderSection({ setNotice, setError }: GrokProviderSection
         onClose={() => setPendingDeleteProvider(null)}
         onConfirm={handleDeleteConfirm}
         title="删除官方 Grok 提供商"
-        message={pendingDeleteProvider ? `确认删除官方 Grok 提供商「${pendingDeleteProvider.name}」？` : '确认删除该官方 Grok 提供商？'}
+        message={
+          pendingDeleteProvider
+            ? `确认删除官方 Grok 提供商「${pendingDeleteProvider.name}」？`
+            : '确认删除该官方 Grok 提供商？'
+        }
         confirmText="确认删除"
         confirmVariant="danger"
         loading={busyId !== null}
