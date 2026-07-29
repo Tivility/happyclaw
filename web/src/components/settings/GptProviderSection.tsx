@@ -147,29 +147,80 @@ function GptProviderEditor({
     }
   }, [cancelOAuthFlow, isCreate, name, oauthFlow, provider, setError, weight]);
 
-  const handleOAuthComplete = useCallback(async () => {
+  /**
+   * `silent` 供轮询使用：后端在浏览器授权还没完成时返回 409，那是**预期状态**
+   * 而不是错误，不能弹给用户看。手动点「我已完成授权」时仍按错误提示。
+   */
+  const completeOAuthFlow = useCallback(
+    async (silent: boolean): Promise<'done' | 'pending' | 'failed'> => {
+      if (!oauthFlow) return 'failed';
+      if (!silent) {
+        setOauthCompleting(true);
+        setError(null);
+      }
+      try {
+        await api.post<{ provider: UnifiedProviderPublic }>(
+          '/api/config/codex/oauth/complete',
+          { state: oauthFlow.state },
+          30000,
+        );
+        setOauthFlow(null);
+        setNotice(
+          isCreate
+            ? 'ChatGPT OAuth 登录成功，GPT 提供商已创建。'
+            : 'ChatGPT OAuth 登录成功，凭据已更新。',
+        );
+        onSave();
+        return 'done';
+      } catch (err) {
+        // 409 = 后端说「授权尚未完成」，轮询里这是预期状态。
+        const status = (err as { status?: number } | null)?.status;
+        if (silent && status === 409) return 'pending';
+        setError(getErrorMessage(err, 'ChatGPT OAuth 登录尚未完成'));
+        return 'failed';
+      } finally {
+        if (!silent) setOauthCompleting(false);
+      }
+    },
+    [isCreate, oauthFlow, onSave, setError, setNotice],
+  );
+
+  const handleOAuthComplete = useCallback(
+    () => void completeOAuthFlow(false),
+    [completeOAuthFlow],
+  );
+
+  /**
+   * 浏览器授权完成后自动落库。与 GrokProviderSection 同源的问题：
+   *
+   * 没有这段轮询时，整条链路是「点登录 → 浏览器授权 → **回来再点一次确认**」。
+   * 但浏览器里授权成功后页面就提示完成了，没人会想到还要回到 HappyClaw 再点一下；
+   * 于是 CLI 已经把 auth.json 写进了 flow 目录，却没人调 /oauth/complete 把它存进
+   * provider 配置，15 分钟后 TTL 清理 rmSync 掉整个目录、**连同那份有效凭据一起
+   * 删掉** —— 用户看到的现象是「我明明登录成功了，设置里还是旧凭据」，且全程没有
+   * 任何报错。
+   *
+   * Grok 那侧生产实测过一次：flow 目录里 auth.json 确实生成了，provider 配置纹丝
+   * 不动，15 分钟后凭据永久丢失。Codex 走的是同一套 device-code + 手动确认流程。
+   */
+  useEffect(() => {
     if (!oauthFlow) return;
-    setOauthCompleting(true);
-    setError(null);
-    try {
-      await api.post<{ provider: UnifiedProviderPublic }>(
-        '/api/config/codex/oauth/complete',
-        { state: oauthFlow.state },
-        30000,
-      );
-      setOauthFlow(null);
-      setNotice(
-        isCreate
-          ? 'ChatGPT OAuth 登录成功，GPT 提供商已创建。'
-          : 'ChatGPT OAuth 登录成功，凭据已更新。',
-      );
-      onSave();
-    } catch (err) {
-      setError(getErrorMessage(err, 'ChatGPT OAuth 登录尚未完成'));
-    } finally {
-      setOauthCompleting(false);
-    }
-  }, [isCreate, oauthFlow, onSave, setError, setNotice]);
+    let cancelled = false;
+    const timer = setInterval(() => {
+      if (cancelled) return;
+      if (Date.now() >= oauthFlow.expiresAt) {
+        clearInterval(timer);
+        return;
+      }
+      void completeOAuthFlow(true).then((result) => {
+        if (result !== 'pending') clearInterval(timer);
+      });
+    }, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [completeOAuthFlow, oauthFlow]);
 
   const handleCopyDeviceCode = useCallback(async () => {
     if (!oauthFlow?.deviceCode) return;
