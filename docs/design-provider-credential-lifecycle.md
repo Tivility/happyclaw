@@ -43,17 +43,38 @@ secrets.grokAuthJson  →  {runtime}/{providerId}/     →  用 refresh_token
 
 ### 一份凭据不能两处同时用
 
-同一个 auth.json 复制到两处分别运行，会形成**两条独立的链**：
+复制之后的两份**不是**一开始就独立的。刚复制的那一刻，两边握着**同一个**
+refresh_token；谁先刷新，谁就把它换掉，另一边手里那份当场作废。只有当两边各自
+成功刷新过至少一次之后，它们才各自持有独立的后代 token，此后互不干扰。
 
-- 各自持有不同的 refresh_token，互不干扰（实测：一份 20 天前的快照，在另一条
-  链刷新过无数次之后，依然能成功刷新）
-- 但**任一条链自己刷新后，它原来的那份快照就废了**
+> 早期版本这里写的是「复制出来就是两条独立链，互不干扰」，并据此认为
+> 「复制凭据去别处跑本身没问题」。**这个结论是错的**，2026-07-29 被生产实证推翻，
+> 见下。
 
-所以「复制凭据去别处跑」本身没问题 —— 副本会接管那条链并自我维护；
-**危险的是刷新之后把副本丢掉**，那条链就没了。
+实证（2026-07-29）：
 
-推论：终端里的 `~/.grok` 与 HappyClaw 的物化目录是两条独立链，互不影响；
-终端能用不代表 HappyClaw 能用，反之亦然。
+- 07-27 13:32 把 `~/.grok/auth.json` 拷进 HappyClaw 的 provider 配置
+- 07-28 04:12 终端侧 `~/.grok` 自行刷新 → 拿到新 token，**原 token 作废**
+- HappyClaw 此后每次 spawn：播种那份已作废的 token → CLI 刷新失败 → CLI **删掉
+  auth.json** → 报 `Authentication required`
+
+指纹比对会让人误判：两边的 refresh_token 当时**确实不同**（`f377ef…` vs
+`2b2116…`），看起来像两条独立链。但不同的原因不是「各自演化」，而是**其中一条
+已经被顶掉了**。判断独立与否不能只看指纹是否相同。
+
+还有一个自锁效应：CLI 刷新失败会把 auth.json 删掉，于是回写逻辑
+（`persistRefreshedProviderAuth`）读不到文件、无可回写，配置里那份死凭据就**永远
+留着**。这条链不可能自愈，只能重新登录。
+
+正确做法是**给 HappyClaw 单独登录一次**，从一开始就是两条各自独立的链：
+
+```bash
+GROK_HOME=data/config/grok/{providerId} grok login
+```
+
+登录后配置里的旧凭据会在下一次 spawn 的回写中被磁盘上的新凭据替换
+（`writeGrokProviderAuthMaterial` 判定 `authStat` 存在且 metadata 匹配，
+不会用旧配置覆盖新登录结果）。
 
 ### 并发使用同一个 provider
 
