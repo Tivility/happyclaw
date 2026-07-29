@@ -58,6 +58,15 @@ function logicalKey(input: ChannelTurnRuntimeInput): string {
 }
 
 /**
+ * 本进程当前持有认领的运行时，按 runId 索引。
+ *
+ * 只用来区分「同一个逻辑 Turn 在本进程里已经跑着」和「别的进程崩了留下残局」——
+ * 后者才是防重放围栏该管的事。dispose() 负责摘除；即使某条路径漏了 dispose，
+ * 残留项也只影响那一条已经处理完的消息，且 isClaimed 会在心跳失效后转 false。
+ */
+const LIVE_RUNTIMES = new Map<string, ChannelTurnRuntime>();
+
+/**
  * Owns the fenced lease and durable card projection for one logical input
  * turn. Provider delivery is intentionally outside this class.
  */
@@ -92,6 +101,29 @@ export class ChannelTurnRuntime {
 
   static start(input: ChannelTurnRuntimeInput): ChannelTurnRuntime {
     const runtime = new ChannelTurnRuntime(input);
+
+    // 本进程已经有同一个逻辑 Turn 在跑 —— 直接退让，**不碰数据库**。
+    //
+    // runId 由 logicalKey 决定（provider/account/externalMessageId/agentId），
+    // 所以暖 runner 的准入回调用同一条消息再 start 一次，拿到的是同一个 runId。
+    // 准入侧本来就会因为 disposition 不是 execute 而放弃，问题出在放弃之前：
+    // 下面那道防重放围栏会先把**仍在运行的那条 Turn** 改成 interrupted，等它正常
+    // 收尾时发现自己被判成「投递后崩溃」，于是给用户弹一条「上一次回复异常中断」。
+    // 现象是回复正常送达，但每一轮后面都紧跟一条误报。
+    //
+    // 不能靠「租约未过期」来区分：进程崩溃留下的租约同样未过期，而那正是围栏要
+    // 拦的场景。能区分二者的是**属主是不是本进程**，所以判据放在这里而不是 SQL 里。
+    const live = LIVE_RUNTIMES.get(runtime.runId);
+    if (live && live.isClaimed) {
+      runtime.initialStatus = 'running';
+      runtime.terminal = true;
+      logger.debug(
+        { runId: runtime.runId, externalMessageId: input.externalMessageId },
+        'Deferred duplicate Turn start; this process already owns the run',
+      );
+      return runtime;
+    }
+
     const { run } = createChannelTurnRun({
       ...input,
       id: runtime.runId,
@@ -124,7 +156,10 @@ export class ChannelTurnRuntime {
       claimChannelTurnRunById(run.id, runtime.owner, runtime.leaseMs) ?? null;
     runtime.initialStatus =
       runtime.claim?.status ?? getChannelTurnRun(run.id)?.status ?? run.status;
-    if (runtime.claim) runtime.startHeartbeat();
+    if (runtime.claim) {
+      runtime.startHeartbeat();
+      LIVE_RUNTIMES.set(runtime.runId, runtime);
+    }
     return runtime;
   }
 
@@ -313,6 +348,9 @@ export class ChannelTurnRuntime {
 
   dispose(): void {
     this.stopHeartbeat();
+    if (LIVE_RUNTIMES.get(this.runId) === this) {
+      LIVE_RUNTIMES.delete(this.runId);
+    }
   }
 
   private startHeartbeat(): void {

@@ -127,6 +127,58 @@ describe('durable channel turn runtime', () => {
     runtime.dispose();
   });
 
+  /**
+   * 同一进程内对同一条消息二次 start，不能伤到正在跑的那一轮。
+   *
+   * runId 由 logicalKey 决定（provider/account/externalMessageId/agentId），暖
+   * runner 的准入回调会用同一条消息再 start 一次，于是拿到同一个 runId。准入侧
+   * 本来就会因为 disposition 不是 execute 而放弃，但在放弃之前，防重放围栏已经
+   * 把仍在运行的那条 Turn 改成了 interrupted —— 等它正常收尾时发现自己被判成
+   * 「投递后崩溃」，给用户弹一条「上一次回复异常中断」。
+   *
+   * 生产实测：一个飞书会话连续 6 轮，回复都正常送达，每轮后面都跟一条误报。
+   *
+   * 注意与上面那个 crash 用例的区别：那里 first.dispose() 代表属主已死，围栏必须
+   * 生效；这里 first 仍然活着且持有认领，围栏必须让开。二者的唯一区别就是属主
+   * 还在不在，所以判据不能写成「租约是否过期」—— 崩溃留下的租约同样没过期。
+   */
+  test('同一进程内重复 start 不围栏正在跑的那一轮', () => {
+    const input = {
+      ...route,
+      externalMessageId: 'msg-warm-readmit',
+      agentId: 'agent-warm-readmit',
+    };
+    const first = ChannelTurnRuntime.start(input);
+    expect(first.executionDisposition).toBe('execute');
+
+    // 回复已送达：卡片进入终态。这正是围栏的触发条件。
+    const card = reliability.createStreamingCardRecord({
+      ...route,
+      turnRunId: first.runId,
+    }).card;
+    expect(
+      reliability.finalizeStreamingCardRecord(card.id, card.revision, {
+        status: 'completed',
+      })?.status,
+    ).toBe('completed');
+
+    // 暖 runner 准入：同一条消息再 start 一次，first 仍在跑、没有 dispose。
+    const duplicate = ChannelTurnRuntime.start(input);
+    expect(duplicate.executionDisposition).not.toBe('execute');
+    expect(duplicate.isClaimed).toBe(false);
+    duplicate.dispose();
+
+    // 关键断言：正在跑的那条 Turn 不能被改成 interrupted。
+    expect(reliability.getChannelTurnRun(first.runId)).toMatchObject({
+      status: 'running',
+    });
+    expect(first.isClaimed).toBe(true);
+
+    // 它随后仍能正常收尾，而不是被判成需要人工对账。
+    expect(first.complete()).toBe(true);
+    first.dispose();
+  });
+
   test('restart never re-executes after a delivered Outbox ACK survived the process', () => {
     const input = {
       ...route,
